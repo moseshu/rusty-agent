@@ -940,10 +940,11 @@ impl Capability for SkillsCapability {
 /// The explicitly selected Codex skills namespace over authority-routed providers.
 ///
 /// Shares the skills family with [`SkillsCapability`] and sandbox skills, so assembly rejects
-/// simultaneous sources. Catalog prompt rendering is supplied by a separate integration.
+/// simultaneous sources. The catalog is resolved after run binding, using the tools' executor cache.
 #[derive(Clone)]
 pub struct SkillsNsCapability {
     tools: Vec<Arc<dyn Tool>>,
+    catalog_prompt: Option<crate::skills_ns::SkillCatalogPrompt>,
 }
 
 impl fmt::Debug for SkillsNsCapability {
@@ -965,9 +966,47 @@ impl SkillsNsCapability {
         executor_roots: std::collections::BTreeMap<String, Workspace>,
         response_byte_budget: usize,
     ) -> Result<Self> {
+        let bundle = crate::skills_ns::skill_tools_with_prompt(
+            providers,
+            executor_roots,
+            response_byte_budget,
+        )?;
         Ok(Self {
-            tools: crate::skills_ns::skill_tools(providers, executor_roots, response_byte_budget)?,
+            tools: bundle.tools,
+            catalog_prompt: bundle.prompt,
         })
+    }
+
+    /// Supplies the resolved context window from the host's model catalog at binding time.
+    /// Absent or nonpositive windows use the upstream 8,000-character fallback.
+    #[must_use]
+    pub fn with_catalog_context_window(mut self, context_window: Option<i64>) -> Self {
+        if let Some(prompt) = &mut self.catalog_prompt {
+            prompt.set_context_window(context_window);
+        }
+        self
+    }
+
+    /// Sets the explicit metadata-token override, capped upstream at 10,000 tokens.
+    /// This takes precedence over a resolved context window regardless of builder order.
+    #[must_use]
+    pub fn with_catalog_max_context_tokens(
+        mut self,
+        max_context_tokens: std::num::NonZeroUsize,
+    ) -> Self {
+        if let Some(prompt) = &mut self.catalog_prompt {
+            prompt.set_max_context_tokens(max_context_tokens);
+        }
+        self
+    }
+
+    /// Includes the upstream optional skill usage instructions, omitted by default.
+    #[must_use]
+    pub fn with_skills_usage_instructions(mut self) -> Self {
+        if let Some(prompt) = &mut self.catalog_prompt {
+            prompt.include_usage_instructions();
+        }
+        self
     }
 
     /// The discovery tool, absent when no supported source is available.
@@ -983,11 +1022,35 @@ impl SkillsNsCapability {
     }
 }
 
+#[async_trait]
 impl Capability for SkillsNsCapability {
     fn kind(&self) -> CapabilityFamily {
         CapabilityFamily::SKILLS
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.clone()
+    }
+
+    fn bind(&self, context: &ra_core::context::RunContext) -> Result<Option<Arc<dyn Capability>>> {
+        let mut bound = self.clone();
+        if let Some(prompt) = &mut bound.catalog_prompt {
+            prompt.bind(context.run_id());
+        }
+        Ok(Some(Arc::new(bound)))
+    }
+
+    async fn instructions(&self) -> Result<Option<PromptSection>> {
+        let Some(prompt) = &self.catalog_prompt else {
+            return Ok(None);
+        };
+        let Some(content) = prompt.render().await else {
+            return Ok(None);
+        };
+        fragment(
+            &self.kind(),
+            "Available skills and their package access",
+            &content,
+            prompt.token_budget(),
+        )
     }
 }

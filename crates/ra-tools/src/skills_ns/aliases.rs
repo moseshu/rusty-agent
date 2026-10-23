@@ -54,7 +54,6 @@ impl AliasPlan {
 
     /// Renders the alias table using the upstream line format.
     #[must_use]
-    #[allow(dead_code)] // Retained with the upstream alias-table contract for catalog renderers.
     pub(crate) fn root_lines(&self) -> Vec<String> {
         self.roots
             .iter()

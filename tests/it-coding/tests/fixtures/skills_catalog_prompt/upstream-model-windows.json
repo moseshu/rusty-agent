@@ -1,0 +1,150 @@
+{
+  "revision": "815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052",
+  "source": "codex-rs/models-manager/models.json",
+  "context_windows": {
+    "gpt-6-astra": 272000,
+    "gpt-6.1-sol": 272000,
+    "gpt-6-sol": 272000,
+    "gpt-6-luna": 272000,
+    "gpt-5.6-sol": 272000,
+    "gpt-5.6-terra": 272000,
+    "gpt-5.6-luna": 272000,
+    "gpt-daybreak-blue-latest": 272000,
+    "gpt-daybreak-red-latest": 372000,
+    "gpt-5.5": 272000,
+    "codex-auto-review": 272000
+  },
+  "matcher_source": "codex-rs/models-manager/src/manager.rs",
+  "fallback_source": "codex-rs/models-manager/src/model_info.rs",
+  "fallback_context_window": 272000,
+  "lookups": [
+    {
+      "model": "gpt-5.5-2026-04-23",
+      "context_window": 272000
+    },
+    {
+      "model": "gpt-5.5-pro",
+      "context_window": 272000
+    },
+    {
+      "model": "custom/gpt-5.5-pro",
+      "context_window": 272000
+    },
+    {
+      "model": "openai-codex/gpt-5.5-2026-04-23",
+      "context_window": 272000
+    },
+    {
+      "model": "gpt-daybreak-red-latest-pro",
+      "context_window": 372000
+    },
+    {
+      "model": "gpt-daybreak-red-latest-2026-01-01",
+      "context_window": 372000
+    },
+    {
+      "model": "custom/gpt-daybreak-red-latest-pro",
+      "context_window": 372000
+    },
+    {
+      "model": "openai-codex/gpt-daybreak-red-latest",
+      "context_window": 372000
+    },
+    {
+      "model": "provider_123/gpt-daybreak-red-latest-pro",
+      "context_window": 372000
+    },
+    {
+      "model": "openai/gpt-daybreak-red-latest",
+      "context_window": 372000
+    },
+    {
+      "model": "ns1/ns2/gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "bad.ns/gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "bad namespace/gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "/gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "\u4f9b\u5e94\u5546/gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "gpt-daybreak-red-latest/extra",
+      "context_window": 372000
+    },
+    {
+      "model": "GPT-DAYBREAK-RED-LATEST",
+      "context_window": 272000
+    },
+    {
+      "model": " gpt-daybreak-red-latest",
+      "context_window": 272000
+    },
+    {
+      "model": "private-model",
+      "context_window": 272000
+    },
+    {
+      "model": "gpt-4.1",
+      "context_window": 272000
+    },
+    {
+      "model": "gpt-4o",
+      "context_window": 272000
+    },
+    {
+      "model": "",
+      "context_window": 272000
+    }
+  ],
+  "synthetic_candidates": [
+    [
+      "gpt-test",
+      111000
+    ],
+    [
+      "gpt-test-pro",
+      222000
+    ],
+    [
+      "gpt-test-pro",
+      999000
+    ],
+    [
+      "custom/gpt-test",
+      333000
+    ]
+  ],
+  "synthetic_lookups": [
+    {
+      "model": "gpt-test-pro-2026",
+      "context_window": 222000
+    },
+    {
+      "model": "provider/gpt-test-pro-2026",
+      "context_window": 222000
+    },
+    {
+      "model": "custom/gpt-test-pro-2026",
+      "context_window": 333000
+    },
+    {
+      "model": "ns1/ns2/gpt-test-pro",
+      "context_window": 272000
+    },
+    {
+      "model": "unknown",
+      "context_window": 272000
+    }
+  ]
+}

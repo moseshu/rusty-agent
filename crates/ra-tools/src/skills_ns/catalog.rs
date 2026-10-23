@@ -212,6 +212,8 @@ pub struct SkillCatalogEntry {
     pub name: String,
     /// Model-visible skill purpose.
     pub description: String,
+    /// Optional concise purpose preferred by the namespace catalog prompt.
+    pub short_description: Option<String>,
     /// Main instruction resource, usually SKILL.md.
     pub main_prompt: SkillResourceId,
     /// Optional presentation path; not a grant.
@@ -239,6 +241,7 @@ impl SkillCatalogEntry {
             authority,
             name: name.into(),
             description: description.into(),
+            short_description: None,
             main_prompt,
             display_path: None,
             alias_root: None,
@@ -252,6 +255,13 @@ impl SkillCatalogEntry {
     #[must_use]
     pub fn with_display_path(mut self, display_path: impl Into<String>) -> Self {
         self.display_path = Some(display_path.into());
+        self
+    }
+
+    /// Sets the concise purpose used by extension-compatible catalog prompts.
+    #[must_use]
+    pub fn with_short_description(mut self, short_description: Option<String>) -> Self {
+        self.short_description = short_description;
         self
     }
 
@@ -285,6 +295,12 @@ impl SkillCatalogEntry {
 
     pub(crate) fn is_model_visible(&self) -> bool {
         self.enabled && self.prompt_visible
+    }
+
+    pub(crate) fn rendered_path(&self) -> &str {
+        self.display_path
+            .as_deref()
+            .unwrap_or_else(|| self.main_prompt.as_str())
     }
 
     pub(crate) fn alias_root(&self) -> Option<&str> {

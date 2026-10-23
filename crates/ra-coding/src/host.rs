@@ -51,6 +51,7 @@ pub struct CodingHost {
     skills: Option<Arc<dyn SkillCatalog>>,
     skill_providers: Option<ra_tools::skills_ns::SkillProviders>,
     skill_roots: BTreeMap<String, Workspace>,
+    skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig,
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
     collaboration: Option<Collaboration>,
@@ -113,6 +114,7 @@ impl CodingHost {
             skills: None,
             skill_providers: None,
             skill_roots: BTreeMap::new(),
+            skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig::default(),
             user_input: None,
             request_user_input: false,
             collaboration: None,
@@ -198,8 +200,8 @@ impl CodingHost {
     /// Executor discovery requires a provider and at least one granted root; a cloud provider
     /// needs no executor roots. Configuring the merged catalog and an available namespace source
     /// together fails assembly. With neither source available, no tools are installed.
-    /// This does not discover disk skills or render a catalog prompt; models must currently
-    /// discover packages through `skills.list`.
+    /// The available-skills catalog is resolved per run, before the first model call. This does
+    /// not discover disk skills; metadata comes from the configured providers.
     #[must_use]
     pub fn with_skill_providers(
         mut self,
@@ -208,6 +210,18 @@ impl CodingHost {
     ) -> Self {
         self.skill_providers = Some(providers);
         self.skill_roots = executor_roots;
+        self
+    }
+
+    /// Configures the namespace catalog's model-window lookup, optional token override and usage
+    /// instructions. The window is resolved for each run, including its model override.
+    /// This does not affect the independent merged catalog.
+    #[must_use]
+    pub fn with_skill_catalog_prompt(
+        mut self,
+        config: crate::skills::SkillCatalogPromptConfig,
+    ) -> Self {
+        self.skill_catalog_prompt = config;
         self
     }
 
@@ -357,7 +371,7 @@ impl CodingHost {
 
     pub(crate) fn skills_ns_capability(
         &self,
-    ) -> ra_core::error::Result<Option<SkillsNsCapability>> {
+    ) -> ra_core::error::Result<Option<crate::skills::SkillCatalogCapability>> {
         let budget = ToolResultBudget::default();
         self.skill_providers
             .clone()
@@ -372,6 +386,12 @@ impl CodingHost {
                             .saturating_mul(ra_core::prompt::CHARS_PER_TOKEN),
                     ),
                 )
+                .map(|capability| {
+                    crate::skills::SkillCatalogCapability::new(
+                        capability,
+                        self.skill_catalog_prompt.clone(),
+                    )
+                })
             })
             .transpose()
     }

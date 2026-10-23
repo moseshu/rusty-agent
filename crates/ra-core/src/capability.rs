@@ -449,6 +449,10 @@ pub trait Capability: Send + Sync + 'static {
     /// is used as it is. `Some` supplies the bound form, which assembly uses in place of the
     /// installed one for this run only. Returning a new value rather than mutating `self` is what
     /// lets one installed capability serve concurrent runs without a per-run deep copy.
+    /// The runner resolves its model before binding; the provider-facing name is available through
+    /// [`RunContext::resolved_model_name`], including a run-level model override.
+    /// That metadata is specific to this binding context; ordinary runtime callbacks do not
+    /// receive it.
     ///
     /// The parameter is the run context because that is this framework's one live per-run value:
     /// tools, guards, hooks, and dynamic instructions already read it, and a second per-run context

@@ -8,11 +8,11 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::ExecutorReadSnapshot;
-use super::aliases::AliasPlan;
 use super::catalog::SkillResourceId;
 use super::provider::MAX_SKILL_RESOURCE_CONTENT_BYTES;
 use super::provider::SkillReadContext;
 use super::provider::SkillReadRequest;
+use super::render::build_alias_plan;
 
 use super::FunctionCallError;
 use super::MAX_HANDLE_BYTES;
@@ -257,24 +257,4 @@ fn page_response(
             "skills.read response budget leaves no room for contents".to_string(),
         )
     })
-}
-
-fn build_alias_plan(entries: &[&super::catalog::SkillCatalogEntry]) -> Option<AliasPlan> {
-    use super::catalog::SkillSourceKind;
-    let source = &entries.first()?.authority.kind;
-    if entries.iter().any(|entry| &entry.authority.kind != source) {
-        return None;
-    }
-    let prefix = match source {
-        SkillSourceKind::Executor => "e",
-        SkillSourceKind::Cloud => "c",
-        SkillSourceKind::Host | SkillSourceKind::Custom(_) => return None,
-    };
-    let mut ordered = entries.to_vec();
-    ordered.sort_by_key(|entry| entry.alias_root_order().unwrap_or(usize::MAX));
-    let roots = ordered
-        .iter()
-        .filter_map(|entry| entry.alias_root())
-        .collect::<Vec<_>>();
-    AliasPlan::build(prefix, &roots)
 }

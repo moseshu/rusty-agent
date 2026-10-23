@@ -1905,3 +1905,110 @@ impl ContextProcessor for TaggingProcessor {
         Ok(ContextProcessorResult::new(input))
     }
 }
+
+#[derive(Clone)]
+struct ModelBoundInstructions {
+    model: Option<String>,
+    bindings: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl Capability for ModelBoundInstructions {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::SKILLS
+    }
+
+    fn bind(&self, context: &RunContext) -> Result<Option<Arc<dyn Capability>>> {
+        let model = context.resolved_model_name().map(str::to_string);
+        self.bindings.lock().unwrap().push(model.clone());
+        Ok(Some(Arc::new(Self {
+            model,
+            bindings: self.bindings.clone(),
+        })))
+    }
+
+    async fn instructions(&self) -> Result<Option<PromptSection>> {
+        PromptSection::new(
+            self.kind().prompt_section_name(),
+            "Model-aware capability instructions",
+            self.kind().prompt_source(),
+            SectionStability::Stable,
+            SectionPosition::Prefix,
+            format!(
+                "capability model: {}",
+                self.model.as_deref().unwrap_or("unnamed default")
+            ),
+        )
+        .map(Some)
+    }
+}
+
+struct BindingModelResolver {
+    model: Arc<RecordingModel>,
+    names: Arc<Mutex<Vec<Option<String>>>>,
+}
+impl ModelResolver for BindingModelResolver {
+    fn resolve_model(&self, name: Option<&str>) -> Result<ResolvedModel> {
+        self.names.lock().unwrap().push(name.map(str::to_string));
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                name.map(|_| "canonical-model".into()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            self.model.clone(),
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn capability_binding_receives_the_resolved_model_before_instructions() {
+    for model_override in [None, Some("requested-alias")] {
+        let model = RecordingModel::new();
+        let bindings = Arc::new(Mutex::new(Vec::new()));
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let capability = Arc::new(ModelBoundInstructions {
+            model: None,
+            bindings: bindings.clone(),
+        });
+        let mut config = RunConfig::new().with_capability(capability);
+        if let Some(name) = model_override {
+            config = config.with_model(name);
+        }
+        let request = RunRequest::new(
+            AgentBinding::direct(agent()),
+            Arc::new(BindingModelResolver {
+                model: model.clone(),
+                names: names.clone(),
+            }),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("go"))],
+        )
+        .with_config(config);
+        Runner::run(request).await.unwrap();
+        let canonical = model_override.map(|_| "canonical-model".to_string());
+        assert_eq!(
+            bindings.lock().unwrap().as_slice(),
+            std::slice::from_ref(&canonical)
+        );
+        assert!(
+            model.instructions.lock().unwrap()[0]
+                .as_deref()
+                .unwrap()
+                .contains(&format!(
+                    "capability model: {}",
+                    canonical.as_deref().unwrap_or("unnamed default")
+                ))
+        );
+        assert!(
+            names
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|name| name.as_deref() == model_override)
+        );
+    }
+}

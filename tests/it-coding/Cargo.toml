@@ -9,6 +9,8 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+# Skill catalogs accept validated host overrides independently of compaction defaults.
+ra-context = { path = "../../crates/ra-context" }
 ra-core = { path = "../../crates/ra-core" }
 ra-coding = { path = "../../crates/ra-coding", features = ["test-api"] }
 ra-exec = { path = "../../crates/ra-exec" }

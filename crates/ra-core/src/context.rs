@@ -108,6 +108,7 @@ pub struct RunContext {
     event_seq_allocator: Option<EventSeqAllocator>,
     tool_input: Option<Arc<Value>>,
     parent_run_id: Option<RunId>,
+    resolved_model_name: Option<String>,
 }
 
 impl RunContext {
@@ -125,6 +126,7 @@ impl RunContext {
             event_seq_allocator: self.event_seq_allocator.clone(),
             tool_input: self.tool_input.clone(),
             parent_run_id: self.parent_run_id.clone(),
+            resolved_model_name: self.resolved_model_name.clone(),
         }
     }
 
@@ -146,6 +148,7 @@ impl RunContext {
             event_seq_allocator: None,
             tool_input: None,
             parent_run_id: None,
+            resolved_model_name: None,
         }
     }
 
@@ -207,6 +210,28 @@ impl RunContext {
     pub fn with_parent_run_id(mut self, parent: RunId) -> Self {
         self.parent_run_id = Some(parent);
         self
+    }
+
+    /// Attaches a provider-facing model name without model settings or a callable model handle.
+    ///
+    /// The runner sets this metadata only on the context passed to capability binding. It does
+    /// not propagate the metadata into tool, hook, guardrail, dynamic-instruction, resumed-run or
+    /// cancellation-notification contexts.
+    #[must_use]
+    pub fn with_resolved_model_name(mut self, model: impl Into<String>) -> Self {
+        self.resolved_model_name = Some(model.into());
+        self
+    }
+
+    /// The resolved model name supplied for capability binding, including the run-level override.
+    ///
+    /// The runner sets this field only on capability-binding contexts. Tool, hook, guardrail,
+    /// dynamic-instruction, resumed-run and cancellation-notification contexts return `None`, even
+    /// when their model is known. Unnamed provider defaults and manually constructed contexts
+    /// without this metadata also return `None`.
+    #[must_use]
+    pub fn resolved_model_name(&self) -> Option<&str> {
+        self.resolved_model_name.as_deref()
     }
 
     /// Identity of this run, stable across every segment it is resumed in.
@@ -314,6 +339,7 @@ impl fmt::Debug for RunContext {
             .field("agent_id", self.agent_id())
             .field("has_app_context", &self.app.is_some())
             .field("has_tool_input", &self.tool_input.is_some())
+            .field("resolved_model_name", &self.resolved_model_name)
             .field("budget", &self.budget)
             .field(
                 "pending_control_requests",

@@ -1,8 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Codex's `skills.list` and `skills.read` contracts, selected explicitly by the host.
 //!
-//! Executor metadata is supplied by a provider; automatic disk discovery and catalog prompt
-//! rendering are separate integrations. Each selected skill root is an independent read grant,
+//! Executor metadata is supplied by a provider; automatic disk discovery is a separate integration.
+//! The capability renders a bounded catalog at run assembly. Each selected skill root is a grant,
 //! keyed by the executor authority id and unrelated to the coding working directory. Per-turn
 //! sandbox permission changes are not interpreted by these tools. Cloud schema and routing are
 //! retained, without an `OpenAI` account backend. The merged [`crate::skill`] tool remains a separate
@@ -38,13 +38,16 @@ use provider::SkillListQuery;
 
 mod aliases;
 pub mod catalog;
+mod catalog_prompt;
 mod list;
+mod prompt;
 pub mod provider;
 mod read;
 mod render;
 mod schema;
 mod warnings;
 
+pub(crate) use prompt::SkillCatalogPrompt;
 pub use provider::{ExecutorSkillProvider, SkillProvider, SkillProviders};
 
 /// The namespace advertised on the Responses wire.
@@ -69,9 +72,25 @@ pub fn skill_tools(
     executor_roots: BTreeMap<String, Workspace>,
     response_byte_budget: usize,
 ) -> CoreResult<Vec<Arc<dyn Tool>>> {
+    Ok(skill_tools_with_prompt(providers, executor_roots, response_byte_budget)?.tools)
+}
+
+pub(crate) struct SkillToolSet {
+    pub(crate) tools: Vec<Arc<dyn Tool>>,
+    pub(crate) prompt: Option<SkillCatalogPrompt>,
+}
+
+pub(crate) fn skill_tools_with_prompt(
+    providers: SkillProviders,
+    executor_roots: BTreeMap<String, Workspace>,
+    response_byte_budget: usize,
+) -> CoreResult<SkillToolSet> {
     let executor_available = providers.has_executor_provider() && !executor_roots.is_empty();
     if !executor_available && !providers.has_cloud_provider() {
-        return Ok(Vec::new());
+        return Ok(SkillToolSet {
+            tools: Vec::new(),
+            prompt: None,
+        });
     }
     let context = SkillToolContext {
         providers,
@@ -80,18 +99,22 @@ pub fn skill_tools(
         executor_catalog: Arc::new(Mutex::new(None)),
         executor_read_snapshot: Arc::new(Mutex::new(None)),
     };
-    Ok(vec![
-        Arc::new(SkillTool::new::<list::ListArgs>(
-            list::TOOL_NAME,
-            list::DESCRIPTION,
-            context.clone(),
-        )?),
-        Arc::new(SkillTool::new::<read::ReadArgs>(
-            read::TOOL_NAME,
-            read::DESCRIPTION,
-            context,
-        )?),
-    ])
+    let prompt = SkillCatalogPrompt::new(context.clone());
+    Ok(SkillToolSet {
+        tools: vec![
+            Arc::new(SkillTool::new::<list::ListArgs>(
+                list::TOOL_NAME,
+                list::DESCRIPTION,
+                context.clone(),
+            )?),
+            Arc::new(SkillTool::new::<read::ReadArgs>(
+                read::TOOL_NAME,
+                read::DESCRIPTION,
+                context,
+            )?),
+        ],
+        prompt: Some(prompt),
+    })
 }
 
 #[derive(Clone)]
@@ -114,8 +137,16 @@ impl SkillToolContext {
         call: &ToolContext<'_>,
         authority: SkillToolAuthoritySelector,
     ) -> SkillCatalog {
+        self.catalog_for_run(call.run().run_id(), authority).await
+    }
+
+    async fn catalog_for_run(
+        &self,
+        run_id: &RunId,
+        authority: SkillToolAuthoritySelector,
+    ) -> SkillCatalog {
         let query = SkillListQuery {
-            turn_id: call.run().run_id().as_str().to_string(),
+            turn_id: run_id.as_str().to_string(),
         };
         match authority {
             // There is no account-backed thread snapshot here; optional cloud adapters own their
@@ -135,7 +166,6 @@ impl SkillToolContext {
                         .executor_catalog
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let run_id = call.run().run_id();
                     if slot.as_ref().is_some_and(|cached| cached.run_id != *run_id) {
                         *slot = None;
                     }

@@ -2831,6 +2831,8 @@ async fn assemble_capabilities(
         config,
     } = request;
     let model_override = config.model();
+    let base = agent.execution_without_external_tools()?;
+    let resolved = models.resolve_model(model_override.or(base.model()))?;
     // The public agent, because binding is told who is running rather than what was assembled —
     // and what was assembled is precisely what does not exist yet at this point.
     let mut context = RunContext::new(run_id.clone(), agent.public())
@@ -2838,6 +2840,9 @@ async fn assemble_capabilities(
         .with_usage_totals(state.usage_totals().clone())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(event_seqs.clone());
+    if let Some(model) = resolved.selector().model() {
+        context = context.with_resolved_model_name(model);
+    }
     if let Some(parent) = state.parent_run_id() {
         context = context.with_parent_run_id(parent.clone());
     }
@@ -2851,13 +2856,11 @@ async fn assemble_capabilities(
     let (assembled, replacements) = plan
         .assemble_with_prepared(&context, &config.prepared_capabilities)
         .await?;
-    let base = agent.execution_without_external_tools()?;
     let base = replace_preinstalled_capability_tools(
         base,
         &config.preinstalled_capability_tools,
         replacements,
     )?;
-    let resolved = models.resolve_model(model_override.or(base.model()))?;
     let mut sampling = ra_core::capability::SamplingContext::default()
         .with_provider(resolved.selector().provider().clone());
     if let Some(model) = resolved.selector().model() {

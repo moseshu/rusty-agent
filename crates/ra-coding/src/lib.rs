@@ -36,6 +36,7 @@ pub mod prompt;
 pub mod prompt_cache_key;
 pub(crate) mod request_permissions;
 pub mod shell_command;
+pub mod skills;
 pub(crate) mod spawned;
 pub mod thread_factory;
 pub mod thread_items;
