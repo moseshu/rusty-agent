@@ -201,6 +201,20 @@ struct EnvironmentSkillResource {
     contents: Option<Arc<str>>,
 }
 
+/// Origin precedence used by Codex Host catalogs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkillScope {
+    /// Repository skills.
+    Repo,
+    /// User-installed skills, including plugins.
+    User,
+    /// Bundled system skills.
+    System,
+    /// Administrator skills.
+    Admin,
+}
+
 /// Metadata shown in the always-visible skills catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillCatalogEntry {
@@ -220,6 +234,7 @@ pub struct SkillCatalogEntry {
     pub display_path: Option<String>,
     alias_root: Option<String>,
     alias_root_order: Option<usize>,
+    prompt_scope: Option<SkillScope>,
     /// Whether the skill may be listed or read.
     pub enabled: bool,
     /// Whether enabled metadata appears in model-visible discovery.
@@ -246,6 +261,7 @@ impl SkillCatalogEntry {
             display_path: None,
             alias_root: None,
             alias_root_order: None,
+            prompt_scope: None,
             enabled: true,
             prompt_visible: true,
         }
@@ -277,6 +293,19 @@ impl SkillCatalogEntry {
     pub fn with_alias_root_order(mut self, alias_root_order: usize) -> Self {
         self.alias_root_order = Some(alias_root_order);
         self
+    }
+
+    /// Sets the Host scope used for catalog ordering.
+    #[must_use]
+    pub fn with_prompt_scope(mut self, scope: SkillScope) -> Self {
+        self.prompt_scope = Some(scope);
+        self
+    }
+
+    /// The Host scope selected for catalog ordering, if supplied.
+    #[must_use]
+    pub fn prompt_scope(&self) -> Option<SkillScope> {
+        self.prompt_scope
     }
 
     /// Marks the entry unavailable for listing and reading.

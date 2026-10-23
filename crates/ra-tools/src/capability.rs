@@ -599,6 +599,7 @@ impl Capability for MemoryCapability {
 #[derive(Debug, Clone)]
 pub struct TodoCapability {
     update_plan: Arc<UpdatePlanTool>,
+    mode: crate::request_user_input::ModeKind,
 }
 
 impl TodoCapability {
@@ -610,7 +611,16 @@ impl TodoCapability {
     pub fn new() -> Result<Self> {
         Ok(Self {
             update_plan: Arc::new(UpdatePlanTool::new()?),
+            mode: crate::request_user_input::ModeKind::Default,
         })
+    }
+
+    /// Binds the effective collaboration mode without changing the tool declaration.
+    #[must_use]
+    pub fn with_mode(mut self, mode: crate::request_user_input::ModeKind) -> Self {
+        self.update_plan = Arc::new(self.update_plan.as_ref().clone().with_mode(mode));
+        self.mode = mode;
+        self
     }
 
     /// The entry that records a plan.
@@ -653,7 +663,11 @@ impl Capability for TodoCapability {
         fragment(
             &self.kind(),
             "What the plan board records and what one call to it replaces",
-            TODO_FRAGMENT,
+            if self.mode == crate::request_user_input::ModeKind::Plan {
+                "Plan:\n- `update_plan` is a TODO/checklist tool and is not allowed in Plan mode. Produce the proposed plan in your response instead."
+            } else {
+                TODO_FRAGMENT
+            },
             TODO_TOKEN_BUDGET,
         )
     }
@@ -937,10 +951,11 @@ impl Capability for SkillsCapability {
     }
 }
 
-/// The explicitly selected Codex skills namespace over authority-routed providers.
+/// The explicitly selected Codex skill catalogs and namespace over authority-routed providers.
 ///
 /// Shares the skills family with [`SkillsCapability`] and sandbox skills, so assembly rejects
-/// simultaneous sources. The catalog is resolved after run binding, using the tools' executor cache.
+/// simultaneous sources. Host sources contribute ordinary file locators without namespace tools.
+/// Catalogs share a metadata budget and resolve after run binding, using per-run source caches.
 #[derive(Clone)]
 pub struct SkillsNsCapability {
     tools: Vec<Arc<dyn Tool>>,
@@ -975,6 +990,17 @@ impl SkillsNsCapability {
             tools: bundle.tools,
             catalog_prompt: bundle.prompt,
         })
+    }
+
+    /// Keeps only Host catalog contributors, without installing namespace tools or executor grants.
+    /// A product can use this when its selected tool surface supports ordinary file reads but
+    /// omits the Executor and Cloud skill namespace.
+    pub fn host_catalog(providers: crate::skills_ns::SkillProviders) -> Result<Self> {
+        Self::new(
+            providers.host_catalog_sources(),
+            std::collections::BTreeMap::new(),
+            0,
+        )
     }
 
     /// Supplies the resolved context window from the host's model catalog at binding time.
@@ -1048,7 +1074,7 @@ impl Capability for SkillsNsCapability {
         };
         fragment(
             &self.kind(),
-            "Available skills and their package access",
+            "Available skills and their source access",
             &content,
             prompt.token_budget(),
         )

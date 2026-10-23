@@ -122,13 +122,13 @@ fn declared_surface(
     host: &CodingHost,
     tier: CodingProfile,
 ) -> Result<DeclaredSurface> {
-    let capabilities = RoleCapabilities::resolve(role, host)?;
+    let capabilities = RoleCapabilities::resolve(role, host, tier)?;
     let profile = tier.to_tool_profile_for_role(
         role,
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
         host.collaboration_namespace()?.as_ref(),
-        host.uses_skills_namespace(),
+        host.skill_tool_surface(),
     )?;
     let registry = ToolRegistry::builder()
         .register_all(capabilities.tools())

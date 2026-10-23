@@ -7,6 +7,115 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Inherited role tools and explicit restrictions
+
+`ReadOnlySpecialist` and `Planner` now inherit the same tools as `Main` for the selected host and
+profile. Shell, patch, web, and collaboration tools follow the ordinary host/profile selection.
+Roles do not replace the inherited sandbox or approval policy. `OneOffAnswer` remains tool-free.
+
+Hosts can explicitly select `CodingHost::with_read_only_role_restrictions(true)`. This product
+extension, disabled by default, withholds `apply_patch` and the entire collaboration tool group
+from specialist/planner roles, including messaging, follow-up tasks, interruption, waiting and
+listing agents. It retains shell and web. It removes dedicated tool
+entries; shell commands remain subject to the inherited sandbox and role instructions, so this
+setting is not a filesystem read-only sandbox. Tool counts, profile floors and prompt fragments
+are narrowed by exactly the withheld entries. Role guidance uses the advertised tool inventory.
+
+`Planner` ports three parts of Codex Plan mode: instructions, `update_plan` refusal, and
+`request_user_input` behavior. Repository mutations are prohibited by its instructions, builds
+and tests may write caches/artifacts, `update_plan` remains declared but returns Codex's Plan-mode
+refusal, and root-thread questions carry `isBlocking=true` and await the response. Child-thread
+questions retain the root-only refusal. Spawned Planner guidance adapts questions to the parent
+agent and returns the plan and unresolved questions to that parent. The embedded upstream template
+is retained; emitted guidance adapts unavailable tools, the root/child audience, and plain-text
+`<proposed_plan>` markup. It does not promise special client rendering.
+Required adaptation text and section boundaries are checked during prompt assembly. Missing or
+ambiguous markers, reversed boundaries, or unadapted references to unavailable control tools return
+a configuration error instead of silently emitting incomplete guidance. The current template's
+rendered text is unchanged by these checks.
+
+The Plan runtime's proposed-plan stream parser and separate plan items, deferred mailbox delivery,
+and restrictions on automatic turns entering/leaving Plan mode are not ported. Plans remain plain
+assistant text. These are recorded gaps, not a claim of complete Plan-mode parity.
+
+ReadOnlySpecialist reuses the upstream Plan template's allowed/non-allowed operation lists,
+including cache-writing builds/tests and prohibitions on formatters or code generation that change
+repository files. Its role allowance is 640 estimated tokens, with a 3,360-token prefix ceiling.
+Planner's allowance remains 3,072 and its ceiling 5,792; other roles retain 192 and 2,912.
+Prompt hashes and the assembly baselines change; tool schemas and
+`TOOL_SCHEMA_REVISION` do not.
+
+Mode selection is bound at agent construction, rather than through Codex's mutable turn settings.
+Reassemble with another role to change it. Standalone framework tool users can select
+`with_mode(ModeKind::Plan)` on `UpdatePlanTool`, `TodoCapability`, or `RequestUserInputTool`;
+constructors preserve Default mode. Existing `AgentControl::with_max_depth` still limits spawning
+and hides collaboration tools at the limit. Without that opt-in the pinned Codex v2 path, and
+Rusty's existing control, impose no depth limit; this change does not add a new depth default.
+
+### Explicit Host skill discovery
+
+Host disk discovery is disabled by default. Enable it with
+`CodingHost::with_skill_discovery(SkillDiscoveryConfig::new())`, using the types in
+`ra_coding::skills`. This discovers the workspace's `.rusty-agent/skills/` and any explicitly
+selected `PluginSkillRoot` directories. Each plugin supplies its owning root and namespace;
+recursive discovery is the default, with `DirectChildren` available for Agent Plugin layouts.
+
+`with_config_rules(SkillConfigRules { entries })` applies Codex's ordered enablement rules after
+product filtering, plugin qualification, and canonical-path deduplication. Each `SkillConfigRule`
+contains a `SkillConfigRuleSelector::Name(full_name)` or `::Path(canonical_document_path)` and
+an `enabled` boolean. Every matching rule is applied in order; later rules override earlier ones,
+including across name and path selectors. Name selectors affect every matching document. Disabled
+entries remain in the catalog with `enabled = false`, and are omitted from the model's catalog.
+Reenabling a skill preserves `policy.allow_implicit_invocation = false` and product restrictions.
+
+The default rules are empty. Build rules from configuration entries with
+`SkillConfigRules::from_configs([SkillConfig { path, name, enabled }, ...])`, passing entries in
+increasing precedence order. As Codex's `[[skills.config]]` loader does, it canonicalizes existing
+paths, trims names, ignores entries with an empty name or with both or neither selectors, and lets
+a repeated selector replace its earlier rule. `SkillConfig` implements serde for host configuration
+files; this API does not read Codex's user/session TOML layers. Relative paths are ignored with a
+warning, because there is no configuration base directory to resolve them against. Directly
+constructed `SkillConfigRules` are used as given: names match exactly, and path selectors are
+native `PathBuf` values in place of Codex's `PathUri`.
+Rules only affect discovered Host entries; Executor and Cloud providers keep their own enablement.
+
+`with_allowlist(["release", "acme:review"])` is an explicit product extension applied after these
+rules. It selects complete, case-sensitive names after plugin qualification. No allowlist retains
+all discovered Host entries, including disabled ones; an empty allowlist selects none. Allowlisting
+a disabled skill retains `enabled = false`; enabling a skill cannot bypass the allowlist.
+**The allowlist is a context filter, not a sandbox.** Excluded skill files remain on disk and
+can still be read by `read_file` or shell commands under their existing permissions. Discovery
+adds no filesystem grants and does not authorize plugin scripts, MCP servers, or hooks. External
+plugin files still require an ordinary file/command tool with appropriate access.
+
+Only metadata enters the run catalog. Host entries use file locators and ordinary file tools;
+Executor and Cloud entries keep `skills.list` / `skills.read`. Allocation follows Codex's
+`render_catalogs` entry point: Cloud is rendered first with a cap of `total - total / 4`, then
+Executor and Host share the budget left after Cloud's actual metadata cost. If filesystem entries
+are omitted and a joint probe can retain every source's entries, the Cloud cap is lowered and
+both buckets are rendered again. Description truncation alone does not trigger rebalancing.
+Cloud preference for matching qualified names applies only to Executor; matching Host entries
+remain in the Host catalog. Source ordering, aliases and Host full descriptions are preserved.
+Core surfaces retain Host catalogs while omitting the namespace tools.
+
+Each run uses the upstream first-step allocation with no previous world-state snapshot. Rusty
+does not retain the Cloud cap or its catalog fingerprint across steps/resume. Host and Executor
+inventories refresh on each new run and remain fixed within that run; this is the existing Rust
+run-based adaptation of Codex's step-based lifecycle.
+
+`agents/openai.yaml` policy preserves `allow_implicit_invocation` and `products` restrictions.
+Choose a restricted product with `with_restriction_product(SkillProduct::Codex)` when needed;
+without a product, product-restricted entries are excluded. Invalid optional metadata is ignored.
+Presentation metadata and dependency declarations are validated for parsing but do not install
+UI assets or dependencies. The legacy merged `with_skill_catalog` extension remains exclusive
+with Host discovery and available namespace providers.
+
+`SkillListQuery::executor_roots` now supplies selected authority ids and canonical local paths to
+providers. Unselected executor authorities are removed before prompting, listing, or package
+resolution, so a direct read now reports `skill package is not available` for them. The default
+tool schema, default static prompt, and schema revision are unchanged.
+
+
 ### Per-turn coding search fallback
 
 `CodingHost::with_web_access` preserves the released local-function behavior on every protocol.

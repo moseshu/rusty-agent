@@ -30,7 +30,7 @@ use crate::{
     capabilities::{COLLABORATION_FAMILY, RoleCapabilities},
     host::CodingHost,
     profile::CodingProfile,
-    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_surface},
+    prompt::{assemble_stable_prefix, assemble_stable_prefix_for_session},
 };
 
 /// The tier a host-backed agent assembles when the caller does not name one.
@@ -229,10 +229,11 @@ pub(crate) async fn assemble_agent(
     profile: CodingProfile,
 ) -> Result<AssembledAgent> {
     let assembled = host_backed_surface(role, host, profile).await?;
-    let prefix = assemble_stable_prefix_for_surface(
+    let prefix = assemble_stable_prefix_for_session(
         role,
         assembled.tool_surface(),
         assembled.capability_sections(),
+        host.is_spawned_agent(),
     )?;
     // Read off the families installed on the surface rather than a tool's model-facing name,
     // which the host's namespace choice changes.
@@ -434,7 +435,7 @@ pub async fn host_backed_surface(
     host: &CodingHost,
     profile: CodingProfile,
 ) -> Result<HostBackedSurface> {
-    let capabilities = RoleCapabilities::resolve(role, host)?;
+    let capabilities = RoleCapabilities::resolve(role, host, profile)?;
     let registry = ToolRegistry::builder()
         .register_all(capabilities.tools())
         .build()?;
@@ -443,7 +444,7 @@ pub async fn host_backed_surface(
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
         host.collaboration_namespace()?.as_ref(),
-        host.uses_skills_namespace(),
+        host.skill_tool_surface(),
     )?;
     let budget = *profile.budget();
     let tool_surface =

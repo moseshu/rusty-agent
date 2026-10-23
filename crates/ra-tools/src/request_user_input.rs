@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Asking the user one to three short questions and waiting for the answers.
 //!
 //! Ported from Codex's `request_user_input` tool (`core/src/tools/handlers/request_user_input.rs`
@@ -16,11 +17,11 @@
 //!
 //! # Differences from Codex
 //!
-//! - Collaboration modes are not ported yet, so every turn is in Default mode: the tool is usable
-//!   only when the host enables it there, and its requests are then never blocking.
+//! - The host binds the collaboration mode when constructing the tool, rather than reading a
+//!   Codex turn context. The default is Default mode; Plan requests are marked blocking.
 //! - A run whose host installed no port is told the tool is not enabled, with a text of Rusty's
 //!   own; a Codex session can always raise the request.
-//! - The root-thread check reads [`RunContext::parent_run_id`]: an agent-tool call's nested run and
+//! - The root-thread check reads [`ra_core::context::RunContext::parent_run_id`]: an agent-tool call's nested run and
 //!   a spawned agent's run are the counterparts of Codex's sub-agent sessions.
 //! - Codex's Guardian reviewer keeps the answers as verified context; Guardian is not ported.
 
@@ -28,7 +29,6 @@ use std::fmt;
 
 use async_trait::async_trait;
 use ra_core::{
-    context::RunContext,
     error::{Error, Result, ToolErrorKind},
     tool::{
         Tool, ToolContext, ToolFailureHandling, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
@@ -211,6 +211,7 @@ pub struct RequestUserInputTool {
     schema: ToolSchema,
     options: ToolOptions,
     available_modes: Vec<ModeKind>,
+    mode: ModeKind,
 }
 
 impl RequestUserInputTool {
@@ -231,6 +232,7 @@ impl RequestUserInputTool {
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_action_classes([crate::action_classes::READ]),
             available_modes,
+            mode: ModeKind::Default,
         })
     }
 
@@ -240,17 +242,19 @@ impl RequestUserInputTool {
         &self.available_modes
     }
 
-    /// The mode a call of `run` is made in. Collaboration modes are not ported yet, so it is
-    /// always Default.
-    const fn mode(_run: &RunContext) -> ModeKind {
-        ModeKind::Default
+    /// Binds the effective collaboration mode for this tool's agent.
+    /// Mode selection does not change sandbox authority or root-thread restrictions.
+    #[must_use]
+    pub const fn with_mode(mut self, mode: ModeKind) -> Self {
+        self.mode = mode;
+        self
     }
 
     async fn ask(&self, context: &ToolContext<'_>) -> std::result::Result<ToolOutput, String> {
         if context.run().parent_run_id().is_some() {
             return Err("request_user_input can only be used by the root thread".to_owned());
         }
-        let mode = Self::mode(context.run());
+        let mode = self.mode;
         if let Some(message) = request_user_input_unavailable_message(mode, &self.available_modes) {
             return Err(message);
         }

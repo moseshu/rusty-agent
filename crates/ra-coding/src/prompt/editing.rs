@@ -5,9 +5,8 @@
 //! role-neutral — any agent that reaches a shell can violate it. Naming `apply_patch` is not, and
 //! it has to clear two separate bars. The tool must actually be advertised, or the text promises
 //! an entry the provider request does not carry. And the role must not be one whose own guidance
-//! says it has no editing tools: this section outranks the role section, so an unconditional "use
-//! `apply_patch`" would be the instruction such an agent reads *first*, with the denial arriving
-//! later.
+//! requires non-mutating work: this section outranks the role section, so an unconditional "use
+//! `apply_patch`" would be the instruction such an agent reads first, before its behavioral limit.
 //!
 //! The slot is `editing_verification` and the verification half of that name is still unwritten.
 //! It belongs in this builder when it lands: the assembler refuses a second claim on a registered

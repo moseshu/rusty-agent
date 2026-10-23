@@ -429,10 +429,7 @@ async fn external_skill_roots_are_selected_by_authority_and_do_not_grant_the_cod
     for (package, message) in [
         ("skill://first/other-root", "failed to read skill resource"),
         ("skill://first/coding", "failed to read skill resource"),
-        (
-            "skill://unselected/pkg",
-            "skill environment is not available for this callback",
-        ),
+        ("skill://unselected/pkg", "skill package is not available"),
     ] {
         let args = json!({"package":package});
         let error = tool
@@ -465,8 +462,8 @@ async fn empty_namespace_configuration_leaves_legacy_selection_and_profile_floor
         (
             SkillProviders::new().with_provider(
                 ra_tools::skills_ns::provider::SkillProviderSource::new(
-                    SkillSourceKind::Host,
-                    "host",
+                    SkillSourceKind::custom("private"),
+                    "private",
                     Arc::new(ExecutorSkillProvider::new(SkillCatalog::default())),
                 ),
             ),

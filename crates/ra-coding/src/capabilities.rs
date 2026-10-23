@@ -1,55 +1,12 @@
-//! Role-aware composition of workspace capabilities and explicitly configured host services.
+//! Role-aware composition of workspace capabilities and configured host services.
 //!
-//! The built-in capability types live in [`ra_tools::capability`]; what this module decides is
-//! which of them a coding agent installs for a given role, and in what order. That is the product
-//! content: the capabilities themselves would serve a data-analysis agent unchanged, while "a
-//! read-only specialist gets discovery and nothing that writes" is a statement about this product.
+//! Specialist and planner roles inherit the host's tools and sandbox by default, as in Codex.
+//! An explicitly selected product extension withholds patches and collaboration for these roles.
+//! One-off answers still install no tools. The withheld inventory narrows profile selection and
+//! budgets together, while missing required services remain assembly errors.
 //!
-//! # Why the role filter reads action classes instead of listing names
-//!
-//! A read-only role's own prompt says it has no editing tools and that an edit will fail. The set
-//! that keeps that promise is exactly the capabilities whose every tool declares
-//! the `read` action class, read from each tool's own declaration rather than from a second list
-//! maintained here — a hand-written survivor list disagrees with the tools the first time one is
-//! added, and the disagreement shows up as a prompt that denies an entry the request carries.
-//!
-//! The filter runs per capability rather than per tool, because a capability is atomic: keeping
-//! half of one would produce a surface no installed capability describes, which is the arrangement
-//! [`Capability`] exists to make unrepresentable. It happens that this product's split lands
-//! cleanly on that boundary — `filesystem` and `search` only observe, `apply_patch` and `shell` do
-//! not — which is a fact about how the families were drawn, not a coincidence to rely on.
-//!
-//! # Why the withheld half is kept rather than dropped
-//!
-//! A role does not select tools; it selects capabilities, and the tool surface is then assembled
-//! from a [`CodingProfile`](crate::CodingProfile) tier that was written for an agent installing
-//! every one of them. A tier states a floor as well as a ceiling, and the floor exists to catch a
-//! surface that *lost* an entry — the failure a ceiling cannot see, where the run keeps going while
-//! the prompt still describes a tool that is gone. A read-only agent trips that floor for a reason
-//! that is not a mistake at all.
-//!
-//! Recording what the role withheld is what tells the two apart. The profile discounts exactly
-//! those entries, so "three tools are missing because this role does not get them" narrows the
-//! tier, while "three tools are missing" still fails it.
-//!
-//! # Where the resulting set goes
-//!
-//! It is read by the agent construction path, for **both** halves it carries: the tools, which go
-//! through a registry and a profile to become one bounded surface, and the prompt fragments that
-//! describe them, which join the product's own sections in the same stable prefix. One switch moves
-//! both because one object produced both.
-//!
-//! The selected set also retains each original capability for runtime binding. The surface records
-//! the exact shared tools already installed on the agent; runtime assembly replaces those with the
-//! bound handlers and rejects unrelated collisions. Static fragments are kept in the reviewed
-//! prefix, while binding, per-run and deferred instructions, sampling and context processing follow
-//! the ordinary run lifecycle. A bound handler may change its implementation, but its declaration
-//! must still match the tool surface the prefix describes.
-//!
-//! Standalone callers use the complete agent builder and bind their requests through its result,
-//! or configure their thread from it. The app-server thread factory does this automatically, and
-//! spawned agents replace the inherited prepared surface with their own. Directly installed run
-//! capabilities, including compaction, retain their order and configuration.
+//! Capability fragments and runtime bindings are selected from the same installed surface.
+//! Planner tools bind Plan-mode behavior without changing their advertised schemas.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -63,7 +20,7 @@ use ra_core::{
 use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
 use ra_tools::{
     agent_ns::collaboration_tools,
-    request_user_input::{RequestUserInputTool, request_user_input_available_modes},
+    request_user_input::{ModeKind, RequestUserInputTool, request_user_input_available_modes},
 };
 
 use crate::{agent::InstalledCapability, host::CodingHost};
@@ -106,12 +63,22 @@ impl RoleCapabilities {
     ///
     /// Propagates tool construction failures, and any incoherence the plan finds in the installed
     /// set — two capabilities claiming one family or a dependency nothing installs.
-    pub(crate) fn resolve(role: &PromptRole, host: &CodingHost) -> Result<Self> {
+    pub(crate) fn resolve(
+        role: &PromptRole,
+        host: &CodingHost,
+        profile: crate::profile::CodingProfile,
+    ) -> Result<Self> {
+        let mode = if matches!(role, PromptRole::Planner) {
+            ModeKind::Plan
+        } else {
+            ModeKind::Default
+        };
+        let restricted = role.is_read_only() && host.read_only_role_restrictions();
         let mut declared: Vec<Arc<dyn Capability>> = vec![
             Arc::new(host.filesystem_capability()?),
             Arc::new(host.search_capability()?),
             Arc::new(host.view_image_capability()?),
-            Arc::new(host.todo_capability()?),
+            Arc::new(host.todo_capability()?.with_mode(mode)),
             Arc::new(host.apply_patch_capability()?),
             Arc::new(host.shell_capability()?),
         ];
@@ -121,11 +88,11 @@ impl RoleCapabilities {
         if let Some(capability) = host.skills_capability()? {
             declared.push(Arc::new(capability));
         }
-        if let Some(capability) = host.skills_ns_capability()? {
+        if let Some(capability) = host.skills_ns_capability(profile)? {
             declared.push(Arc::new(capability));
         }
         if host.request_user_input_enabled() {
-            declared.push(Arc::new(ControlCapability::user_input()?));
+            declared.push(Arc::new(ControlCapability::user_input(mode)?));
         }
         declared.extend(host.capabilities().iter().cloned());
         // A spawned agent is assembled without the collaboration tools unless the host says its
@@ -133,20 +100,22 @@ impl RoleCapabilities {
         // withheld, so the tier's band shrinks with it rather than failing its floor.
         let mut not_offered: Vec<Arc<dyn Capability>> = Vec::new();
         if host.collaboration_enabled() {
-            let capability = Arc::new(ControlCapability::collaboration(
-                host.collaboration_namespace()?.as_ref(),
-            )?);
+            let capability =
+                ControlCapability::collaboration(host.collaboration_namespace()?.as_ref())?;
             if host.collaboration_offered() {
-                declared.push(capability);
+                declared.push(Arc::new(capability));
             } else {
-                not_offered.push(capability);
+                not_offered.push(Arc::new(capability));
             }
         }
 
         let (installed, mut withheld): (Vec<_>, Vec<_>) = if role.is_one_off() {
             (Vec::new(), declared)
-        } else if role.is_read_only() {
-            declared.into_iter().partition(only_observes)
+        } else if restricted {
+            declared.into_iter().partition(|capability| {
+                capability.kind() != CapabilityFamily::APPLY_PATCH
+                    && capability.kind().as_str() != COLLABORATION_FAMILY
+            })
         } else {
             (declared, Vec::new())
         };
@@ -406,12 +375,13 @@ struct ControlCapability {
 }
 
 impl ControlCapability {
-    fn user_input() -> Result<Self> {
+    fn user_input(mode: ModeKind) -> Result<Self> {
         Ok(Self {
             family: CapabilityFamily::new("user_input")?,
-            tools: vec![Arc::new(RequestUserInputTool::new(
-                request_user_input_available_modes(true),
-            )?)],
+            tools: vec![Arc::new(
+                RequestUserInputTool::new(request_user_input_available_modes(true))?
+                    .with_mode(mode),
+            )],
         })
     }
 
@@ -476,19 +446,4 @@ fn render_names(names: &[String]) -> String {
         .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Whether installing this capability adds nothing that can change the workspace.
-///
-/// A capability that contributes no tool passes: there is nothing in it to withhold from a
-/// read-only agent.
-fn only_observes(capability: &Arc<dyn Capability>) -> bool {
-    capability.tools().iter().all(|tool| {
-        let options = tool.options();
-        let classes = options.action_classes();
-        !classes.is_empty()
-            && classes
-                .iter()
-                .all(|class| class.as_str() == ra_tools::action_classes::READ)
-    })
 }

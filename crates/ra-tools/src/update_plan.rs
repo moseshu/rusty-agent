@@ -2,8 +2,8 @@
 //! Codex's plan tool: the original schema, argument errors and `Plan updated` response.
 //!
 //! The call's arguments retain the complete plan and optional explanation in run history. A host
-//! reads that record instead of a second process-local plan. Collaboration modes are not yet
-//! available in the run context, so this tool operates in the runtime's Default mode.
+//! reads that record instead of a second process-local plan. The host binds the collaboration
+//! mode when constructing the tool; Plan mode refuses updates, as in Codex.
 //!
 //! Size limits are a separately selected host extension. The default accepts the same plans as
 //! Codex, including an empty plan, blank step text and multiple steps marked in progress.
@@ -20,6 +20,8 @@ use ra_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::request_user_input::ModeKind;
 
 const TOOL_NAME: &str = "update_plan";
 const DESCRIPTION: &str = "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n";
@@ -150,12 +152,13 @@ struct UpdatePlanInput {
 }
 
 /// The `update_plan` tool, with Codex's native non-strict schema.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UpdatePlanTool {
     origin: ToolOrigin,
     schema: ToolSchema,
     options: ToolOptions,
     limits: PlanLimits,
+    mode: ModeKind,
 }
 
 impl UpdatePlanTool {
@@ -181,6 +184,7 @@ impl UpdatePlanTool {
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_action_classes([crate::action_classes::READ]),
             limits: PlanLimits::new(),
+            mode: ModeKind::Default,
         })
     }
 
@@ -188,6 +192,13 @@ impl UpdatePlanTool {
     #[must_use]
     pub const fn with_limits(mut self, limits: PlanLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Binds the effective collaboration mode. Plan mode refuses checklist updates.
+    #[must_use]
+    pub const fn with_mode(mut self, mode: ModeKind) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -232,6 +243,13 @@ impl Tool for UpdatePlanTool {
     }
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        if self.mode == ModeKind::Plan {
+            return Err(Error::tool(
+                ToolErrorKind::InvalidInput,
+                TOOL_NAME,
+                "update_plan is a TODO/checklist tool and is not allowed in Plan mode",
+            ));
+        }
         let input: UpdatePlanInput =
             serde_json::from_value(context.arguments().clone()).map_err(|error| {
                 Error::tool(

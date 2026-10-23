@@ -64,6 +64,22 @@ fn schema_preserves_codex_optional_explanation_and_non_strictness() {
 }
 
 #[tokio::test]
+async fn plan_mode_refuses_checklist_updates_before_parsing_arguments() {
+    let tool = UpdatePlanTool::new()
+        .unwrap()
+        .with_mode(ra_tools::request_user_input::ModeKind::Plan);
+    for arguments in [json!({"plan":[]}), json!(null), json!({"plan":"invalid"})] {
+        let output = observe(&tool, &arguments).await;
+        assert!(
+            output
+                .as_text()
+                .unwrap()
+                .contains("update_plan is a TODO/checklist tool and is not allowed in Plan mode")
+        );
+    }
+}
+
+#[tokio::test]
 async fn optional_explanation_is_accepted_without_extra_guidance_or_plan_echo() {
     let tool = UpdatePlanTool::new().unwrap();
     for explanation in [None, Some(Value::Null), Some(json!("The parser changed."))] {
@@ -107,7 +123,7 @@ async fn malformed_arguments_return_codex_parse_error_prefix() {
             json!({"plan":[step("x", "unknown")]}),
             "unknown variant `unknown`",
         ),
-        (json!({"plan":[], "explanation":5}), "invalid type: integer"),
+        (json!({"plan":[], "explanation":5}), "expected a string"),
         (
             json!({"plan":[{"step":"x", "status":"pending", "other":true}]}),
             "unknown field `other`",

@@ -50,19 +50,6 @@ const TOKEN_BUDGET: usize = 512;
 pub(crate) struct ToolSurfacePromptBuilder;
 
 impl ToolSurfacePromptBuilder {
-    /// Returns whether an advertised tool has the given model-facing name, qualified by its
-    /// namespace when it has one.
-    ///
-    /// This is deliberately the same exposure predicate used by the stable inventory. Prompt
-    /// sections that give tool-specific advice must not infer availability from an agent role:
-    /// the agent construction path is the only place that knows which tools the provider receives.
-    pub(crate) fn contains_advertised_tool(tools: &[Arc<dyn Tool>], name: &str) -> bool {
-        tools.iter().any(|tool| {
-            tool.options().is_advertised_to_model()
-                && tool.model_definition().qualified_name() == name
-        })
-    }
-
     /// Checks the inventory this builder would render against the names assembly charged for.
     ///
     /// This is the seam a profile switch has to survive. The registry decided which entries the
@@ -119,17 +106,6 @@ impl ToolSurfacePromptBuilder {
             render_difference(&inventoried, &charged),
             render_difference(&charged, &inventoried)
         )))
-    }
-
-    /// Builds the model-visible inventory: the advertised names, sorted, and nothing else.
-    ///
-    /// Registration order is host startup detail, and letting it reach this text would invalidate
-    /// an otherwise reusable prefix.
-    pub(crate) fn build_tool_surface_section(
-        tools: &[Arc<dyn Tool>],
-    ) -> Result<Option<PromptSection>> {
-        let entries = advertised_entries(tools)?;
-        Self::build_tool_surface_section_from_entries(&entries)
     }
 
     /// Builds the inventory section from one already-validated model-facing projection.
@@ -192,7 +168,7 @@ impl ToolSurfacePromptBuilder {
 }
 
 /// Collects the advertised tools, keyed and therefore sorted by model-facing name.
-fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, ContentHash>> {
+pub(super) fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, ContentHash>> {
     let mut entries = BTreeMap::new();
     for tool in tools {
         // The same rule the surface budget applies, read from the one place that owns it, so the

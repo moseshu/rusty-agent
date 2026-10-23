@@ -1,7 +1,14 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Provider routing and bounded reads through an explicitly granted local filesystem.
 
-use std::{future::Future, io::Read, path::Path, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    io::Read,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
 
 use ra_exec::fs::{RootedFileSystem, Workspace};
 
@@ -17,12 +24,15 @@ pub const LOCAL_ENVIRONMENT_ID: &str = "local";
 /// Authority identity required for cloud entries in the Codex skills tool contract.
 pub const CLOUD_AUTHORITY_ID: &str = "codex_apps";
 
-/// Per-call list context. Discovery-specific roots are deferred to the discovery integration.
+/// Per-call list context and explicitly selected local executor roots.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SkillListQuery {
     /// Run identity supplied by the callback; no framework thread storage is required.
     pub turn_id: String,
+    /// Selected authority ids and their granted local paths. Empty for Host and Cloud queries.
+    /// This is the local adaptation of the upstream selected/resolved executor roots.
+    pub executor_roots: BTreeMap<String, PathBuf>,
 }
 
 /// A resource read with its authority and callback access.
@@ -144,6 +154,25 @@ impl SkillProviders {
         ))
     }
 
+    /// Adds a Host catalog source. Host entries contribute paths to the prompt and are read
+    /// with ordinary filesystem tools; the namespace does not serve Host resources.
+    #[must_use]
+    pub fn with_host_provider(self, provider: Arc<dyn SkillProvider>) -> Self {
+        self.with_provider(SkillProviderSource::new(
+            SkillSourceKind::Host,
+            "host",
+            provider,
+        ))
+    }
+
+    /// Whether Host catalog discovery is configured.
+    #[must_use]
+    pub fn has_host_provider(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.kind == SkillSourceKind::Host)
+    }
+
     /// Whether an executor source is configured, even if its catalog is currently empty.
     #[must_use]
     pub fn has_executor_provider(&self) -> bool {
@@ -160,6 +189,12 @@ impl SkillProviders {
             .any(|source| source.kind == SkillSourceKind::Cloud)
     }
 
+    pub(crate) fn host_catalog_sources(mut self) -> Self {
+        self.sources
+            .retain(|source| source.kind == SkillSourceKind::Host);
+        self
+    }
+
     pub(super) async fn list(&self, kind: &SkillSourceKind, query: SkillListQuery) -> SkillCatalog {
         let mut catalog = SkillCatalog::default();
         for source in self.sources.iter().filter(|source| &source.kind == kind) {
@@ -170,6 +205,12 @@ impl SkillProviders {
                     source.label, err.message
                 )),
             }
+        }
+        if *kind == SkillSourceKind::Executor {
+            catalog.entries.retain(|entry| {
+                entry.authority.kind == SkillSourceKind::Executor
+                    && query.executor_roots.contains_key(&entry.authority.id)
+            });
         }
         catalog
     }
@@ -214,8 +255,14 @@ impl ExecutorSkillProvider {
 }
 
 impl SkillProvider for ExecutorSkillProvider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
-        Box::pin(async { Ok(self.catalog.clone()) })
+    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        Box::pin(async move {
+            let mut catalog = self.catalog.clone();
+            catalog
+                .entries
+                .retain(|entry| query.executor_roots.contains_key(&entry.authority.id));
+            Ok(catalog)
+        })
     }
 
     fn read<'a>(

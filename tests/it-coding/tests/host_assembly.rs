@@ -20,7 +20,7 @@ use ra_coding::{
 use ra_core::{
     agent::{
         AgentId, AgentSpec,
-        control::{AgentPath, AgentStatus},
+        control::{AgentControlPort, AgentPath, AgentStatus},
     },
     cancel::CancelScope,
     capability::{
@@ -396,64 +396,55 @@ async fn coding_thread_completes_beyond_the_previous_turn_limit() {
 #[tokio::test]
 async fn configured_profiles_preserve_independent_tools_and_role_boundaries() {
     let workspace = tempfile::tempdir().unwrap();
-    let host = Arc::new(configured_host::Services::default())
+    let base = Arc::new(configured_host::Services::default())
         .install(CodingHost::open(workspace.path()).unwrap());
-    for tier in CodingProfile::SHIPPED {
-        for role in [
-            PromptRole::Main,
-            PromptRole::Coordinator,
-            PromptRole::ReadOnlySpecialist,
-            PromptRole::Planner,
-            PromptRole::OneOffAnswer,
-        ] {
-            let assembled = host_backed_surface(&role, &host, tier).await.unwrap();
-            let built =
-                build_agent_with_control(AgentId::new("coding"), "Coding", &role, &host, tier)
-                    .await
-                    .unwrap();
-            let agent = built.agent();
-            let names: Vec<_> = assembled.tool_surface().advertised_names().collect();
-            assert!(
-                !names
-                    .iter()
-                    .any(|name| ["agent", "mcp", "tool_search"].contains(name))
-            );
-            assert_eq!(agent.tools().len(), names.len());
-            let spawn = qualified("spawn_agent");
-            // The tree exists exactly when the surface carries the tools that act on it.
-            assert_eq!(
-                built.agent_control().is_some(),
-                names.contains(&spawn.as_str()),
-                "{tier:?} / {role:?}"
-            );
-            if role.is_one_off() {
-                assert!(names.is_empty());
-            } else if tier != CodingProfile::Core && !role.is_read_only() {
-                assert_eq!(names.len(), 18);
-                for name in ["web_search", "web_fetch", "skill", "request_user_input"] {
-                    assert!(names.contains(&name), "{tier:?}: missing {name}");
+    for restricted in [false, true] {
+        let host = base.clone().with_read_only_role_restrictions(restricted);
+        for tier in CodingProfile::SHIPPED {
+            let inherited = host_backed_surface(&PromptRole::Main, &base, tier)
+                .await
+                .unwrap();
+            let expected: Vec<_> = inherited.tool_surface().advertised_names().collect();
+            for role in [
+                PromptRole::Main,
+                PromptRole::Coordinator,
+                PromptRole::ReadOnlySpecialist,
+                PromptRole::Planner,
+                PromptRole::OneOffAnswer,
+            ] {
+                let assembled = host_backed_surface(&role, &host, tier).await.unwrap();
+                let built =
+                    build_agent_with_control(AgentId::new("coding"), "Coding", &role, &host, tier)
+                        .await
+                        .unwrap();
+                let names: Vec<_> = assembled.tool_surface().advertised_names().collect();
+                let mut wanted = expected.clone();
+                if role.is_one_off() {
+                    wanted.clear();
+                } else if restricted && role.is_read_only() {
+                    wanted.retain(|name| {
+                        *name != "apply_patch" && !name.starts_with("collaboration.")
+                    });
                 }
-                for name in [
-                    "spawn_agent",
-                    "send_message",
-                    "followup_task",
-                    "interrupt_agent",
-                    "wait_agent",
-                    "list_agents",
-                ] {
-                    let name = qualified(name);
-                    assert!(names.contains(&name.as_str()), "{tier:?}: missing {name}");
-                    // Codex's default places them in a namespace; none is offered bare.
-                    assert!(!names.contains(&&name[COLLABORATION.len() + 1..]));
+                assert_eq!(
+                    names, wanted,
+                    "{tier:?} / {role:?} / restricted={restricted}"
+                );
+                assert_eq!(built.agent().tools().len(), names.len());
+                assert_eq!(
+                    built.agent_control().is_some(),
+                    names.iter().any(|name| name.starts_with("collaboration."))
+                );
+                if !role.is_one_off() {
+                    for name in ["exec_command", "write_stdin"] {
+                        assert!(names.contains(&name));
+                    }
+                    if tier != CodingProfile::Core {
+                        for name in ["web_search", "web_fetch", "request_user_input"] {
+                            assert!(names.contains(&name));
+                        }
+                    }
                 }
-            }
-            if role.is_read_only() {
-                assert!(agent.tools().iter().all(|tool| {
-                    let options = tool.options();
-                    let classes = options.action_classes();
-                    !classes.is_empty() && classes.iter().all(|class| class.as_str() == "read")
-                }));
-                assert!(!names.contains(&spawn.as_str()));
             }
         }
     }
@@ -521,7 +512,7 @@ async fn switching_a_profile_moves_all_capability_contributions_together() {
     for (tier, role, selected) in [
         (CodingProfile::Full, PromptRole::Main, true),
         (CodingProfile::Core, PromptRole::Main, false),
-        (CodingProfile::Full, PromptRole::ReadOnlySpecialist, false),
+        (CodingProfile::Full, PromptRole::ReadOnlySpecialist, true),
         (CodingProfile::Full, PromptRole::OneOffAnswer, false),
     ] {
         let built = build_agent_with_control(AgentId::new("coding"), "Coding", &role, &host, tier)
@@ -548,40 +539,41 @@ async fn switching_a_profile_moves_all_capability_contributions_together() {
         .with_services(host.build_tool_services());
         let result = Runner::run(built.bind(request)).await.unwrap();
         assert_eq!(result.final_text(), "done");
-        let requests = script.requests.lock().unwrap();
-        for request in requests.iter() {
-            assert_eq!(request_tools(request), expected_tools);
-            let instructions = request.system_instructions().unwrap();
-            assert_eq!(
-                instructions.contains("configured profile operation"),
-                selected
-            );
-            assert_eq!(
-                instructions.contains("Profile runtime instructions."),
-                selected
-            );
-            assert_eq!(
-                instructions.matches("configured profile operation").count(),
-                usize::from(selected)
-            );
-            assert_eq!(
-                request_tools(request)
-                    .iter()
-                    .filter(|name| *name == "profile_probe")
-                    .count(),
-                usize::from(selected)
-            );
-            assert_eq!(
-                request.model_settings().temperature(),
-                selected.then_some(0.23)
-            );
-            assert_eq!(request.input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile context projection.")), selected);
+        {
+            let requests = script.requests.lock().unwrap();
+            for request in requests.iter() {
+                assert_eq!(request_tools(request), expected_tools);
+                let instructions = request.system_instructions().unwrap();
+                assert_eq!(
+                    instructions.contains("configured profile operation"),
+                    selected
+                );
+                assert_eq!(
+                    instructions.contains("Profile runtime instructions."),
+                    selected
+                );
+                assert_eq!(
+                    instructions.matches("configured profile operation").count(),
+                    usize::from(selected)
+                );
+                assert_eq!(
+                    request_tools(request)
+                        .iter()
+                        .filter(|name| *name == "profile_probe")
+                        .count(),
+                    usize::from(selected)
+                );
+                assert_eq!(
+                    request.model_settings().temperature(),
+                    selected.then_some(0.23)
+                );
+                assert_eq!(request.input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile context projection.")), selected);
+            }
+            if selected {
+                assert!(requests[1].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
+                assert!(!requests[0].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
+            }
         }
-        if selected {
-            assert!(requests[1].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
-            assert!(!requests[0].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
-        }
-        drop(requests);
         if let Some(control) = built.agent_control() {
             control.shutdown().await;
         }
@@ -589,8 +581,8 @@ async fn switching_a_profile_moves_all_capability_contributions_together() {
     let samples = samples.lock().unwrap();
     assert_eq!(
         samples.len(),
-        1,
-        "withdrawn capabilities are never bound or sampled"
+        2,
+        "only the main and default specialist Full surfaces bind this capability"
     );
     assert_eq!(samples[0].model(), Some("test-model"));
     assert_eq!(samples[0].provider(), Some(&ProviderKey::new("test")));
@@ -673,30 +665,31 @@ async fn a_spawned_agent_binds_its_own_profile_contributions_and_tool_handlers()
         assert_eq!(request.input().iter().filter(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile context projection.")).count(), 1,
             "thread settings snapshots must retain the run-bound processor exactly once");
     }
-    let requests = script.child_requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    for request in requests.iter() {
-        assert_eq!(request_tools(request), child_tools);
-        assert_eq!(
-            request
-                .system_instructions()
+    {
+        let requests = script.child_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(request_tools(request), child_tools);
+            assert_eq!(
+                request
+                    .system_instructions()
+                    .unwrap()
+                    .matches("configured profile operation")
+                    .count(),
+                1
+            );
+            assert_eq!(request.input().iter().filter(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile context projection.")).count(), 1);
+        }
+        assert!(request_tools(&requests[0]).contains(&"profile_probe".to_owned()));
+        assert!(!request_tools(&requests[0]).contains(&qualified("spawn_agent")));
+        assert_eq!(requests[0].model_settings().temperature(), Some(0.23));
+        assert!(requests[1].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
+        assert!(
+            serde_json::to_string(requests[1].input())
                 .unwrap()
-                .matches("configured profile operation")
-                .count(),
-            1
+                .contains("Profile bound tool result.")
         );
-        assert_eq!(request.input().iter().filter(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile context projection.")).count(), 1);
     }
-    assert!(request_tools(&requests[0]).contains(&"profile_probe".to_owned()));
-    assert!(!request_tools(&requests[0]).contains(&qualified("spawn_agent")));
-    assert_eq!(requests[0].model_settings().temperature(), Some(0.23));
-    assert!(requests[1].input().iter().any(|item| matches!(item, ModelInputItem::Message(message) if message.text_content() == "Profile deferred instructions.")));
-    assert!(
-        serde_json::to_string(requests[1].input())
-            .unwrap()
-            .contains("Profile bound tool result.")
-    );
-    drop(requests);
     assert_eq!(
         samples.lock().unwrap().len(),
         2,
@@ -1039,6 +1032,73 @@ async fn spawned_agents_are_offered_collaboration_when_the_host_says_so() {
 }
 
 #[tokio::test]
+async fn observational_roles_inherit_spawned_tools_and_respect_configured_depth() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host = Arc::new(configured_host::Services::default())
+        .install(CodingHost::open(workspace.path()).unwrap())
+        .with_spawned_agent_collaboration();
+    for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
+        let script = Arc::new(Script::default());
+        script.responses.lock().unwrap().extend([
+            collab("spawn_agent", json!({"task_name":"worker", "message":"worker task: Inspect the repository", "fork_turns":"none"})),
+            collab("wait_agent", json!({"timeout_ms":10000})),
+            answer("delegated"),
+        ]);
+        let built = build_agent_with_control(
+            AgentId::new("coding"),
+            "Coding",
+            &role,
+            &host,
+            CodingProfile::Full,
+        )
+        .await
+        .unwrap();
+        let expected: Vec<_> = declared_tools(built.agent())
+            .into_iter()
+            .filter(|name| !name.starts_with("collaboration."))
+            .collect();
+        let control = built.agent_control().unwrap().clone().with_max_depth(1);
+        let thread = AgentThread::builder(
+            SessionId::new(role.role_name()),
+            AgentBinding::direct(built.agent().clone()),
+            Arc::new(Resolver(script.clone())),
+        )
+        .with_config(built.configure_run(host.build_run_config()))
+        .with_services(host.build_tool_services())
+        .with_agent_control(control.clone())
+        .build();
+        complete_turn(&thread, "delegate inspection").await;
+        let child_tools = request_tools(&script.child_requests.lock().unwrap()[0]);
+        assert_eq!(child_tools, expected);
+        if matches!(role, PromptRole::Planner) {
+            let parent_prompt = built.agent().instructions().unwrap().as_static().unwrap();
+            assert!(parent_prompt.contains("Strongly prefer using the `request_user_input` tool"));
+            let child_prompt = script.child_requests.lock().unwrap()[0]
+                .system_instructions()
+                .unwrap()
+                .to_owned();
+            assert!(!child_prompt.contains("Strongly prefer using the `request_user_input` tool"));
+            assert!(child_prompt.contains("Ask direct questions when clarification is necessary"));
+            assert!(
+                child_prompt
+                    .contains("Return your plan and any unresolved questions to the parent agent")
+            );
+            assert!(!child_prompt.contains("client can render it specially"));
+            assert!(child_prompt.contains("plain-text plan markup"));
+        }
+        assert!(child_tools.contains(&"apply_patch".to_owned()));
+        assert!(child_tools.contains(&"exec_command".to_owned()));
+        assert!(
+            control
+                .handle(&AgentPath::from_string("/root/worker".to_owned()).unwrap())
+                .unwrap()
+                .spawn_depth_exceeded()
+        );
+        thread.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn thread_shutdown_cancels_and_waits_for_a_running_child() {
     let workspace = tempfile::tempdir().unwrap();
     let host = Arc::new(configured_host::Services::default())
@@ -1128,4 +1188,62 @@ async fn an_approval_resume_keeps_the_thread_bound_to_its_control_tree() {
     assert!(history.contains("/root"), "{history}");
     assert!(!history.contains("not enabled for this run"));
     thread.shutdown().await;
+}
+
+#[tokio::test]
+async fn restricted_roles_withhold_all_collaboration_handlers_in_every_namespace() {
+    use ra_core::tool::ToolNamespace;
+    let workspace = tempfile::tempdir().unwrap();
+    let base = Arc::new(configured_host::Services::default())
+        .install(CodingHost::open(workspace.path()).unwrap());
+    for namespace in [None, Some(ToolNamespace::new("agents").unwrap())] {
+        let host = base
+            .clone()
+            .with_collaboration_namespace(namespace)
+            .with_read_only_role_restrictions(true);
+        for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
+            for tier in CodingProfile::SHIPPED {
+                let built =
+                    build_agent_with_control(AgentId::new("coding"), "Coding", &role, &host, tier)
+                        .await
+                        .unwrap();
+                assert!(built.agent_control().is_none());
+                let names: Vec<_> = built
+                    .agent()
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.origin().name())
+                    .collect();
+                for unavailable in [
+                    "apply_patch",
+                    "spawn_agent",
+                    "send_message",
+                    "followup_task",
+                    "interrupt_agent",
+                    "wait_agent",
+                    "list_agents",
+                ] {
+                    assert!(
+                        !names.contains(&unavailable),
+                        "{tier:?} {role:?}: {unavailable}"
+                    );
+                }
+                assert!(names.contains(&"exec_command"));
+                assert!(names.contains(&"write_stdin"));
+                if tier != CodingProfile::Core {
+                    assert!(names.contains(&"web_search"));
+                    assert!(names.contains(&"web_fetch"));
+                }
+                let config = built.configure_run(host.build_run_config());
+                assert!(
+                    !config
+                        .capabilities()
+                        .iter()
+                        .any(|capability| capability.kind().as_str() == "collaboration")
+                );
+                let prompt = built.agent().instructions().unwrap().as_static().unwrap();
+                assert!(prompt.contains("No collaboration tools are advertised; do not delegate tasks or direct other agents"));
+            }
+        }
+    }
 }

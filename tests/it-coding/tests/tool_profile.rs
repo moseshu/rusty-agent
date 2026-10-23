@@ -758,13 +758,15 @@ fn test_a_reconciled_surface_renders_the_verified_name_snapshot() {
 
 /// A role that installs fewer capabilities narrows its tier instead of failing the tier's floor.
 ///
-/// The floor is there to catch a surface that lost an entry, and a read-only agent is short three
+/// The floor is there to catch a surface that lost an entry, and a restricted read-only agent is short one
 /// on purpose. Both facts have to survive: the profile discounts exactly what the role withheld,
 /// and it says so in its own identity rather than reporting itself as the tier it is not.
 #[tokio::test]
 async fn test_a_read_only_role_narrows_its_tier_rather_than_failing_the_floor() {
     let workspace = TempDir::new().expect("a workspace");
-    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+    let host = CodingHost::open(workspace.path())
+        .expect("the host opens a workspace")
+        .with_read_only_role_restrictions(true);
 
     for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
         let assembled = host_backed_surface(&role, &host, CodingProfile::Core)
@@ -774,7 +776,7 @@ async fn test_a_read_only_role_narrows_its_tier_rather_than_failing_the_floor() 
 
         assert_eq!(
             surface.advertised_names().collect::<Vec<_>>(),
-            ["glob", "grep", "read_file"],
+            ["exec_command", "glob", "grep", "read_file", "write_stdin"],
             "role `{role}`"
         );
         assert_eq!(
@@ -896,13 +898,15 @@ async fn test_every_advertised_entry_is_explained_by_the_capability_that_contrib
 
 /// A role that gives up a capability gives up the paragraph describing it, in the same step.
 ///
-/// The withheld half is what the role filter can lose quietly: an agent whose role section says it
-/// has no editing tools, carrying a paragraph about how `apply_patch` matches context lines. The
+/// The withheld half is what the explicit host restriction can lose quietly: a role without the
+/// patch tool, carrying a paragraph about how `apply_patch` matches context lines. The
 /// fragment cannot survive its capability, because the capability is what produced it.
 #[tokio::test]
 async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_withheld() {
     let workspace = TempDir::new().expect("a workspace");
-    let host = CodingHost::open(workspace.path()).expect("the host opens a workspace");
+    let host = CodingHost::open(workspace.path())
+        .expect("the host opens a workspace")
+        .with_read_only_role_restrictions(true);
 
     let assembled =
         host_backed_surface(&PromptRole::ReadOnlySpecialist, &host, CodingProfile::Core)
@@ -914,7 +918,7 @@ async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_wit
         .iter()
         .map(|section| section.name().as_str())
         .collect();
-    assert_eq!(sections, ["filesystem", "search"]);
+    assert_eq!(sections, ["filesystem", "search", "shell"]);
 
     let prefix = assemble_stable_prefix_for_surface(
         &PromptRole::ReadOnlySpecialist,
@@ -924,12 +928,11 @@ async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_wit
     .expect("the read-only prefix assembles")
     .system_instructions()
     .to_owned();
-    for withheld in ["apply_patch", "exec_command", "write_stdin"] {
-        assert!(
-            !prefix.contains(&format!("`{withheld}`")),
-            "the read-only prefix describes `{withheld}`, which its request does not carry"
-        );
-    }
+    assert!(
+        !prefix.contains("`apply_patch`"),
+        "the restricted role must not describe an unavailable editing entry"
+    );
+    assert!(prefix.contains("`exec_command`") && prefix.contains("`write_stdin`"));
     // The kept half is the other side of the same guarantee: withholding the writing capabilities
     // must not take the reading ones' text with them.
     assert!(
@@ -940,7 +943,7 @@ async fn test_a_read_only_role_gives_up_the_fragments_of_the_capabilities_it_wit
 /// No tier and role assemble a prefix that names an entry their own request does not carry.
 ///
 /// The two existing checks each cover one half of one row: assembly refuses a tier that advertises
-/// part of a capability, and the read-only case asserts the three entries it gave up are absent from
+/// part of a capability, and the restricted-role case asserts its withheld editing entry is absent from
 /// its prefix. Neither is a statement about the matrix, and the matrix is where the mistake actually
 /// lives — a section that names an entry unconditionally, or a capability fragment kept for a tier
 /// that dropped its family, is wrong in exactly one of the combinations nobody assembled.

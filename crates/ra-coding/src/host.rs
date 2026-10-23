@@ -39,6 +39,7 @@ use ra_tools::capability::{
 /// - **Host-Visible Channel**: [`HostEvent`](ra_core::event::HostEvent) emitted to UI, telemetry,
 ///   and rollout logs without leaking into model prompts.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // Independent feature choices, not mutually exclusive states.
 pub struct CodingHost {
     workspace: Workspace,
     mcp: Option<Arc<crate::mcp::CodingMcpRuntime>>,
@@ -52,9 +53,11 @@ pub struct CodingHost {
     skill_providers: Option<ra_tools::skills_ns::SkillProviders>,
     skill_roots: BTreeMap<String, Workspace>,
     skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig,
+    skill_discovery: Option<crate::skills::SkillDiscoveryConfig>,
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
     collaboration: Option<Collaboration>,
+    read_only_role_restrictions: bool,
     /// Set on the host a spawned agent is assembled from.
     spawned_agent: bool,
     capabilities: Vec<Arc<dyn Capability>>,
@@ -115,9 +118,11 @@ impl CodingHost {
             skill_providers: None,
             skill_roots: BTreeMap::new(),
             skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig::default(),
+            skill_discovery: None,
             user_input: None,
             request_user_input: false,
             collaboration: None,
+            read_only_role_restrictions: false,
             spawned_agent: false,
             capabilities: Vec::new(),
         })
@@ -187,7 +192,7 @@ impl CodingHost {
     }
 
     /// Selects the merged `skill` compatibility extension.
-    /// Configuring an available namespace source as well fails agent assembly.
+    /// Configuring Host discovery or an available namespace source as well fails agent assembly.
     #[must_use]
     pub fn with_skill_catalog(mut self, catalog: Arc<dyn SkillCatalog>) -> Self {
         self.skills = Some(catalog);
@@ -213,6 +218,16 @@ impl CodingHost {
         self
     }
 
+    /// Enables Host skill metadata discovery per run. Project and explicitly selected plugin
+    /// roots contribute file locators, independently of Executor/Cloud namespace providers.
+    /// Discovery is disabled by default. The allowlist filters context, not file or execution
+    /// permissions; this call grants no additional filesystem access or plugin trust.
+    #[must_use]
+    pub fn with_skill_discovery(mut self, config: crate::skills::SkillDiscoveryConfig) -> Self {
+        self.skill_discovery = Some(config);
+        self
+    }
+
     /// Configures the namespace catalog's model-window lookup, optional token override and usage
     /// instructions. The window is resolved for each run, including its model override.
     /// This does not affect the independent merged catalog.
@@ -230,6 +245,21 @@ impl CodingHost {
             (providers.has_executor_provider() && !self.skill_roots.is_empty())
                 || providers.has_cloud_provider()
         })
+    }
+
+    pub(crate) fn skill_tool_surface(&self) -> crate::skills::SkillToolSurface {
+        if self.uses_skills_namespace() {
+            crate::skills::SkillToolSurface::Namespace
+        } else if self.skill_discovery.is_some()
+            || self
+                .skill_providers
+                .as_ref()
+                .is_some_and(ra_tools::skills_ns::SkillProviders::has_host_provider)
+        {
+            crate::skills::SkillToolSurface::Host
+        } else {
+            crate::skills::SkillToolSurface::Merged
+        }
     }
 
     /// Adds an explicitly selected product capability. Roles and tiers select its tools together
@@ -261,6 +291,22 @@ impl CodingHost {
 
     pub(crate) const fn request_user_input_enabled(&self) -> bool {
         self.request_user_input
+    }
+
+    /// Selects the optional tool restrictions for read-only specialist and planner roles.
+    ///
+    /// Disabled by default: roles inherit the host's tools and sandbox, as in Codex. When enabled,
+    /// these roles withhold `apply_patch` and the entire collaboration tool group, including
+    /// messaging and follow-up tasks. Shell and web remain available. Commands follow the inherited
+    /// sandbox, so this setting does not enforce filesystem read-only access.
+    #[must_use]
+    pub const fn with_read_only_role_restrictions(mut self, enabled: bool) -> Self {
+        self.read_only_role_restrictions = enabled;
+        self
+    }
+
+    pub(crate) const fn read_only_role_restrictions(&self) -> bool {
+        self.read_only_role_restrictions
     }
 
     /// Enables the six collaboration tools in Codex's default `collaboration` namespace.
@@ -316,6 +362,10 @@ impl CodingHost {
         }
     }
 
+    pub(crate) const fn is_spawned_agent(&self) -> bool {
+        self.spawned_agent
+    }
+
     pub(crate) const fn collaboration_enabled(&self) -> bool {
         self.collaboration.is_some()
     }
@@ -361,9 +411,11 @@ impl CodingHost {
     }
 
     pub(crate) fn skills_capability(&self) -> ra_core::error::Result<Option<SkillsCapability>> {
-        if self.skills.is_some() && self.uses_skills_namespace() {
+        if self.skills.is_some()
+            && (self.skill_tool_surface() != crate::skills::SkillToolSurface::Merged)
+        {
             return Err(ra_core::error::Error::config(
-                "configure either the merged skill catalog or skills namespace providers, not both",
+                "configure either the merged skill catalog or skills namespace providers/Host discovery, not both",
             ));
         }
         self.skills.clone().map(SkillsCapability::new).transpose()
@@ -371,22 +423,35 @@ impl CodingHost {
 
     pub(crate) fn skills_ns_capability(
         &self,
+        profile: crate::profile::CodingProfile,
     ) -> ra_core::error::Result<Option<crate::skills::SkillCatalogCapability>> {
         let budget = ToolResultBudget::default();
-        self.skill_providers
-            .clone()
-            .filter(|_| self.uses_skills_namespace())
+        let mut providers = self.skill_providers.clone().unwrap_or_default();
+        if let Some(config) = &self.skill_discovery {
+            providers = providers.with_host_provider(Arc::new(crate::skills::HostSkillProvider {
+                config: config.clone(),
+                workspace_root: self.workspace.root().to_path_buf(),
+            }));
+        }
+        Some(providers)
+            .filter(|providers| self.uses_skills_namespace() || providers.has_host_provider())
             .map(|providers| {
-                SkillsNsCapability::new(
-                    providers,
-                    self.skill_roots.clone(),
-                    budget.max_bytes().min(
-                        budget
-                            .max_tokens()
-                            .saturating_mul(ra_core::prompt::CHARS_PER_TOKEN),
-                    ),
-                )
-                .map(|capability| {
+                let capability = if profile == crate::profile::CodingProfile::Core
+                    && providers.has_host_provider()
+                {
+                    SkillsNsCapability::host_catalog(providers)
+                } else {
+                    SkillsNsCapability::new(
+                        providers,
+                        self.skill_roots.clone(),
+                        budget.max_bytes().min(
+                            budget
+                                .max_tokens()
+                                .saturating_mul(ra_core::prompt::CHARS_PER_TOKEN),
+                        ),
+                    )
+                };
+                capability.map(|capability| {
                     crate::skills::SkillCatalogCapability::new(
                         capability,
                         self.skill_catalog_prompt.clone(),

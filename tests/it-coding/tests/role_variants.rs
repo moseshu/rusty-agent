@@ -8,22 +8,12 @@ fn test_read_only_specialist_role_constraints() {
 
     let content = section.content();
 
-    // Explicit capability unavailability wording
-    assert!(
-        content.contains(
-            "You do NOT have access to file editing tools - attempting to edit files will fail"
-        ),
-        "must contain exact capability unavailability wording"
-    );
-
-    // Shell escape closures
-    assert!(content.contains("touch"));
-    assert!(content.contains("rm"));
-    assert!(content.contains("mv"));
-    assert!(content.contains("cp"));
-    assert!(content.contains(">"));
-    assert!(content.contains(">>"));
-    assert!(content.contains("/tmp"));
+    assert!(content.contains("non-mutating exploration"));
+    assert!(content.contains("The dedicated file editing tool is not advertised"));
+    assert!(content.contains(
+        "No collaboration tools are advertised; do not delegate tasks or direct other agents"
+    ));
+    assert!(content.contains("parent session's sandbox and permissions"));
 
     assert!(PromptRole::ReadOnlySpecialist.is_read_only());
     assert!(!PromptRole::ReadOnlySpecialist.is_one_off());
@@ -103,4 +93,70 @@ fn test_custom_text_overrides_a_builtin_role_rather_than_being_dropped() {
     let unchanged = RolePromptBuilder::build_role_section_with_custom_text(&PromptRole::Main, None)
         .expect("no override");
     assert_eq!(unchanged.content(), stock.content());
+}
+
+#[test]
+fn role_guidance_tracks_the_advertised_editing_and_collaboration_tools() {
+    for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
+        let inherited = RolePromptBuilder::build_role_section_for_tools(
+            &role,
+            &[
+                "apply_patch",
+                "exec_command",
+                "write_stdin",
+                "collaboration.spawn_agent",
+                "update_plan",
+                "request_user_input",
+            ],
+        )
+        .unwrap();
+        assert!(
+            inherited
+                .content()
+                .contains("The dedicated file editing tool is available")
+        );
+        assert!(
+            !inherited
+                .content()
+                .contains("The dedicated file editing tool is not advertised")
+        );
+        assert!(!inherited.content().contains(
+            "No collaboration tools are advertised; do not delegate tasks or direct other agents"
+        ));
+        let restricted = RolePromptBuilder::build_role_section_for_tools(
+            &role,
+            &["exec_command", "write_stdin"],
+        )
+        .unwrap();
+        assert!(
+            restricted
+                .content()
+                .contains("The dedicated file editing tool is not advertised")
+        );
+        assert!(restricted.content().contains(
+            "No collaboration tools are advertised; do not delegate tasks or direct other agents"
+        ));
+        for content in [inherited.content(), restricted.content()] {
+            assert!(!content.contains("client can render it specially"));
+            assert!(content.contains("Dry-run style commands"));
+            assert!(content.contains("Tests, builds, or checks that may write to caches"));
+            assert!(content.contains("Running formatters or linters that rewrite files"));
+            assert!(content.contains("Applying patches, migrations, or codegen"));
+        }
+        if matches!(role, PromptRole::Planner) {
+            assert!(
+                inherited
+                    .content()
+                    .contains("## Plan Mode vs update_plan tool")
+            );
+            assert!(!restricted.content().contains("update_plan"));
+            assert!(!restricted.content().contains("request_user_input"));
+            assert!(
+                inherited
+                    .content()
+                    .contains("Tests, builds, or checks that may write to caches")
+            );
+            assert!(inherited.content().contains("<proposed_plan>"));
+        }
+    }
 }

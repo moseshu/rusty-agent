@@ -37,11 +37,12 @@
 //! single total because a total is the number nobody defends: any one topic can grow into the room
 //! the others left, and the review that would have caught it sees only a prefix that still fits.
 //!
-//! Three sizes are in use. A section that states a *stance* — identity, engineering judgment,
-//! personality, role — gets 192, and a rule list the model has to apply — editing, autonomy,
+//! A section that states a *stance* — identity, engineering judgment, personality, ordinary role —
+//! gets 192, and a rule list the model has to apply — editing, autonomy,
 //! channels, formatting — gets 256. The tool-use behavior contract gets 128, while the generated
 //! tool surface gets 512: the latter has to name every advertised tool and is bounded by the
-//! coding profile's explicit aggregate-name budget. Nothing derives these numbers; they are roughly
+//! coding profile's explicit aggregate-name budget. Specialist and planner role rules have the
+//! separate allowances described below. Nothing derives these numbers; they are roughly
 //! a third above what each section costs today, which is room to rewrite a paragraph and not room
 //! to add a second topic under an existing heading.
 //!
@@ -51,7 +52,8 @@
 //! writes them, because a ceiling that only covered the sections this crate happens to own would
 //! stop describing the prefix the moment a capability was installed.
 //!
-//! Their sum is the ceiling on the assembled prefix: 2912 estimated tokens, more than twice
+//! The ordinary-role allowance sums to 2912 estimated tokens. Specialist examples add 448;
+//! Planner adds 2880 for the upstream Plan template. The ordinary allowance is more than twice
 //! [`MIN_CACHEABLE_PREFIX_TOKENS`](ra_core::prompt::MIN_CACHEABLE_PREFIX_TOKENS). The floor and the
 //! ceiling are different kinds of fact — below the floor Anthropic does not receive
 //! `cache_control`, while above the ceiling it costs more every turn than this product has decided
@@ -133,12 +135,23 @@ pub fn assemble_stable_prefix_for_surface(
     surface: &ToolSurface,
     capability_sections: &[PromptSection],
 ) -> Result<StablePrefix> {
+    assemble_stable_prefix_for_session(role, surface, capability_sections, false)
+}
+
+/// Assembles root or spawned-agent guidance from the same validated tool inventory.
+pub(crate) fn assemble_stable_prefix_for_session(
+    role: &PromptRole,
+    surface: &ToolSurface,
+    capability_sections: &[PromptSection],
+    spawned_agent: bool,
+) -> Result<StablePrefix> {
     let entries = ToolSurfacePromptBuilder::reconcile_with_surface(surface)?;
     assemble_stable_prefix_with_inventory(
         role,
-        entries.contains_key("apply_patch"),
+        &entries.keys().map(String::as_str).collect::<Vec<_>>(),
         ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
         capability_sections,
+        spawned_agent,
     )
 }
 
@@ -162,10 +175,14 @@ pub fn assemble_stable_prefix_for_tools(
     role: &PromptRole,
     tools: &[Arc<dyn Tool>],
 ) -> Result<StablePrefix> {
-    let apply_patch_is_advertised =
-        ToolSurfacePromptBuilder::contains_advertised_tool(tools, "apply_patch");
-    let tool_surface = ToolSurfacePromptBuilder::build_tool_surface_section(tools)?;
-    assemble_stable_prefix_with_inventory(role, apply_patch_is_advertised, tool_surface, &[])
+    let entries = tool_surface::advertised_entries(tools)?;
+    assemble_stable_prefix_with_inventory(
+        role,
+        &entries.keys().map(String::as_str).collect::<Vec<_>>(),
+        ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
+        &[],
+        false,
+    )
 }
 
 /// Assembles the stable prefix once the tool-inventory projection is fixed.
@@ -176,19 +193,20 @@ pub fn assemble_stable_prefix_for_tools(
 /// capability was installed to speak for one.
 fn assemble_stable_prefix_with_inventory(
     role: &PromptRole,
-    apply_patch_is_advertised: bool,
+    tool_names: &[&str],
     tool_surface: Option<PromptSection>,
     capability_sections: &[PromptSection],
+    spawned_agent: bool,
 ) -> Result<StablePrefix> {
     let mut sections = vec![
         IdentityPromptBuilder::build_identity_section()?,
         EngineeringPromptBuilder::build_engineering_section()?,
-        EditingPromptBuilder::build_editing_section(role, apply_patch_is_advertised)?,
+        EditingPromptBuilder::build_editing_section(role, tool_names.contains(&"apply_patch"))?,
         AutonomyPromptBuilder::build_autonomy_section()?,
         ChannelsPromptBuilder::build_channels_section()?,
         FormattingPromptBuilder::build_formatting_section()?,
         PersonalityPromptBuilder::build_personality_section()?,
-        RolePromptBuilder::build_role_section(role)?,
+        RolePromptBuilder::build_role_section_for_session(role, tool_names, spawned_agent)?,
     ];
     // One condition for both, read from the inventory builder rather than restated here. Added on
     // its own, the selection rules would tell an agent whose request carries no tools to choose

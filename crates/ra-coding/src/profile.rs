@@ -13,7 +13,8 @@
 //! and MCP resources are resolved per run rather than represented by static placeholder functions.
 //!
 //! **A tier and a role are different questions.** A tier says what this product advertises; a role
-//! says which capabilities an agent installs, and a read-only one installs nothing that writes. The
+//! says which capabilities an agent installs. Read-only roles inherit tools by default; explicit
+//! host restrictions may withhold editing and spawning. The
 //! role-aware constructor below is where the two meet, by subtracting withheld entries from the
 //! tier's selection and withheld *advertised* entries from its band. What it does not do is relax
 //! the tier: an entry missing because its host service is absent is in no role's withheld set, so it
@@ -28,7 +29,7 @@ use ra_core::{
 };
 use ra_runtime::tool::profile::{ToolProfile, ToolProfileId, ToolSurfaceBudget};
 
-use crate::host::default_collaboration_namespace;
+use crate::{host::default_collaboration_namespace, skills::SkillToolSurface};
 use serde::{Deserialize, Serialize};
 
 /// What the coding agent's whole advertised surface may cost per turn.
@@ -129,14 +130,14 @@ impl CodingProfile {
             &BTreeSet::new(),
             &BTreeSet::new(),
             Some(&default_collaboration_namespace()?),
-            false,
+            SkillToolSurface::Merged,
         )
     }
 
     /// Builds the profile for a role that installs only some of what this tier names.
     ///
     /// A role selects capabilities, not tools, and a capability it does not install takes its
-    /// entries with it. Without this the read-only roles would be judged against a band measured
+    /// entries with it. Without this restricted roles would be judged against a band measured
     /// for an agent holding everything, and every one of them would fail the tier's floor — the
     /// check whose whole purpose is to catch a surface that lost an entry nobody meant to drop.
     ///
@@ -155,13 +156,13 @@ impl CodingProfile {
         withheld: &BTreeSet<ToolLookupKey>,
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
-        skills_namespace: bool,
+        skills: SkillToolSurface,
     ) -> Result<ToolProfile> {
         // A narrowed tier is a different profile and says so. The identity reaches assembly errors
         // and the surface's own record, and `core` naming three entries would read there as the
         // tier having quietly shrunk.
         let narrowed = self
-            .declared_keys(collaboration_namespace, skills_namespace)?
+            .declared_keys(collaboration_namespace, skills)?
             .map_or_else(
                 || !withheld.is_empty(),
                 |keys| keys.iter().any(|key| withheld.contains(key)),
@@ -176,7 +177,7 @@ impl CodingProfile {
             withheld,
             withheld_advertised,
             collaboration_namespace,
-            skills_namespace,
+            skills,
         )
     }
 
@@ -216,29 +217,29 @@ impl CodingProfile {
     fn declared_keys(
         self,
         collaboration_namespace: Option<&ToolNamespace>,
-        skills_namespace: bool,
+        skills: SkillToolSurface,
     ) -> Result<Option<Vec<ToolLookupKey>>> {
         Ok(match self {
             Self::Core => Some(lookup_keys(&CORE)?),
-            Self::CodexLike => Some(
-                lookup_keys(&CORE)?
-                    .into_iter()
-                    .chain(
-                        lookup_keys(&CODEX_LIKE_EXTRA)?
-                            .into_iter()
-                            .filter(|key| !skills_namespace || key.name() != "skill"),
-                    )
-                    .chain(if skills_namespace {
-                        vec![
-                            ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "list")?,
-                            ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "read")?,
-                        ]
-                    } else {
-                        Vec::new()
-                    })
-                    .chain(collaboration_keys(collaboration_namespace)?)
-                    .collect(),
-            ),
+            Self::CodexLike => {
+                Some(
+                    lookup_keys(&CORE)?
+                        .into_iter()
+                        .chain(lookup_keys(&CODEX_LIKE_EXTRA)?.into_iter().filter(|key| {
+                            skills == SkillToolSurface::Merged || key.name() != "skill"
+                        }))
+                        .chain(if skills == SkillToolSurface::Namespace {
+                            vec![
+                                ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "list")?,
+                                ToolLookupKey::namespaced(ToolNamespace::new("skills")?, "read")?,
+                            ]
+                        } else {
+                            Vec::new()
+                        })
+                        .chain(collaboration_keys(collaboration_namespace)?)
+                        .collect(),
+                )
+            }
             Self::Full => None,
         })
     }
@@ -256,12 +257,16 @@ impl CodingProfile {
         withheld: &BTreeSet<ToolLookupKey>,
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
-        skills_namespace: bool,
+        skills: SkillToolSurface,
     ) -> Result<ToolProfile> {
-        let declared = self.declared_keys(collaboration_namespace, skills_namespace)?;
+        let declared = self.declared_keys(collaboration_namespace, skills)?;
         let (mut floor, ceiling) = self.band();
-        if skills_namespace && self != Self::Core {
-            floor += 1;
+        if self != Self::Core {
+            match skills {
+                SkillToolSurface::Namespace => floor += 1,
+                SkillToolSurface::Host => floor = floor.saturating_sub(1),
+                SkillToolSurface::Merged => {}
+            }
         }
         // What the tier would have advertised and this role does not. `full` names nothing of its
         // own, so every withheld advertised entry is one it would otherwise have taken.

@@ -1,6 +1,14 @@
-//! Model-aware catalog configuration for the explicitly selected skills namespace.
+//! Explicit Host discovery and model-aware configuration for skill catalogs.
 
+mod config;
+mod discovery;
+mod metadata;
+mod parser;
+pub use metadata::SkillProduct;
 mod windows;
+pub use config::{SkillConfig, SkillConfigRule, SkillConfigRuleSelector, SkillConfigRules};
+pub(crate) use discovery::HostSkillProvider;
+pub use discovery::{PluginSkillRoot, SkillDiscoveryConfig, SkillDiscoveryMode};
 
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -13,7 +21,7 @@ use ra_core::{
 };
 use ra_tools::capability::SkillsNsCapability;
 
-/// Product configuration for the upstream single-catalog prompt.
+/// Product configuration for the upstream skill catalogs and their shared metadata budget.
 ///
 /// The resolved run model selects a window from the Codex catalog table, independently of the
 /// Agents SDK compaction capacities. Lookup uses the longest model prefix, then retries a single
@@ -123,4 +131,12 @@ impl Capability for SkillCatalogCapability {
         }
         capability.bind(context)
     }
+}
+
+/// How the product selects skill tools; Host catalogs use existing filesystem tools.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillToolSurface {
+    Merged,
+    Namespace,
+    Host,
 }

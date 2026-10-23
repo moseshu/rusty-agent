@@ -7,7 +7,8 @@ use ra_core::state::RunId;
 
 use super::{
     SkillToolAuthority, SkillToolAuthoritySelector, SkillToolContext,
-    render::{SkillMetadataBudget, render_available_skills, skill_metadata_budget},
+    allocation::render_catalogs,
+    render::{SkillMetadataBudget, skill_metadata_budget},
     warnings::bounded_warnings,
 };
 
@@ -48,7 +49,13 @@ impl SkillCatalogPrompt {
     }
 
     pub(crate) fn token_budget(&self) -> usize {
+        let providers = &self.context.providers;
+        let count = usize::from(
+            providers.has_executor_provider() && !self.context.executor_roots.is_empty(),
+        ) + usize::from(providers.has_cloud_provider())
+            + usize::from(providers.has_host_provider());
         super::catalog_prompt::fixed_prompt_token_budget(self.include_skills_usage_instructions)
+            .saturating_mul(count)
             .saturating_add(self.metadata_budget().token_limit())
     }
 
@@ -58,7 +65,7 @@ impl SkillCatalogPrompt {
 
     pub(crate) async fn render(&self) -> Option<String> {
         let run_id = self.run_id.as_ref()?;
-        let mut catalog = super::catalog::SkillCatalog::default();
+        let mut catalogs = Vec::new();
         for selector in [
             SkillToolAuthoritySelector::Executor,
             SkillToolAuthoritySelector::Cloud,
@@ -68,34 +75,47 @@ impl SkillCatalogPrompt {
                 SkillToolAuthority::from_authority(&entry.authority)
                     .is_some_and(|authority| authority.selector() == selector)
             });
-            catalog.extend(source);
+            catalogs.push(source);
         }
-        for warning in bounded_warnings(&catalog.warnings) {
-            tracing::warn!(%run_id, "{warning}");
+        let mut host = self.context.host_catalog_for_run(run_id).await;
+        host.entries
+            .retain(|entry| entry.authority.kind == super::catalog::SkillSourceKind::Host);
+        let executor = &catalogs[0];
+        let cloud = &catalogs[1];
+        for catalog in [executor, cloud, &host] {
+            for warning in bounded_warnings(&catalog.warnings) {
+                tracing::warn!(%run_id, "{warning}");
+            }
         }
-        let rendered = render_available_skills(
-            &catalog,
+        let rendered = render_catalogs(
+            executor,
+            cloud,
+            &host,
             self.metadata_budget(),
             self.include_skills_usage_instructions,
-        )?;
-        let report = &rendered.report;
-        tracing::debug!(
-            total_count = report.total_count,
-            included_count = report.included_count,
-            omitted_count = report.omitted_count,
-            truncated_description_chars = report.truncated_description_chars,
-            truncated_description_count = report.truncated_description_count,
-            metadata_cost = rendered.metadata_cost(
-                self.metadata_budget(),
-                self.include_skills_usage_instructions
-            ),
-            "rendered skill catalog"
         );
-        if let Some(warning) = report.warning_message() {
-            tracing::warn!(%run_id, "{warning}");
+        let mut fragments = Vec::new();
+        for catalog in [rendered.executor, rendered.cloud, rendered.host]
+            .into_iter()
+            .flatten()
+        {
+            tracing::debug!(
+                metadata_cost = catalog.metadata_cost(
+                    self.metadata_budget(),
+                    self.include_skills_usage_instructions
+                ),
+                total_count = catalog.report.total_count,
+                included_count = catalog.report.included_count,
+                omitted_count = catalog.report.omitted_count,
+                "rendered skill catalog"
+            );
+            if let Some(warning) = catalog.report.warning_message() {
+                tracing::warn!(%run_id, "{warning}");
+            }
+            if let Some(fragment) = catalog.into_fragment(self.include_skills_usage_instructions) {
+                fragments.push(fragment.render());
+            }
         }
-        rendered
-            .into_fragment(self.include_skills_usage_instructions)
-            .map(|fragment| fragment.render())
+        (!fragments.is_empty()).then(|| fragments.join("\n"))
     }
 }

@@ -586,3 +586,71 @@ async fn cloud_providers_use_the_documented_authority_identity() {
         "skill package is not available"
     );
 }
+
+struct RootQueryProvider {
+    queries: std::sync::Mutex<Vec<SkillListQuery>>,
+}
+impl SkillProvider for RootQueryProvider {
+    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        self.queries.lock().unwrap().push(query);
+        Box::pin(async {
+            Ok(SkillCatalog {
+                entries: ["selected", "unselected"]
+                    .into_iter()
+                    .map(|authority| {
+                        entry(
+                            SkillSourceKind::Executor,
+                            authority,
+                            &format!("skill://{authority}/review"),
+                            "resource",
+                        )
+                    })
+                    .collect(),
+                warnings: vec![],
+            })
+        })
+    }
+    fn read<'a>(&'a self, _: SkillReadRequest<'a>) -> SkillProviderFuture<'a, SkillReadResult> {
+        Box::pin(async { Err(SkillProviderError::new("not needed")) })
+    }
+}
+
+#[tokio::test]
+async fn executor_queries_and_all_discovery_consumers_are_limited_to_selected_roots() {
+    use ra_core::capability::Capability;
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = ra_exec::fs::Workspace::open(directory.path()).unwrap();
+    let provider = Arc::new(RootQueryProvider {
+        queries: Default::default(),
+    });
+    let capability = ra_tools::capability::SkillsNsCapability::new(
+        SkillProviders::new().with_executor_provider(provider.clone()),
+        roots("selected", workspace.clone()),
+        8000,
+    )
+    .unwrap();
+    let bound = capability.bind(&run()).unwrap().unwrap();
+    let prompt = bound.instructions().await.unwrap().unwrap();
+    assert!(prompt.content().contains("skill://selected/review"));
+    assert!(!prompt.content().contains("unselected"));
+    let list = response(
+        capability.list().unwrap().as_ref(),
+        json!({"authority":{"kind":"executor"}}),
+    )
+    .await;
+    assert_eq!(list["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(list["skills"][0]["package"], "skill://selected/review");
+    let denied = call(
+        capability.read().unwrap().as_ref(),
+        json!({"package":"skill://unselected/review"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error_message(denied), "skill package is not available");
+    let queries = provider.queries.lock().unwrap();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].executor_roots,
+        [("selected".into(), workspace.root().to_path_buf())].into()
+    );
+}

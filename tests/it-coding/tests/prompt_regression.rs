@@ -46,6 +46,11 @@ static SHIPPED_ROLES: [PromptRole; 5] = [
 /// kinds of fact — below the floor Anthropic does not receive `cache_control`; above the
 /// ceiling it costs more on every turn than this product has decided a system prompt is worth.
 const PREFIX_TOKEN_CEILING: usize = 2_912;
+const SPECIALIST_ROLE_TOKEN_ALLOWANCE: usize = 640;
+const SPECIALIST_PREFIX_TOKEN_CEILING: usize =
+    PREFIX_TOKEN_CEILING - 192 + SPECIALIST_ROLE_TOKEN_ALLOWANCE;
+const PLAN_ROLE_TOKEN_ALLOWANCE: usize = 3_072;
+const PLAN_PREFIX_TOKEN_CEILING: usize = PREFIX_TOKEN_CEILING - 192 + PLAN_ROLE_TOKEN_ALLOWANCE;
 
 /// The capability families whose fragments this repository writes.
 ///
@@ -139,13 +144,16 @@ async fn shipped_prefixes() -> Vec<(String, StablePrefix)> {
             host_backed_prefix(&role, &host).await,
         ));
     }
-    // The read-only variant is the one whose capability set is narrowed, and its fragments are the
-    // half a role filter can silently keep: text describing an editing entry, in the prefix of an
-    // agent whose own role section says it has none.
-    prefixes.push((
-        format!("{}_host_backed", PromptRole::ReadOnlySpecialist.role_name()),
-        host_backed_prefix(&PromptRole::ReadOnlySpecialist, &host).await,
-    ));
+    for role in [PromptRole::ReadOnlySpecialist, PromptRole::Planner] {
+        prefixes.push((
+            format!("{}_host_backed", role.role_name()),
+            host_backed_prefix(&role, &host).await,
+        ));
+        prefixes.push((
+            format!("{}_restricted_host_backed", role.role_name()),
+            host_backed_prefix(&role, &host.clone().with_read_only_role_restrictions(true)).await,
+        ));
+    }
     prefixes
 }
 
@@ -207,6 +215,14 @@ async fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
             let budget = section
                 .token_budget()
                 .expect("covered by the declaration test above");
+            if section.name().as_str() == "role" && label.starts_with("read_only_specialist") {
+                assert_eq!(budget, SPECIALIST_ROLE_TOKEN_ALLOWANCE);
+                continue;
+            }
+            if section.name().as_str() == "role" && label.starts_with("planner") {
+                assert_eq!(budget, PLAN_ROLE_TOKEN_ALLOWANCE);
+                continue;
+            }
             if let Some(previous) = allowances.insert(section.name().as_str().to_owned(), budget) {
                 assert_eq!(
                     previous,
@@ -232,14 +248,21 @@ async fn test_the_declared_allowances_sum_to_the_prefix_ceiling() {
 async fn test_every_shipped_prefix_clears_the_anthropic_floor_and_stays_below_the_ceiling() {
     for (label, prefix) in shipped_prefixes().await {
         let tokens = prefix.token_estimate();
+        let ceiling = if label.starts_with("planner") {
+            PLAN_PREFIX_TOKEN_CEILING
+        } else if label.starts_with("read_only_specialist") {
+            SPECIALIST_PREFIX_TOKEN_CEILING
+        } else {
+            PREFIX_TOKEN_CEILING
+        };
         assert!(
             tokens >= MIN_CACHEABLE_PREFIX_TOKENS,
             "the `{label}` prefix is {tokens} tokens, below the \
              {MIN_CACHEABLE_PREFIX_TOKENS}-token caching floor"
         );
         assert!(
-            tokens <= PREFIX_TOKEN_CEILING,
-            "the `{label}` prefix is {tokens} tokens, over the {PREFIX_TOKEN_CEILING}-token \
+            tokens <= ceiling,
+            "the `{label}` prefix is {tokens} tokens, over the {ceiling}-token \
              ceiling its own sections declare"
         );
     }

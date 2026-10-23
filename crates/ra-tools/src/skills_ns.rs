@@ -2,7 +2,8 @@
 //! Codex's `skills.list` and `skills.read` contracts, selected explicitly by the host.
 //!
 //! Executor metadata is supplied by a provider; automatic disk discovery is a separate integration.
-//! The capability renders a bounded catalog at run assembly. Each selected skill root is a grant,
+//! Host providers contribute file locators to the same bounded run catalog; they add no tools or
+//! filesystem grants. The capability renders a bounded catalog at run assembly. Each selected skill root is a grant,
 //! keyed by the executor authority id and unrelated to the coding working directory. Per-turn
 //! sandbox permission changes are not interpreted by these tools. Cloud schema and routing are
 //! retained, without an `OpenAI` account backend. The merged [`crate::skill`] tool remains a separate
@@ -37,8 +38,10 @@ use catalog::{SkillAuthority, SkillCatalog, SkillPackageId, SkillReadResult, Ski
 use provider::SkillListQuery;
 
 mod aliases;
+mod allocation;
 pub mod catalog;
 mod catalog_prompt;
+mod host_aliases;
 mod list;
 mod prompt;
 pub mod provider;
@@ -86,7 +89,8 @@ pub(crate) fn skill_tools_with_prompt(
     response_byte_budget: usize,
 ) -> CoreResult<SkillToolSet> {
     let executor_available = providers.has_executor_provider() && !executor_roots.is_empty();
-    if !executor_available && !providers.has_cloud_provider() {
+    let tools_available = executor_available || providers.has_cloud_provider();
+    if !tools_available && !providers.has_host_provider() {
         return Ok(SkillToolSet {
             tools: Vec::new(),
             prompt: None,
@@ -97,22 +101,27 @@ pub(crate) fn skill_tools_with_prompt(
         executor_roots: Arc::new(executor_roots),
         response_byte_budget,
         executor_catalog: Arc::new(Mutex::new(None)),
+        host_catalog: Arc::new(Mutex::new(None)),
         executor_read_snapshot: Arc::new(Mutex::new(None)),
     };
     let prompt = SkillCatalogPrompt::new(context.clone());
     Ok(SkillToolSet {
-        tools: vec![
-            Arc::new(SkillTool::new::<list::ListArgs>(
-                list::TOOL_NAME,
-                list::DESCRIPTION,
-                context.clone(),
-            )?),
-            Arc::new(SkillTool::new::<read::ReadArgs>(
-                read::TOOL_NAME,
-                read::DESCRIPTION,
-                context,
-            )?),
-        ],
+        tools: if tools_available {
+            vec![
+                Arc::new(SkillTool::new::<list::ListArgs>(
+                    list::TOOL_NAME,
+                    list::DESCRIPTION,
+                    context.clone(),
+                )?),
+                Arc::new(SkillTool::new::<read::ReadArgs>(
+                    read::TOOL_NAME,
+                    read::DESCRIPTION,
+                    context,
+                )?),
+            ]
+        } else {
+            Vec::new()
+        },
         prompt: Some(prompt),
     })
 }
@@ -123,6 +132,7 @@ struct SkillToolContext {
     executor_roots: Arc<BTreeMap<String, Workspace>>,
     response_byte_budget: usize,
     executor_catalog: Arc<Mutex<Option<ExecutorCatalog>>>,
+    host_catalog: Arc<Mutex<Option<ExecutorCatalog>>>,
     executor_read_snapshot: Arc<Mutex<Option<ExecutorReadSnapshot>>>,
 }
 
@@ -147,12 +157,25 @@ impl SkillToolContext {
     ) -> SkillCatalog {
         let query = SkillListQuery {
             turn_id: run_id.as_str().to_string(),
+            executor_roots: self
+                .executor_roots
+                .iter()
+                .map(|(id, root)| (id.clone(), root.root().to_path_buf()))
+                .collect(),
         };
         match authority {
             // There is no account-backed thread snapshot here; optional cloud adapters own their
             // catalog lifecycle. The default cloud slot has no provider and returns an empty catalog.
             SkillToolAuthoritySelector::Cloud => {
-                self.providers.list(&SkillSourceKind::Cloud, query).await
+                self.providers
+                    .list(
+                        &SkillSourceKind::Cloud,
+                        SkillListQuery {
+                            executor_roots: BTreeMap::new(),
+                            ..query
+                        },
+                    )
+                    .await
             }
             SkillToolAuthoritySelector::Executor => {
                 if self.executor_roots.is_empty() {
@@ -181,6 +204,37 @@ impl SkillToolContext {
                     .clone()
             }
         }
+    }
+
+    async fn host_catalog_for_run(&self, run_id: &RunId) -> SkillCatalog {
+        let cell = {
+            let mut slot = self
+                .host_catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.as_ref().is_some_and(|cached| cached.run_id != *run_id) {
+                *slot = None;
+            }
+            Arc::clone(
+                &slot
+                    .get_or_insert_with(|| ExecutorCatalog {
+                        run_id: run_id.clone(),
+                        catalog: Arc::new(OnceCell::new()),
+                    })
+                    .catalog,
+            )
+        };
+        cell.get_or_init(|| {
+            self.providers.list(
+                &SkillSourceKind::Host,
+                SkillListQuery {
+                    turn_id: run_id.as_str().to_string(),
+                    executor_roots: BTreeMap::new(),
+                },
+            )
+        })
+        .await
+        .clone()
     }
 
     fn response_byte_budget(&self) -> usize {

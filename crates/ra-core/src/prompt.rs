@@ -479,7 +479,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 pub enum PromptRole {
     /// Main autonomous execution agent.
     Main,
-    /// Read-only specialist agent without editing tools.
+    /// Specialist agent instructed to perform read-only exploration.
     ReadOnlySpecialist,
     /// Read-only planning and architecture agent.
     Planner,
@@ -492,7 +492,7 @@ pub enum PromptRole {
 }
 
 impl PromptRole {
-    /// Returns whether this role is strictly read-only.
+    /// Returns whether the role requests read-only behavior; products select its actual tools.
     #[must_use]
     pub const fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnlySpecialist | Self::Planner)

@@ -80,10 +80,10 @@ fn fixture_catalog(case: &Value, workspace: &Workspace, kind: &str) -> SkillCata
         .filter(|entry| entry["authority"]["kind"] == kind)
         .map(|entry| {
             let id = entry["id"].as_str().unwrap();
-            let source = if kind == "executor" {
-                SkillSourceKind::Executor
-            } else {
-                SkillSourceKind::Cloud
+            let source = match kind {
+                "executor" => SkillSourceKind::Executor,
+                "host" => SkillSourceKind::Host,
+                _ => SkillSourceKind::Cloud,
             };
             let resource = if kind == "executor" {
                 SkillResourceId::environment(
@@ -102,6 +102,14 @@ fn fixture_catalog(case: &Value, workspace: &Workspace, kind: &str) -> SkillCata
                 resource,
             )
             .with_short_description(entry["short_description"].as_str().map(str::to_string));
+            if let Some(scope) = entry["scope"].as_str() {
+                result = result.with_prompt_scope(match scope {
+                    "repo" => SkillScope::Repo,
+                    "user" => SkillScope::User,
+                    "system" => SkillScope::System,
+                    _ => SkillScope::Admin,
+                });
+            }
             if let Some(root) = entry["alias_root"].as_str() {
                 result = result.with_alias_root(root);
             }
@@ -126,6 +134,27 @@ fn fixture_catalog(case: &Value, workspace: &Workspace, kind: &str) -> SkillCata
     }
 }
 
+fn fixture_capability(case: &Value, workspace: &Workspace) -> SkillsNsCapability {
+    let usage = case["usage"].as_bool().unwrap();
+    let providers = SkillProviders::new()
+        .with_executor_provider(provider(fixture_catalog(case, workspace, "executor")))
+        .with_cloud_provider(provider(fixture_catalog(case, workspace, "cloud")))
+        .with_host_provider(provider(fixture_catalog(case, workspace, "host")));
+    let max_tokens = case["max_context_tokens"]
+        .as_u64()
+        .and_then(|n| NonZeroUsize::new(usize::try_from(n).unwrap()));
+    let mut capability = SkillsNsCapability::new(providers, roots(workspace), 8000)
+        .unwrap()
+        .with_catalog_context_window(case["context_window"].as_i64());
+    if let Some(limit) = max_tokens {
+        capability = capability.with_catalog_max_context_tokens(limit);
+    }
+    if usage {
+        capability = capability.with_skills_usage_instructions();
+    }
+    capability
+}
+
 #[tokio::test]
 async fn catalog_text_and_allocation_match_the_executed_upstream_renderer() {
     let reference: Vec<Value> = serde_json::from_str(include_str!(
@@ -137,22 +166,8 @@ async fn catalog_text_and_allocation_match_the_executed_upstream_renderer() {
     let mut fixed_allowances = BTreeMap::new();
     for record in reference {
         let case = &record["case"];
-        let providers = SkillProviders::new()
-            .with_executor_provider(provider(fixture_catalog(case, &workspace, "executor")))
-            .with_cloud_provider(provider(fixture_catalog(case, &workspace, "cloud")));
-        let max_tokens = case["max_context_tokens"]
-            .as_u64()
-            .and_then(|n| NonZeroUsize::new(usize::try_from(n).unwrap()));
         let usage = case["usage"].as_bool().unwrap();
-        let mut capability = SkillsNsCapability::new(providers, roots(&workspace), 8000)
-            .unwrap()
-            .with_catalog_context_window(case["context_window"].as_i64());
-        if let Some(limit) = max_tokens {
-            capability = capability.with_catalog_max_context_tokens(limit);
-        }
-        if usage {
-            capability = capability.with_skills_usage_instructions();
-        }
+        let capability = fixture_capability(case, &workspace);
         assert!(capability.static_instructions().await.unwrap().is_none());
         assert!(capability.instructions().await.unwrap().is_none());
         let bound = capability.bind(&run("oracle")).unwrap().unwrap();
@@ -169,12 +184,20 @@ async fn catalog_text_and_allocation_match_the_executed_upstream_renderer() {
             assert_eq!(fixed, *fixed_allowances.entry(usage).or_insert(fixed));
             section.content().to_string()
         });
-        assert_eq!(
-            actual,
-            record["prompt"].as_str().map(str::to_string),
-            "{}",
-            case["name"]
-        );
+        let actual_fragments = actual
+            .as_deref()
+            .unwrap_or_default()
+            .split_inclusive("</skills_instructions>")
+            .map(str::trim)
+            .filter(|fragment| !fragment.is_empty())
+            .collect::<Vec<_>>();
+        let expected_fragments = record["catalogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|catalog| catalog["prompt"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_fragments, expected_fragments, "{}", case["name"]);
     }
 }
 
@@ -379,4 +402,100 @@ async fn discovery_failure_does_not_hide_cloud_skills_or_publish_unsupported_aut
         assert!(!prompt.content().contains("private discovery failure"));
         assert!(!prompt.content().contains("executor skills unavailable"));
     }
+}
+
+#[tokio::test]
+async fn cloud_preference_keeps_the_host_copy_of_a_qualified_skill() {
+    let reference: Vec<Value> = serde_json::from_str(include_str!(
+        "fixtures/skills_catalog_prompt/upstream-render.json"
+    ))
+    .unwrap();
+    let record = reference
+        .iter()
+        .find(|record| record["case"]["name"] == "cloud-prefers-qualified-name")
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(directory.path()).unwrap();
+    let capability = fixture_capability(&record["case"], &workspace);
+    let bound = capability.bind(&run("cloud-priority")).unwrap().unwrap();
+    let section = bound.instructions().await.unwrap().unwrap();
+    let content = section.content();
+    assert_eq!(content.matches("- plugin:review:").count(), 2, "{content}");
+    assert!(content.contains("(cloud package:"));
+    assert!(content.contains("(file:"));
+    assert!(!content.contains("(executor package:"));
+}
+
+#[tokio::test]
+async fn cloud_caps_rebalance_only_when_all_omitted_filesystem_skills_can_be_retained() {
+    let reference: Vec<Value> = serde_json::from_str(include_str!(
+        "fixtures/skills_catalog_prompt/upstream-render.json"
+    ))
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(directory.path()).unwrap();
+    let mut scenarios = 0;
+    for record in reference
+        .iter()
+        .filter(|record| record["case"]["expected_rebalance"].is_boolean())
+    {
+        scenarios += 1;
+        let case = &record["case"];
+        let rebalance = case["expected_rebalance"].as_bool().unwrap();
+        let all_fit = case["expected_all_fit"].as_bool().unwrap();
+        let capability = fixture_capability(case, &workspace);
+        let bound = capability.bind(&run("budget-pressure")).unwrap().unwrap();
+        let section = bound.instructions().await.unwrap().unwrap();
+        let fragments = section
+            .content()
+            .split_inclusive("</skills_instructions>")
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let cloud = fragments
+            .iter()
+            .find(|fragment| fragment.contains("- cloud-skill-"))
+            .unwrap();
+        assert_eq!(
+            *cloud,
+            record["catalogs"][1]["prompt"].as_str().unwrap(),
+            "{}",
+            case["name"]
+        );
+        let initial_cloud = record["cloud_without_filesystem"]["prompt"]
+            .as_str()
+            .unwrap();
+        assert_eq!(*cloud != initial_cloud, rebalance, "{}", case["name"]);
+        assert_eq!(
+            record["catalogs"][1]["cloud_limit"].as_u64().unwrap()
+                < record["cloud_without_filesystem"]["cloud_limit"]
+                    .as_u64()
+                    .unwrap(),
+            rebalance,
+            "{}",
+            case["name"]
+        );
+        for kind in ["executor", "host"] {
+            let expected_count = case["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["authority"]["kind"] == kind)
+                .count();
+            if expected_count == 0 {
+                continue;
+            }
+            let actual_count = section
+                .content()
+                .lines()
+                .filter(|line| line.starts_with(&format!("- {kind}-skill-")))
+                .count();
+            assert_eq!(
+                actual_count == expected_count,
+                all_fit,
+                "{} {kind}",
+                case["name"]
+            );
+        }
+    }
+    assert_eq!(scenarios, 10);
 }

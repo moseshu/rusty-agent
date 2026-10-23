@@ -7,6 +7,8 @@
 //! collaboration tools only when the host says its model takes them (see
 //! [`CodingHost::with_spawned_agent_collaboration`]). Its background terminals are stopped once it
 //! is closed or the tree shuts down, as Codex's session shutdown stops a thread's processes.
+//! A planner child returns its plan and unresolved questions to the parent; its prompt does not
+//! encourage root-only user questions. This is a product adaptation of inherited planner roles.
 //!
 //! A spawn naming an `agent_type`, or made while a handoff has moved the turn to another agent,
 //! runs that registered declaration as it is: the factory prepares only the agent it assembles.

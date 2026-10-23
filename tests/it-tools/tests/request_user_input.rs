@@ -284,6 +284,24 @@ async fn request_user_input_round_trip_in_default_mode() {
     );
 }
 
+/// Codex's request_user_input_sets_blocking_from_turn_mode.
+#[tokio::test]
+async fn request_user_input_marks_plan_mode_requests_blocking() {
+    let port = ScriptedPort::answering(Some(RequestUserInputResponse::new()));
+    let tool = RequestUserInputTool::new(request_user_input_available_modes(false))
+        .unwrap()
+        .with_mode(ModeKind::Plan);
+    let output = observe(&tool, &run(), &services(&port), &confirm_arguments()).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(body(&output)).unwrap(),
+        json!({"answers":{}})
+    );
+    let asked = port.asked();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].2.is_blocking());
+    assert_eq!(asked[0].2.auto_resolution_ms(), None);
+}
+
 /// Codex's `normalize_request_user_input_tool_args_sets_other_on_every_question`: whatever the
 /// model sends, every question lets the user answer otherwise; `isSecret` passes through.
 #[tokio::test]

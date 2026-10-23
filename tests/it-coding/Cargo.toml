@@ -17,7 +17,10 @@ ra-exec = { path = "../../crates/ra-exec" }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9.34"
+thiserror = "2"
 tempfile = "3"
 async-trait = "0.1"
 futures = "0.3"

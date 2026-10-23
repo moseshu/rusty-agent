@@ -115,7 +115,7 @@ async fn executor_skill_tool_reads_references_within_the_host_grant() {
                 .await
                 .unwrap_err()
         ),
-        "skill environment is not available for this callback"
+        "skill package is not available"
     );
 }
 

@@ -457,11 +457,9 @@ async fn test_host_backed_one_off_agents_carry_no_tools() {
     );
 }
 
-/// A read-only role keeps the observing entries and loses what writes.
+/// Read-only roles inherit the host tool surface and retain observation entries.
 ///
-/// The two halves are one guarantee: withholding the editing entries is what the role text
-/// promises, and withholding the search entries as well would leave a read-only specialist unable
-/// to inspect either an identified file or an unknown workspace.
+/// Behavioral constraints do not remove tools unless the host explicitly selects restrictions.
 #[tokio::test]
 async fn test_host_backed_read_only_agents_keep_the_observing_entries() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -487,10 +485,17 @@ async fn test_host_backed_read_only_agents_keep_the_observing_entries() {
         // would never hit a cached prefix twice.
         assert_eq!(
             names,
-            vec!["glob", "grep", "read_file"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>(),
+            vec![
+                "apply_patch",
+                "exec_command",
+                "glob",
+                "grep",
+                "read_file",
+                "write_stdin"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
             "role `{role}`"
         );
 
@@ -511,16 +516,13 @@ async fn test_host_backed_read_only_agents_keep_the_observing_entries() {
             instructions.contains("`glob`"),
             "role `{role}` must inventory glob"
         );
-        // Both halves of the denial: the entry is absent from the inventory, and the editing
-        // section does not instruct the agent to reach for it anyway.
-        assert!(
-            !instructions.contains("`apply_patch`"),
-            "role `{role}` must not name an unavailable editing entry"
-        );
-        assert!(
-            !instructions.contains("`exec_command`") && !instructions.contains("`write_stdin`"),
-            "role `{role}` must not name an unavailable execution entry"
-        );
+        for name in ["apply_patch", "exec_command", "write_stdin"] {
+            assert!(
+                instructions.contains(&format!("`{name}`")),
+                "role `{role}` must inventory {name}"
+            );
+        }
+        assert!(!instructions.contains("No file editing tool"));
     }
 }
 
@@ -1092,7 +1094,7 @@ fn test_read_only_roles_keep_git_safety_without_the_editing_entry() {
 
         assert!(
             !prefix.system_instructions().contains("apply_patch"),
-            "{role} states it has no editing tools; its prefix must not name one"
+            "{role} was assembled without tools; its prefix must not name an editing entry"
         );
         assert!(
             editing.contains("pre-existing changes") && editing.contains("`git reset --hard`"),

@@ -40,8 +40,19 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/prompt/role.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/collaboration-mode-templates/templates/plan.md (original template; tool/audience/plain-text markup adaptations and shared non-mutating examples) |
+| `crates/ra-tools/src/request_user_input.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/request_user_input.rs; request_user_input_spec.rs; codex-rs/tools/src/tool_config.rs (mode availability and blocking requests) |
 | `crates/ra-tools/src/skills_ns.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/mod.rs; state.rs |
 | `crates/ra-coding/src/skills/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/models-manager/models.json::models[*].context_window; src/manager.rs::find_model_by_longest_prefix/find_model_by_namespaced_suffix; src/model_info.rs::model_info_from_slug |
+| `crates/ra-coding/src/skills/parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/parser.rs |
+| `crates/ra-coding/src/skills/config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/skills_config.rs::SkillConfig/SkillConfigRuleSelector/SkillConfigRule/SkillConfigRules/skill_config_rules_from_stack/skill_config_rule_selector |
+| `crates/ra-coding/src/skills/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/{discovery,host,host_merge,namespace}.rs; host_service.rs::build_skill_outcome; provider/host.rs::catalog_entry_from_skill; codex-rs/exec-server/src/local_file_system.rs::sync_walk; codex-rs/utils/plugins/src/plugin_namespace.rs |
+| `crates/ra-coding/src/skills/metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/{metadata,model,interface}.rs; codex-rs/protocol/src/protocol.rs::Product |
+| `crates/ra-tools/src/skills_ns/host_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_aliases.rs |
+| `crates/ra-tools/src/skills_ns/allocation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/world_state_catalogs.rs::render_catalogs/render_with_cloud_limit/rebalance_to_retain_all_skills (first-step allocation without previous world state) |
+| `crates/ra-tools/src/skills_ns/render_dedup.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/render_dedup.rs |
+| `tests/it-coding/tests/skill_frontmatter.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/parser_tests.rs |
+| `tests/it-coding/tests/skill_config_rules.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/skills_config_tests.rs (rule resolution and configuration-entry conversion); codex-rs/ext/skills/src/host_service_tests.rs (ordered overrides and per-configuration enablement isolation) |
 | `crates/ra-tools/src/skills_ns/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/catalog.rs |
 | `crates/ra-tools/src/skills_ns/provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/provider.rs; provider/executor.rs; sources.rs |
 | `crates/ra-tools/src/skills_ns/aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/aliases.rs |

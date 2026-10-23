@@ -8,26 +8,41 @@ python3 generate_reference.py /path/to/codex
 ```
 
 The script verifies the checkout revision and builds an isolated Rust harness. It compiles the
-original `render.rs` and `render_dedup.rs`, `catalog_prompt.rs`, `aliases.rs`, the original
-`AvailableSkillsInstructions` implementation and fragment `render` method, and the upstream byte
-based token estimator. Catalog/environment records and the fragment trait boundary are substituted;
-no discovery, executor, OpenAI account, model or Rusty implementation supplies expected text. The
-Host alias discovery stub is never used: these cases cover Executor/Cloud single-catalog rendering.
-This does not run the complete Codex workspace or claim the multi-catalog allocator was tested.
+original `render.rs`, `render_dedup.rs`, `host_aliases.rs`, `catalog_prompt.rs`, `aliases.rs`, the
+original fragment rendering and byte-based token estimator. It also extracts and compiles the
+**unmodified bodies** of `world_state_catalogs.rs::CatalogContext::render_catalogs`,
+`render_with_cloud_limit`, and `rebalance_to_retain_all_skills`, together with their original
+contribution/allocation records and attributes. The runtime context is substituted with
+`include_instructions=true` and `previous_world_state=None`. The original entry point computes
+its own Cloud fingerprint and allocation; neither source preference nor the budgeting control
+flow is supplied by Rusty or rewritten in the harness.
 
-The 28 cases preserve complete marked prompts, including optional usage instructions. They cover
-empty and hidden inventories, provider order, short descriptions, Executor/Cloud and mixed locators,
-Unicode limits, character versus token budgets, omission notices, no fragment fitting, alias costs
-and selection, alias order, literal backslashes, context percentage and fallback, and the explicit
-10,000 token override cap. Repeated large descriptions make budget decisions observable in the
-rendered text, rather than only checking the budget helper's return value.
+Catalog/environment records and the fragment trait boundary are substituted. No discovery,
+executor, OpenAI account, model or Rusty implementation supplies expected text. This does not run
+the full Codex workspace, filesystem discovery, or persistent world-state diff/recovery.
 
-`it-tools/skills_catalog_prompt` compares real run-bound capability output byte for byte against
-these results. Its separate lifecycle tests exercise shared discovery and reading a listed alias
-without calling `skills.list`. `it-coding/skills_catalog_prompt` uses production assembly and the
-Runner to verify model-visible instructions and direct reads from an external skill root.
+The 66 cases preserve each source's marked fragment separately, in the original entry point's
+contribution order. There is no synthetic expected prompt assembled with Rusty's newline join.
+The production test splits Rusty's marked run prompt and compares its fragments byte for byte
+with those independently returned by the original entry point. The fixture also records each
+source's budget, metadata cost, report and accepted Cloud cap.
+
+Coverage includes the earlier inventories, aliases, Unicode, token/character budgets, omission
+notices and explicit override limits. The six upstream pressure cases come directly from
+`catalog_rebalances_only_to_avoid_omissions_and_retains_the_allocation`: description-only pressure
+(17 Executor / 82 Cloud), rescuable omissions (40 / 5), and unavoidable omissions (40 / 160), each
+with token and fallback character accounting. Four more cases exercise Host and mixed-filesystem
+rescues. Every case also runs the original entry point with only its Cloud inventory, so tests can
+compare initial and accepted Cloud text/caps without reproducing that policy. These are fresh
+allocations for each call; persisted cross-step allocations are outside this Rust adaptation.
+
+Additional cases verify empty/disabled/hidden Cloud inventories release their unused allowance,
+Cloud-only capping, odd-budget rounding, and qualified Cloud preference that removes only the
+Executor copy while retaining Host. `it-tools/skills_catalog_prompt` also verifies shared run
+loading and reading aliases without `skills.list`; `it-coding/skills_catalog_prompt` exercises
+production assembly and the Runner.
 
 The Rust capability also declares a paragraph token ceiling independently of measured output. Tests
 compare that ceiling to the actual estimate, then subtract this fixture's upstream metadata budget
-to verify a constant fixed-wording allowance per usage setting. This allowance is Rust host
+to verify a constant fixed-wording allowance per usage setting and configured source count. This allowance is Rust host
 bookkeeping, not additional upstream prompt text; no expected prompt was regenerated for it.
