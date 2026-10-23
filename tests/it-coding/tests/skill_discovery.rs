@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Host discovery, context filtering, filesystem boundaries, and production run refresh.
 #[path = "../../support/configured_coding_host.rs"]
 #[allow(dead_code)]
@@ -346,6 +347,187 @@ async fn follows_directory_aliases_handles_cycles_and_deduplicates_canonical_pat
         .unwrap();
     assert!(direct.entries.is_empty());
     assert_eq!(direct.warnings.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ignores_symlinked_skill_files_and_directory_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let external_skill = skill(external.path(), "external", "external");
+    let valid_skill = skill(temp.path(), ".rusty-agent/skills/cycle/demo", "demo");
+    let skills_root = temp.path().join(".rusty-agent/skills");
+    fs::create_dir_all(skills_root.join("linked-file")).unwrap();
+    symlink(external_skill, skills_root.join("linked-file/SKILL.md")).unwrap();
+    symlink(skills_root.join("cycle"), skills_root.join("cycle/loop")).unwrap();
+
+    let catalog = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SkillDiscoveryConfig::new().discover(temp.path()),
+    )
+    .await
+    .expect("directory symlink cycles must not prevent discovery from completing")
+    .unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["demo"]);
+    assert_eq!(
+        catalog.entries[0].main_prompt.as_str(),
+        fs::canonicalize(valid_skill).unwrap().to_str().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_external_directories_do_not_inherit_plugin_namespace() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        ".codex-plugin/plugin.json",
+        r#"{"name":"outer"}"#,
+    );
+    let direct_skill = skill(temp.path(), ".rusty-agent/skills/direct", "skill");
+    let external_skill = skill(external.path(), "plain", "skill");
+    symlink(
+        external.path(),
+        temp.path().join(".rusty-agent/skills/linked"),
+    )
+    .unwrap();
+
+    let catalog = SkillDiscoveryConfig::new()
+        .discover(temp.path())
+        .await
+        .unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["outer:skill", "skill"]);
+    for (entry, path) in catalog.entries.iter().zip([direct_skill, external_skill]) {
+        assert_eq!(
+            entry.main_prompt.as_str(),
+            fs::canonicalize(path).unwrap().to_str().unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ancestor_symlink_roots_preserve_inherited_plugin_namespace() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("a/b/c/d/e/f/outer");
+    write(
+        &workspace,
+        ".codex-plugin/plugin.json",
+        r#"{"name":"outer"}"#,
+    );
+    let direct_skill = skill(&workspace, ".rusty-agent/skills/direct", "skill");
+    symlink(temp.path(), workspace.join(".rusty-agent/skills/ancestor")).unwrap();
+
+    let catalog = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SkillDiscoveryConfig::new().discover(&workspace),
+    )
+    .await
+    .expect("ancestor directory symlinks must not prevent discovery from completing")
+    .unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["outer:skill"]);
+    assert_eq!(
+        catalog.entries[0].main_prompt.as_str(),
+        fs::canonicalize(direct_skill).unwrap().to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn same_name_skills_preserve_native_path_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let accented_skill = skill(temp.path(), ".rusty-agent/skills/é", "demo");
+    let ascii_skill = skill(temp.path(), ".rusty-agent/skills/a", "demo");
+
+    let catalog = SkillDiscoveryConfig::new()
+        .discover(temp.path())
+        .await
+        .unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["demo", "demo"]);
+    assert_eq!(
+        catalog
+            .entries
+            .iter()
+            .map(|entry| entry.main_prompt.as_str())
+            .collect::<Vec<_>>(),
+        [
+            fs::canonicalize(ascii_skill).unwrap(),
+            fs::canonicalize(accented_skill).unwrap(),
+        ]
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn same_name_skills_sort_by_path_after_breadth_first_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    // Breadth-first discovery visits z before a/b; the final path tie-breaker must reorder them.
+    let shallow_skill = skill(temp.path(), ".rusty-agent/skills/z", "demo");
+    let nested_skill = skill(temp.path(), ".rusty-agent/skills/a/b", "demo");
+
+    let catalog = SkillDiscoveryConfig::new()
+        .discover(temp.path())
+        .await
+        .unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["demo", "demo"]);
+    assert_eq!(
+        catalog
+            .entries
+            .iter()
+            .map(|entry| entry.main_prompt.as_str())
+            .collect::<Vec<_>>(),
+        [
+            fs::canonicalize(nested_skill).unwrap(),
+            fs::canonicalize(shallow_skill).unwrap(),
+        ]
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn duplicate_host_root_paths_preserve_first_root_scope() {
+    use ra_tools::skills_ns::catalog::SkillScope;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = skill(temp.path(), ".rusty-agent/skills/demo", "demo");
+    let config = SkillDiscoveryConfig::new().with_plugin_root(
+        PluginSkillRoot::new(
+            temp.path().join(".rusty-agent/skills"),
+            temp.path(),
+            "later-plugin",
+        )
+        .unwrap(),
+    );
+
+    let catalog = config.discover(temp.path()).await.unwrap();
+
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    assert_eq!(names(&catalog), ["demo"]);
+    assert_eq!(catalog.entries[0].prompt_scope(), Some(SkillScope::Repo));
+    assert_eq!(
+        catalog.entries[0].main_prompt.as_str(),
+        fs::canonicalize(path).unwrap().to_str().unwrap()
+    );
 }
 
 struct ReadModel {
