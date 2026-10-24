@@ -89,3 +89,11 @@ pub fn find_plugin_manifest_path(plugin_root: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+/// Returns the directory for commands converted into skills during explicit local installation.
+#[must_use]
+pub fn migrated_command_skills_root(
+    plugin_root: &super::AbsolutePathBuf,
+) -> super::AbsolutePathBuf {
+    super::join_absolute_path(plugin_root, ".codex-plugin/migrated-command-skills")
+}

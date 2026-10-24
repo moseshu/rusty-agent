@@ -34,3 +34,6 @@ ra-model = { path = "../../crates/ra-model", features = ["anthropic"] }
 wiremock = "0.6"
 
 ra-sandbox = { path = "../../crates/ra-sandbox" }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

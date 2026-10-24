@@ -40,12 +40,21 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/plugins/store.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store.rs (local Store, layout, staging, activation/rollback, cleanup and errors; account identity paths excluded) |
+| `crates/ra-coding/src/plugins/command_migration.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration.rs |
+| `crates/ra-coding/src/plugins/command_migration/plugin.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration/plugin.rs |
+| `crates/ra-coding/src/plugins/command_migration/render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration/render.rs |
+| `crates/ra-coding/src/plugins/manifest/cache.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest/manifest_cache.rs (Host cache ownership/revision/LRU; native key adaptation) |
+| `tests/it-coding/tests/plugin_store.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store_tests.rs (all non-account cases); store.rs (additional source-version/fallback/layout regressions) |
+| `tests/it-coding/tests/plugin_store_failures.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store.rs (staging/activation/rollback/cleanup error branches, using deterministic filesystem operation injection) |
+| `tests/it-coding/tests/plugin_command_migration.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration_tests.rs; manager_tests.rs (local command materialization and migration-error fixtures, without runtime inventory loading) |
+| `tests/it-coding/tests/plugin_manifest_cache.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest/manifest_cache_tests.rs (Host revision/ownership/diagnostic/concurrency fixtures); manifest_cache.rs (LRU and concurrent-miss regressions) |
 | `crates/ra-coding/src/plugins/identity.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/plugin_id.rs |
 | `crates/ra-coding/src/plugins/installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/installed.rs (version helpers; account install identity metadata excluded) |
 | `crates/ra-coding/src/permissions/path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs (base/home scopes and expansion shared with Host manifest loading); utils/path-uri/src/lib.rs (native POSIX permission operations) |
 | `crates/ra-coding/src/plugins/model.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/manifest.rs |
 | `crates/ra-coding/src/plugins/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (HooksFile, event groups and handler declarations; no runtime/config state) |
-| `crates/ra-coding/src/plugins/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (schema classification and Host finder) |
+| `crates/ra-coding/src/plugins/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (schema classification and Host finder); src/lib.rs::migrated_command_skills_root |
 | `crates/ra-coding/src/plugins/manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs; manifest/manifest_cache.rs (disabled-cache standalone load); codex-rs/utils/path-uri/src/lib.rs (native Host path subset); utils/absolute-path/src/lib.rs (checked absolute-path entry) |
 | `crates/ra-coding/src/plugins/manifest/agent.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest.rs |
 | `tests/it-coding/tests/plugin_identity.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/plugin_id_tests.rs; plugin_id.rs (key/error regressions) |

@@ -7,6 +7,44 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Explicit local plugin Store and command migration
+
+`ra_coding::plugins::store::PluginStore` adds local installation and removal. Construct it with
+`try_new(product_home: PathBuf)` to receive a `PluginStoreError`, or use the upstream-compatible
+`new` constructor, which panics for an invalid home. Construction resolves paths without creating
+directories. Its home-resolution error context says `failed to resolve product home`, adapting
+the upstream diagnostic's Codex branding.
+`install(source: AbsolutePathBuf, id: PluginId)` selects a version from the source;
+`install_with_version` accepts an explicit cache version. Both stage the local directory, skip
+symlink entries, check the selected manifest's path and bytes, and activate under
+`plugins/cache/<marketplace>/<name>/<version>`.
+
+Legacy packages without a version use `local`. Agent Plugins use `1.0.0` when their version is
+absent or blank; a portable version string with invalid directory characters maps to `agent-plugins-<24 hex characters>`
+without changing manifest metadata. Same-version replacement backs up the previous package and
+attempts restoration if activation fails. Failed restoration preserves the backup and reports its
+path. New-version activation precedes pruning; an error can leave the new version on disk while
+an undeletable older version remains active. This is the upstream filesystem lifecycle.
+
+Legacy command files migrate only in staging to `.codex-plugin/migrated-command-skills`.
+The source directory stays unchanged. Plugin migration requires a description, rejects unsupported
+runtime template expansion and name collisions, and skips generated skills exceeding 4,000 bytes.
+Migration errors emit warnings and do not fail installation. Agent Plugins skip command migration.
+The generic `command_migration` profile APIs retain their separate explicit import/description
+options; selecting one does not enable startup discovery or change plugin migration defaults.
+Their explicit term variants currently rewrite to the literal `Codex`, as in the upstream
+`external-agent-migration` consumer. The plugin installation profile supplies no term variants.
+That external-agent migration feature is outside the current plugin slice; its product branding
+remains undecided until its consumer is ported.
+
+`uninstall` removes the package's version cache and retains persistent `plugins/data` contents.
+It does not write enablement configuration or refresh runtime consumers. Store clones share the
+source's 128-entry manifest cache; independent stores remain isolated. Revisions include content,
+overlay and resource-root identity, with inputs above 64 KiB parsed outside the cache lock.
+Standalone manifest APIs continue to use an uncached owner. Product configuration, marketplace
+management, downloads, activation into skills/MCP/hooks, and account identity remain outside these
+new local operations.
+
 ### Read-only Host plugin metadata
 
 `ra_coding::plugins` adds explicit Host package inspection. `PluginId` preserves the upstream
