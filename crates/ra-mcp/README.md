@@ -110,8 +110,9 @@ Completions and Anthropic adapters refuse namespaced tools, as the Python SDK do
 `InProcessToolServer::connect(name, handler, options)` accepts the official SDK's
 `ServerHandler`, exposed through `ra_mcp::rmcp`. `server.client()` provides the same
 initialized client used above; `server.cleanup()` closes both sides and joins the
-server task. Its bounded memory stream performs no OS IPC or networking. The
-host tool registration facade and typed registration helpers remain follow-up work.
+server task. Its bounded memory stream performs no OS IPC or networking. Host tools
+use the official SDK's `ServerHandler` registration surface; a separate registration
+facade or `ToolInput` derive macro is not required by this integration's contract.
 
 ## Product runtime controls
 
