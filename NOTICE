@@ -40,6 +40,22 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/plugins/identity.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/plugin_id.rs |
+| `crates/ra-coding/src/plugins/installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/installed.rs (version helpers; account install identity metadata excluded) |
+| `crates/ra-coding/src/permissions/path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs (base/home scopes and expansion shared with Host manifest loading); utils/path-uri/src/lib.rs (native POSIX permission operations) |
+| `crates/ra-coding/src/plugins/model.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/manifest.rs |
+| `crates/ra-coding/src/plugins/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (HooksFile, event groups and handler declarations; no runtime/config state) |
+| `crates/ra-coding/src/plugins/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (schema classification and Host finder) |
+| `crates/ra-coding/src/plugins/manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs; manifest/manifest_cache.rs (disabled-cache standalone load); codex-rs/utils/path-uri/src/lib.rs (native Host path subset); utils/absolute-path/src/lib.rs (checked absolute-path entry) |
+| `crates/ra-coding/src/plugins/manifest/agent.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest.rs |
+| `tests/it-coding/tests/plugin_identity.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/plugin_id_tests.rs; plugin_id.rs (key/error regressions) |
+| `tests/it-coding/tests/plugin_installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store_tests.rs (active version selection); core-plugin-common/src/installed.rs (read-only helper regressions) |
+| `tests/it-coding/tests/plugin_discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (Host finder tests and schema classification) |
+| `tests/it-coding/tests/plugin_manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs (Host interface/version/keywords/alternate-path tests) |
+| `tests/it-coding/tests/plugin_agent_manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest_tests.rs |
+| `tests/it-coding/tests/plugin_hook_declarations.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (HooksFile JSON, MCP input, additional-context serialization, and Windows override TOML fixtures adapted to plugin JSON) |
+| `tests/it-coding/tests/plugin_manifest_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{manifest,agent_plugin_manifest}.rs; codex-rs/utils/path-uri/src/lib.rs (Host boundary regressions) |
+| `tests/it-coding/tests/plugin_resource_mapping.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/manifest.rs (generic resource mapping contract regressions) |
 | `crates/ra-coding/src/prompt/role.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/collaboration-mode-templates/templates/plan.md (original template; tool/audience/plain-text markup adaptations and shared non-mutating examples) |
 | `crates/ra-tools/src/request_user_input.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/request_user_input.rs; request_user_input_spec.rs; codex-rs/tools/src/tool_config.rs (mode availability and blocking requests) |
 | `crates/ra-tools/src/skills_ns/access.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/file-system/src/environment_accessor.rs::EnvironmentAccessKey/FileSystemEnvironmentAccessor (weak filesystem identity and captured permissions); codex-rs/ext/skills/src/state.rs::ExecutorReadSnapshot |

@@ -7,6 +7,29 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Read-only Host plugin metadata
+
+`ra_coding::plugins` adds explicit Host package inspection. `PluginId` preserves the upstream
+plugin/marketplace key validation, and `manifest::load_plugin_manifest(&Path)` returns an optional
+manifest with native `AbsolutePathBuf` resources. Pass an absolute package root; relative roots
+are rejected. The parser selects schema-declared Agent Plugins `plugin.json` before the legacy
+`.codex-plugin`, `.claude-plugin`, and `.cursor-plugin` locations. An invalid selected manifest
+does not fall through to a lower-priority manifest. Agent Plugins retain fixed skill/MCP resources
+and the upstream inline `com.openai` extension/legacy overlay precedence.
+
+The `model` module retains generic resource mapping, inline MCP objects and typed hook declarations.
+`installed::active_plugin_version` only inspects an explicitly supplied cache directory: `local`
+wins, otherwise versions use semantic ordering when both parse and lexical ordering otherwise.
+These APIs do not install packages, read product configuration, discover plugins at startup, activate
+skills/MCP servers, execute hooks, or provide Executor URI authority. Existing host assembly and
+configuration-source behavior are unchanged. This additive surface belongs to the Internal
+product crate, rather than the provider-neutral framework contract.
+
+Home-relative Host roots use the current thread's `permissions::AbsolutePathBufGuard` home override;
+setting its deserialization base still does not make a relative package root acceptable. Component
+paths must retain the Host convention after joining, including at the filesystem root. Codex's
+account-backed remote-plugin identity sidecar types and parser are excluded.
+
 ### Inherited role tools and explicit restrictions
 
 `ReadOnlySpecialist` and `Planner` now inherit the same tools as `Main` for the selected host and

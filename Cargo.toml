@@ -117,6 +117,8 @@ schemars = "0.8"
 jsonschema = { version = "0.58.6", default-features = false }
 toml = "0.8"
 sha2 = "0.10"
+semver = "1"
+percent-encoding = "2"
 
 # --- 错误与日志 ---
 thiserror = "2"

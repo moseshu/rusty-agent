@@ -33,6 +33,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+percent-encoding = { workspace = true }
 serde_yaml = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

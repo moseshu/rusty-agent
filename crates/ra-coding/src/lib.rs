@@ -31,6 +31,7 @@ pub mod host;
 pub mod mcp;
 pub mod permission_mode;
 pub mod permissions;
+pub mod plugins;
 pub mod profile;
 pub mod prompt;
 pub mod prompt_cache_key;

@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::plugins::{
+    AbsolutePathBuf, discovery::DISCOVERABLE_PLUGIN_MANIFEST_PATHS, manifest::host_basename,
+};
 use ra_core::error::{Error, Result};
 use ra_tools::skills_ns::{
     SkillProvider,
@@ -27,11 +30,6 @@ use super::{
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_SKILLS_DIRS_PER_ROOT: usize = 2_000;
 const MAX_SKILLS_ENTRIES_PER_ROOT: usize = 20_000;
-const MANIFEST_PATHS: &[&str] = &[
-    ".codex-plugin/plugin.json",
-    ".claude-plugin/plugin.json",
-    ".cursor-plugin/plugin.json",
-];
 
 /// Whether a plugin root discovers every nested skill or only immediate child skills.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -387,7 +385,7 @@ fn nearest_namespace(path: &Path, cache: &mut HashMap<PathBuf, Option<String>>) 
 }
 
 fn namespace_at(root: &Path) -> Option<String> {
-    let path = MANIFEST_PATHS
+    let path = DISCOVERABLE_PLUGIN_MANIFEST_PATHS
         .iter()
         .map(|path| root.join(path))
         .find(|path| path.is_file())?;
@@ -398,7 +396,10 @@ fn namespace_at(root: &Path) -> Option<String> {
         Some(value) => value.as_str()?,
     };
     Some(if name.trim().is_empty() {
-        root.file_name()?.to_string_lossy().into_owned()
+        AbsolutePathBuf::try_from(root)
+            .ok()
+            .and_then(|root| host_basename(&root))
+            .unwrap_or_else(|| name.into())
     } else {
         name.into()
     })

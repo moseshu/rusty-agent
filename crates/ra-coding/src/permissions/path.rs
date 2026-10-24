@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The lexical path operations the permission transforms use: the parts of Codex's `PathUri`
 //! (`utils/path-uri/src/lib.rs`) and `AbsolutePathBuf::from_absolute_path`
 //! (`utils/absolute-path/src/lib.rs`) they rely on, over native POSIX paths.
@@ -180,7 +181,8 @@ pub(crate) fn from_absolute_path(path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn expand_home_directory(path: &Path) -> PathBuf {
+/// Expands a leading home-relative spelling using the current thread's home override.
+pub(crate) fn expand_home_directory(path: &Path) -> PathBuf {
     if let Some(path_str) = path.to_str()
         && let Some(rest) = path_str.strip_prefix('~')
         && let Some(home) = AbsolutePathBufGuard::home_directory()
@@ -189,6 +191,10 @@ fn expand_home_directory(path: &Path) -> PathBuf {
             return home;
         } else if let Some(rest) = rest.strip_prefix('/') {
             return home.join(rest.trim_start_matches('/'));
+        } else if cfg!(windows)
+            && let Some(rest) = rest.strip_prefix('\\')
+        {
+            return home.join(rest.trim_start_matches('\\'));
         }
     }
     path.to_path_buf()
