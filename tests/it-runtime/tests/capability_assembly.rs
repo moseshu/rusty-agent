@@ -2012,3 +2012,45 @@ async fn capability_binding_receives_the_resolved_model_before_instructions() {
         );
     }
 }
+
+struct AppContextBinding(Arc<Mutex<Vec<Option<String>>>>);
+
+impl Capability for AppContextBinding {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::SKILLS
+    }
+    fn bind(&self, context: &RunContext) -> Result<Option<Arc<dyn Capability>>> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(context.app_context::<String>().cloned());
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn initial_capability_binding_uses_the_same_application_context_precedence_as_tools() {
+    for configured in [false, true] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut config =
+            RunConfig::new().with_capability(Arc::new(AppContextBinding(observed.clone())));
+        if configured {
+            config = config.with_app_context(Arc::new("configured".to_string()));
+        }
+        let model = RecordingModel::new();
+        let request = run_request(&model, config, &CancelScope::root())
+            .with_app_context(Arc::new("requested".to_string()));
+        Runner::run(request).await.unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(
+                if configured {
+                    "configured"
+                } else {
+                    "requested"
+                }
+                .to_string()
+            )]
+        );
+    }
+}

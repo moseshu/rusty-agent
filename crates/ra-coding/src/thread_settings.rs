@@ -146,6 +146,7 @@ pub struct CodingThreadSettings {
     approvals_reviewer: ApprovalsReviewer,
     sandbox_policy: SandboxPolicy,
     active_permission_profile: Option<String>,
+    file_system_read_policy: Option<crate::permissions::FileSystemPermissions>,
     base_permission: PermissionEngine,
     exec_policy: Arc<ExecPolicyManager>,
     allow_prefix_rules: AllowPrefixRules,
@@ -462,6 +463,12 @@ impl CodingThreadSettings {
         self.permissions.turn(run_id)
     }
 
+    pub(crate) fn file_system_read_policy(
+        &self,
+    ) -> Option<&crate::permissions::FileSystemPermissions> {
+        self.file_system_read_policy.as_ref()
+    }
+
     pub(crate) fn thread_permissions(&self) -> &ThreadPermissions {
         &self.permissions
     }
@@ -472,6 +479,7 @@ impl CodingThreadSettings {
 pub struct CodingThreadSettingsAdapter {
     initial: CodingThreadSettings,
     profiles: BTreeMap<String, SandboxPolicy>,
+    file_system_read_profiles: BTreeMap<String, crate::permissions::FileSystemPermissions>,
 }
 
 impl CodingThreadSettingsAdapter {
@@ -512,6 +520,7 @@ impl CodingThreadSettingsAdapter {
                 approval_policy: AskForApproval::default(),
                 approvals_reviewer: ApprovalsReviewer::default(),
                 active_permission_profile: None,
+                file_system_read_policy: None,
                 base_permission: PermissionEngine::default(),
                 exec_policy: Arc::new(ExecPolicyManager::default()),
                 allow_prefix_rules: AllowPrefixRules::default(),
@@ -521,6 +530,7 @@ impl CodingThreadSettingsAdapter {
                 permissions: Arc::default(),
             },
             profiles,
+            file_system_read_profiles: BTreeMap::new(),
         })
     }
 
@@ -556,8 +566,54 @@ impl CodingThreadSettingsAdapter {
             .with_sandbox_policy(policy.clone())
             .validate()
             .map_err(Error::config)?;
-        self.profiles.insert(name.into(), policy);
+        let name = name.into();
+        self.file_system_read_profiles.remove(&name);
+        self.profiles.insert(name, policy);
         Ok(self)
+    }
+
+    /// Sets restricted read entries for in-process executor filesystem operations.
+    /// Legacy command sandboxing remains selected separately by `sandbox_policy`.
+    /// With no entries every live skill read is denied; discovery materializations remain usable.
+    /// This product filter does not restrict shell or ordinary filesystem tools.
+    pub fn with_file_system_read_policy(
+        mut self,
+        policy: crate::permissions::FileSystemPermissions,
+    ) -> Result<Self> {
+        self.validate_file_system_read_policy(&policy)?;
+        self.initial.file_system_read_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// Registers the restricted read component of a named thread permission profile.
+    /// The corresponding legacy command policy must already be registered with `with_profile`.
+    pub fn with_file_system_read_profile(
+        mut self,
+        name: impl Into<String>,
+        policy: crate::permissions::FileSystemPermissions,
+    ) -> Result<Self> {
+        let name = name.into();
+        if !self.profiles.contains_key(&name) {
+            return Err(Error::config(format!(
+                "unknown permissions profile: {name}"
+            )));
+        }
+        self.validate_file_system_read_policy(&policy)?;
+        self.file_system_read_profiles.insert(name, policy);
+        Ok(self)
+    }
+
+    fn validate_file_system_read_policy(
+        &self,
+        policy: &crate::permissions::FileSystemPermissions,
+    ) -> Result<()> {
+        let paths = PolicyPaths::new(&self.initial.cwd);
+        crate::permissions::normalize_additional_permissions_with_context(
+            AdditionalPermissionProfile::new().with_file_system(policy.clone()),
+            &paths.context(),
+        )
+        .map_err(Error::config)?;
+        Ok(())
     }
 
     /// Installs the explicitly selected product snapshot on a framework configuration.
@@ -605,6 +661,7 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         if let Some(policy) = update.sandbox_policy() {
             settings.sandbox_policy = policy.clone();
             settings.active_permission_profile = None;
+            settings.file_system_read_policy = None;
         }
         if let Some(profile) = update.permissions() {
             settings.sandbox_policy = self
@@ -613,6 +670,7 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
                 .cloned()
                 .ok_or_else(|| format!("unknown permissions profile: {profile}"))?;
             settings.active_permission_profile = Some(profile.to_owned());
+            settings.file_system_read_policy = self.file_system_read_profiles.get(profile).cloned();
         }
         Ok(install(current.clone(), settings))
     }

@@ -2167,7 +2167,7 @@ async fn run_loop_inner(
     let assembly = capabilities.prepare(CapabilityAssemblyRequest {
         agent: &agent,
         run_id: &run_id,
-        app_context: app_context.as_ref(),
+        app_context: config.app_context().or(app_context.as_ref()),
         tool_input: tool_input.as_ref(),
         state: &state,
         event_seqs: &event_seqs,
@@ -4850,7 +4850,7 @@ async fn run_one_turn(
     // one; either delivery is persisted once it is recorded.
     let delivered_mail = deliver_agent_mail(context, state, progress, turn_scope);
     let delivered_input = deliver_pending_input(context, state, progress, turn_scope);
-    contribute_turn_input(context, state, progress.reference_turn(), turn_scope)
+    contribute_turn_input(context, agent, state, progress.reference_turn(), turn_scope)
         .await
         .map_err(|error| error.with_run_state(state.clone()))?;
     if (delivered_mail || delivered_input)
@@ -5549,15 +5549,17 @@ fn deliver_pending_input(
 /// Commits contextual input atomically, leaving accepted input retryable on failure or cancellation.
 async fn contribute_turn_input(
     context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
     state: &mut RunState,
     turn: u64,
     cancel: &CancelScope,
 ) -> Result<()> {
+    let run = live_context(context, agent, state);
     let mut messages = Vec::new();
     for contributor in context.input_contributors {
         messages.extend(
             cancel
-                .run(contributor.contribute_turn_input(state.pending_input_contributions()))
+                .run(contributor.contribute_turn_input(&run, state.pending_input_contributions()))
                 .await??,
         );
     }

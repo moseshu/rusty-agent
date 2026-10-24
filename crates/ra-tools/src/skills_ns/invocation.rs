@@ -20,6 +20,7 @@ impl SkillToolContext {
     pub(super) async fn contribute_turn_input(
         &self,
         run_id: &ra_core::state::RunId,
+        run: &ra_core::context::RunContext,
         input: &[ModelInputItem],
         required: &[(String, Vec<String>)],
         host_surface: bool,
@@ -99,13 +100,14 @@ impl SkillToolContext {
             &std::collections::HashMap::new(),
         ));
         Ok(self
-            .load_skill_prompts(run_id, selected, &superseded_names, &host_snapshot)
+            .load_skill_prompts(run_id, run, selected, &superseded_names, &host_snapshot)
             .await)
     }
 
     async fn load_skill_prompts(
         &self,
         run_id: &ra_core::state::RunId,
+        run: &ra_core::context::RunContext,
         selected: Vec<SkillCatalogEntry>,
         superseded_names: &std::collections::HashSet<String>,
         host_snapshot: &super::HostSkillsSnapshot,
@@ -116,7 +118,7 @@ impl SkillToolContext {
         for entry in selected {
             let core_host =
                 entry.authority.kind == SkillSourceKind::Host && entry.host_prompt_kind.is_some();
-            match self.read_main_prompt(&entry, host_snapshot).await {
+            match self.read_main_prompt(&entry, host_snapshot, run).await {
                 Ok(result) => {
                     let contents = if entry.authority.kind == SkillSourceKind::Host
                         && entry.host_prompt_kind == Some(HostSkillPromptKind::Core)
@@ -167,6 +169,7 @@ impl SkillToolContext {
         &self,
         entry: &SkillCatalogEntry,
         host_snapshot: &super::HostSkillsSnapshot,
+        run: &ra_core::context::RunContext,
     ) -> std::result::Result<SkillReadResult, String> {
         if entry.authority.kind == SkillSourceKind::Host && entry.host_prompt_kind.is_some() {
             let contents = host_snapshot
@@ -178,19 +181,22 @@ impl SkillToolContext {
                 contents,
             });
         }
+        let executor_access = if entry.authority.kind == SkillSourceKind::Executor {
+            self.executor_access(&entry.authority.id, run)
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         let context = match entry.authority.kind {
             SkillSourceKind::Host => SkillReadContext::Host {
                 snapshot: Some(host_snapshot),
             },
             SkillSourceKind::Cloud => SkillReadContext::Cloud,
             SkillSourceKind::Executor => {
-                let fs = self
-                    .executor_roots
-                    .get(&entry.authority.id)
-                    .ok_or_else(|| {
-                        "skill environment is not available for this callback".to_string()
-                    })?;
-                SkillReadContext::Executor { fs }
+                let fs = executor_access.as_ref().ok_or_else(|| {
+                    "skill environment is not available for this callback".to_string()
+                })?;
+                SkillReadContext::Executor { access: fs }
             }
             _ => return Err("skill provider is not configured".to_string()),
         };

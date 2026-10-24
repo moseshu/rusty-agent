@@ -34,6 +34,31 @@ impl SkillCatalogPrompt {
         }
     }
 
+    pub(crate) fn with_access_policy(
+        mut self,
+        policy: std::sync::Arc<dyn super::SkillExecutorAccessPolicy>,
+    ) -> Self {
+        self.context.access_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn tools(
+        &self,
+    ) -> ra_core::error::Result<Vec<std::sync::Arc<dyn ra_core::tool::Tool>>> {
+        Ok(vec![
+            std::sync::Arc::new(super::SkillTool::new::<super::list::ListArgs>(
+                super::list::TOOL_NAME,
+                super::list::DESCRIPTION,
+                self.context.clone(),
+            )?),
+            std::sync::Arc::new(super::SkillTool::new::<super::read::ReadArgs>(
+                super::read::TOOL_NAME,
+                super::read::DESCRIPTION,
+                self.context.clone(),
+            )?),
+        ])
+    }
+
     pub(crate) fn set_context_window(&mut self, context_window: Option<i64>) {
         self.context_window = context_window;
     }
@@ -52,6 +77,7 @@ impl SkillCatalogPrompt {
 
     pub(crate) async fn contribute_turn_input(
         &self,
+        run: &ra_core::context::RunContext,
         input: &[ra_core::item::ModelInputItem],
         required: &[(String, Vec<String>)],
     ) -> ra_core::error::Result<Vec<ra_core::item::Message>> {
@@ -59,7 +85,7 @@ impl SkillCatalogPrompt {
             return Ok(Vec::new());
         };
         self.context
-            .contribute_turn_input(run_id, input, required, self.host_surface)
+            .contribute_turn_input(run_id, run, input, required, self.host_surface)
             .await
     }
 

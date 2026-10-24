@@ -275,6 +275,132 @@ async fn runtime_keeps_paginated_skill_results_in_the_tail_without_context_trunc
     assert_eq!(*model.observed.lock().unwrap(), model.original);
 }
 
+#[cfg(unix)]
+#[test]
+fn non_utf8_cwd_home_and_tmpdir_remain_valid_permission_values() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let native_cwd = root.join(OsString::from_vec(b"cwd-\xff".to_vec()));
+    let home = root.join(OsString::from_vec(b"home-\xfe".to_vec()));
+    let temporary = root.join(OsString::from_vec(b"tmp-\xfd".to_vec()));
+    // Permission contexts can name absent directories. APFS rejects invalid UTF-8 filenames,
+    // so keep the workspace native and pass non-UTF-8 context values without creating them.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "native_permission_context_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("RA_SKILL_NATIVE_ROOT", root)
+        .env("RA_SKILL_NATIVE_CWD", &native_cwd)
+        .env("HOME", &home)
+        .env("TMPDIR", &temporary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed;")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "Subprocess entry for native permission paths; executed by its parent test"]
+async fn native_permission_context_child() {
+    use ra_coding::{
+        permissions::FileSystemPermissions, thread_settings::CodingThreadSettingsAdapter,
+    };
+    use ra_protocol::server::protocol::SandboxPolicy;
+    let root = std::path::PathBuf::from(std::env::var_os("RA_SKILL_NATIVE_ROOT").unwrap());
+    std::fs::create_dir(root.join("skill")).unwrap();
+    let original = "executor reference\n".repeat(8000);
+    let file = root.join("skill/reference.md");
+    let host = CodingHost::open(&root).unwrap();
+    let package = "skill://root/skill".to_string();
+    let resource = format!("{package}/reference.md");
+    let catalog = SkillCatalog {
+        entries: vec![SkillCatalogEntry::new(
+            SkillPackageId(package.clone()),
+            SkillAuthority::new(SkillSourceKind::Executor, "root"),
+            "Reference",
+            "Read a reference",
+            SkillResourceId::environment(
+                format!("{package}/SKILL.md"),
+                LOCAL_ENVIRONMENT_ID,
+                host.workspace_root().join("skill/SKILL.md"),
+            ),
+        )],
+        warnings: vec![],
+    };
+    let services = Arc::new(configured_host::Services::default());
+    let roots = [("root".to_string(), Workspace::open(&root).unwrap())].into();
+    let host = host
+        .with_web_access(services.clone())
+        .with_user_input(services)
+        .with_collaboration()
+        .with_skill_providers(
+            SkillProviders::new()
+                .with_executor_provider(Arc::new(ExecutorSkillProvider::new(catalog))),
+            roots,
+        );
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &PromptRole::Main,
+        &host,
+        CodingProfile::CodexLike,
+    )
+    .await
+    .unwrap();
+    for restricted in [false, true] {
+        std::fs::write(&file, &original).unwrap();
+        let model = Arc::new(PagingModel {
+            package: package.clone(),
+            resource: resource.clone(),
+            original: original.clone(),
+            file: file.clone(),
+            observed: Default::default(),
+            step: Default::default(),
+        });
+        let native_cwd = std::path::PathBuf::from(std::env::var_os("RA_SKILL_NATIVE_CWD").unwrap());
+        let adapter = CodingThreadSettingsAdapter::new(
+            native_cwd,
+            SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+        )
+        .unwrap();
+        let adapter = if restricted {
+            adapter
+                .with_file_system_read_policy(FileSystemPermissions::from_read_write_roots(
+                    Some(vec![host.workspace_root().to_path_buf()]),
+                    None,
+                ))
+                .unwrap()
+        } else {
+            adapter
+        };
+        let request = RunRequest::new(
+            AgentBinding::direct(built.agent().clone()),
+            Arc::new(PagingResolver(model.clone())),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("read reference"))],
+        )
+        .with_config(adapter.initialize(host.build_run_config()))
+        .with_services(host.build_tool_services());
+        Runner::run(built.bind(request)).await.unwrap();
+        assert_eq!(*model.observed.lock().unwrap(), original);
+    }
+}
+
 #[tokio::test]
 async fn responses_wire_snapshot_includes_the_explicit_executor_skill_interface() {
     use ra_model::openai::{auth::OpenAiAuth, responses::OpenAiResponsesModel};

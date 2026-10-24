@@ -47,13 +47,12 @@ async fn executor_provider_bounds_streams_checks_utf8_and_preserves_preloaded_co
             fixture.resource.clone(),
         )
         .unwrap();
+    let access = ra_tools::skills_ns::SkillExecutorAccess::new(fixture.workspace.clone(), None);
     let base = SkillReadRequest {
         authority: SkillAuthority::new(SkillSourceKind::Executor, "selected"),
         package: SkillPackageId(fixture.package.clone()),
         resource,
-        context: SkillReadContext::Executor {
-            fs: &fixture.workspace,
-        },
+        context: SkillReadContext::Executor { access: &access },
     };
     let path = fixture.directory.path().join("skill/reference.md");
     std::fs::write(&path, vec![b'x'; MAX_SKILL_RESOURCE_CONTENT_BYTES]).unwrap();
@@ -124,6 +123,7 @@ async fn executor_provider_bounds_streams_checks_utf8_and_preserves_preloaded_co
 #[tokio::test]
 async fn host_root_and_symlink_escapes_are_refused_and_failure_text_is_bounded() {
     let fixture = ExecutorFixture::new("contents");
+    let access = ra_tools::skills_ns::SkillExecutorAccess::new(fixture.workspace.clone(), None);
     let outside = tempfile::TempDir::new().unwrap();
     std::fs::write(outside.path().join("secret"), "secret contents").unwrap();
     let pair = fixture.pair(1000);
@@ -160,9 +160,7 @@ async fn host_root_and_symlink_escapes_are_refused_and_failure_text_is_bounded()
             authority: SkillAuthority::new(SkillSourceKind::Executor, "selected"),
             package: SkillPackageId(fixture.package),
             resource,
-            context: SkillReadContext::Executor {
-                fs: &fixture.workspace,
-            },
+            context: SkillReadContext::Executor { access: &access },
         })
         .await
         .unwrap_err();

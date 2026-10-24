@@ -2946,6 +2946,7 @@ name = "ra-coding"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "dunce",
  "futures",
  "globset",
  "ra-context",
@@ -2959,6 +2960,7 @@ dependencies = [
  "ra-protocol",
  "ra-runtime",
  "ra-tools",
+ "rustix",
  "schemars 0.8.22",
  "serde",
  "serde_json",

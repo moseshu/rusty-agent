@@ -1024,6 +1024,22 @@ impl SkillsNsCapability {
         })
     }
 
+    /// Combines callback step settings with live grants for each executor read.
+    /// Only executor reads use this policy; Host and Cloud retain their provider lifecycles.
+    pub fn with_executor_access_policy(
+        mut self,
+        policy: Arc<dyn crate::skills_ns::SkillExecutorAccessPolicy>,
+    ) -> Result<Self> {
+        if let Some(prompt) = self.catalog_prompt.take() {
+            let prompt = prompt.with_access_policy(policy);
+            if !self.tools.is_empty() {
+                self.tools = prompt.tools()?;
+            }
+            self.catalog_prompt = Some(prompt);
+        }
+        Ok(self)
+    }
+
     /// Keeps only Host catalog contributors, without installing namespace tools or executor grants.
     /// A product can use this when its selected tool surface supports ordinary file reads but
     /// omits the Executor and Cloud skill namespace.
@@ -1091,11 +1107,12 @@ impl Capability for SkillsNsCapability {
 
     async fn contribute_turn_input(
         &self,
+        run: &ra_core::context::RunContext,
         input: &[ra_core::item::ModelInputItem],
     ) -> Result<Vec<ra_core::item::Message>> {
         if let Some(prompt) = &self.catalog_prompt {
             prompt
-                .contribute_turn_input(input, &self.required_skills)
+                .contribute_turn_input(run, input, &self.required_skills)
                 .await
         } else {
             crate::skills_ns::validate_required_skills(
@@ -1118,6 +1135,9 @@ impl Capability for SkillsNsCapability {
         let mut bound = self.clone();
         if let Some(prompt) = &mut bound.catalog_prompt {
             prompt.bind(context.run_id());
+            if !bound.tools.is_empty() {
+                bound.tools = prompt.tools()?;
+            }
         }
         Ok(Some(Arc::new(bound)))
     }

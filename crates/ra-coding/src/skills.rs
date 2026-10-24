@@ -1,5 +1,6 @@
 //! Explicit Host discovery and model-aware configuration for skill catalogs.
 
+mod access;
 mod config;
 mod discovery;
 mod metadata;
@@ -107,6 +108,38 @@ pub fn model_context_window_for_candidates(model: &str, candidates: &[(&str, u64
     windows::context_window_from_candidates(model, candidates)
 }
 
+/// Native skill policy paths for the external integration-test workspace.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod access_test_api {
+    use crate::permissions::{
+        FileSystemPermissions, FileSystemSandboxEntry, FileSystemSandboxPolicyContext,
+    };
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+
+    /// Runs the ported helper without requiring the path to exist.
+    pub fn canonicalize_preserving_symlinks(path: &Path) -> io::Result<PathBuf> {
+        super::access::canonicalize_preserving_symlinks(path)
+    }
+
+    /// Normalizes a policy root through its first existing ancestor.
+    #[must_use]
+    pub fn normalize_effective_path(path: &Path) -> PathBuf {
+        super::access::normalize_effective_path(path)
+    }
+
+    /// Resolves policy entries using the same path helpers as descriptor reads.
+    pub fn effective_read_entries(
+        policy: &FileSystemPermissions,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> io::Result<Vec<FileSystemSandboxEntry>> {
+        super::access::effective_read_entries(policy, context)
+    }
+}
+
 // Keep the validated host overrides' existing normalization without consulting the SDK defaults.
 fn override_lookup_key(model: &str) -> String {
     let normalized = model.trim().to_lowercase();
@@ -144,6 +177,8 @@ impl Capability for SkillCatalogCapability {
             .map(|model| self.config.context_window(model))
             .map(|window| i64::try_from(window).unwrap_or(i64::MAX));
         let mut capability = self.inner.clone().with_catalog_context_window(window);
+        capability =
+            capability.with_executor_access_policy(Arc::new(access::CodingSkillAccessPolicy))?;
         if let Some(limit) = self.config.max_context_tokens {
             capability = capability.with_catalog_max_context_tokens(limit);
         }

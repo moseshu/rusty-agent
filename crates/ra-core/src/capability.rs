@@ -448,11 +448,16 @@ pub trait Capability: Send + Sync + 'static {
     /// This runtime extension ports Codex's turn-input contributor lifecycle. It is separate
     /// from SDK system instructions and context projection: returned messages enter authoritative
     /// history once, after blocking input guardrails. `input` excludes session history and previously
-    /// processed input. An empty slice still permits a capability to validate inference prerequisites.
+    /// processed input. `context` is the current step's view, with its captured application settings.
+    /// An empty slice still permits a capability to validate inference prerequisites.
     /// The runtime retains pending input across cancellation and checkpoints, and commits the
     /// messages only after every contributor succeeds. Implementations must tolerate retries.
-    async fn contribute_turn_input(&self, input: &[ModelInputItem]) -> Result<Vec<Message>> {
-        let _ = input;
+    async fn contribute_turn_input(
+        &self,
+        context: &RunContext,
+        input: &[ModelInputItem],
+    ) -> Result<Vec<Message>> {
+        let _ = (context, input);
         Ok(Vec::new())
     }
 

@@ -3,14 +3,16 @@
 //!
 //! Executor metadata is supplied by a provider; automatic disk discovery is a separate integration.
 //! Host providers contribute file locators to the same bounded run catalog; they add no tools or
-//! filesystem grants. The capability renders a bounded catalog at run assembly. Each selected skill root is a grant,
-//! keyed by the executor authority id and unrelated to the coding working directory. Per-turn
-//! sandbox permission changes are not interpreted by these tools. Cloud schema and routing are
+//! filesystem grants. The capability renders a bounded catalog at run assembly. Each selected
+//! skill root is a grant, keyed by the executor authority id and unrelated to the coding working
+//! directory. An optional product policy combines the step baseline with live grants per callback. Cloud
+//! schema and routing are
 //! retained, without an `OpenAI` account backend. The merged [`crate::skill`] tool remains a separate
 //! compatibility extension and cannot share the skills capability family on one agent.
 //!
 //! A tool pair owns one executor read snapshot. Unlike Codex's thread-owned slot, its lifetime is
-//! the pair's lifetime; keys include authority, package, resource binding and filesystem identity.
+//! the pair's lifetime; keys include authority, package, resource binding, filesystem identity
+//! and the complete captured permission context.
 //! Cache hits deliberately retain old file contents, including after the last page is read.
 
 use std::{
@@ -29,7 +31,7 @@ use ra_core::{
         ToolOrigin, ToolOutput, ToolSchema,
     },
 };
-use ra_exec::fs::{RootedFileSystem, Workspace};
+use ra_exec::fs::Workspace;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -37,6 +39,7 @@ use tokio::sync::OnceCell;
 use catalog::{SkillAuthority, SkillCatalog, SkillPackageId, SkillReadResult, SkillSourceKind};
 use provider::SkillListQuery;
 
+mod access;
 mod aliases;
 mod allocation;
 pub mod catalog;
@@ -56,6 +59,7 @@ mod schema;
 mod selection;
 mod warnings;
 
+pub use access::{SkillExecutorAccess, SkillExecutorAccessPolicy, SkillFilePermissions};
 pub use host_selection::collect_host_skill_mentions;
 pub use host_snapshot::HostSkillsSnapshot;
 pub(crate) use prompt::SkillCatalogPrompt;
@@ -136,6 +140,7 @@ pub(crate) fn skill_tools_with_prompt(
     }
     let context = SkillToolContext {
         providers,
+        access_policy: None,
         executor_roots: Arc::new(executor_roots),
         response_byte_budget,
         executor_catalog: Arc::new(Mutex::new(None)),
@@ -145,18 +150,7 @@ pub(crate) fn skill_tools_with_prompt(
     let prompt = SkillCatalogPrompt::new(context.clone());
     Ok(SkillToolSet {
         tools: if tools_available {
-            vec![
-                Arc::new(SkillTool::new::<list::ListArgs>(
-                    list::TOOL_NAME,
-                    list::DESCRIPTION,
-                    context.clone(),
-                )?),
-                Arc::new(SkillTool::new::<read::ReadArgs>(
-                    read::TOOL_NAME,
-                    read::DESCRIPTION,
-                    context,
-                )?),
-            ]
+            prompt.tools()?
         } else {
             Vec::new()
         },
@@ -169,6 +163,7 @@ struct SkillToolContext {
     providers: SkillProviders,
     executor_roots: Arc<BTreeMap<String, Workspace>>,
     response_byte_budget: usize,
+    access_policy: Option<Arc<dyn SkillExecutorAccessPolicy>>,
     executor_catalog: Arc<Mutex<Option<ExecutorCatalog>>>,
     host_catalog: Arc<Mutex<Option<ExecutorCatalog>>>,
     executor_read_snapshot: Arc<Mutex<Option<ExecutorReadSnapshot>>>,
@@ -180,6 +175,26 @@ struct ExecutorCatalog {
 }
 
 impl SkillToolContext {
+    fn executor_access(
+        &self,
+        authority: &str,
+        run: &ra_core::context::RunContext,
+    ) -> CoreResult<Option<SkillExecutorAccess>> {
+        let Some(workspace) = self.executor_roots.get(authority) else {
+            return Ok(None);
+        };
+        let permissions = self
+            .access_policy
+            .as_ref()
+            .map(|policy| policy.capture(run))
+            .transpose()?
+            .flatten();
+        Ok(Some(SkillExecutorAccess::new(
+            workspace.clone(),
+            permissions,
+        )))
+    }
+
     async fn catalog(
         &self,
         call: &ToolContext<'_>,
@@ -283,7 +298,7 @@ impl SkillToolContext {
 struct ExecutorReadSnapshot {
     authority: SkillAuthority,
     package: SkillPackageId,
-    access: Arc<RootedFileSystem>,
+    access: access::SkillExecutorAccessKey,
     result: Arc<SkillReadResult>,
 }
 

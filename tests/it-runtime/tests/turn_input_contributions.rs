@@ -62,7 +62,11 @@ impl Capability for Contributor {
     fn tools(&self) -> Vec<Arc<dyn ra_core::tool::Tool>> {
         vec![]
     }
-    async fn contribute_turn_input(&self, input: &[ModelInputItem]) -> Result<Vec<Message>> {
+    async fn contribute_turn_input(
+        &self,
+        _context: &ra_core::context::RunContext,
+        input: &[ModelInputItem],
+    ) -> Result<Vec<Message>> {
         self.seen.lock().unwrap().push(input.to_vec());
         if self.fail.swap(false, Ordering::SeqCst) {
             return Err(Error::caller("preparation failed"));
@@ -321,7 +325,11 @@ impl Capability for CancelContributor {
     fn tools(&self) -> Vec<Arc<dyn ra_core::tool::Tool>> {
         vec![]
     }
-    async fn contribute_turn_input(&self, _: &[ModelInputItem]) -> Result<Vec<Message>> {
+    async fn contribute_turn_input(
+        &self,
+        _context: &ra_core::context::RunContext,
+        _: &[ModelInputItem],
+    ) -> Result<Vec<Message>> {
         self.cancel
             .cancel(ra_core::cancel::CancelReason::UserInterrupt);
         std::future::pending().await

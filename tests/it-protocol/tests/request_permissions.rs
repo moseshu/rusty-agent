@@ -204,7 +204,10 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        let workspace = tempfile::tempdir().unwrap();
+        Self::with_workspace(tempfile::tempdir().unwrap())
+    }
+
+    fn with_workspace(workspace: tempfile::TempDir) -> Self {
         let host = CodingHost::open(workspace.path()).unwrap();
         let store = Arc::new(InMemoryThreadStore::new());
         let server = AppServer::new(std::env::temp_dir().join("rusty-agent-request-permissions"))
@@ -2885,3 +2888,6 @@ async fn any_grant_preapproves_patches_of_an_unconfined_thread() {
     );
     assert!(!server.root().join("early.txt").exists());
 }
+
+#[path = "request_permissions/skills.rs"]
+mod skills;

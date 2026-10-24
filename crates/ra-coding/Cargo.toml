@@ -14,6 +14,7 @@ workspace = true
 test-api = []
 
 [dependencies]
+dunce = { workspace = true }
 globset = { workspace = true }
 url = { workspace = true }
 ra-core = { workspace = true }
@@ -41,3 +42,6 @@ schemars = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }

@@ -365,6 +365,67 @@ RunState schema 15 records the new rule field. Reading schemas through 14 drops 
 session rules, so future calls require fresh approval. Exact pending-call answers remain intact.
 The migration runs only for old schemas. A current-schema rule is not silently discarded.
 
+### Callback-local executor skill read permissions
+
+Coding skill reads now construct an accessor inside each callback using that callback's
+`RunContext`: its baseline comes from the model step's captured `CodingThreadSettings`, while
+session and originating-turn `request_permissions` grants are read live. Because permission
+requests serialize tool execution, later `skills.read` calls in the same response see an approved
+grant. A baseline update published during a step takes effect on the next step; outstanding calls
+retain their issuing step's baseline. Turn grants expire with the turn. No ContextProcessor or
+per-step refresh hook is involved, including in caller-managed continuations.
+
+The earlier development version incorrectly froze grants at model-step preparation and reused
+bind-time baseline settings. Its same-step denial behavior has been removed.
+
+Legacy sandbox policies keep their existing read semantics within explicitly selected skill
+roots. Configure an optional skill-read filter with
+`CodingThreadSettingsAdapter::with_file_system_read_policy(FileSystemPermissions)`. This builder
+now returns `Result<Self>` and validates entries immediately; an explicitly empty filter denies
+all live skill reads. For a named profile, register the legacy policy with `with_profile`, then
+attach the skill-read entries with `with_file_system_read_profile`; both builders validate before
+installation. A named selection selects both components; a legacy sandbox selection clears the
+skill-read component. Preloaded discovery contents still do not reopen the main prompt. Host and
+Cloud keep their existing source lifecycles.
+
+**The extra skill-read filter is a product extension, not a filesystem security boundary.** It
+applies only to executor skill reads and live skill injection. Other tools, including `read_file`
+and shell commands, retain their own policies and can read a file excluded by this filter.
+
+`SkillReadContext` has one executor variant, `Executor { access }`. Providers must read through
+`access.read_text`; the pre-release raw `Workspace` variant and `ExecutorWithPermissions` variant
+have been removed. Standalone callers can create an accessor with
+`SkillExecutorAccess::new(workspace, None)`, explicitly retaining their selected-root contract.
+`SkillExecutorAccessPolicy::capture` now receives the current callback's `RunContext` and returns
+optional immutable `SkillFilePermissions`. `same_permissions` compares full captured values;
+there is no string cache key or JSON encoding of native cwd, home, or temporary-directory paths.
+
+Pagination keeps a weak filesystem identity and the captured permission object, compared by value.
+File edits alone retain the cached snapshot. Changed access rereads and revalidates the cursor;
+a denied read returns `failed to read skill resource`, while changed contents after an allowed
+cache miss produce the existing stale-cursor error.
+
+Local descriptor checks reject a deny matching either the requested path or the opened target.
+Policy roots and literal glob prefixes use Codex's `canonicalize_preserving_symlinks` and
+`should_preserve_logical_path` rules. Paths containing nested symlinks retain their complete
+logical spelling; an allow or deny on such a link does not expand to its canonical target.
+Without a nested symlink, top-level aliases such as macOS `/tmp` and `/var` are resolved.
+Missing descendants are normalized through the first existing ancestor using the same rule.
+The resource is opened once through its selected directory capability and read from that same
+descriptor. The earlier development version's full symlink resolution and nested-alias test
+expectations have been removed.
+This adapter does not provide Codex's separate kernel-sandboxed filesystem worker. Restricted
+reads use descriptor paths on macOS/Linux; other platforms return Unsupported. Linux and complete
+platform `Minimal` defaults are not newly verified by these changes. The local descriptor adapter
+and the skill-only filter remain conditional review recommendations awaiting user confirmation;
+this record does not treat the reviewer recommendation as user acceptance.
+
+The existing `Capability::contribute_turn_input` callback now takes
+`(&self, context: &RunContext, input: &[ModelInputItem])` so live explicit skill injection receives
+the same step settings as tool callbacks. Existing implementations must accept the new parameter;
+the default still returns no messages. No permission types enter the provider-neutral core, and
+tool schemas and persisted run-state formats do not change.
+
 ### Contextual input contributions and skill mentions
 
 `Capability::contribute_turn_input` is an optional runtime extension for contextual messages;

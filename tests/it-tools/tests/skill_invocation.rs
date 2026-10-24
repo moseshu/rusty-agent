@@ -195,7 +195,7 @@ async fn hidden_prompt_truncates_at_utf8_boundary_and_keeps_full_read_metadata()
     .unwrap()
     .unwrap();
     let messages = capability
-        .contribute_turn_input(&[text("$hidden $hidden")])
+        .contribute_turn_input(&run(), &[text("$hidden $hidden")])
         .await
         .unwrap();
     assert_eq!(messages.len(), 1);
@@ -214,7 +214,7 @@ async fn hidden_prompt_truncates_at_utf8_boundary_and_keeps_full_read_metadata()
     );
     assert!(
         capability
-            .contribute_turn_input(&[])
+            .contribute_turn_input(&run(), &[])
             .await
             .unwrap()
             .is_empty()
@@ -255,13 +255,16 @@ async fn failed_reads_do_not_block_other_skills_and_non_user_text_does_not_trigg
     .unwrap()
     .unwrap();
     assert!(
-        cap.contribute_turn_input(&[ModelInputItem::Message(Message::system("$cloud"))])
-            .await
-            .unwrap()
-            .is_empty()
+        cap.contribute_turn_input(
+            &run(),
+            &[ModelInputItem::Message(Message::system("$cloud"))]
+        )
+        .await
+        .unwrap()
+        .is_empty()
     );
     let result = cap
-        .contribute_turn_input(&[text("$broken $cloud")])
+        .contribute_turn_input(&run(), &[text("$broken $cloud")])
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
@@ -298,7 +301,10 @@ async fn core_host_documents_remain_complete_and_plugin_documents_are_bounded() 
         .bind(&run())
         .unwrap()
         .unwrap();
-        let messages = cap.contribute_turn_input(&[text("$host")]).await.unwrap();
+        let messages = cap
+            .contribute_turn_input(&run(), &[text("$host")])
+            .await
+            .unwrap();
         assert_eq!(
             message_text(&messages[0]),
             format!(
@@ -372,7 +378,7 @@ async fn required_skill_checks_do_not_read_and_missing_integration_is_an_error()
         .unwrap();
     assert!(
         capability
-            .contribute_turn_input(&[])
+            .contribute_turn_input(&run(), &[])
             .await
             .unwrap_err()
             .to_string()
@@ -387,7 +393,7 @@ async fn required_skill_checks_do_not_read_and_missing_integration_is_an_error()
             .unwrap()
             .unwrap();
     assert!(
-        cap.contribute_turn_input(&[])
+        cap.contribute_turn_input(&run(), &[])
             .await
             .unwrap_err()
             .to_string()
@@ -474,7 +480,10 @@ async fn executor_selection_supersedes_core_host_prompts_with_the_same_name() {
     .bind(&run())
     .unwrap()
     .unwrap();
-    let messages = cap.contribute_turn_input(&[text("$review")]).await.unwrap();
+    let messages = cap
+        .contribute_turn_input(&run(), &[text("$review")])
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 1);
     assert!(message_text(&messages[0]).contains("Executor instructions"));
     assert_eq!(executor.reads.lock().unwrap().len(), 1);
@@ -498,7 +507,7 @@ async fn fragment_locator_limits_preserve_complete_hidden_resource_access() {
     .unwrap()
     .unwrap();
     let messages = cap
-        .contribute_turn_input(&[text(&format!("[$selected]({path})"))])
+        .contribute_turn_input(&run(), &[text(&format!("[$selected]({path})"))])
         .await
         .unwrap();
     let fragment = message_text(&messages[0]);
@@ -536,7 +545,7 @@ async fn replacing_environment_requirements_preserves_selection_and_error_order(
         .bind(&run())
         .unwrap()
         .unwrap();
-    let error = cap.contribute_turn_input(&[]).await.unwrap_err();
+    let error = cap.contribute_turn_input(&run(), &[]).await.unwrap_err();
     assert!(
         error
             .to_string()
@@ -553,7 +562,12 @@ async fn empty_requirement_lists_remove_environment_prerequisites() {
         .bind(&run())
         .unwrap()
         .unwrap();
-    assert!(cap.contribute_turn_input(&[]).await.unwrap().is_empty());
+    assert!(
+        cap.contribute_turn_input(&run(), &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -596,7 +610,7 @@ async fn core_host_fragments_precede_extension_fragments_in_the_returned_input()
     .unwrap()
     .unwrap();
     let fragments = cap
-        .contribute_turn_input(&[text("$cloud $host")])
+        .contribute_turn_input(&run(), &[text("$cloud $host")])
         .await
         .unwrap();
     assert_eq!(fragments.len(), 2);

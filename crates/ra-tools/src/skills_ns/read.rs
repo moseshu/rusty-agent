@@ -102,6 +102,13 @@ pub(super) async fn handle(
             .bind_environment_package_resource(&package, resource.clone())
             .unwrap_or_else(|| SkillResourceId::new(resource)),
     };
+    let executor_access = if output_authority == SkillToolAuthoritySelector::Executor {
+        context
+            .executor_access(&authority.id, call.run())
+            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
+    } else {
+        None
+    };
     let (read_context, access_key) = match output_authority {
         SkillToolAuthoritySelector::Cloud => (SkillReadContext::Cloud, None),
         SkillToolAuthoritySelector::Executor => {
@@ -110,15 +117,15 @@ pub(super) async fn handle(
                 .filter(|(id, path)| {
                     *id == super::provider::LOCAL_ENVIRONMENT_ID && path.is_absolute()
                 })
-                .and_then(|_| context.executor_roots.get(&authority.id))
+                .and(executor_access.as_ref())
                 .ok_or_else(|| {
                     FunctionCallError::RespondToModel(
                         "skill environment is not available for this callback".to_string(),
                     )
                 })?;
             (
-                SkillReadContext::Executor { fs },
-                Some(Arc::clone(fs.filesystem())),
+                SkillReadContext::Executor { access: fs },
+                Some(fs.cache_key()),
             )
         }
     };
@@ -135,7 +142,7 @@ pub(super) async fn handle(
             snapshot.authority == authority
                 && snapshot.package == package
                 && snapshot.result.resource == requested_resource
-                && Arc::ptr_eq(&snapshot.access, access)
+                && snapshot.access == *access
         })?;
         let start = parse_pagination_cursor(
             Some(cursor),

@@ -13,6 +13,8 @@ use ra_core::{
 use ra_tools::skills_ns::{SkillProvider, SkillProviders, catalog::*, provider::*, skill_tools};
 use serde_json::{Value, json};
 
+#[path = "skills_ns/access.rs"]
+mod access;
 #[path = "skills_ns/aliases.rs"]
 mod aliases;
 #[path = "skills_ns/budget.rs"]
@@ -143,7 +145,7 @@ async fn explicit_injection_truncation_does_not_truncate_the_namespace_resource(
     .unwrap()
     .unwrap();
     let fragments = cap
-        .contribute_turn_input(&[ModelInputItem::Message(Message::user("$review"))])
+        .contribute_turn_input(&run(), &[ModelInputItem::Message(Message::user("$review"))])
         .await
         .unwrap();
     assert_eq!(fragments.len(), 1);

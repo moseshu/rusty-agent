@@ -1,5 +1,5 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Provider routing and bounded reads through an explicitly granted local filesystem.
+//! Provider routing and bounded reads through captured local filesystem access.
 
 use std::{
     collections::BTreeMap,
@@ -9,8 +9,6 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-
-use ra_exec::fs::{RootedFileSystem, Workspace};
 
 use super::catalog::{
     SkillAuthority, SkillCatalog, SkillPackageId, SkillProviderError, SkillProviderResult,
@@ -48,7 +46,7 @@ pub struct SkillReadRequest<'a> {
     pub context: SkillReadContext<'a>,
 }
 
-/// Executor access is a host-selected directory capability; cloud providers own their transport.
+/// Executor access combines selected roots with captured permissions; cloud providers own their transport.
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum SkillReadContext<'a> {
@@ -57,10 +55,10 @@ pub enum SkillReadContext<'a> {
         /// Core Host resources loaded for this run. Extension catalogs do not expand membership.
         snapshot: Option<&'a super::HostSkillsSnapshot>,
     },
-    /// Read within this root, which is the host's explicit grant.
+    /// Read through this callback's selected root and captured permissions.
     Executor {
-        /// The granted workspace capability.
-        fs: &'a Workspace,
+        /// Permission-aware filesystem accessor, matching the upstream single Executor variant.
+        access: &'a super::SkillExecutorAccess,
     },
     /// A host-supplied cloud adapter. No `OpenAI` account backend is installed.
     Cloud,
@@ -293,10 +291,13 @@ impl SkillProvider for ExecutorSkillProvider {
                     "executor skill resource does not match its package",
                 ));
             }
-            let SkillReadContext::Executor { fs } = request.context else {
-                return Err(SkillProviderError::new(
-                    "executor skill reads require filesystem access",
-                ));
+            let access = match request.context {
+                SkillReadContext::Executor { access } => access.clone(),
+                _ => {
+                    return Err(SkillProviderError::new(
+                        "executor skill reads require filesystem access",
+                    ));
+                }
             };
             if let Some(contents) = request.resource.environment_contents() {
                 return Ok(SkillReadResult {
@@ -309,24 +310,9 @@ impl SkillProvider for ExecutorSkillProvider {
                     "executor skill resource is not bound to an environment",
                 ));
             };
-            // Environment paths are absolute, as upstream PathUri requires. Keep native path
-            // components through the capability open instead of resolving a lossy string.
-            let relative = resource_path
-                .strip_prefix(fs.root())
-                .map_err(|err| {
-                    SkillProviderError::new(format!(
-                        "failed to read executor skill resource {}: {err}",
-                        request.resource.as_str()
-                    ))
-                })?
-                .to_path_buf();
-            let filesystem = Arc::clone(fs.filesystem());
-            let resource = request.resource.clone();
-            let contents = tokio::task::spawn_blocking(move || {
-                read_bounded_text(&filesystem, &relative, resource.as_str())
-            })
-            .await
-            .map_err(|err| SkillProviderError::new(err.to_string()))??;
+            let contents = access
+                .read_text(resource_path, request.resource.as_str())
+                .await?;
             Ok(SkillReadResult {
                 resource: request.resource,
                 contents,
@@ -335,8 +321,8 @@ impl SkillProvider for ExecutorSkillProvider {
     }
 }
 
-fn read_bounded_text(
-    filesystem: &RootedFileSystem,
+pub(super) fn read_bounded_text(
+    access: &super::SkillExecutorAccess,
     path: &Path,
     resource: &str,
 ) -> SkillProviderResult<String> {
@@ -345,9 +331,17 @@ fn read_bounded_text(
             "failed to read executor skill resource {resource}: {error}"
         ))
     };
-    let file = filesystem
-        .open_read(path)
+    let relative = path
+        .strip_prefix(access.workspace.root())
+        .map_err(|error| read_error(error.to_string()))?;
+    let file = access
+        .workspace
+        .filesystem()
+        .open_read(relative)
         .map_err(|err| read_error(err.to_string()))?;
+    access
+        .check_read(&file, path)
+        .map_err(|error| read_error(error.to_string()))?;
     let mut contents = Vec::new();
     // Read at most one sentinel byte beyond the limit, never an unbounded resource.
     file.take((MAX_SKILL_RESOURCE_CONTENT_BYTES + 1) as u64)
