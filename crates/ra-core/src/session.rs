@@ -7,6 +7,7 @@
 
 pub mod callback;
 pub mod compaction;
+pub mod contextual;
 pub mod id;
 pub mod interrupt;
 pub mod port;

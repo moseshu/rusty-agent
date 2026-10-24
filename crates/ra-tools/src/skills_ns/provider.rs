@@ -52,6 +52,11 @@ pub struct SkillReadRequest<'a> {
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum SkillReadContext<'a> {
+    /// Read a selected Host resource with the core loader's immutable discovery snapshot.
+    Host {
+        /// Core Host resources loaded for this run. Extension catalogs do not expand membership.
+        snapshot: Option<&'a super::HostSkillsSnapshot>,
+    },
     /// Read within this root, which is the host's explicit grant.
     Executor {
         /// The granted workspace capability.
@@ -154,8 +159,9 @@ impl SkillProviders {
         ))
     }
 
-    /// Adds a Host catalog source. Host entries contribute paths to the prompt and are read
-    /// with ordinary filesystem tools; the namespace does not serve Host resources.
+    /// Adds a Host catalog source. Explicit mentions load main prompts through the selected
+    /// Host lifecycle; other files use ordinary filesystem tools. The namespace does not serve
+    /// Host resources.
     #[must_use]
     pub fn with_host_provider(self, provider: Arc<dyn SkillProvider>) -> Self {
         self.with_provider(SkillProviderSource::new(

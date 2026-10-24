@@ -19,7 +19,7 @@ use ra_core::{
     agent::control::InterAgentMessageKind,
     error::{Error, Result},
     item::{MessageRole, ModelInputItem},
-    session::interrupt::is_interrupted_turn_marker,
+    session::contextual::is_contextual_user_message,
     state::RunId,
 };
 
@@ -128,9 +128,10 @@ impl UserMessagePosition {
 /// `user_message_positions_in_rollout`.
 ///
 /// A user message is a message with the user's role that a run, or a segment of it, starts on and
-/// that is neither an inter-agent envelope nor an interrupted-run marker, as Codex counts only the
+/// that is neither inter-agent mail nor model-only context, as Codex counts only the
 /// messages it parses as user messages: inter-agent communication has an item of its own there,
-/// and the marker is a context fragment. A continuation base is the run's history supplied again
+/// while interruption markers and selected-skill instructions are context fragments. A continuation
+/// base is the run's history supplied again
 /// in place of what it recorded, not new input, and holds none.
 ///
 /// # Errors
@@ -209,7 +210,7 @@ pub(crate) fn is_user_message(item: &ModelInputItem) -> bool {
         ModelInputItem::Message(message)
             if message.role() == MessageRole::User
                 && InterAgentMessageKind::of(message).is_none()
-                && !is_interrupted_turn_marker(message)
+                && !is_contextual_user_message(message)
     )
 }
 

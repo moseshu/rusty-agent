@@ -1,0 +1,314 @@
+{
+  "revision": "815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052",
+  "entries": [
+    {
+      "name": "alpha",
+      "path": "/one/SKILL.md",
+      "authority": 0,
+      "package": "one",
+      "enabled": true
+    },
+    {
+      "name": "alpha",
+      "path": "/two/SKILL.md",
+      "authority": 1,
+      "package": "two",
+      "enabled": true
+    },
+    {
+      "name": "plugin:beta",
+      "path": "/beta/SKILL.md",
+      "authority": 0,
+      "package": "beta",
+      "enabled": true
+    },
+    {
+      "name": "disabled",
+      "path": "/disabled/SKILL.md",
+      "authority": 0,
+      "package": "disabled",
+      "enabled": false
+    },
+    {
+      "name": "hidden",
+      "path": "/hidden/SKILL.md",
+      "authority": 0,
+      "package": "hidden",
+      "enabled": true
+    },
+    {
+      "name": "PATH",
+      "path": "/env/SKILL.md",
+      "authority": 0,
+      "package": "env",
+      "enabled": true
+    },
+    {
+      "name": "alpha_extra",
+      "path": "/extra/SKILL.md",
+      "authority": 0,
+      "package": "extra",
+      "enabled": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "plain",
+      "inputs": [
+        {
+          "text": "$alpha"
+        }
+      ],
+      "selected": [
+        0
+      ],
+      "selected_host": []
+    },
+    {
+      "id": "duplicates",
+      "inputs": [
+        {
+          "text": "$alpha $alpha"
+        }
+      ],
+      "selected": [
+        0
+      ],
+      "selected_host": []
+    },
+    {
+      "id": "qualified",
+      "inputs": [
+        {
+          "text": "$plugin:beta"
+        }
+      ],
+      "selected": [
+        2
+      ],
+      "selected_host": [
+        2
+      ]
+    },
+    {
+      "id": "hidden",
+      "inputs": [
+        {
+          "text": "$hidden"
+        }
+      ],
+      "selected": [
+        4
+      ],
+      "selected_host": [
+        4
+      ]
+    },
+    {
+      "id": "disabled",
+      "inputs": [
+        {
+          "text": "$disabled"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "case_sensitive",
+      "inputs": [
+        {
+          "text": "$Alpha"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "environment_variables",
+      "inputs": [
+        {
+          "text": "$PATH [$HOME](/one/SKILL.md) $XDG_CONFIG_HOME"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "linked_exact_path",
+      "inputs": [
+        {
+          "text": "[$alpha](/two/SKILL.md)"
+        }
+      ],
+      "selected": [
+        1
+      ],
+      "selected_host": [
+        1
+      ]
+    },
+    {
+      "id": "linked_uri",
+      "inputs": [
+        {
+          "text": "[$alpha](skill:///two/SKILL.md)"
+        }
+      ],
+      "selected": [
+        1
+      ],
+      "selected_host": [
+        1
+      ]
+    },
+    {
+      "id": "linked_unknown_no_fallback",
+      "inputs": [
+        {
+          "text": "[$alpha](/missing/SKILL.md)"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "non_skill_link",
+      "inputs": [
+        {
+          "text": "[$alpha](app://one) [$alpha](plugin://one) [$alpha](mcp://one)"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "plain_after_link",
+      "inputs": [
+        {
+          "text": "[$alpha](/two/SKILL.md) $alpha"
+        }
+      ],
+      "selected": [
+        0,
+        1
+      ],
+      "selected_host": [
+        1
+      ]
+    },
+    {
+      "id": "structured_blocks_plain",
+      "inputs": [
+        {
+          "text": "$alpha"
+        },
+        {
+          "name": "alpha",
+          "path": "/two/SKILL.md",
+          "kind": "skill"
+        }
+      ],
+      "selected": [
+        1
+      ],
+      "selected_host": [
+        1
+      ]
+    },
+    {
+      "id": "structured_missing_blocks_plain",
+      "inputs": [
+        {
+          "name": "alpha",
+          "path": "/missing/SKILL.md",
+          "kind": "mention"
+        },
+        {
+          "text": "$alpha"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "non_skill_structured_keeps_plain",
+      "inputs": [
+        {
+          "name": "alpha",
+          "path": "app://one",
+          "kind": "mention"
+        },
+        {
+          "text": "$alpha"
+        }
+      ],
+      "selected": [
+        0
+      ],
+      "selected_host": []
+    },
+    {
+      "id": "spacing",
+      "inputs": [
+        {
+          "text": "[$alpha]   ( /two/SKILL.md )"
+        }
+      ],
+      "selected": [
+        1
+      ],
+      "selected_host": [
+        1
+      ]
+    },
+    {
+      "id": "empty_link_falls_back",
+      "inputs": [
+        {
+          "text": "[$alpha]()"
+        }
+      ],
+      "selected": [
+        0
+      ],
+      "selected_host": []
+    },
+    {
+      "id": "ordinary_markdown",
+      "inputs": [
+        {
+          "text": "[alpha](/two/SKILL.md) alpha"
+        }
+      ],
+      "selected": [],
+      "selected_host": []
+    },
+    {
+      "id": "exact_boundaries",
+      "inputs": [
+        {
+          "text": "$alphas $alpha_extra"
+        }
+      ],
+      "selected": [
+        6
+      ],
+      "selected_host": [
+        6
+      ]
+    },
+    {
+      "id": "unicode_and_sigils",
+      "inputs": [
+        {
+          "text": "中文💡$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ $alpha.skill"
+        }
+      ],
+      "selected": [
+        0
+      ],
+      "selected_host": []
+    }
+  ]
+}

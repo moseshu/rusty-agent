@@ -14,7 +14,7 @@
 //! Runtime events can take ownership of its completion; background commands finish on exit,
 //! independently of when the model receives their result. What Codex keeps
 //! out of a turn's items is kept out here too: system and developer messages, and the marker an
-//! interrupt leaves for the model.
+//! interrupt leaves for the model, and selected-skill context fragments.
 //!
 //! A record recorded again under its id replaces the item it made, in place, as Codex upserts an
 //! item by id; the runner records a record again when settlement changes it.
@@ -57,7 +57,7 @@ use ra_core::{
         OutputPhase, RunItem, RunItemKind, ToolCall,
     },
     session::{
-        interrupt::is_interrupted_turn_marker,
+        contextual::is_contextual_user_message,
         rollout::{RolloutRunEnd, RolloutRunEnded, RolloutRunStarted},
     },
 };
@@ -169,9 +169,9 @@ impl ItemProjector {
 }
 
 /// The user's input a user message carries, or `None` for one that is not the user's own: the
-/// marker an interrupt leaves, or a message with nothing to show.
+/// skill context, the marker an interrupt leaves, or a message with nothing to show.
 fn user_message(id: &str, message: &Message) -> Option<ThreadItem> {
-    if is_interrupted_turn_marker(message) {
+    if is_contextual_user_message(message) {
         return None;
     }
     let content: Vec<UserInput> = message.content().iter().filter_map(user_input).collect();

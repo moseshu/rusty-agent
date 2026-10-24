@@ -115,3 +115,50 @@ async fn call_in_run(tool: &dyn Tool, args: Value, run_id: &str) -> Result<ToolO
     tool.call(ToolContext::new(&run, tool, &CallId::new("call"), &args))
         .await
 }
+
+#[tokio::test]
+async fn explicit_injection_truncation_does_not_truncate_the_namespace_resource() {
+    use ra_core::{
+        capability::Capability,
+        item::{Message, ModelInputItem},
+    };
+    use ra_tools::capability::SkillsNsCapability;
+    let catalog = SkillCatalog {
+        entries: vec![entry(
+            SkillSourceKind::Cloud,
+            CLOUD_AUTHORITY_ID,
+            "cloud/review",
+            "cloud/review/SKILL.md",
+        )],
+        warnings: vec![],
+    };
+    let body = "Instructions. ".repeat(900);
+    let cap = SkillsNsCapability::new(
+        cloud(catalog, &body),
+        BTreeMap::new(),
+        ra_tools::skills_ns::MAX_SKILL_RESPONSE_BYTES,
+    )
+    .unwrap()
+    .bind(&run())
+    .unwrap()
+    .unwrap();
+    let fragments = cap
+        .contribute_turn_input(&[ModelInputItem::Message(Message::user("$review"))])
+        .await
+        .unwrap();
+    assert_eq!(fragments.len(), 1);
+    let text = fragments[0].content()[0].as_text().unwrap();
+    assert!(text.len() < body.len());
+    let reader = cap
+        .tools()
+        .into_iter()
+        .find(|tool| tool.model_definition().qualified_name() == "skills.read")
+        .unwrap();
+    let page = response(
+        reader.as_ref(),
+        json!({"authority":{"kind":"cloud"},"package":"cloud/review"}),
+    )
+    .await;
+    assert_eq!(page["contents"], body);
+    assert!(page["next_cursor"].is_null());
+}

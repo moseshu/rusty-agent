@@ -827,3 +827,22 @@ async fn forking_twice_drops_to_the_first_message() {
     assert_eq!(meta.forked_from_id(), Some(fork1.session_id()));
     assert!(fork2.reconstruction().history().is_empty());
 }
+
+#[test]
+fn skill_context_does_not_create_user_turns_or_change_the_fork_boundary() {
+    let skill = " \n<SKILL>\n<name>demo</name>\nprivate instructions\n</SKILL> ";
+    let mut rollout = Rollout::default();
+    rollout
+        .start_with("first", vec![user(skill), user("first request")])
+        .end("first", RolloutRunEnd::Completed)
+        .start_with("second", vec![user(skill), user("second request")])
+        .end("second", RolloutRunEnd::Completed);
+    let records = rollout.records();
+    assert_eq!(positions(&records), vec![(0, 1), (2, 1)]);
+    let before_second = truncate_rollout_before_nth_user_message(records.clone(), 1).unwrap();
+    assert_eq!(positions(&before_second), vec![(0, 1)]);
+    assert_eq!(
+        reconstruct_history(&before_second).unwrap().history().len(),
+        3
+    );
+}

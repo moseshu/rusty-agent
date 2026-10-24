@@ -2171,7 +2171,7 @@ fn current_schema_preserves_ownerless_rules_instead_of_applying_legacy_migration
     assert_eq!(state.permission_rules().len(), 1);
     assert_eq!(
         RUN_STATE_SCHEMA_VERSION,
-        ra_core::compat::SchemaVersion::new(15)
+        ra_core::compat::SchemaVersion::new(16)
     );
     assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }
@@ -2228,4 +2228,13 @@ fn malformed_optional_generated_cache_hints_follow_the_sdk_restore_behavior() {
         restored.generated_prompt_cache_key(),
         Some("prompt-cache-key-1")
     );
+}
+
+#[test]
+fn pending_context_input_requires_a_started_run_identity() {
+    let mut state = RunState::start(RunId::new("unstarted-context"));
+    state.queue_input_contributions([ModelInputItem::Message(Message::user("accepted input"))]);
+    let wire = serde_json::to_value(&state).unwrap();
+    let error = serde_json::from_value::<RunState>(wire).unwrap_err();
+    assert!(error.to_string().contains("names no current agent"));
 }

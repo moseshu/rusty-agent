@@ -666,3 +666,71 @@ fn model_lookup_preserves_longest_prefix_ties_and_full_name_priority() {
         );
     }
 }
+
+struct ExplicitModel;
+#[async_trait]
+impl Model for ExplicitModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        assert!(
+            !request
+                .system_instructions()
+                .unwrap()
+                .contains("actual skill body")
+        );
+        let selected: Vec<_> = request
+            .input()
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message(message) => Some(message),
+                _ => None,
+            })
+            .flat_map(Message::content)
+            .filter_map(|block| block.as_text())
+            .filter(|text| text.starts_with("<skill>"))
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].contains("<name>skill-0</name>"));
+        assert!(selected[0].contains("actual skill body from an external root"));
+        assert!(
+            !request
+                .input()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::ToolCallOutput(_)))
+        );
+        Ok(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("answer"),
+            RunItemKind::Message(Message::assistant("complete", OutputPhase::Final)),
+        )]))
+    }
+}
+#[tokio::test]
+async fn an_explicit_namespace_skill_is_injected_before_any_tool_call() {
+    let coding = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let (host, provider) = host(
+        &Workspace::open(coding.path()).unwrap(),
+        &Workspace::open(external.path()).unwrap(),
+    );
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &PromptRole::Main,
+        &host,
+        CodingProfile::CodexLike,
+    )
+    .await
+    .unwrap();
+    let request = RunRequest::new(
+        AgentBinding::direct(built.agent().clone()),
+        Arc::new(Resolver(Arc::new(ExplicitModel))),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user(
+            "Use $skill-0 $skill-0",
+        ))],
+    )
+    .with_config(host.build_run_config())
+    .with_services(host.build_tool_services());
+    Runner::run(built.bind(request)).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}

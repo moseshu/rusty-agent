@@ -42,16 +42,54 @@ mod allocation;
 pub mod catalog;
 mod catalog_prompt;
 mod host_aliases;
+mod host_selection;
+mod host_snapshot;
+mod invocation;
 mod list;
+mod mentions;
 mod prompt;
 pub mod provider;
 mod read;
 mod render;
+mod required;
 mod schema;
+mod selection;
 mod warnings;
 
+pub use host_selection::collect_host_skill_mentions;
+pub use host_snapshot::HostSkillsSnapshot;
 pub(crate) use prompt::SkillCatalogPrompt;
 pub use provider::{ExecutorSkillProvider, SkillProvider, SkillProviders};
+pub use ra_core::session::contextual::is_skill_prompt_fragment;
+#[doc(hidden)]
+pub use required::set_required_skills;
+pub use required::{EnvironmentSkillRequirements, validate_required_skills};
+pub use selection::collect_explicit_skill_mentions;
+
+/// Product input used for exact skill selection, without adding Codex UI fields to model items.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SkillInput {
+    /// Text that may contain plain or linked dollar mentions.
+    Text {
+        /// Complete input text.
+        text: String,
+    },
+    /// A structured skill selection; its name blocks plain-name fallback in the same batch.
+    Skill {
+        /// The selected display name.
+        name: String,
+        /// Exact native instruction path.
+        path: std::path::PathBuf,
+    },
+    /// A structured resource mention, resolved only when its path identifies a skill.
+    Mention {
+        /// The mentioned display name.
+        name: String,
+        /// Exact resource locator.
+        path: String,
+    },
+}
 
 /// The namespace advertised on the Responses wire.
 pub const SKILLS_NAMESPACE: &str = "skills";

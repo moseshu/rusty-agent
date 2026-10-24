@@ -23,6 +23,9 @@ mod prompt_cache_key;
 #[path = "threads/coding_tools.rs"]
 mod coding_tools;
 
+#[path = "threads/skill_context.rs"]
+mod skill_context;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},

@@ -65,6 +65,11 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // Codex ext/skills/src/required.rs::EnvironmentSkillRequirements is a borrowed public record.
+    (
+        "crates/ra-tools/src/skills_ns/required.rs",
+        "EnvironmentSkillRequirements",
+    ),
     // Codex skill catalog and callback records retain the upstream public field surface.
     ("crates/ra-tools/src/skills_ns/catalog.rs", "SkillAuthority"),
     ("crates/ra-tools/src/skills_ns/catalog.rs", "SkillPackageId"),

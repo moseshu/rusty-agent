@@ -66,7 +66,7 @@ use crate::{
     context::RunContext,
     error::{Error, Result},
     hook::{CompactTrigger, HookEvent, UserHookDispatcher},
-    item::{Compaction, ItemId, ModelInputItem, ModelResponse, RunItem},
+    item::{Compaction, ItemId, Message, ModelInputItem, ModelResponse, RunItem},
     model::{ModelOutputSchema, ModelSettings, ProviderKey},
     prompt::{PromptSection, PromptSectionName, PromptSource},
     sandbox::{
@@ -441,6 +441,19 @@ pub trait Capability: Send + Sync + 'static {
     /// An implementation that also implements [`ContextProcessor`] returns `Some(self)`.
     fn context_processor(&self) -> Option<&dyn ContextProcessor> {
         None
+    }
+
+    /// Contributes contextual messages for newly accepted input before inference.
+    ///
+    /// This runtime extension ports Codex's turn-input contributor lifecycle. It is separate
+    /// from SDK system instructions and context projection: returned messages enter authoritative
+    /// history once, after blocking input guardrails. `input` excludes session history and previously
+    /// processed input. An empty slice still permits a capability to validate inference prerequisites.
+    /// The runtime retains pending input across cancellation and checkpoints, and commits the
+    /// messages only after every contributor succeeds. Implementations must tolerate retries.
+    async fn contribute_turn_input(&self, input: &[ModelInputItem]) -> Result<Vec<Message>> {
+        let _ = input;
+        Ok(Vec::new())
     }
 
     /// Binds this capability to the run it is about to serve.

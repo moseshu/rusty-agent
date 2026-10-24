@@ -960,6 +960,7 @@ impl Capability for SkillsCapability {
 pub struct SkillsNsCapability {
     tools: Vec<Arc<dyn Tool>>,
     catalog_prompt: Option<crate::skills_ns::SkillCatalogPrompt>,
+    required_skills: Vec<(String, Vec<String>)>,
 }
 
 impl fmt::Debug for SkillsNsCapability {
@@ -971,6 +972,36 @@ impl fmt::Debug for SkillsNsCapability {
 }
 
 impl SkillsNsCapability {
+    /// Retains environment requirement checks on a Host-only product surface.
+    /// Executor and Cloud inventories are used only for prerequisite validation: their tools,
+    /// catalogs and explicit invocation are withheld. Host skills retain their ordinary lifecycle.
+    pub fn host_catalog_with_requirements(
+        providers: crate::skills_ns::SkillProviders,
+        executor_roots: std::collections::BTreeMap<String, ra_exec::fs::Workspace>,
+    ) -> Result<Self> {
+        let mut capability = Self::new(providers, executor_roots, 0)?;
+        capability.tools.clear();
+        if let Some(prompt) = &mut capability.catalog_prompt {
+            prompt.use_host_surface();
+        }
+        Ok(capability)
+    }
+    /// Requires enabled skills bound to this environment before every model call.
+    /// Replaces the names previously selected for that environment; an empty list clears them.
+    /// This validates discovery without preloading the skill bodies.
+    #[must_use]
+    pub fn with_required_skills(
+        mut self,
+        environment_id: impl Into<String>,
+        skill_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        crate::skills_ns::set_required_skills(
+            &mut self.required_skills,
+            environment_id.into(),
+            skill_names.into_iter().map(Into::into).collect(),
+        );
+        self
+    }
     /// Builds the pair with one snapshot slot and independent grants keyed by executor authority.
     /// Executor discovery requires a provider and at least one root; cloud needs no executor
     /// roots. With neither source available, the capability contributes no tools.
@@ -989,6 +1020,7 @@ impl SkillsNsCapability {
         Ok(Self {
             tools: bundle.tools,
             catalog_prompt: bundle.prompt,
+            required_skills: Vec::new(),
         })
     }
 
@@ -1055,6 +1087,31 @@ impl Capability for SkillsNsCapability {
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.clone()
+    }
+
+    async fn contribute_turn_input(
+        &self,
+        input: &[ra_core::item::ModelInputItem],
+    ) -> Result<Vec<ra_core::item::Message>> {
+        if let Some(prompt) = &self.catalog_prompt {
+            prompt
+                .contribute_turn_input(input, &self.required_skills)
+                .await
+        } else {
+            crate::skills_ns::validate_required_skills(
+                None,
+                self.required_skills
+                    .iter()
+                    .map(|(environment_id, skill_names)| {
+                        crate::skills_ns::EnvironmentSkillRequirements {
+                            environment_id,
+                            skill_names,
+                        }
+                    }),
+            )
+            .map_err(ra_core::error::Error::config)?;
+            Ok(Vec::new())
+        }
     }
 
     fn bind(&self, context: &ra_core::context::RunContext) -> Result<Option<Arc<dyn Capability>>> {

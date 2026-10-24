@@ -207,6 +207,7 @@ impl CodingHost {
     /// together fails assembly. With neither source available, no tools are installed.
     /// The available-skills catalog is resolved per run, before the first model call. This does
     /// not discover disk skills; metadata comes from the configured providers.
+    /// Explicit dollar or linked mentions load selected main prompts into the run's user history.
     #[must_use]
     pub fn with_skill_providers(
         mut self,
@@ -229,7 +230,8 @@ impl CodingHost {
     }
 
     /// Configures the namespace catalog's model-window lookup, optional token override and usage
-    /// instructions. The window is resolved for each run, including its model override.
+    /// instructions, and optional environment skill prerequisites. The window is resolved for
+    /// each run, including its model override.
     /// This does not affect the independent merged catalog.
     #[must_use]
     pub fn with_skill_catalog_prompt(
@@ -434,9 +436,20 @@ impl CodingHost {
             }));
         }
         Some(providers)
-            .filter(|providers| self.uses_skills_namespace() || providers.has_host_provider())
+            .filter(|providers| {
+                self.uses_skills_namespace()
+                    || providers.has_host_provider()
+                    || self.skill_catalog_prompt.has_requirements()
+            })
             .map(|providers| {
                 let capability = if profile == crate::profile::CodingProfile::Core
+                    && self.skill_catalog_prompt.has_requirements()
+                {
+                    SkillsNsCapability::host_catalog_with_requirements(
+                        providers,
+                        self.skill_roots.clone(),
+                    )
+                } else if profile == crate::profile::CodingProfile::Core
                     && providers.has_host_provider()
                 {
                     SkillsNsCapability::host_catalog(providers)

@@ -4517,3 +4517,23 @@ async fn children_and_grandchildren_inherit_the_root_cache_override() {
         );
     }
 }
+
+#[test]
+fn skill_context_is_retained_without_becoming_a_fork_turn_boundary() {
+    let skill = ModelInputItem::Message(Message::user("<skill>private instructions</skill>"));
+    let history = vec![
+        ModelInputItem::Message(Message::user("first")),
+        ModelInputItem::Message(Message::assistant("first answer", OutputPhase::Final)),
+        ModelInputItem::Message(Message::user("second")),
+        skill.clone(),
+        ModelInputItem::Message(Message::assistant("second answer", OutputPhase::Final)),
+    ];
+    assert_eq!(
+        fork_history(&history, SpawnAgentForkMode::LastNTurns(1)),
+        history[2..]
+    );
+    assert_eq!(
+        fork_history(&history, SpawnAgentForkMode::FullHistory),
+        history
+    );
+}

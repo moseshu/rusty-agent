@@ -215,6 +215,16 @@ pub enum SkillScope {
     Admin,
 }
 
+/// Main-prompt behavior of skills discovered by the core-compatible Host loader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostSkillPromptKind {
+    /// Core Host skills retain the complete document and native locator.
+    Core,
+    /// Agent Plugin skills retain the native locator but bound their document to 8,000 bytes.
+    AgentPlugin,
+}
+
 /// Metadata shown in the always-visible skills catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillCatalogEntry {
@@ -235,6 +245,7 @@ pub struct SkillCatalogEntry {
     alias_root: Option<String>,
     alias_root_order: Option<usize>,
     prompt_scope: Option<SkillScope>,
+    pub(crate) host_prompt_kind: Option<HostSkillPromptKind>,
     /// Whether the skill may be listed or read.
     pub enabled: bool,
     /// Whether enabled metadata appears in model-visible discovery.
@@ -262,9 +273,17 @@ impl SkillCatalogEntry {
             alias_root: None,
             alias_root_order: None,
             prompt_scope: None,
+            host_prompt_kind: None,
             enabled: true,
             prompt_visible: true,
         }
+    }
+
+    /// Marks a discovered Host skill for the core Host prompt lifecycle.
+    #[must_use]
+    pub const fn with_host_prompt_kind(mut self, kind: HostSkillPromptKind) -> Self {
+        self.host_prompt_kind = Some(kind);
+        self
     }
 
     /// Sets the optional presentation locator without changing read routing.

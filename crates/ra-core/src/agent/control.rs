@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     item::{AgentId, Message, MessageRole, ModelInputItem, OutputPhase},
-    session::SessionId,
+    session::{SessionId, contextual::is_contextual_user_message},
 };
 
 /// Canonical path of an agent in its tree: `/root` for the root, `/root/<name>/...` below it.
@@ -604,7 +604,7 @@ fn is_fork_turn_boundary(item: &ModelInputItem) -> bool {
     let ModelInputItem::Message(message) = item else {
         return false;
     };
-    if message.role() != MessageRole::User {
+    if message.role() != MessageRole::User || is_contextual_user_message(message) {
         return false;
     }
     match InterAgentMessageKind::of(message) {

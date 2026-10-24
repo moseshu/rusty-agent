@@ -914,3 +914,344 @@ async fn discovering_an_external_plugin_does_not_grant_the_workspace_reader_acce
     Runner::run(built.bind(request)).await.unwrap();
     assert_eq!(*model.step.lock().unwrap(), 2);
 }
+
+struct InjectedModel {
+    expected: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Model for InjectedModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !request
+                .system_instructions()
+                .unwrap_or_default()
+                .contains("PRIVATE BODY")
+        );
+        let injected: Vec<_> = request
+            .input()
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message(message) => Some(message),
+                _ => None,
+            })
+            .flat_map(Message::content)
+            .filter_map(|content| content.as_text())
+            .filter(|text| text.starts_with("<skill>"))
+            .collect();
+        assert_eq!(injected, [self.expected.as_str()]);
+        Ok(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("answer"),
+            RunItemKind::Message(Message::assistant("complete", OutputPhase::Final)),
+        )]))
+    }
+}
+
+#[tokio::test]
+async fn production_host_mentions_read_only_the_selected_document_and_keep_core_contents_complete()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let path = skill(temp.path(), ".rusty-agent/skills/review", "review");
+    let path = fs::canonicalize(path).unwrap();
+    let body = format!(
+        "---\nname: review\ndescription: Review code.\n---\nPRIVATE BODY {}",
+        "é".repeat(5000)
+    );
+    fs::write(&path, &body).unwrap();
+    let host = CodingHost::open(temp.path())
+        .unwrap()
+        .with_skill_discovery(SkillDiscoveryConfig::new());
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &PromptRole::Main,
+        &host,
+        CodingProfile::Core,
+    )
+    .await
+    .unwrap();
+    for mention in [
+        "$review".to_string(),
+        format!("[$review]({})", path.display()),
+    ] {
+        let model = Arc::new(InjectedModel {
+            expected: format!(
+                "<skill>\n<name>review</name>\n<path>{}</path>\n{body}\n</skill>",
+                path.display()
+            ),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let request = RunRequest::new(
+            AgentBinding::direct(built.agent().clone()),
+            Arc::new(Resolver(model.clone())),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user(mention))],
+        )
+        .with_config(host.build_run_config())
+        .with_services(host.build_tool_services());
+        let result = Runner::run(built.bind(request)).await.unwrap();
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(result.state().generated_items().iter().filter(|item|matches!(item.kind(),RunItemKind::Message(m) if m.role()==ra_core::item::MessageRole::User)).count(),1);
+    }
+}
+
+#[tokio::test]
+async fn required_environment_skills_block_production_inference_even_on_core_surfaces() {
+    use ra_coding::skills::SkillCatalogPromptConfig;
+    use ra_exec::fs::Workspace;
+    use ra_tools::skills_ns::{
+        ExecutorSkillProvider, SkillProviders, catalog::*, provider::LOCAL_ENVIRONMENT_ID,
+    };
+    for available in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path()).unwrap();
+        let catalog = SkillCatalog {
+            entries: if available {
+                vec![
+                    SkillCatalogEntry::new(
+                        SkillPackageId("skill://root/review".into()),
+                        SkillAuthority::new(SkillSourceKind::Executor, "root"),
+                        "review",
+                        "Review code.",
+                        SkillResourceId::environment(
+                            "skill://root/review/SKILL.md",
+                            LOCAL_ENVIRONMENT_ID,
+                            temp.path().join("SKILL.md"),
+                        ),
+                    )
+                    .hidden_from_prompt(),
+                ]
+            } else {
+                vec![]
+            },
+            warnings: vec![],
+        };
+        let host = CodingHost::open(temp.path())
+            .unwrap()
+            .with_skill_providers(
+                SkillProviders::new()
+                    .with_executor_provider(Arc::new(ExecutorSkillProvider::new(catalog))),
+                [("root".into(), workspace)].into(),
+            )
+            .with_skill_catalog_prompt(
+                SkillCatalogPromptConfig::new()
+                    .with_required_skills(LOCAL_ENVIRONMENT_ID, ["review"]),
+            );
+        let built = ra_coding::build_agent_with_control(
+            AgentId::new("coding"),
+            "Coding",
+            &PromptRole::Main,
+            &host,
+            CodingProfile::Core,
+        )
+        .await
+        .unwrap();
+        let model = Arc::new(PrerequisiteModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let request = RunRequest::new(
+            AgentBinding::direct(built.agent().clone()),
+            Arc::new(Resolver(model.clone())),
+            RunId::generate(),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user(
+                "Review the workspace",
+            ))],
+        )
+        .with_config(host.build_run_config())
+        .with_services(host.build_tool_services());
+        let result = Runner::run(built.bind(request)).await;
+        assert_eq!(result.is_ok(), available);
+        assert_eq!(
+            model.calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(available)
+        );
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains(
+                    "Required skill \"review\" from environment \"local\" is unavailable"
+                )
+            );
+        }
+    }
+}
+struct PrerequisiteModel {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl Model for PrerequisiteModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !request
+                .tools()
+                .iter()
+                .any(|tool| tool.qualified_name().starts_with("skills."))
+        );
+        assert!(
+            !request
+                .system_instructions()
+                .unwrap_or_default()
+                .contains("executor package")
+        );
+        Ok(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("answer"),
+            RunItemKind::Message(Message::assistant("complete", OutputPhase::Final)),
+        )]))
+    }
+}
+
+struct FailingForeignHost {
+    path: String,
+}
+impl ra_tools::skills_ns::SkillProvider for FailingForeignHost {
+    fn list(
+        &self,
+        _: ra_tools::skills_ns::provider::SkillListQuery,
+    ) -> ra_tools::skills_ns::provider::SkillProviderFuture<
+        '_,
+        ra_tools::skills_ns::catalog::SkillCatalog,
+    > {
+        Box::pin(async {
+            use ra_tools::skills_ns::catalog::*;
+            Ok(SkillCatalog {
+                entries: vec![SkillCatalogEntry::new(
+                    SkillPackageId(self.path.clone()),
+                    SkillAuthority::new(SkillSourceKind::Host, "foreign"),
+                    "foreign",
+                    "Foreign skill",
+                    SkillResourceId::new(self.path.clone()),
+                )],
+                warnings: vec![],
+            })
+        })
+    }
+    fn read<'a>(
+        &'a self,
+        _: ra_tools::skills_ns::provider::SkillReadRequest<'a>,
+    ) -> ra_tools::skills_ns::provider::SkillProviderFuture<
+        'a,
+        ra_tools::skills_ns::catalog::SkillReadResult,
+    > {
+        Box::pin(async {
+            Err(ra_tools::skills_ns::catalog::SkillProviderError::new(
+                "foreign provider unavailable",
+            ))
+        })
+    }
+}
+struct NoInjectedSkill;
+#[async_trait]
+impl Model for NoInjectedSkill {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        assert!(
+            !request
+                .input()
+                .iter()
+                .filter_map(|item| match item {
+                    ModelInputItem::Message(message) => Some(message),
+                    _ => None,
+                })
+                .flat_map(Message::content)
+                .filter_map(|block| block.as_text())
+                .any(|text| text.starts_with("<skill>"))
+        );
+        Ok(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("answer"),
+            RunItemKind::Message(Message::assistant("complete", OutputPhase::Final)),
+        )]))
+    }
+}
+#[tokio::test]
+async fn builtin_host_reads_cannot_fall_back_to_resources_outside_the_loaded_snapshot() {
+    let coding = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    skill(coding.path(), ".rusty-agent/skills/known", "known");
+    let foreign_path = write(foreign.path(), "SKILL.md", "UNLOADED SECRET");
+    let host = CodingHost::open(coding.path())
+        .unwrap()
+        .with_skill_discovery(SkillDiscoveryConfig::new())
+        .with_skill_providers(
+            ra_tools::skills_ns::SkillProviders::new().with_host_provider(Arc::new(
+                FailingForeignHost {
+                    path: foreign_path.to_str().unwrap().into(),
+                },
+            )),
+            Default::default(),
+        );
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &PromptRole::Main,
+        &host,
+        CodingProfile::Core,
+    )
+    .await
+    .unwrap();
+    let request = RunRequest::new(
+        AgentBinding::direct(built.agent().clone()),
+        Arc::new(Resolver(Arc::new(NoInjectedSkill))),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("$foreign"))],
+    )
+    .with_config(host.build_run_config())
+    .with_services(host.build_tool_services());
+    Runner::run(built.bind(request)).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn builtin_host_fallback_reads_the_snapshot_path_after_lexical_resolution() {
+    use std::os::unix::fs::symlink;
+    let coding = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    let known =
+        fs::canonicalize(skill(coding.path(), ".rusty-agent/skills/known", "known")).unwrap();
+    let known_body = fs::read_to_string(&known).unwrap();
+    write(foreign.path(), "SKILL.md", "UNLOADED SECRET");
+    fs::create_dir(foreign.path().join("nested")).unwrap();
+    let alias = known.parent().unwrap().join("alias");
+    symlink(foreign.path().join("nested"), &alias).unwrap();
+    let requested = alias.join("..").join("SKILL.md");
+    assert_eq!(fs::read_to_string(&requested).unwrap(), "UNLOADED SECRET");
+    let host = CodingHost::open(coding.path())
+        .unwrap()
+        .with_skill_discovery(SkillDiscoveryConfig::new())
+        .with_skill_providers(
+            ra_tools::skills_ns::SkillProviders::new().with_host_provider(Arc::new(
+                FailingForeignHost {
+                    path: requested.to_str().unwrap().into(),
+                },
+            )),
+            Default::default(),
+        );
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &PromptRole::Main,
+        &host,
+        CodingProfile::Core,
+    )
+    .await
+    .unwrap();
+    let model = Arc::new(InjectedModel {
+        expected: format!(
+            "<skill>\n<name>foreign</name>\n<path>{}</path>\n{known_body}\n</skill>",
+            requested.display()
+        ),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let request = RunRequest::new(
+        AgentBinding::direct(built.agent().clone()),
+        Arc::new(Resolver(model)),
+        RunId::generate(),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("$foreign"))],
+    )
+    .with_config(host.build_run_config())
+    .with_services(host.build_tool_services());
+    Runner::run(built.bind(request)).await.unwrap();
+}

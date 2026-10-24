@@ -365,6 +365,39 @@ RunState schema 15 records the new rule field. Reading schemas through 14 drops 
 session rules, so future calls require fresh approval. Exact pending-call answers remain intact.
 The migration runs only for old schemas. A current-schema rule is not silently discarded.
 
+### Contextual input contributions and skill mentions
+
+`Capability::contribute_turn_input` is an optional runtime extension for contextual messages;
+SDK dynamic/system instructions keep their existing behavior. The runner supplies only newly
+accepted input, excluding session history and input dropped by a session callback. Blocking input
+guardrails run first. Returned messages enter authoritative history atomically after all installed
+contributors succeed; they reach Session persistence and rollout recording as ordinary items.
+
+RunState schema 16 adds `pending_input_contributions`, defaulting to an empty list for old states.
+It retains accepted input across a failed or cancelled contribution and is cleared after commit.
+Errors at this new preparation boundary carry a checkpoint. Older runtimes preserve the field as
+unknown data but cannot finish the pending contribution before inference. Existing model-error
+checkpoint rules are unchanged.
+
+Explicitly configured Codex skill catalogs now load `$name` or `[$name](path)` selections before
+inference. Extension main prompts are bounded to 8,000 UTF-8 bytes, names to 256 and locators to
+1,024; full resource metadata and `skills.read` contents remain intact. Core Host skills retain
+complete documents and locators, while Agent Plugin documents use the 8,000-byte bound. Hidden
+skills remain explicitly invocable; disabled skills do not. The merged `skill` compatibility
+extension and sandbox `load_skill` retain their separate contracts.
+
+Selected `<skill>` user-role fragments remain in model history but are hidden from client thread
+items and excluded from stored/user-fork turn boundaries. Marker recognition also handles older
+records without annotations. Core Host text links expand `~` and require absolute native paths;
+`file://` and relative text links are rejected. Only structured Skill inputs resolve relative paths
+against the process cwd.
+
+`SkillCatalogPromptConfig::with_required_skills(environment_id, names)` opts into source-scoped
+prerequisites. It checks enabled discovery entries bound to that environment before each model
+call, without reading their bodies. Core surfaces retain these checks even when namespace tools
+are withheld. Reconfigure the selected requirements on the next run or checkpoint resume to
+remove an environment requirement; no environment manager or OpenAI account backend is added.
+
 ### Dynamic instructions are system instructions
 
 Static, synchronous, and asynchronous instruction callbacks now all supply the model's system

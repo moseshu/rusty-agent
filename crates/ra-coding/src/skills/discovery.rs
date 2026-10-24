@@ -11,8 +11,8 @@ use ra_core::error::{Error, Result};
 use ra_tools::skills_ns::{
     SkillProvider,
     catalog::{
-        SkillAuthority, SkillCatalog, SkillCatalogEntry, SkillPackageId, SkillResourceId,
-        SkillScope, SkillSourceKind,
+        HostSkillPromptKind, SkillAuthority, SkillCatalog, SkillCatalogEntry, SkillPackageId,
+        SkillResourceId, SkillScope, SkillSourceKind,
     },
     provider::{SkillListQuery, SkillProviderFuture, SkillReadRequest},
 };
@@ -320,6 +320,11 @@ fn load_root(
             parsed.description,
             SkillResourceId::new(display.clone()),
         )
+        .with_host_prompt_kind(if mode == SkillDiscoveryMode::DirectChildren {
+            HostSkillPromptKind::AgentPlugin
+        } else {
+            HostSkillPromptKind::Core
+        })
         .with_display_path(discovered.to_string_lossy().replace('\\', "/"))
         .with_short_description(parsed.short_description)
         .with_prompt_scope(if plugin.is_some() {
@@ -547,12 +552,41 @@ impl SkillProvider for HostSkillProvider {
     }
     fn read<'a>(
         &'a self,
-        _: SkillReadRequest<'a>,
+        request: SkillReadRequest<'a>,
     ) -> SkillProviderFuture<'a, ra_tools::skills_ns::catalog::SkillReadResult> {
-        Box::pin(async {
-            Err(ra_tools::skills_ns::catalog::SkillProviderError::new(
-                "Host skills are read with filesystem tools",
-            ))
+        Box::pin(async move {
+            use ra_tools::skills_ns::{
+                catalog::{SkillProviderError, SkillReadResult},
+                provider::SkillReadContext,
+            };
+            let SkillReadContext::Host {
+                snapshot: Some(snapshot),
+            } = request.context
+            else {
+                return Err(SkillProviderError::new(
+                    "host skill provider requires a host skills snapshot",
+                ));
+            };
+            let Some(resource_path) = snapshot.resource_path(request.resource.as_str()) else {
+                return Err(SkillProviderError::new(format!(
+                    "host skill resource is not loaded: {}",
+                    request.resource.as_str()
+                )));
+            };
+            // The run catalog supplies the discovered locator. Selection grants no filesystem
+            // permissions; Host reads retain the host's ambient access, as in Codex's snapshot.
+            let contents = tokio::fs::read_to_string(resource_path)
+                .await
+                .map_err(|error| {
+                    SkillProviderError::new(format!(
+                        "failed to read host skill resource {}: {error}",
+                        request.resource.as_str()
+                    ))
+                })?;
+            Ok(SkillReadResult {
+                resource: request.resource,
+                contents,
+            })
         })
     }
 }

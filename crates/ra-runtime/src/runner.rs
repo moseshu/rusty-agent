@@ -1506,6 +1506,8 @@ struct TurnLoopContext<'a> {
     deferred_prompts: &'a [DeferredPrompt],
     /// Run-bound processors remain separate from declarative settings snapshots.
     capability_processors: &'a [Arc<dyn ContextProcessor>],
+    /// Bound contributors process accepted input independently of model history projections.
+    input_contributors: &'a [Arc<dyn Capability>],
     /// Declaration-owned preparation, reused when control returns to that declaration.
     capabilities: &'a RunCapabilities,
     /// Prepares sandbox agents before their turns.
@@ -2079,6 +2081,11 @@ async fn run_loop_inner(
     let _deadline = arm_deadline(&cancel);
 
     let resuming = state.current_agent().is_some();
+    let mut new_turn_input = if resuming {
+        Vec::new()
+    } else {
+        requested_input.clone()
+    };
     // A segment that answers questions the last one stopped on finishes that turn rather than
     // starting a new one, which is what the agent tree's budget reminder is keyed to.
     let continues_turn = !state.pending_interruptions().is_empty()
@@ -2130,10 +2137,17 @@ async fn run_loop_inner(
             }
         }
     };
+    if !resuming && session.is_some() {
+        new_turn_input = session_input
+            .iter()
+            .filter_map(RunItem::to_model_input)
+            .collect();
+    }
     if let Err(error) = state.begin_segment(agent.public_id().clone(), requested_input.clone()) {
         ra_core::trace::record_error(span, &error);
         return Err(error);
     }
+    state.queue_input_contributions(new_turn_input);
     if session.is_some() {
         state.bind_session_persistence();
     }
@@ -2240,6 +2254,9 @@ async fn run_loop_inner(
         capability_processors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.context_processors),
+        input_contributors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.input_contributors),
         capabilities: &capabilities,
         sandbox,
         agent_mail: agent_handle.as_ref(),
@@ -2769,6 +2786,7 @@ struct PreparedRunCapabilities {
     agent: AgentBinding,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
     deferred_prompts: Vec<DeferredPrompt>,
+    input_contributors: Vec<Arc<dyn Capability>>,
 }
 
 /// Like the SDK's agent-instance cache, all contribution channels share one preparation.
@@ -2872,6 +2890,7 @@ async fn assemble_capabilities(
         agent: execution,
         context_processors: assembled.context_processors().to_vec(),
         deferred_prompts: assembled.deferred_prompts().to_vec(),
+        input_contributors: assembled.capabilities().to_vec(),
     })
 }
 
@@ -4807,6 +4826,9 @@ async fn run_one_turn(
         capability_processors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.context_processors),
+        input_contributors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.input_contributors),
         ..*context
     };
     let context = &step_context;
@@ -4828,6 +4850,9 @@ async fn run_one_turn(
     // one; either delivery is persisted once it is recorded.
     let delivered_mail = deliver_agent_mail(context, state, progress, turn_scope);
     let delivered_input = deliver_pending_input(context, state, progress, turn_scope);
+    contribute_turn_input(context, state, progress.reference_turn(), turn_scope)
+        .await
+        .map_err(|error| error.with_run_state(state.clone()))?;
     if (delivered_mail || delivered_input)
         && let Some(rollout) = context.events.rollout
     {
@@ -5500,6 +5525,7 @@ fn deliver_pending_input(
     if messages.is_empty() {
         return false;
     }
+    state.queue_input_contributions(messages.iter().cloned().map(ModelInputItem::Message));
     // Numbered by the whole run's turn, like mail, so a resumed segment does not collide with what
     // an earlier one recorded.
     let turn = progress.reference_turn();
@@ -5518,6 +5544,42 @@ fn deliver_pending_input(
     }
     state.record_generated_items(items);
     true
+}
+
+/// Commits contextual input atomically, leaving accepted input retryable on failure or cancellation.
+async fn contribute_turn_input(
+    context: &TurnLoopContext<'_>,
+    state: &mut RunState,
+    turn: u64,
+    cancel: &CancelScope,
+) -> Result<()> {
+    let mut messages = Vec::new();
+    for contributor in context.input_contributors {
+        messages.extend(
+            cancel
+                .run(contributor.contribute_turn_input(state.pending_input_contributions()))
+                .await??,
+        );
+    }
+    let items: Vec<_> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            RunItem::new(
+                ItemId::new(format!(
+                    "input-context-{turn}-{}-{index}",
+                    state.generated_items().len()
+                )),
+                RunItemKind::Message(message),
+            )
+        })
+        .collect();
+    for item in &items {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    state.record_generated_items(items);
+    state.clear_input_contributions();
+    Ok(())
 }
 
 /// Whether a run that reached `outcome` carries on because input is pending: Codex's follow-up on

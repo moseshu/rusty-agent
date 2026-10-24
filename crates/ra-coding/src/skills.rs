@@ -34,9 +34,30 @@ pub struct SkillCatalogPromptConfig {
     context_windows: ContextWindowConfig,
     max_context_tokens: Option<NonZeroUsize>,
     include_skills_usage_instructions: bool,
+    required_skills: Vec<(String, Vec<String>)>,
 }
 
 impl SkillCatalogPromptConfig {
+    pub(crate) fn has_requirements(&self) -> bool {
+        !self.required_skills.is_empty()
+    }
+    /// Requires exact skill names from a selected environment before inference.
+    /// Requirements are scoped by the main resource's environment binding, including Cloud
+    /// resources. They do not select or read skills. Replaces this environment's previous list.
+    /// Selection order is retained; an empty list removes the environment requirement.
+    #[must_use]
+    pub fn with_required_skills(
+        mut self,
+        environment_id: impl Into<String>,
+        skill_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        ra_tools::skills_ns::set_required_skills(
+            &mut self.required_skills,
+            environment_id.into(),
+            skill_names.into_iter().map(Into::into).collect(),
+        );
+        self
+    }
     /// Uses the Codex catalog context-window table with upstream catalog defaults.
     #[must_use]
     pub fn new() -> Self {
@@ -128,6 +149,9 @@ impl Capability for SkillCatalogCapability {
         }
         if self.config.include_skills_usage_instructions {
             capability = capability.with_skills_usage_instructions();
+        }
+        for (environment, names) in &self.config.required_skills {
+            capability = capability.with_required_skills(environment, names.iter().cloned());
         }
         capability.bind(context)
     }

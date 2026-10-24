@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(15);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(16);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -198,10 +198,15 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          resumes under whatever limit the host supplies.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(15),
         "Persisted the agent that owns each sticky permission rule, so an `always` answer covers \
          only that agent's later calls. Reading an older checkpoint drops its ownerless sticky \
          rules and asks again. An older runtime cannot read a session rule that carries an owner.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted accepted input awaiting contextual contributions. An older runtime may infer \
+         without completing those contributions after a cancelled preparation.",
     ),
 ];
 
@@ -1084,6 +1089,8 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     original_input: Vec<ModelInputItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_input_contributions: Vec<ModelInputItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     generated_items: Vec<RunItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     model_responses: Vec<ModelResponse>,
@@ -1211,6 +1218,8 @@ struct RunStateRecord {
     #[serde(default)]
     original_input: Vec<ModelInputItem>,
     #[serde(default)]
+    pending_input_contributions: Vec<ModelInputItem>,
+    #[serde(default)]
     generated_items: Vec<RunItem>,
     #[serde(default)]
     model_responses: Vec<ModelResponse>,
@@ -1295,6 +1304,7 @@ impl TryFrom<RunStateRecord> for RunState {
             starting_agent,
             current_agent,
             original_input,
+            pending_input_contributions,
             generated_items,
             model_responses,
             pending_interruptions,
@@ -1360,6 +1370,7 @@ impl TryFrom<RunStateRecord> for RunState {
         // can tell.
         if current_agent.is_none()
             && !(original_input.is_empty()
+                && pending_input_contributions.is_empty()
                 && generated_items.is_empty()
                 && model_responses.is_empty())
         {
@@ -1444,6 +1455,7 @@ impl TryFrom<RunStateRecord> for RunState {
             starting_agent,
             current_agent,
             original_input,
+            pending_input_contributions,
             generated_items,
             model_responses,
             pending_interruptions,
@@ -1512,6 +1524,7 @@ impl RunState {
             starting_agent: None,
             current_agent: None,
             original_input: Vec::new(),
+            pending_input_contributions: Vec::new(),
             generated_items: Vec::new(),
             model_responses: Vec::new(),
             pending_interruptions: Vec::new(),
@@ -1937,6 +1950,24 @@ impl RunState {
     #[must_use]
     pub fn original_input(&self) -> &[ModelInputItem] {
         &self.original_input
+    }
+
+    /// Accepted input whose contextual contributors have not committed yet.
+    #[must_use]
+    pub fn pending_input_contributions(&self) -> &[ModelInputItem] {
+        &self.pending_input_contributions
+    }
+
+    /// Queues newly accepted input, excluding prior session history.
+    #[doc(hidden)]
+    pub fn queue_input_contributions(&mut self, input: impl IntoIterator<Item = ModelInputItem>) {
+        self.pending_input_contributions.extend(input);
+    }
+
+    /// Acknowledges the input after all contextual messages have entered history.
+    #[doc(hidden)]
+    pub fn clear_input_contributions(&mut self) {
+        self.pending_input_contributions.clear();
     }
 
     /// Whether the model input is reconstructible from this state alone.

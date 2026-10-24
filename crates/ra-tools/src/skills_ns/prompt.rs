@@ -19,6 +19,7 @@ pub(crate) struct SkillCatalogPrompt {
     context_window: Option<i64>,
     max_context_tokens: Option<NonZeroUsize>,
     include_skills_usage_instructions: bool,
+    host_surface: bool,
 }
 
 impl SkillCatalogPrompt {
@@ -29,6 +30,7 @@ impl SkillCatalogPrompt {
             context_window: None,
             max_context_tokens: None,
             include_skills_usage_instructions: false,
+            host_surface: false,
         }
     }
 
@@ -42,6 +44,23 @@ impl SkillCatalogPrompt {
 
     pub(crate) fn include_usage_instructions(&mut self) {
         self.include_skills_usage_instructions = true;
+    }
+
+    pub(crate) fn use_host_surface(&mut self) {
+        self.host_surface = true;
+    }
+
+    pub(crate) async fn contribute_turn_input(
+        &self,
+        input: &[ra_core::item::ModelInputItem],
+        required: &[(String, Vec<String>)],
+    ) -> ra_core::error::Result<Vec<ra_core::item::Message>> {
+        let Some(run_id) = &self.run_id else {
+            return Ok(Vec::new());
+        };
+        self.context
+            .contribute_turn_input(run_id, input, required, self.host_surface)
+            .await
     }
 
     fn metadata_budget(&self) -> SkillMetadataBudget {
@@ -70,6 +89,10 @@ impl SkillCatalogPrompt {
             SkillToolAuthoritySelector::Executor,
             SkillToolAuthoritySelector::Cloud,
         ] {
+            if self.host_surface {
+                catalogs.push(super::catalog::SkillCatalog::default());
+                continue;
+            }
             let mut source = self.context.catalog_for_run(run_id, selector).await;
             source.entries.retain(|entry| {
                 SkillToolAuthority::from_authority(&entry.authority)

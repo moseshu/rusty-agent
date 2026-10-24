@@ -61,6 +61,13 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-tools/src/skills_ns/read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/read.rs |
 | `crates/ra-tools/src/skills_ns/catalog_prompt.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/catalog_prompt.rs; fragments.rs; codex-rs/context-fragments/src/fragment.rs |
 | `crates/ra-tools/src/skills_ns/prompt.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/extension.rs; world_state_catalogs.rs |
+| `crates/ra-core/src/session/contextual.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/lib.rs::is_skill_prompt_fragment; codex-rs/context-fragments/src/fragment.rs::matches_marked_text; codex-rs/core/src/context/contextual_user_message.rs |
+| `crates/ra-tools/src/skills_ns/mentions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/mentions.rs |
+| `crates/ra-tools/src/skills_ns/selection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/selection.rs |
+| `crates/ra-tools/src/skills_ns/host_snapshot.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_snapshot.rs; provider/host.rs |
+| `crates/ra-tools/src/skills_ns/host_selection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/selection.rs; name_counts.rs; codex-rs/utils/absolute-path/src/lib.rs (home expansion and absolute/relative input rules) |
+| `crates/ra-tools/src/skills_ns/invocation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/extension.rs::contribute/read_main_prompt; fragments.rs; host_prompt.rs |
+| `crates/ra-tools/src/skills_ns/required.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/required.rs |
 | `crates/ra-tools/src/skills_ns/schema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/tools/schema.rs |
 | `crates/ra-tools/src/skills_ns/render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/render.rs |
 | `crates/ra-tools/src/skills_ns/warnings.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/warnings.rs |
