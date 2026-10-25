@@ -4,6 +4,7 @@
 //! create MCP connections, register agents, or execute hook declarations.
 //! The Store installs only explicitly supplied local directories; it does not enable plugins.
 //! Explicit materialization runs Git/npm and owns temporary source files through the returned value.
+//! Plugin activation and marketplace configuration values belong to [`crate::config`].
 //! Host resources use the existing absolute-path type; generic manifest resource mapping remains
 //! available without claiming executor filesystem or URI authority support.
 

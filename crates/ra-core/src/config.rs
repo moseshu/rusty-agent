@@ -7,8 +7,9 @@
 //! and are carried by [`Layered<T>`]. What lives here is the machinery for "where a value came
 //! from, what overrode what, and why something did not take effect". Reading files and environment
 //! variables is likewise elsewhere: `ra-core` performs no IO, so this module only fixes the **path
-//! and naming conventions** ([`CONFIG_DIR_NAME`], [`env_key`]) while discovery and parsing belong
-//! to `ra-cli`.
+//! and naming conventions** ([`CONFIG_DIR_NAME`], [`env_key`]). Hosts that select this helper own
+//! discovery and parsing. The coding product uses its separate Codex configuration contract;
+//! this helper does not reparse, merge or attribute that product's configuration stack.
 //!
 //! # Six sources, lowest to highest precedence
 //!
@@ -29,12 +30,12 @@
 //! **1. Nothing external is read by default.** [`SourceSelection::default`] is
 //! [`SourceSelection::isolated`], so only `Builtin` and `Explicit` apply. When the framework is
 //! embedded in someone else's process, quietly reading `~/.rusty-agent/config.toml` is
-//! unacceptable — that is the host application's user directory, not ours. `ra-cli` opens things
-//! up by calling [`SourceSelection::all`] explicitly. This mirrors claude's `setting_sources`:
-//! **sources are selected, not discovered**.
+//! unacceptable — that is the host application's user directory, not ours. A host may select
+//! [`SourceSelection::all`] explicitly. Selection governs only values already supplied to this
+//! helper; it does not discover or read any external configuration.
 //!
-//! **2. Excluded sources stay visible in diagnostics.** The isolation switch (mirroring
-//! `strict_mcp_config`) makes on-disk configuration inert, but if `doctor` showed only the
+//! **2. Excluded sources stay visible in diagnostics.** Source selection makes excluded values
+//! inert, but if a diagnostic showed only the
 //! effective value the user would be stuck on "I clearly wrote that config, why is it ignored".
 //! So [`FieldReport`] lists every layer and distinguishes [`LayerStatus::Shadowed`] (a higher
 //! layer won) from [`LayerStatus::Excluded`] (the source was never enabled) — **the two kinds of
@@ -176,7 +177,7 @@ impl fmt::Display for SettingSource {
 ///
 /// ```ignore
 /// let isolated = SourceSelection::isolated();     // built-in defaults plus caller input only
-/// let usual = SourceSelection::all();             // what ra-cli uses
+/// let usual = SourceSelection::all();             // a host selects every generic source
 /// let custom = SourceSelection::isolated().with(SettingSource::Env); // CI: environment only
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

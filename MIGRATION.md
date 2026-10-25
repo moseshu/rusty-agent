@@ -7,6 +7,75 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Product configuration sources and composition primitives
+
+`ra_coding::config` adds the Codex product source identities, metadata, source display,
+`merge_toml_values`, `build_cli_overrides_layer`, shell-filter helpers and `version_for_toml`.
+These APIs compose explicitly supplied values. They do not discover files, construct an effective
+configuration stack, enforce requirements or configure a running host. Product loading remains
+in progress; no configuration file or environment variable is newly read by these primitives.
+
+The product configuration contract follows Codex, independently of `ra_core::config`'s generic
+six-source helpers. The latter retain their API, source order, isolation defaults, naming constants
+and behavior. Their documentation now describes host-selected generic sources instead of claiming
+that the CLI already calls `SourceSelection::all()`. The product will not run values through a
+second generic parse/merge/origin pass. The agreed product loader retains `.rusty-agent/config.toml`
+for user/project files and does not automatically discover `config.local.toml` or generic `RA_*`
+overrides. Dedicated home/platform source adaptation belongs to the actual loader implementation.
+
+`ConfigLayerSource` retains distinct packaged, managed, system, base-user, selected-profile,
+project, session and legacy-managed identities. Equality compares identity fields; partial order
+compares precedence, so different project files can have equal precedence. Legacy managed layers
+remain above session flags. The upstream `dot_codex_folder` field name is retained for API parity;
+its value is the selected product project configuration directory.
+
+Composition preserves recursive tables, replacement of ordinary arrays/scalars, canonical aliases,
+sparse-overlay preservation of unrelated aliases, structured feature boolean/table compatibility,
+credential-source reassignment, host-key normalization and shell-filter representation changes.
+It is the ordinary config merge contract; requirements have separate field-specific semantics and
+are not implemented by this helper. Session dotted-path writes preserve input order. Fingerprints
+retain the exact `sha256:` encoding over recursively sorted JSON, including array order.
+
+`ra-coding` enables TOML's `preserve_order` feature as upstream does. Table iteration order is part
+of the policy contract: when domain or filter keys normalize to the same key, the later declaration
+wins; case-insensitive filter lookup returns the first matching declaration. Using sorted tables
+instead can reverse allow/deny or include/exclude decisions even with identical merge code.
+
+The three typed ConfigToml assertions associated with the ported merge fixtures remain pending
+until that schema exists. Passing raw-value tests does not establish loader, trust or
+requirements parity.
+
+### Explicit plugin configuration values
+
+`ra_coding::config` owns the Codex plugin and marketplace configuration value types in
+`config/types.rs`, and the shared `AppToolApproval` / `McpServerToolConfig` types in
+`config/mcp_types.rs`. Plugins consume these product configuration types. Values include optional
+activation overrides, `_default`, per-server and per-tool policy, and marketplace origin metadata,
+and can be deserialized from explicitly supplied TOML or JSON. This module does
+not discover configuration files, resolve layers or requirements, enable installed plugins, or load
+skills, MCP servers, apps or hooks. The product configuration loader remains a prerequisite for
+those consumers; the existing framework configuration mechanism and source conventions are unchanged.
+
+`PluginsConfigToml::default()` has no `_default` entry. An empty explicit `_default` table enables
+plugins by default. `PluginConfig.enabled` remains `Option<bool>`. `allows_plugin` is a policy
+predicate: without `_default` it returns true, including for entries with `enabled = false`.
+The upstream loader applies `entry.enabled.unwrap_or(true) && policy.allows_plugin(id)`, where
+`entry` is the configured plugin entry after layer merging and `policy` is the plugin policy value.
+An entry with `enabled = false` remains disabled without `_default` because the first operand is
+false. Callers must not use `allows_plugin` alone as a complete activation decision. Configuration
+parsing does not validate plugin IDs.
+
+Product `AppToolApproval` retains `auto`, `prompt`, `writes` and `approve`, independently of the
+Agents SDK's MCP `require_approval` settings. Its restriction operation preserves the upstream
+intersection, including `auto` with `writes` becoming `prompt`. Output budgets remain nonzero and
+restriction takes the lower explicit limit without changing approval. These value operations do
+not apply either of the upstream installed/selected MCP overlay paths to running servers.
+
+The presence of `ema_auth`, including null or false, retains the unsupported-overlay marker through
+serialization. A future loader must consume it as a server denial; parsing alone does not change
+`enabled`. No retired authentication implementation is added. The upstream serde and JsonSchema
+behavior is preserved: schema restrictions do not add `serde(deny_unknown_fields)` to these types.
+
 ### Explicit Git/npm plugin source materialization
 
 `ra_coding::plugins::materialize::materialize_marketplace_plugin_source(&Path, &MarketplacePluginSource)`

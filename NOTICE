@@ -40,6 +40,17 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/config/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
+| `crates/ra-coding/src/config/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |
+| `crates/ra-coding/src/config/key_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/key_aliases.rs |
+| `crates/ra-coding/src/config/overrides.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/overrides.rs |
+| `crates/ra-coding/src/config/fingerprint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint.rs::version_for_toml (source-origin traversal awaits the real layer stack) |
+| `crates/ra-coding/src/config/domain.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs::normalize_host/normalize_dns_host_or_ip_literal/normalize_ip_literal |
+| `tests/it-coding/tests/config_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge_tests.rs (all 25 raw-TOML fixtures; three typed ConfigToml projection assertions await the product schema) |
+| `tests/it-coding/tests/config_primitives.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint_tests.rs; network-proxy/src/domain_matcher_tests.rs (host cases through public merge); config/src/{config_layer_source,merge,overrides}.rs (public contract regressions) |
+| `crates/ra-coding/src/config/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs::PluginsDefaultConfig/PluginsConfigToml/PluginConfig/PluginMcpServerConfig/MarketplaceConfig/MarketplaceSourceType (configuration values and pure policy operations only) |
+| `crates/ra-coding/src/config/mcp_types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types.rs::AppToolApproval/McpServerToolConfig (shared product MCP configuration values and pure policy operations) |
+| `tests/it-coding/tests/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types_tests.rs::plugin_activation_inherits_defaults_without_explicit_enablement; mcp_types_tests.rs::app_tool_approval_restrictions_never_weaken_either_policy; core-plugins/src/loader_tests.rs::legacy_ema_policy_disables_installed_and_selected_plugin_servers (serialization assertions only); types.rs/mcp_types.rs (additional configuration-value regressions) |
 | `crates/ra-coding/src/plugins/materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::MaterializedMarketplacePluginSource/materialize_marketplace_plugin_source/materialize_marketplace_plugin_source_with_mode/clone_git_plugin_source/run_git/run_git_output |
 | `crates/ra-coding/src/plugins/materialize/test_api.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{loader,git_policy,npm_source,plugin_bundle_archive}.rs (thin external-test access to original helpers and error records) |
 | `crates/ra-coding/src/plugins/git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/git_policy.rs; git-utils/src/lib.rs::SAFE_BARE_REPOSITORY_CONFIG; utils/absolute-path/src/lib.rs::canonicalize |
