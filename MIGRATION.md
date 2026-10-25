@@ -7,6 +7,48 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Read-only plugin marketplaces and source descriptors
+
+`ra_coding::plugins::marketplace` adds the Codex catalog list/load/find APIs for explicitly
+supplied Host roots and home discovery. Supported layouts, in precedence order, are
+`.agents/plugins/marketplace.json`, `.agents/plugins/api_marketplace.json`,
+`.claude-plugin/marketplace.json`, and `.cursor-plugin/marketplace.json`. Home precedes selected
+roots; catalogs are deduplicated by native path, while distinct catalogs with the same name remain
+distinct. A selected root can also be a supported manifest file or a nested directory in a Git
+checkout. These functions read local catalogs and manifests without creating a Store or starting
+Git, npm, HTTP requests, installation, authentication, or configuration writes.
+
+Local sources resolve against the marketplace root, with the upstream `./` requirement and
+Cursor-layout exception. Git/npm sources remain descriptors. Remote fallback manifests expose
+metadata only: resource paths and interface assets are removed from parsed listing metadata,
+while the generated JSON remains available to a future installer. A selected real local manifest
+does not fall back to catalog metadata when parsing fails. Invalid source entries are skipped;
+malformed catalog JSON or typed policy fields still fail the catalog. `find_marketplace_plugin`
+selects the first resolvable duplicate. `find_installable_marketplace_plugin` then applies
+installation and product restrictions without installing anything: missing products are unrestricted,
+an explicit empty list rejects selection, and a nonempty list requires a matching explicit product.
+
+The Local/Git marketplace-origin parser and staging admission helpers remain internal, as upstream;
+registration and materialization consumers are not included yet. Origin parsing retains its own
+reference precedence, local canonicalization, tilde expansion and URL rules; these intentionally
+differ from plugin source descriptors. Standalone catalog functions use a disabled manifest cache;
+the internal owner-aware list path accepts the existing Store-owned cache for later manager use.
+`MarketplaceAddError` retains the upstream public declaration for future public registration
+operations and is also returned by the feature-gated test bridge. Its presence does not add a
+registration operation to the default build.
+
+`ra_protocol::server::protocol::{PluginInstallPolicy, PluginAuthPolicy, Product}` now carries the
+upstream protocol label sets, including their serde spellings and aliases.
+Authentication policy is timing metadata only. No account backend or protocol management handlers
+are introduced. `ra_coding::skills::SkillProduct` reexports this shared `Product`, preserving its
+name, variants, `non_exhaustive` contract and deserialization behavior; serialization, hashing and
+upstream Product helpers become available. All three protocol enums use `#[non_exhaustive]` as a
+Rust API-evolution adaptation, consistent with other ported protocol labels: downstream matches
+must handle future variants. Serde still rejects unknown labels; this attribute adds no wire
+fallback. Existing skill filtering and its explicit source selection remain unchanged, and the
+extension-safety gate needs no exception. The upstream `JsonSchema` and TypeScript derives are
+omitted consistently with other protocol types until a protocol-schema export consumer is ported.
+
 ### Explicit local plugin Store and command migration
 
 `ra_coding::plugins::store::PluginStore` adds local installation and removal. Construct it with

@@ -40,6 +40,15 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/plugins/marketplace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace.rs (Host catalogs, policies, source descriptors and fallback metadata) |
+| `crates/ra-coding/src/plugins/marketplace/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/git-utils/src/info.rs::get_git_repo_root/find_ancestor_git_entry |
+| `crates/ra-coding/src/plugins/marketplace_add.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add.rs::MarketplaceAddError (no registration or config writes) |
+| `crates/ra-coding/src/plugins/marketplace_add/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/source.rs (Local/Git parser and staging admission; no clone implementation) |
+| `crates/ra-protocol/src/server/protocol/plugins.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/plugin.rs::PluginInstallPolicy/PluginAuthPolicy; protocol/src/protocol.rs::Product |
+| `tests/it-coding/tests/plugin_marketplace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_tests.rs (all 36 tests) |
+| `tests/it-coding/tests/plugin_marketplace_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/source.rs (all 13 parser/admission tests) |
+| `tests/it-coding/tests/plugin_marketplace_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace.rs; marketplace_add/source.rs; git-utils/src/info.rs (consumer boundary regressions) |
+| `tests/it-protocol/tests/plugin_labels.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/plugin.rs; protocol/src/protocol.rs::Product (wire labels, conversions and product restriction regressions) |
 | `crates/ra-coding/src/plugins/store.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store.rs (local Store, layout, staging, activation/rollback, cleanup and errors; account identity paths excluded) |
 | `crates/ra-coding/src/plugins/command_migration.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration.rs |
 | `crates/ra-coding/src/plugins/command_migration/plugin.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration/plugin.rs |

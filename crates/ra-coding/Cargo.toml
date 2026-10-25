@@ -15,6 +15,7 @@ test-api = []
 
 [dependencies]
 dunce = { workspace = true }
+dirs = { workspace = true }
 globset = { workspace = true }
 url = { workspace = true }
 ra-core = { workspace = true }

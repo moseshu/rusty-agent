@@ -12,6 +12,8 @@ pub mod hook_config;
 pub mod identity;
 pub mod installed;
 pub mod manifest;
+pub mod marketplace;
+pub mod marketplace_add;
 pub mod model;
 pub mod store;
 

@@ -119,6 +119,7 @@ toml = "0.8"
 sha2 = "0.10"
 semver = "1"
 percent-encoding = "2"
+dirs = "6"
 
 # --- 错误与日志 ---
 thiserror = "2"

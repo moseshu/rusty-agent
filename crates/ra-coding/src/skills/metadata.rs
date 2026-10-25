@@ -4,21 +4,8 @@
 
 use serde::Deserialize;
 
-/// Upstream product labels used only when selecting skills with an explicit product restriction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum SkillProduct {
-    /// `ChatGPT` product skills.
-    #[serde(alias = "CHATGPT")]
-    Chatgpt,
-    /// Coding product skills.
-    #[serde(alias = "CODEX")]
-    Codex,
-    /// Atlas product skills.
-    #[serde(alias = "ATLAS")]
-    Atlas,
-}
+/// Product labels shared with marketplace policy, preserving the existing skill-facing name.
+pub use ra_protocol::server::protocol::Product as SkillProduct;
 
 #[derive(Default, Deserialize)]
 pub(super) struct SkillMetadataFile {
