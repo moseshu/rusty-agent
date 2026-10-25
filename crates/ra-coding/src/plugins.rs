@@ -1,20 +1,26 @@
-//! Product plugin packages, Host manifests, explicit local installation, and command migration.
+//! Product plugin packages, Host manifests, source materialization, and local installation.
 //!
 //! These entries follow Codex's package formats. They do not read product configuration,
 //! create MCP connections, register agents, or execute hook declarations.
 //! The Store installs only explicitly supplied local directories; it does not enable plugins.
+//! Explicit materialization runs Git/npm and owns temporary source files through the returned value.
 //! Host resources use the existing absolute-path type; generic manifest resource mapping remains
 //! available without claiming executor filesystem or URI authority support.
 
 pub mod command_migration;
 pub mod discovery;
+mod git_policy;
 pub mod hook_config;
 pub mod identity;
 pub mod installed;
 pub mod manifest;
 pub mod marketplace;
 pub mod marketplace_add;
+pub mod materialize;
 pub mod model;
+mod npm_source;
+mod plugin_bundle_archive;
+mod process;
 pub mod store;
 
 pub use identity::{PluginId, PluginIdError};

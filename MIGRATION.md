@@ -7,6 +7,45 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Explicit Git/npm plugin source materialization
+
+`ra_coding::plugins::materialize::materialize_marketplace_plugin_source(&Path, &MarketplacePluginSource)`
+ports the synchronous Codex source primitive. Pass a source resolved by the catalog. Local sources
+return the same path without existence checks or staging; Git/npm sources return
+`MaterializedMarketplacePluginSource`, whose public `path` points into an owned temporary directory.
+Keep the result alive through `PluginStore::install`; dropping it removes temporary sources and
+retains the original repository and any package already copied into the Store. No install,
+enablement or configuration-write operation runs automatically.
+
+Git defaults to Manual mode, retains the upstream safe-bare-repository setting, and disables
+terminal prompts. Optional subdirectories use the upstream sparse checkout sequence. SHA takes
+precedence over ref; after checkout, `rev-parse HEAD` must match the requested SHA case-insensitively.
+Errors preserve status/stdout/stderr and temporary-directory cleanup. The internal Automatic mode
+removes exactly the upstream repository-scoped variables, sets `GIT_OPTIONAL_LOCKS=0`, and holds a
+trusted bare-repository guard during initial clones. Global Git configuration and transport settings
+remain available. Explicit working-directory operations in Manual mode remove inherited `GIT_DIR`.
+The trusted staging root is canonicalized and must remain under product home. Its two home-related
+diagnostics adapt the upstream Codex branding to `product home`.
+
+npm invokes `pack --ignore-scripts --pack-destination`, optional `--registry`, then `--` and the
+package/version selector. It requires exactly one regular `.tgz`, checks its size against 50 MiB,
+extracts at most 250 MiB of declared regular-file content, requires `extracted/package`, and checks
+`package.json` name equality. Archive extraction retains the source's native-path checks, link and
+special-entry rejection, cumulative overflow handling and errors. Extraction can leave prior files
+when a later entry fails; the npm owner removes that failed temporary tree. The generic codec's
+local pack/unpack implementation is retained internally without account upload or sharing APIs.
+
+This primitive follows the upstream Git/npm transport behavior, including Git environment policy
+and archive admission checks. Host installation, marketplace registration/updates, configuration
+requirements and runtime refresh remain separate consumers. Completing the product's unified
+network-policy task is not a prerequisite for porting plugin materialization or management. That
+task's existing OAuth credential-handling and web/MCP policy responsibilities remain unchanged.
+Existing upstream HTTP destination, routing and proxy constraints belong
+with their HTTP consumers when those are ported. Local Git/fake-npm tests do not validate external
+downloads. The source primitive gains no extra network-policy parameter or stricter catalog rules.
+Windows background commands retain `CREATE_NO_WINDOW`; the Windows-only console test is ported but
+has not run on this host.
+
 ### Read-only plugin marketplaces and source descriptors
 
 `ra_coding::plugins::marketplace` adds the Codex catalog list/load/find APIs for explicitly

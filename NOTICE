@@ -40,6 +40,19 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/plugins/materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::MaterializedMarketplacePluginSource/materialize_marketplace_plugin_source/materialize_marketplace_plugin_source_with_mode/clone_git_plugin_source/run_git/run_git_output |
+| `crates/ra-coding/src/plugins/materialize/test_api.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{loader,git_policy,npm_source,plugin_bundle_archive}.rs (thin external-test access to original helpers and error records) |
+| `crates/ra-coding/src/plugins/git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/git_policy.rs; git-utils/src/lib.rs::SAFE_BARE_REPOSITORY_CONFIG; utils/absolute-path/src/lib.rs::canonicalize |
+| `crates/ra-coding/src/plugins/npm_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/npm_source.rs |
+| `crates/ra-coding/src/plugins/plugin_bundle_archive.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/plugin_bundle_archive.rs (generic local bundle codec; no sharing or account transport) |
+| `crates/ra-coding/src/plugins/process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/process/src/lib.rs::background_command |
+| `tests/it-coding/tests/plugin_materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader_tests.rs (both Git materialization cases); loader.rs (ownership, failure, mode and Store integration regressions) |
+| `tests/it-coding/tests/plugin_git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/startup_sync_tests.rs::git_command_sanitizes_ambient_repository_environment; git_policy.rs (Manual/Automatic and trusted-repository regressions) |
+| `tests/it-coding/tests/plugin_npm_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/npm_source_tests.rs (all npm source fixtures) |
+| `tests/it-coding/tests/plugin_npm_source_failures.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/npm_source.rs (command errors, archive selection, metadata, limits and cleanup regressions) |
+| `tests/it-coding/tests/plugin_bundle_archive.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/plugin_bundle_archive_tests.rs (both pack/unpack fixtures) |
+| `tests/it-coding/tests/plugin_bundle_archive_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/plugin_bundle_archive.rs (member paths/types, limits, overflow and partial-extraction regressions) |
+| `tests/it-coding/tests/plugin_background_command.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/process/src/background_command_tests.rs (Windows detached-parent console and std/Tokio output fixture) |
 | `crates/ra-coding/src/plugins/marketplace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace.rs (Host catalogs, policies, source descriptors and fallback metadata) |
 | `crates/ra-coding/src/plugins/marketplace/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/git-utils/src/info.rs::get_git_repo_root/find_ancestor_git_entry |
 | `crates/ra-coding/src/plugins/marketplace_add.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add.rs::MarketplaceAddError (no registration or config writes) |

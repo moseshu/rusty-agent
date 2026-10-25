@@ -47,6 +47,8 @@ schemars = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tempfile = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
