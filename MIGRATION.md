@@ -45,6 +45,67 @@ The three typed ConfigToml assertions associated with the ported merge fixtures 
 until that schema exists. Passing raw-value tests does not establish loader, trust or
 requirements parity.
 
+### Product MCP and path prerequisites
+
+`ra_coding::config` now also owns the complete upstream MCP server input and transport
+model, requirement provenance, sourced values, `Constrained` operations and MCP matching functions.
+`ra_protocol::server::protocol` owns `EnvironmentMcpPolicy` and its complete family of managed
+MCP identities, positional/value matchers and plugin requirements, following upstream
+`protocol/src/mcp_policy.rs`. Config re-exports the matcher/requirement types it consumes; it does
+not own or re-export environment policy. Executor/environment descriptors can carry these records
+without depending on the coding product. The protocol gate explicitly retains the three upstream
+public-field records and three closed deserialization unions; matching consumers must handle any
+future new union form explicitly. These are value-level prerequisites: they do not constitute
+`ConfigToml`, requirements composition, `ConfigLayerStack`, filesystem source loading,
+plugin activation or runtime registration. `config::McpServerConfig` describes a file;
+`mcp::McpServerConfig` continues to own an explicitly constructed SDK server registration.
+
+MCP parsing preserves transport-specific errors, local/remote environment variable selectors,
+legacy millisecond timeout fallback, positive tool budgets, unknown-field tolerance, OAuth
+client secret redaction, startup readiness and credential namespace separation. Exact legacy
+command identities continue to ignore arguments; matcher identities match every positional
+argument and full URL value. Invalid full-match regexes remain validation errors. The validation
+entry point is public in this Internal product crate so explicit callers and the external test
+workspace can validate the same raw requirements without fabricating an effective stack.
+
+The OpenAI-account `chatgpt` MCP auth variant is omitted under the repository's account exclusion.
+Generic MCP OAuth, enterprise IdP profile/registration values and no-fallback EMA transport checks
+are retained. Runtime-only enterprise registration cannot be deserialized from declarations and
+is cleared before a failed resolution attempt. Stack provenance selection and enterprise policy
+binding are still pending their actual stack consumer; calling the record-construction method is
+not evidence that provenance has been checked. OpenAI user/workspace credential custody is not
+ported.
+
+`ra_paths` ports the original immutable `PathUri`, `LegacyAppPathString`, platform grammar,
+byte-preserving fallback and configuration path validation. Foreign Windows and POSIX text is
+preserved until resolution with the owning environment; a foreign URI is refused at native I/O
+conversion. These types do not introduce remote filesystem authority. TypeScript export is omitted,
+because no TypeScript export consumer is present. The utility has no internal crate dependency,
+so Executor consumers need not depend on the coding product. The existing `ra_execpolicy` absolute-path/guard exports remain compatibility
+re-exports of this same type. The existing native POSIX permission policy representation
+is retained; the new URI module does not claim to upgrade that policy or provide Executor I/O.
+
+The canonical native `ra_paths::AbsolutePathBuf` gains the original explicit-base/checked constructors,
+join, parent/ancestor traversal, `Deref<Target = Path>`, owned `PathBuf` conversion and filesystem canonicalization. It owns the synchronous base/home
+scope formerly implemented in `permissions::path`; that old public permission guard path remains a
+re-export of the same guard, so configuration, manifests and permissions share one scope.
+Protocol path adapters also call the shared constructors, including app-server homes and socket
+paths; a synchronous home override is honored consistently. Permission adapters retain their
+NUL-path rejection while delegating lexical normalization and home expansion to `ra_paths`. The
+shared `expand_home_directory` function exposes the existing upstream expansion operation without
+forcing relative paths absolute or consulting cwd; this visibility adaptation removes duplicate
+implementations in existing consumers.
+The guard remains thread-bound (`!Send`/`!Sync`), preserving the existing Rust adaptation for
+thread-local state. Base guard drop clears the base as upstream does; home scopes nest and restore
+on unwind. Host home fallback uses `dirs::home_dir`, matching upstream. No scope is entered by
+default, and relative deserialization without a base still fails.
+
+Both upstream symlink-preserving canonicalization functions now live in `ra_paths`. Existing
+skills access uses `canonicalize_preserving_symlinks`; its nested-symlink decision helper is no
+longer copied into coding. The permissive function retains logical paths when canonicalization
+fails; `canonicalize_existing_preserving_symlinks` propagates those failures. Top-level system
+aliases still canonicalize. The earlier claim that these helpers had no consumer was incorrect.
+
 ### Explicit plugin configuration values
 
 `ra_coding::config` owns the Codex plugin and marketplace configuration value types in

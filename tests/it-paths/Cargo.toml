@@ -1,0 +1,17 @@
+[package]
+name = "it-paths"
+description = "Integration tests for native and executor URI paths."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-paths = { path = "../../crates/ra-paths", features = ["test-api"] }
+dirs = "6"
+dunce = "1"
+serde_json = "1"
+tempfile = "3"
+url = "2"

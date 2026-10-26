@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+ra-paths = { workspace = true }
 anyhow = { workspace = true }
 multimap = { workspace = true }
 fd-lock = { workspace = true }

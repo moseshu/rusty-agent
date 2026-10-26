@@ -43,7 +43,7 @@ pub(crate) mod parser;
 pub(crate) mod policy;
 pub mod rule;
 
-pub use absolute_path::AbsolutePathBuf;
+pub use absolute_path::{AbsolutePathBuf, AbsolutePathBufGuard, normalize_windows_device_path};
 pub use amend::{AmendError, blocking_append_allow_prefix_rule, blocking_append_network_rule};
 pub use decision::Decision;
 pub use error::{Error, ErrorLocation, Result, TextPosition, TextRange};

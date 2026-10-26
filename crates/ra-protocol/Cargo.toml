@@ -24,6 +24,7 @@ test-api = []
 
 [dependencies]
 ra-core = { workspace = true }
+ra-paths = { workspace = true }
 ra-runtime = { workspace = true }
 ra-session = { workspace = true }
 async-trait = { workspace = true }

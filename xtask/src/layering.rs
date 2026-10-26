@@ -71,6 +71,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-uds", Layer::Service),
     ("ra-exec", Layer::Service),
     ("ra-execpolicy", Layer::Service),
+    ("ra-paths", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
     ("ra-mcp", Layer::Service),
@@ -144,7 +145,9 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // needs nothing from the framework — a decision is about command tokens, not tools or runs —
     // and stays a crate of its own so the Starlark interpreter is a dependency of the one product
     // that judges commands with it, not of the executor or the tool layer.
-    ("ra-execpolicy", &[]),
+    ("ra-execpolicy", &["ra-paths"]),
+    // Native and executor URI paths contain no framework or product dependencies.
+    ("ra-paths", &[]),
     // The sandbox backends. `ra-core` alone: the local backend spawns its own processes — one-shot
     // and interactive alike — rather than going through `ra-exec`, because the environment policy,
     // resource ceilings and per-command fence that crate applies are this product's, not the
@@ -159,7 +162,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // own: the thread does, and the host builds it.
     (
         "ra-protocol",
-        &["ra-core", "ra-runtime", "ra-session", "ra-uds"],
+        &["ra-core", "ra-runtime", "ra-session", "ra-uds", "ra-paths"],
     ),
     (
         "ra-eval",
@@ -206,6 +209,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-tools",
             "ra-protocol",
             "ra-execpolicy",
+            "ra-paths",
         ],
     ),
     ("ra-cli", &["ra-coding", "ra-protocol", "ra-eval"]),

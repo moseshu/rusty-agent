@@ -22,6 +22,7 @@ members = [
     "it-session-sqlite",
     "it-exec",
     "it-execpolicy",
+    "it-paths",
     "it-sandbox",
     "it-mcp",
     "it-protocol",

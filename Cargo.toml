@@ -31,6 +31,7 @@ missing_panics_doc = "allow"
 [workspace.dependencies]
 rusty-agent = { path = "crates/rusty-agent", version = "0.3.0" }
 # --- 内部 crate ---
+ra-paths = { path = "crates/ra-paths", version = "0.3.0" }
 ra-uds = { path = "crates/ra-uds", version = "0.3.0" }
 ra-core = { path = "crates/ra-core", version = "0.3.0" }
 ra-macros = { path = "crates/ra-macros", version = "0.3.0" }
@@ -74,6 +75,8 @@ jsonwebtoken = "9.3.1"
 constant_time_eq = "0.3.1"
 http = "1"
 url = "2"
+urlencoding = "2.1.3"
+regex-lite = "0.1.8"
 dunce = "1"
 # WebSocket framing over the local control socket, using the published transport dependency.
 tokio-tungstenite = "0.29"

@@ -41,6 +41,7 @@
 mod dynamic_tools;
 mod item;
 mod mcp;
+mod mcp_policy;
 mod permissions;
 mod plugins;
 mod server_request;
@@ -58,6 +59,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
 pub use self::mcp::*;
+pub use self::mcp_policy::{
+    EnvironmentMcpPolicy, McpServerCommandMatcher, McpServerIdentity, McpServerRequirement,
+    McpServerValueMatcher, PluginMcpRequirements,
+};
 pub use self::plugins::{PluginAuthPolicy, PluginInstallPolicy, Product};
 pub use self::streaming::*;
 pub(crate) use self::thread_lifecycle::ThreadPolicyFields;

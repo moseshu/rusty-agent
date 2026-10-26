@@ -12,6 +12,7 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result},
 };
+use ra_paths::canonicalize_preserving_symlinks;
 use ra_tools::skills_ns::{SkillExecutorAccessPolicy, SkillFilePermissions};
 
 use crate::{
@@ -180,27 +181,6 @@ pub(super) fn normalize_effective_path(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
-}
-
-/// Resolves system aliases while retaining logical paths containing nested symbolic links.
-/// Missing paths retain their logical absolute spelling, as in the upstream path helper.
-pub(super) fn canonicalize_preserving_symlinks(path: &Path) -> io::Result<PathBuf> {
-    let logical = crate::permissions::path::from_absolute_path(path)?;
-    let preserve_logical_path = should_preserve_logical_path(&logical);
-    match dunce::canonicalize(path) {
-        Ok(canonical) if preserve_logical_path && canonical != logical => Ok(logical),
-        Ok(canonical) => Ok(canonical),
-        Err(_) => Ok(logical),
-    }
-}
-
-fn should_preserve_logical_path(logical: &Path) -> bool {
-    logical.ancestors().any(|ancestor| {
-        let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
-            return false;
-        };
-        metadata.file_type().is_symlink() && ancestor.parent().and_then(Path::parent).is_some()
-    })
 }
 
 fn normalize_glob_prefix(

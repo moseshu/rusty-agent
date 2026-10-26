@@ -14,6 +14,8 @@ workspace = true
 test-api = []
 
 [dependencies]
+base64 = { workspace = true }
+regex-lite = { workspace = true }
 dunce = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
@@ -29,6 +31,7 @@ ra-patch = { workspace = true }
 ra-tools = { workspace = true }
 ra-protocol = { workspace = true }
 ra-execpolicy = { workspace = true }
+ra-paths = { workspace = true }
 shlex = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

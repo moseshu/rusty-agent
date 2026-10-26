@@ -328,6 +328,27 @@ async fn initialize_returns_the_hosts_normalized_absolute_home() {
     assert!(response.codex_home().is_absolute());
 }
 
+#[tokio::test]
+async fn initialize_uses_the_shared_home_override_during_construction() {
+    let home = tempfile::tempdir().unwrap();
+    let server = ra_paths::AbsolutePathBufGuard::with_home_directory(home.path(), || {
+        Server::start_with_home("~/state/../server home")
+    });
+    let mut connection = server.open(1).await;
+    let answer = server
+        .call(
+            &mut connection,
+            1,
+            "initialize",
+            Some(initialize_params("client", None)),
+        )
+        .await;
+    assert_eq!(
+        answer["result"]["codexHome"],
+        json!(home.path().join("server home"))
+    );
+}
+
 /// Codex's response requires `codexHome` and reads it as an absolute, normalized path.
 #[test]
 fn initialize_response_requires_an_absolute_home() {

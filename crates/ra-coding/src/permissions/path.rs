@@ -8,108 +8,21 @@
 //! and symbolic links are kept as written.
 
 use std::{
-    cell::RefCell,
     io,
-    marker::PhantomData,
     path::{Component, Path, PathBuf},
-    rc::Rc,
 };
 
-thread_local! {
-    static ABSOLUTE_PATH_BASE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    static ABSOLUTE_PATH_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
-
-/// The base for deserializing permission paths: Codex's `AbsolutePathBufGuard`.
-///
-/// Hold this guard during synchronous deserialization on the current thread. Without it only
-/// absolute paths may be read, even when a relative spelling starts with `~`. Dropping the guard
-/// clears the base, as upstream does. The guard cannot move between threads because its state is
-/// thread-local.
-#[must_use]
-#[non_exhaustive]
-pub struct AbsolutePathBufGuard {
-    thread_bound: PhantomData<Rc<()>>,
-}
-
-impl AbsolutePathBufGuard {
-    /// Sets `base_path` as the base for paths read on this thread until the guard is dropped.
-    pub fn new(base_path: &Path) -> Self {
-        ABSOLUTE_PATH_BASE.with(|cell| *cell.borrow_mut() = Some(base_path.to_path_buf()));
-        Self {
-            thread_bound: PhantomData,
-        }
-    }
-
-    /// Reads the base, requiring it for non-absolute input before home expansion.
-    ///
-    /// # Errors
-    ///
-    /// Returns Codex's error if `path` is relative and no base was set.
-    pub fn deserialization_base(path: &Path) -> Result<Option<PathBuf>, &'static str> {
-        let base = ABSOLUTE_PATH_BASE.with(|cell| cell.borrow().clone());
-        if base.is_none() && !path.is_absolute() {
-            return Err("AbsolutePathBuf deserialized without a base path");
-        }
-        Ok(base)
-    }
-
-    /// The home override on this thread, or the host home when none was supplied.
-    #[must_use]
-    pub fn home_directory() -> Option<PathBuf> {
-        ABSOLUTE_PATH_HOME
-            .with(|cell| cell.borrow().clone())
-            .or_else(std::env::home_dir)
-    }
-
-    /// Expands home-relative paths using `home_directory` during synchronous `operation`.
-    /// Restores the previous override afterwards, including on panic.
-    pub fn with_home_directory<T>(home_directory: &Path, operation: impl FnOnce() -> T) -> T {
-        let previous_home =
-            ABSOLUTE_PATH_HOME.with(|cell| cell.replace(Some(home_directory.to_path_buf())));
-        let _guard = HomeDirectoryGuard(previous_home);
-        operation()
-    }
-}
-
-impl Drop for AbsolutePathBufGuard {
-    fn drop(&mut self) {
-        ABSOLUTE_PATH_BASE.with(|cell| *cell.borrow_mut() = None);
-    }
-}
-
-struct HomeDirectoryGuard(Option<PathBuf>);
-
-impl Drop for HomeDirectoryGuard {
-    fn drop(&mut self) {
-        ABSOLUTE_PATH_HOME.with(|cell| *cell.borrow_mut() = self.0.take());
-    }
-}
+pub use ra_paths::AbsolutePathBufGuard;
+pub(crate) use ra_paths::expand_home_directory;
 
 /// `path` normalized lexically, or `None` if it is not absolute or contains a NUL character.
 pub(crate) fn normalize(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
         return None;
     }
-    let mut normalized = PathBuf::new();
-    let mut depth = 0_usize;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if depth > 0 {
-                    normalized.pop();
-                    depth -= 1;
-                }
-            }
-            Component::Normal(name) => {
-                normalized.push(name);
-                depth += 1;
-            }
-        }
-    }
-    Some(normalized)
+    ra_paths::AbsolutePathBuf::from_absolute_path_checked(path)
+        .ok()
+        .map(ra_paths::AbsolutePathBuf::into_path_buf)
 }
 
 /// `path` resolved against `base`: Codex's `PathUri::join`. An absolute `path` replaces `base`;
@@ -167,35 +80,11 @@ pub(crate) fn deserialize_absolute_path(path: &Path) -> io::Result<PathBuf> {
 /// `path` made absolute and normal: Codex's `AbsolutePathBuf::from_absolute_path`. A leading `~`
 /// is the home directory, and a relative path is resolved against the current directory.
 pub(crate) fn from_absolute_path(path: &Path) -> io::Result<PathBuf> {
-    let expanded = expand_home_directory(path);
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir()?.join(expanded)
-    };
-    normalize(&absolute).ok_or_else(|| {
+    let absolute = ra_paths::AbsolutePathBuf::from_absolute_path(path)?;
+    normalize(absolute.as_path()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path is not absolute: {}", path.display()),
         )
     })
-}
-
-/// Expands a leading home-relative spelling using the current thread's home override.
-pub(crate) fn expand_home_directory(path: &Path) -> PathBuf {
-    if let Some(path_str) = path.to_str()
-        && let Some(rest) = path_str.strip_prefix('~')
-        && let Some(home) = AbsolutePathBufGuard::home_directory()
-    {
-        if rest.is_empty() {
-            return home;
-        } else if let Some(rest) = rest.strip_prefix('/') {
-            return home.join(rest.trim_start_matches('/'));
-        } else if cfg!(windows)
-            && let Some(rest) = rest.strip_prefix('\\')
-        {
-            return home.join(rest.trim_start_matches('\\'));
-        }
-    }
-    path.to_path_buf()
 }

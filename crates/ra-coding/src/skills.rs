@@ -122,7 +122,7 @@ pub mod access_test_api {
 
     /// Runs the ported helper without requiring the path to exist.
     pub fn canonicalize_preserving_symlinks(path: &Path) -> io::Result<PathBuf> {
-        super::access::canonicalize_preserving_symlinks(path)
+        ra_paths::canonicalize_preserving_symlinks(path)
     }
 
     /// Normalizes a policy root through its first existing ancestor.

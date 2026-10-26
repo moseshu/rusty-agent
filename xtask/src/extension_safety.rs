@@ -49,6 +49,11 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
     "ResolvedInstructions",
     "SummarySlot",
     "ShellInvocation",
+    // Codex protocol/src/mcp_policy.rs defines closed deserialization unions. Adding a form must
+    // force matcher and validation consumers to handle it rather than selecting a fallback.
+    "McpServerIdentity",
+    "McpServerValueMatcher",
+    "McpServerRequirement",
     "FileMode",
 ];
 
@@ -65,6 +70,19 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
+    // Codex protocol/src/mcp_policy.rs records retain their field-for-field upstream shape.
+    (
+        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
+        "EnvironmentMcpPolicy",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
+        "McpServerCommandMatcher",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
+        "PluginMcpRequirements",
+    ),
     // Codex ext/skills/src/required.rs::EnvironmentSkillRequirements is a borrowed public record.
     (
         "crates/ra-tools/src/skills_ns/required.rs",

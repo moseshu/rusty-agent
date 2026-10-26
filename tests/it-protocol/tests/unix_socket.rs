@@ -33,6 +33,22 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn control_paths_use_the_shared_home_override() {
+    let home = tempfile::tempdir().unwrap();
+    ra_paths::AbsolutePathBufGuard::with_home_directory(home.path(), || {
+        let expected = home.path().join("state");
+        assert_eq!(
+            app_server_control_socket_path("~/state").unwrap(),
+            app_server_control_socket_path(&expected).unwrap()
+        );
+        assert_eq!(
+            app_server_startup_lock_path("~/state").unwrap(),
+            app_server_startup_lock_path(&expected).unwrap()
+        );
+    });
+}
+
 const PATIENCE: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
@@ -720,7 +736,6 @@ async fn managed_shutdown_drains_the_app_server_and_removes_the_socket() {
 async fn stale_socket_is_replaced_but_existing_files_and_unrelated_symlinks_are_preserved() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rpc.sock");
-    let physical;
     let (sender, _events) = mpsc::channel(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
@@ -732,7 +747,7 @@ async fn stale_socket_is_replaced_but_existing_files_and_unrelated_symlinks_are_
     )
     .await
     .unwrap();
-    physical = std::fs::read_link(&path).unwrap();
+    let physical = std::fs::read_link(&path).unwrap();
     shutdown.cancel();
     timeout(PATIENCE, acceptor).await.unwrap().unwrap();
     assert!(!physical.exists());

@@ -22,6 +22,7 @@ tests/
 ├── it-core/          # one host crate per crate under test
 │   ├── src/lib.rs    # empty; exists only so cargo treats this as a crate
 │   └── tests/*.rs    # the actual test cases
+├── it-paths/         # native absolute paths and executor URI grammar
 ├── it-model/
 ├── ...
 ├── it-eval/          # host for ra-eval (every library crate gets one)
