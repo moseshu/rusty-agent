@@ -3001,6 +3001,7 @@ dependencies = [
  "ra-protocol",
  "ra-runtime",
  "ra-tools",
+ "regex",
  "regex-lite",
  "rustix",
  "schemars 0.8.22",

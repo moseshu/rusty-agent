@@ -7,6 +7,7 @@
 mod constraint;
 mod domain;
 mod fingerprint;
+mod hook_config;
 mod key_aliases;
 mod mcp_ema;
 mod mcp_requirements;
@@ -21,6 +22,10 @@ mod tool_exposure;
 mod types;
 
 pub use fingerprint::version_for_toml;
+pub use hook_config::{
+    HookEventsToml, HookHandlerConfig, HookStateToml, HooksFile, HooksToml,
+    ManagedHooksRequirementsToml, MatcherGroup,
+};
 pub use mcp_ema::{McpEmaRegistration, McpEnterpriseManagedAuthConfig, McpServerIdpOAuthConfig};
 pub use mcp_types::{
     AppToolApproval, DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerAuth, McpServerConfig,

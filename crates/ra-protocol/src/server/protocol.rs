@@ -39,6 +39,7 @@
 //! [`RequestPermissionProfile`], which refuses them as Codex does.
 
 mod dynamic_tools;
+mod hooks;
 mod item;
 mod mcp;
 mod mcp_policy;
@@ -58,6 +59,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
+pub use self::hooks::HookTrustStatus;
 pub use self::mcp::*;
 pub use self::mcp_policy::{
     EnvironmentMcpPolicy, McpServerCommandMatcher, McpServerIdentity, McpServerRequirement,

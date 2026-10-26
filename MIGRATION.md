@@ -106,6 +106,50 @@ longer copied into coding. The permissive function retains logical paths when ca
 fails; `canonicalize_existing_preserving_symlinks` propagates those failures. Top-level system
 aliases still canonicalize. The earlier claim that these helpers had no consumer was incorrect.
 
+### Host hook configuration and parsing prerequisites
+
+`ra_coding::config` now owns the complete upstream hook declaration types, `HooksToml`,
+`HookStateToml` and `ManagedHooksRequirementsToml`. The already committed
+`plugins::hook_config` path remains a re-export of those same declaration types. This avoids a
+second configuration implementation while preserving callers of the plugin manifest API.
+
+`ra_coding::hooks` ports the original compiled matcher, complete command-output parser and all
+output wire records, normalized-identity hashing, trust/enablement predicates and timeout
+normalization. Matcher spelling remains part of identity; simple names and pipe alternatives
+match exactly, regexes use upstream search semantics, and only occurrence-bearing events retain
+matchers. Matcher applicability matches the core enum variants, with a fallback for its
+non-exhaustive event set; future unknown event kinds do not acquire matcher behavior. Shutdown
+events retain the one-second default/three-second cap, while ordinary events retain 600 seconds
+without a new cap.
+
+The parser retains unsupported-field diagnostics, decision precedence, context, legacy forms and
+reserved-field behavior. Its output is product data, not an applied SDK permission decision.
+Eleven original output-schema fixtures are copied unchanged and compared as JSON values; input
+schema records and the upstream schema writer are not included. Upstream descriptions embedded
+in those JSON Schemas are retained literally with a local doc-markdown lint allowance. Parser,
+matcher and identity operations have Internal product visibility so explicit callers and the
+external test workspace can exercise them without a fake effective configuration stack.
+
+Trust hashing requires an already normalized, TOML-representable handler. It does not select a
+Windows command, normalize context limits, substitute environment values, discover sources or
+establish managed/built-in authority. Those remain discovery responsibilities. The original
+managed/built-in precedence and ordinary saved-hash behavior are preserved as separate operations.
+The upstream hash panic is reachable with valid JSON declarations: a timeout above `i64::MAX`,
+or an additional-context limit above `i64::MAX` on 64-bit targets, cannot serialize as TOML.
+Ordinary-event timeout normalization retains these large values. Two panic regression tests
+preserve this upstream behavior; any rejection or warning during discovery must be decided and
+documented separately when discovery is ported.
+`ra_protocol::server::protocol::HookTrustStatus` owns the shared wire metadata; TS/JsonSchema
+exports are omitted consistently with other protocol metadata and the Rust enum is non-exhaustive.
+
+This batch does not implement the effective hook-state/config-stack consumer, file discovery,
+command/MCP runners, placeholder/environment handling, async process ownership, output spilling or
+UserHook dispatch adaptation. Full plugin enablement and configuration prerequisites remain open.
+There is no default hook execution or implicit change to SDK lifecycle observers, existing hook
+event decisions, tool permissions or sandbox behavior. The workspace's existing regex 1.13.1 is
+reused (upstream locks 1.12.3); matcher fixtures verify the ported behavior without changing package
+versions or the existing TOML preserve_order setting.
+
 ### Explicit plugin configuration values
 
 `ra_coding::config` owns the Codex plugin and marketplace configuration value types in

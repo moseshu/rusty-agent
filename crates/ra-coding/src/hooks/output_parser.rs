@@ -1,0 +1,599 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
+//! Typed command-hook output parsing before runtime event adaptation.
+
+#[derive(Debug, Clone)]
+/// Fields shared by ordinary synchronous hook outputs.
+pub struct UniversalOutput {
+    /// Whether universal output permits continued processing.
+    pub continue_processing: bool,
+    /// An optional universal stop explanation.
+    pub stop_reason: Option<String>,
+    /// The declared output suppression flag, subject to event-specific validation.
+    pub suppress_output: bool,
+    /// Optional user-visible hook feedback.
+    pub system_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// Startup context and universal output fields.
+pub struct SessionStartOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// Optional context for the model, before event-level applicability and spill handling.
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// Validated pre-tool feedback, optional input rewrite and parser diagnostics.
+pub struct PreToolUseOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// A non-empty validated pre-tool denial reason.
+    pub block_reason: Option<String>,
+    /// Optional context for the model, before event-level applicability and spill handling.
+    pub additional_context: Option<String>,
+    /// An input rewrite paired with the required explicit allow decision.
+    pub updated_input: Option<serde_json::Value>,
+    /// Why an otherwise typed output requests unsupported behavior.
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed product permission-request decision before runtime policy enforcement.
+pub enum PermissionRequestDecision {
+    /// A parsed approval, still subject to the runtime permission policy.
+    Allow,
+    /// A denial with a required or defaulted explanation.
+    Deny {
+        /// The denial message.
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+/// A permission-request decision and unsupported-field diagnostic.
+pub struct PermissionRequestOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// A decision retained only if event-specific validation succeeded.
+    pub decision: Option<PermissionRequestDecision>,
+    /// Why an otherwise typed output requests unsupported behavior.
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// Post-tool feedback and context; block indicates feedback for the next model step.
+pub struct PostToolUseOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// Whether a valid block decision and required reason were supplied.
+    pub should_block: bool,
+    /// The original feedback reason, without presentation trimming.
+    pub reason: Option<String>,
+    /// Why a requested block or reason cannot be applied.
+    pub invalid_block_reason: Option<String>,
+    /// Optional context for the model, before event-level applicability and spill handling.
+    pub additional_context: Option<String>,
+    /// Why an otherwise typed output requests unsupported behavior.
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// User-prompt feedback and optional additional context.
+pub struct UserPromptSubmitOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// Whether a valid block decision and required reason were supplied.
+    pub should_block: bool,
+    /// The original feedback reason, without presentation trimming.
+    pub reason: Option<String>,
+    /// Why a requested block or reason cannot be applied.
+    pub invalid_block_reason: Option<String>,
+    /// Optional context for the model, before event-level applicability and spill handling.
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// Stop or subagent-stop feedback with block-reason validation.
+pub struct StopOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// Whether a valid block decision and required reason were supplied.
+    pub should_block: bool,
+    /// The original feedback reason, without presentation trimming.
+    pub reason: Option<String>,
+    /// Why a requested block or reason cannot be applied.
+    pub invalid_block_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// Compaction event output without an event-specific state transition.
+pub struct StatelessHookOutput {
+    /// Universal fields parsed from this output.
+    pub universal: UniversalOutput,
+    /// Why an otherwise typed output requests unsupported behavior.
+    pub invalid_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// The restricted interrupt output carrying only an optional system message.
+pub struct InterruptOutput {
+    /// Optional user-visible hook feedback.
+    pub system_message: Option<String>,
+}
+
+use super::output_wire::BlockDecisionWire;
+use super::output_wire::HookUniversalOutputWire;
+use super::output_wire::InterruptCommandOutputWire;
+use super::output_wire::PermissionRequestBehaviorWire;
+use super::output_wire::PermissionRequestCommandOutputWire;
+use super::output_wire::PermissionRequestDecisionWire;
+use super::output_wire::PostCompactCommandOutputWire;
+use super::output_wire::PostToolUseCommandOutputWire;
+use super::output_wire::PreCompactCommandOutputWire;
+use super::output_wire::PreToolUseCommandOutputWire;
+use super::output_wire::PreToolUseDecisionWire;
+use super::output_wire::PreToolUsePermissionDecisionWire;
+use super::output_wire::SessionStartCommandOutputWire;
+use super::output_wire::StopCommandOutputWire;
+use super::output_wire::SubagentStartCommandOutputWire;
+use super::output_wire::SubagentStopCommandOutputWire;
+use super::output_wire::UserPromptSubmitCommandOutputWire;
+
+/// Parses the original session-start command-hook output contract.
+#[must_use]
+pub fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
+    let wire: SessionStartCommandOutputWire = parse_json(stdout)?;
+    Some(session_start_output(
+        wire.universal,
+        wire.hook_specific_output
+            .and_then(|output| output.additional_context),
+    ))
+}
+
+/// Parses the original subagent-start command-hook output contract.
+#[must_use]
+pub fn parse_subagent_start(stdout: &str) -> Option<SessionStartOutput> {
+    let wire: SubagentStartCommandOutputWire = parse_json(stdout)?;
+    Some(session_start_output(
+        wire.universal,
+        wire.hook_specific_output
+            .and_then(|output| output.additional_context),
+    ))
+}
+
+fn session_start_output(
+    universal: HookUniversalOutputWire,
+    additional_context: Option<String>,
+) -> SessionStartOutput {
+    SessionStartOutput {
+        universal: UniversalOutput::from(universal),
+        additional_context,
+    }
+}
+
+/// Parses the original pre-tool-use command-hook output contract.
+#[must_use]
+pub fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
+    let PreToolUseCommandOutputWire {
+        universal: universal_wire,
+        decision,
+        reason,
+        hook_specific_output,
+    } = parse_json(stdout)?;
+    let universal = UniversalOutput::from(universal_wire);
+    let hook_specific_output = hook_specific_output.as_ref();
+    let additional_context =
+        hook_specific_output.and_then(|output| output.additional_context.clone());
+    let use_hook_specific_decision = hook_specific_output.is_some_and(|output| {
+        output.permission_decision.is_some()
+            || output.permission_decision_reason.is_some()
+            || output.updated_input.is_some()
+    });
+    let invalid_reason = unsupported_pre_tool_use_universal(&universal).or_else(|| {
+        if use_hook_specific_decision {
+            hook_specific_output.and_then(unsupported_pre_tool_use_hook_specific_output)
+        } else {
+            unsupported_pre_tool_use_legacy_decision(decision.as_ref(), reason.as_deref())
+        }
+    });
+    let block_reason = if invalid_reason.is_none() {
+        if use_hook_specific_decision {
+            hook_specific_output.and_then(|output| match output.permission_decision {
+                Some(PreToolUsePermissionDecisionWire::Deny) => output
+                    .permission_decision_reason
+                    .as_deref()
+                    .and_then(trimmed_reason),
+                _ => None,
+            })
+        } else {
+            match decision.as_ref() {
+                Some(PreToolUseDecisionWire::Block) => reason.as_deref().and_then(trimmed_reason),
+                Some(PreToolUseDecisionWire::Approve) | None => None,
+            }
+        }
+    } else {
+        None
+    };
+    let updated_input = if invalid_reason.is_none() {
+        hook_specific_output.and_then(|output| {
+            matches!(
+                output.permission_decision,
+                Some(PreToolUsePermissionDecisionWire::Allow)
+            )
+            .then(|| output.updated_input.clone())
+            .flatten()
+        })
+    } else {
+        None
+    };
+
+    Some(PreToolUseOutput {
+        universal,
+        block_reason,
+        additional_context,
+        updated_input,
+        invalid_reason,
+    })
+}
+
+/// Parses the original permission-request command-hook output contract.
+#[must_use]
+pub fn parse_permission_request(stdout: &str) -> Option<PermissionRequestOutput> {
+    let wire: PermissionRequestCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    let hook_specific_output = wire.hook_specific_output.as_ref();
+    let decision = hook_specific_output.and_then(|output| output.decision.as_ref());
+    let invalid_reason = unsupported_permission_request_universal(&universal).or_else(|| {
+        hook_specific_output.and_then(|output| {
+            unsupported_permission_request_hook_specific_output(output.decision.as_ref())
+        })
+    });
+    let decision = if invalid_reason.is_none() {
+        decision.map(permission_request_decision)
+    } else {
+        None
+    };
+
+    Some(PermissionRequestOutput {
+        universal,
+        decision,
+        invalid_reason,
+    })
+}
+
+/// Parses the original post-tool-use command-hook output contract.
+#[must_use]
+pub fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
+    let wire: PostToolUseCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    let invalid_reason = unsupported_post_tool_use_universal(&universal).or_else(|| {
+        wire.hook_specific_output
+            .as_ref()
+            .and_then(unsupported_post_tool_use_hook_specific_output)
+    });
+    let should_block = matches!(wire.decision, Some(BlockDecisionWire::Block));
+    let invalid_block_reason = if should_block
+        && match wire.reason.as_deref() {
+            Some(reason) => reason.trim().is_empty(),
+            None => true,
+        } {
+        Some(invalid_block_message("PostToolUse"))
+    } else if !should_block && universal.continue_processing && wire.reason.is_some() {
+        Some("PostToolUse hook returned reason without decision".to_string())
+    } else {
+        None
+    };
+    let additional_context = wire
+        .hook_specific_output
+        .and_then(|output| output.additional_context);
+
+    Some(PostToolUseOutput {
+        universal,
+        should_block: should_block && invalid_reason.is_none() && invalid_block_reason.is_none(),
+        reason: wire.reason,
+        invalid_block_reason,
+        additional_context,
+        invalid_reason,
+    })
+}
+
+/// Parses the original pre-compact command-hook output contract.
+#[must_use]
+pub fn parse_pre_compact(stdout: &str) -> Option<StatelessHookOutput> {
+    let wire: PreCompactCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    Some(StatelessHookOutput {
+        universal,
+        invalid_reason: None,
+    })
+}
+
+/// Parses the original post-compact command-hook output contract.
+#[must_use]
+pub fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput> {
+    let wire: PostCompactCommandOutputWire = parse_json(stdout)?;
+    let universal = UniversalOutput::from(wire.universal);
+    Some(StatelessHookOutput {
+        universal,
+        invalid_reason: None,
+    })
+}
+
+/// Parses the original interrupt command-hook output contract.
+#[must_use]
+pub fn parse_interrupt(stdout: &str) -> Option<InterruptOutput> {
+    let wire: InterruptCommandOutputWire = parse_json(stdout)?;
+    Some(InterruptOutput {
+        system_message: wire.system_message,
+    })
+}
+
+/// Parses the original user-prompt-submit command-hook output contract.
+#[must_use]
+pub fn parse_user_prompt_submit(stdout: &str) -> Option<UserPromptSubmitOutput> {
+    let wire: UserPromptSubmitCommandOutputWire = parse_json(stdout)?;
+    let should_block = matches!(wire.decision, Some(BlockDecisionWire::Block));
+    let invalid_block_reason = if should_block
+        && match wire.reason.as_deref() {
+            Some(reason) => reason.trim().is_empty(),
+            None => true,
+        } {
+        Some(invalid_block_message("UserPromptSubmit"))
+    } else {
+        None
+    };
+    let additional_context = wire
+        .hook_specific_output
+        .and_then(|output| output.additional_context);
+    Some(UserPromptSubmitOutput {
+        universal: UniversalOutput::from(wire.universal),
+        should_block: should_block && invalid_block_reason.is_none(),
+        reason: wire.reason,
+        invalid_block_reason,
+        additional_context,
+    })
+}
+
+/// Parses the original stop command-hook output contract.
+#[must_use]
+pub fn parse_stop(stdout: &str) -> Option<StopOutput> {
+    let wire: StopCommandOutputWire = parse_json(stdout)?;
+    Some(stop_output(
+        wire.universal,
+        wire.decision,
+        wire.reason,
+        "Stop",
+    ))
+}
+
+/// Parses the original subagent-stop command-hook output contract.
+#[must_use]
+pub fn parse_subagent_stop(stdout: &str) -> Option<StopOutput> {
+    let wire: SubagentStopCommandOutputWire = parse_json(stdout)?;
+    Some(stop_output(
+        wire.universal,
+        wire.decision,
+        wire.reason,
+        "SubagentStop",
+    ))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Retain the upstream owned wire-output decomposition."
+)]
+fn stop_output(
+    universal: HookUniversalOutputWire,
+    decision: Option<BlockDecisionWire>,
+    reason: Option<String>,
+    event_name: &str,
+) -> StopOutput {
+    let should_block = matches!(decision, Some(BlockDecisionWire::Block));
+    let invalid_block_reason = if should_block
+        && match reason.as_deref() {
+            Some(reason) => reason.trim().is_empty(),
+            None => true,
+        } {
+        Some(invalid_block_message(event_name))
+    } else {
+        None
+    };
+    StopOutput {
+        universal: UniversalOutput::from(universal),
+        should_block: should_block && invalid_block_reason.is_none(),
+        reason,
+        invalid_block_reason,
+    }
+}
+
+impl From<HookUniversalOutputWire> for UniversalOutput {
+    fn from(value: HookUniversalOutputWire) -> Self {
+        Self {
+            continue_processing: value.r#continue,
+            stop_reason: value.stop_reason,
+            suppress_output: value.suppress_output,
+            system_message: value.system_message,
+        }
+    }
+}
+
+fn parse_json<T>(stdout: &str) -> Option<T>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// Whether trimmed output starts with an object or array delimiter.
+#[must_use]
+pub fn looks_like_json(stdout: &str) -> bool {
+    let trimmed = stdout.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn invalid_block_message(event_name: &str) -> String {
+    format!("{event_name} hook returned decision:block without a non-empty reason")
+}
+
+fn unsupported_pre_tool_use_universal(universal: &UniversalOutput) -> Option<String> {
+    if !universal.continue_processing {
+        Some("PreToolUse hook returned unsupported continue:false".to_string())
+    } else if universal.stop_reason.is_some() {
+        Some("PreToolUse hook returned unsupported stopReason".to_string())
+    } else if universal.suppress_output {
+        Some("PreToolUse hook returned unsupported suppressOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_permission_request_universal(universal: &UniversalOutput) -> Option<String> {
+    if !universal.continue_processing {
+        Some("PermissionRequest hook returned unsupported continue:false".to_string())
+    } else if universal.stop_reason.is_some() {
+        Some("PermissionRequest hook returned unsupported stopReason".to_string())
+    } else if universal.suppress_output {
+        Some("PermissionRequest hook returned unsupported suppressOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_post_tool_use_universal(universal: &UniversalOutput) -> Option<String> {
+    if universal.suppress_output {
+        Some("PostToolUse hook returned unsupported suppressOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_permission_request_hook_specific_output(
+    decision: Option<&PermissionRequestDecisionWire>,
+) -> Option<String> {
+    let decision = decision?;
+    if decision.updated_input.is_some() {
+        Some("PermissionRequest hook returned unsupported updatedInput".to_string())
+    } else if decision.updated_permissions.is_some() {
+        Some("PermissionRequest hook returned unsupported updatedPermissions".to_string())
+    } else if decision.interrupt {
+        Some("PermissionRequest hook returned unsupported interrupt:true".to_string())
+    } else {
+        None
+    }
+}
+
+fn permission_request_decision(
+    decision: &PermissionRequestDecisionWire,
+) -> PermissionRequestDecision {
+    match decision.behavior {
+        PermissionRequestBehaviorWire::Allow => PermissionRequestDecision::Allow,
+        PermissionRequestBehaviorWire::Deny => PermissionRequestDecision::Deny {
+            message: decision
+                .message
+                .as_deref()
+                .and_then(trimmed_reason)
+                .unwrap_or_else(|| "PermissionRequest hook denied approval".to_string()),
+        },
+    }
+}
+
+fn unsupported_post_tool_use_hook_specific_output(
+    output: &super::output_wire::PostToolUseHookSpecificOutputWire,
+) -> Option<String> {
+    if output.updated_mcp_tool_output.is_some() {
+        Some("PostToolUse hook returned unsupported updatedMCPToolOutput".to_string())
+    } else {
+        None
+    }
+}
+
+fn unsupported_pre_tool_use_hook_specific_output(
+    output: &super::output_wire::PreToolUseHookSpecificOutputWire,
+) -> Option<String> {
+    if output.updated_input.is_some()
+        && !matches!(
+            output.permission_decision,
+            Some(PreToolUsePermissionDecisionWire::Allow)
+        )
+    {
+        Some("PreToolUse hook returned updatedInput without permissionDecision:allow".to_string())
+    } else {
+        match output.permission_decision {
+            Some(PreToolUsePermissionDecisionWire::Allow) => {
+                output.updated_input.is_none().then(|| {
+                    "PreToolUse hook returned unsupported permissionDecision:allow".to_string()
+                })
+            }
+            Some(PreToolUsePermissionDecisionWire::Ask) => {
+                Some("PreToolUse hook returned unsupported permissionDecision:ask".to_string())
+            }
+            Some(PreToolUsePermissionDecisionWire::Deny) => {
+                if output
+                    .permission_decision_reason
+                    .as_deref()
+                    .and_then(trimmed_reason)
+                    .is_none()
+                {
+                    Some(invalid_pre_tool_use_reason_message())
+                } else {
+                    None
+                }
+            }
+            None => {
+                if output.permission_decision_reason.is_some() {
+                    Some("PreToolUse hook returned permissionDecisionReason without permissionDecision".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn unsupported_pre_tool_use_legacy_decision(
+    decision: Option<&PreToolUseDecisionWire>,
+    reason: Option<&str>,
+) -> Option<String> {
+    match decision {
+        Some(PreToolUseDecisionWire::Approve) => {
+            Some("PreToolUse hook returned unsupported decision:approve".to_string())
+        }
+        Some(PreToolUseDecisionWire::Block) => {
+            if reason.and_then(trimmed_reason).is_none() {
+                Some(invalid_block_message("PreToolUse"))
+            } else {
+                None
+            }
+        }
+        None => {
+            if reason.is_some() {
+                Some("PreToolUse hook returned reason without decision".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn invalid_pre_tool_use_reason_message() -> String {
+    "PreToolUse hook returned permissionDecision:deny without a non-empty permissionDecisionReason"
+        .to_string()
+}
+
+fn trimmed_reason(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}

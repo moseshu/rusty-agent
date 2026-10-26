@@ -90,7 +90,7 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/plugins/installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/installed.rs (version helpers; account install identity metadata excluded) |
 | `crates/ra-coding/src/permissions/path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs (shared native normalization, home expansion and guard via ra-paths); utils/path-uri/src/lib.rs (native POSIX permission adapters) |
 | `crates/ra-coding/src/plugins/model.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/manifest.rs |
-| `crates/ra-coding/src/plugins/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (HooksFile, event groups and handler declarations; no runtime/config state) |
+| `crates/ra-coding/src/config/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (shared declarations, per-handler state and managed requirements; committed plugin path remains a compatibility re-export) |
 | `crates/ra-coding/src/plugins/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (schema classification and Host finder); src/lib.rs::migrated_command_skills_root |
 | `crates/ra-coding/src/plugins/manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs; manifest/manifest_cache.rs (disabled-cache standalone load); codex-rs/utils/path-uri/src/lib.rs (native Host path subset); utils/absolute-path/src/lib.rs (checked absolute-path entry) |
 | `crates/ra-coding/src/plugins/manifest/agent.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest.rs |
@@ -224,6 +224,16 @@ local upstream checkouts used for the port; each file lists its original source.
 | `tests/it-paths/tests/path_api_string.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/api_path_string_tests.rs |
 | `tests/it-paths/tests/path_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/config_path_tests.rs |
 | `tests/it-paths/tests/path_platform.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/platform_tests.rs |
+| `crates/ra-coding/src/hooks/matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/matcher.rs; hooks/src/events/common.rs::matcher_pattern_for_event/matches_matcher/matcher_inputs |
+| `crates/ra-coding/src/hooks/output_parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/output_parser.rs (complete production parsing and validation) |
+| `crates/ra-coding/src/hooks/output_wire.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/schema.rs (complete output wire records and their schema dependencies; input records and fixture writer are not included) |
+| `crates/ra-coding/src/hooks/trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::NormalizedHookIdentity/hook_hash/hook_trust_status/hook_enabled/hook_trusted_hash |
+| `crates/ra-coding/src/hooks/timing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::normalize_command_hook; hooks/src/events/session_end.rs (timeout constants) |
+| `crates/ra-protocol/src/server/protocol/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs::HookTrustStatus (without TS/JsonSchema export; non-exhaustive Rust enum) |
+| `tests/it-coding/tests/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (all ten original tests) |
+| `tests/it-coding/tests/hook_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/common.rs::tests (all matcher cases) |
+| `tests/it-coding/tests/hook_output_parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/output_parser.rs::tests (four original cases plus output-contract regressions) |
+| `crates/ra-coding/src/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/schema.rs::schema_for_type (test-api schema generation settings; product module exports) |
 
 The metadata/title resolution, URL display-name behavior, and bare function-tool naming
 (original names and include_server_in_tool_names prefixes) in crates/ra-mcp/src/catalog.rs,
@@ -350,3 +360,8 @@ openai/openai-agents-python, revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/run_internal/{prompt_cache_key,run_grouping,run_loop}.py,
 src/agents/{run_state,result}.py and tests/test_prompt_cache_key.py (MIT).
 See third_party/openai-agents-python.LICENSE for the retained license.
+
+The eleven JSON files under tests/it-coding/tests/fixtures/hooks_output are copied
+unchanged from openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
+codex-rs/hooks/schema/generated/*.output.schema.json (Apache-2.0). They are fixed
+upstream expectations for output wire-schema verification, not locally refreshed snapshots.

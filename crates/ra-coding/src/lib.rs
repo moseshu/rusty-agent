@@ -28,6 +28,7 @@ pub mod dangerous_action;
 pub mod doctor;
 pub mod exec_policy;
 pub(crate) mod final_answer;
+pub mod hooks;
 pub mod host;
 pub mod mcp;
 pub mod permission_mode;
