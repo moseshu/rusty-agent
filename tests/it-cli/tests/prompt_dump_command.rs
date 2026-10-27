@@ -98,9 +98,26 @@ async fn test_a_host_backed_dump_keeps_one_off_roles_tool_free() {
     );
 }
 
-/// A read-only role's report advertises what observes and nothing that writes.
+/// The capability entries a role's report advertises, in report order.
+fn capability_entries(report: &str) -> Vec<&str> {
+    report
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|source| source.starts_with("capability("))
+        .collect()
+}
+
+/// Read-only roles inherit the host's tools and sandbox, as Codex roles do: without the optional
+/// role restrictions their report advertises the same capability entries as the main role,
+/// including the writing ones.
 #[tokio::test]
-async fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
+async fn test_a_host_backed_dump_gives_read_only_roles_the_host_tools() {
+    let main = run(&["ra", "prompt", "dump", "--role", "main"]).await;
+    let host_entries = capability_entries(main.stdout());
+    assert!(
+        host_entries.contains(&"capability(apply_patch)"),
+        "the host advertises apply_patch"
+    );
     for role in ["read_only_specialist", "planner"] {
         let report = run(&["ra", "prompt", "dump", "--role", role]).await;
         let stdout = report.stdout();
@@ -108,12 +125,11 @@ async fn test_a_host_backed_dump_leaves_read_only_roles_the_observing_entry() {
             stdout.contains("tool_surface"),
             "`{role}` must advertise the entries it did receive"
         );
-        for withheld in ["apply_patch", "exec_command", "write_stdin"] {
-            assert!(
-                !stdout.contains(withheld),
-                "`{role}` must not advertise `{withheld}`"
-            );
-        }
+        assert_eq!(
+            capability_entries(stdout),
+            host_entries,
+            "`{role}` must inherit the host's capability entries"
+        );
     }
 }
 
@@ -195,9 +211,21 @@ async fn test_the_recorded_dump_is_the_form_the_comparison_reads() {
 
     assert!(value["prefix_hash"].is_string());
     assert!(value["sections"].is_array());
+    assert!(value["cache_plan"]["prefix_hash"].is_string());
+    let cache_scope = value["cache_plan"]
+        .get("cache_scope")
+        .expect("a recorded dump keeps the fallback scope field, so its shape matches a run's");
     assert!(
-        value["cache_plan"]["cache_scope"].is_string(),
-        "a recorded dump carries the placeholder scope, so its shape matches a run's"
+        cache_scope.is_null() || cache_scope.is_string(),
+        "the fallback scope is absent (null) or a string"
+    );
+    assert!(
+        value["prompt_cache_key"].is_string(),
+        "a recorded dump carries the prompt cache key route"
+    );
+    assert!(
+        value["prompt_cache_key_source"].is_string(),
+        "a recorded dump says where the prompt cache key comes from"
     );
     assert!(
         recorded.stdout().ends_with('\n'),
