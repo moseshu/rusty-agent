@@ -921,7 +921,22 @@ defaults and error codes follow the OpenAI Agents SDK.
 | `UnsupportedScheme` and `EphemeralMountRemoval` have private fields | Code that reads them | Use `scheme()` on the former; build the latter only through `new` and its two constructors |
 | `SandboxErrorDetails` is `#[non_exhaustive]` | Code that matches it exhaustively | Add a wildcard arm |
 
+### Executor plugin delivery boundary
+
+Explicit selected roots flow through `ExecutorCapabilityDiscoveryCache`,
+`ExecutorPluginProvider`, the bound filesystem and `PluginMcpProvider`. Resource descriptors retain
+the environment that owns their URI. Declaration loading and policy overlays return values;
+`executor_plugin_hook_sources` returns only admitted inline cleanup sources from a supplied step
+snapshot and enabled-tool lookup. These entry points do not constitute an effective config loader,
+a global MCP registry or hook execution. Their callers own activation, registration, dispatch and
+refresh through the product's corresponding consumers. A missing executor resource remains a
+failure even when an identically named Host file exists.
+
 ### Executor review corrections
+
+The environment-info RPC timeout is 30 seconds and the environment-status RPC timeout is
+10 seconds, matching the source defaults. The session-recovery regression uses the production
+environment-info timeout.
 
 Linux filesystem-helper preparation now uses the source WSL1/bubblewrap support check,
 `linux_sandbox_arg0_override` and permission-profile argument lowering, specialized to the source

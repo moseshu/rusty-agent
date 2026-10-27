@@ -5,8 +5,10 @@
 //! The Store installs only explicitly supplied local directories; it does not enable plugins.
 //! Explicit materialization runs Git/npm and owns temporary source files through the returned value.
 //! Plugin activation and marketplace configuration values belong to [`crate::config`].
-//! Host resources use native absolute paths. URI parsing and inert environment-bound descriptors
-//! preserve resource ownership without selecting or connecting an executor filesystem.
+//! Host resources use native absolute paths. Executor providers resolve explicitly selected
+//! roots through their owning environment and retain that filesystem for later resource and MCP
+//! reads. MCP policy overlays and inline cleanup admission return declarations for the product's
+//! registration and dispatch consumers. URI descriptors preserve the source environment identity.
 
 mod bundled_hooks;
 mod executor_hook_source;

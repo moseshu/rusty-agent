@@ -12,6 +12,7 @@ ra-config = { path = "../../crates/ra-config" }
 ra-http = { path = "../../crates/ra-http", features = ["test-api"] }
 ra-paths = { path = "../../crates/ra-paths" }
 ra-coding = { path = "../../crates/ra-coding" }
+ra-mcp = { path = "../../crates/ra-mcp" }
 futures = "0.3"
 http = "1"
 serde_json = "1"

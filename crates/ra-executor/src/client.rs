@@ -63,8 +63,8 @@ use tracing::{Instrument, debug, instrument::WithSubscriber};
 mod connection_failure;
 use connection_failure::ConnectionFailure;
 pub(crate) use connection_failure::can_retry_connection_attempt;
-const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(10);
-const ENVIRONMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const ENVIRONMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(25);
 const SESSION_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 struct Inner {
