@@ -10,6 +10,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes bounded-parser limits to the external integration-test workspace.
+test-api = []
+
 [dependencies]
 base64 = { workspace = true }
 ra-paths = { workspace = true }

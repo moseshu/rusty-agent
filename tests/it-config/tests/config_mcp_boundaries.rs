@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ra_coding::config::*;
+use ra_config::*;
 
 #[test]
 fn ema_rejects_alternate_credentials_and_executor_custody() {

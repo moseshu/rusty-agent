@@ -1,0 +1,16 @@
+[package]
+name = "it-filesystem"
+description = "Integration tests for executor filesystem permission policies."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-filesystem = { path = "../../crates/ra-filesystem" }
+ra-paths = { path = "../../crates/ra-paths" }
+anyhow = "1"
+pretty_assertions = "1"
+tempfile = "3"

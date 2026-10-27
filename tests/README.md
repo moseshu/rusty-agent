@@ -46,13 +46,13 @@ modern `foo.rs + foo/` module layout.
 
 ## The `test-api` feature
 
-Two crates (`ra-exec`, `ra-coding`) carry a `test-api` feature whose only contents are
-thin re-exports of private functions, gated as `#[cfg(feature = "test-api")] pub mod
+Several library crates carry a `test-api` feature whose only contents are thin
+re-exports of private functions and constants, gated as `#[cfg(feature = "test-api")] pub mod
 test_api`. It exists because the alternative is worse in both directions: making those
 functions `pub` puts them in the public surface forever, and leaving them private means
 the behaviour nobody can reach is also the behaviour nobody can protect.
 
-What it is *for* is narrow, and both current cases are the same shape — **code that
+What it is *for* is narrow, and the two original cases below share one shape — **code that
 cannot be exercised from a test on the machine most people are sitting at**:
 
 - `ra-exec::sandbox::bwrap::test_api` — the Linux BPF filter and the descriptor that

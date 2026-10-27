@@ -50,11 +50,11 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-config/src/overrides.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/overrides.rs |
 | `crates/ra-config/src/fingerprint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint.rs::version_for_toml (source-origin traversal awaits the real layer stack) |
 | `crates/ra-config/src/domain.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs::normalize_host/normalize_dns_host_or_ip_literal/normalize_ip_literal |
-| `tests/it-coding/tests/config_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge_tests.rs (all 25 raw-TOML fixtures; three typed ConfigToml projection assertions await the product schema) |
-| `tests/it-coding/tests/config_primitives.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint_tests.rs; network-proxy/src/domain_matcher_tests.rs (host cases through public merge); config/src/{config_layer_source,merge,overrides}.rs (public contract regressions) |
+| `tests/it-config/tests/config_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge_tests.rs (all 25 raw-TOML fixtures; three typed ConfigToml projection assertions await the product schema) |
+| `tests/it-config/tests/config_primitives.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint_tests.rs; network-proxy/src/domain_matcher_tests.rs (host cases through public merge); config/src/{config_layer_source,merge,overrides}.rs (public contract regressions) |
 | `crates/ra-config/src/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs::PluginsDefaultConfig/PluginsConfigToml/PluginConfig/PluginMcpServerConfig/MarketplaceConfig/MarketplaceSourceType (configuration values and pure policy operations only) |
 | `crates/ra-config/src/mcp_types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types.rs (product MCP configuration and transport validation; OpenAI account authentication omitted) |
-| `tests/it-coding/tests/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types_tests.rs::plugin_activation_inherits_defaults_without_explicit_enablement; mcp_types_tests.rs::app_tool_approval_restrictions_never_weaken_either_policy; core-plugins/src/loader_tests.rs::legacy_ema_policy_disables_installed_and_selected_plugin_servers (serialization assertions only); types.rs/mcp_types.rs (additional configuration-value regressions) |
+| `tests/it-config/tests/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types_tests.rs::plugin_activation_inherits_defaults_without_explicit_enablement; mcp_types_tests.rs::app_tool_approval_restrictions_never_weaken_either_policy; core-plugins/src/loader_tests.rs::legacy_ema_policy_disables_installed_and_selected_plugin_servers (serialization assertions only); types.rs/mcp_types.rs (additional configuration-value regressions) |
 | `crates/ra-coding/src/plugins/materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::MaterializedMarketplacePluginSource/materialize_marketplace_plugin_source/materialize_marketplace_plugin_source_with_mode/clone_git_plugin_source/run_git/run_git_output |
 | `crates/ra-coding/src/plugins/materialize/test_api.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{loader,git_policy,npm_source,plugin_bundle_archive}.rs (thin external-test access to original helpers and error records) |
 | `crates/ra-coding/src/plugins/git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/git_policy.rs; git-utils/src/lib.rs::SAFE_BARE_REPOSITORY_CONFIG; utils/absolute-path/src/lib.rs::canonicalize |
@@ -219,10 +219,10 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-paths/src/native_path_bytes.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/native_path_bytes.rs |
 | `crates/ra-paths/src/platform.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/platform.rs |
 | `tests/it-paths/tests/absolute_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs::tests (explicit-base, checked, traversal, canonicalization, symlink-preserving and guard cases; unwind and trait regressions added) |
-| `tests/it-coding/tests/config_mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types_tests.rs |
-| `tests/it-coding/tests/config_mcp_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_ema_tests.rs::ema_rejects_alternate_credentials_and_executor_custody (additional registration, timeout and credential namespace regressions) |
-| `tests/it-coding/tests/config_mcp_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_requirements_tests.rs (additional validation and HTTP identity regressions) |
-| `tests/it-coding/tests/config_constraints.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/constraint.rs::tests (additional rejection and provenance regressions) |
+| `tests/it-config/tests/config_mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types_tests.rs |
+| `tests/it-config/tests/config_mcp_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_ema_tests.rs::ema_rejects_alternate_credentials_and_executor_custody (additional registration, timeout and credential namespace regressions) |
+| `tests/it-config/tests/config_mcp_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_requirements_tests.rs (additional validation and HTTP identity regressions) |
+| `tests/it-config/tests/config_constraints.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/constraint.rs::tests (additional rejection and provenance regressions) |
 | `tests/it-paths/tests/path_uri.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/tests.rs |
 | `tests/it-paths/tests/path_api_string.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/api_path_string_tests.rs |
 | `tests/it-paths/tests/path_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/config_path_tests.rs |
@@ -233,7 +233,7 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/hooks/trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::NormalizedHookIdentity/hook_hash/hook_trust_status/hook_enabled/hook_trusted_hash |
 | `crates/ra-coding/src/hooks/timing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::normalize_command_hook; hooks/src/events/session_end.rs (timeout constants) |
 | `crates/ra-protocol/src/server/protocol/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs::HookTrustStatus (without TS/JsonSchema export; non-exhaustive Rust enum) |
-| `tests/it-coding/tests/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (all ten original tests) |
+| `tests/it-config/tests/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (all ten original tests) |
 | `tests/it-coding/tests/hook_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/common.rs::tests (all matcher cases) |
 | `tests/it-coding/tests/hook_output_parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/output_parser.rs::tests (four original cases plus output-contract regressions) |
 | `crates/ra-coding/src/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/schema.rs::schema_for_type (test-api schema generation settings; product module exports) |
@@ -488,11 +488,14 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-coding/tests/plugin_executor_mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/mcp/src/plugin/provider_tests.rs |
 | `tests/it-coding/tests/plugin_executor_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/executor_provider_tests.rs |
 | `tests/it-coding/tests/plugin_mcp_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/plugin_config_tests.rs |
+| `tests/it-filesystem/tests/permission_local_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/local_aliases_tests.rs |
+| `tests/it-filesystem/tests/permission_targets.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/target_tests.rs (private SHADOWED message asserted through its text) |
+| `tests/it-executor-protocol/tests/rpc.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server-protocol/src/rpc_tests.rs |
 | `tests/it-executor/tests/environment_connect_options.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment/connect_options_tests.rs |
 | `tests/it-paths/tests/system_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs tests (system aliases) |
 
-| `tests/it-executor/tests/network_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/network_policy_tests.rs |
-| `tests/it-executor/tests/websocket_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/websocket-client/src/network_policy_tests.rs |
+| `tests/it-http/tests/network_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/network_policy_tests.rs |
+| `tests/it-http/tests/websocket_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/websocket-client/src/network_policy_tests.rs |
 
 | `crates/ra-sandbox/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `crates/ra-exec/src/filesystem/helper_linux.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/{manager,landlock,bwrap}.rs (filesystem-helper specialization with managed_network=None) |

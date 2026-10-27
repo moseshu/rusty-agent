@@ -262,6 +262,13 @@ impl HttpClientFactory {
     }
 
     /// Resolves the proxy route for a concrete destination without blocking a Tokio worker.
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos")),
+        allow(
+            clippy::unused_async,
+            reason = "Only the Windows and macOS system-proxy lookups await; callers share one async API."
+        )
+    )]
     pub async fn resolve_proxy_route_async(
         &self,
         request_url: String,

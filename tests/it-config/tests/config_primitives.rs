@@ -3,12 +3,12 @@
 
 use std::cmp::Ordering;
 
-use ra_coding::config::{
+use ra_config::{
     ConfigLayerSource, ShellEnvironmentPolicyFilterRepresentation as FilterRepresentation,
     build_cli_overrides_layer, format_config_layer_source, is_structured_feature_path,
     merge_toml_values, shell_environment_filter_entry, version_for_toml,
 };
-use ra_execpolicy::AbsolutePathBuf;
+use ra_paths::AbsolutePathBuf;
 use toml::Value;
 
 fn path(name: &str) -> AbsolutePathBuf {

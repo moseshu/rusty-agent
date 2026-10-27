@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 
-use ra_coding::config::{
+use ra_config::{
     AppToolApproval, MarketplaceConfig, MarketplaceSourceType, McpServerToolConfig, PluginConfig,
     PluginMcpServerConfig, PluginsConfigToml, PluginsDefaultConfig,
 };

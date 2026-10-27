@@ -1,0 +1,14 @@
+[package]
+name = "it-executor-protocol"
+description = "Integration tests for executor JSON-RPC and capability discovery wire records."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-executor-protocol = { path = "../../crates/ra-executor-protocol", features = ["test-api"] }
+pretty_assertions = "1"
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }

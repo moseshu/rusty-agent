@@ -1,0 +1,13 @@
+[package]
+name = "it-tls"
+description = "Integration tests for process-wide TLS provider initialization."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-tls = { path = "../../crates/ra-tls" }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "ring"] }

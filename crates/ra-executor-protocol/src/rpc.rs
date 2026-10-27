@@ -277,3 +277,13 @@ pub struct JSONRPCErrorError {
     pub data: Option<serde_json::Value>,
     pub message: String,
 }
+
+/// Bounded-parser limits exposed only for integration tests.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod test_api {
+    /// Maximum number of JSON values accepted in one JSON-RPC message.
+    pub const MAX_JSONRPC_VALUE_NODES: usize = super::MAX_JSONRPC_VALUE_NODES;
+    /// Private `serde_json` token that wraps a raw JSON value.
+    pub const SERDE_JSON_RAW_VALUE_TOKEN: &str = super::SERDE_JSON_RAW_VALUE_TOKEN;
+}

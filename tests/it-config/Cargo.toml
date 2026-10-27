@@ -1,0 +1,15 @@
+[package]
+name = "it-config"
+description = "Integration tests for shared product configuration values."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-config = { path = "../../crates/ra-config", features = ["test-api"] }
+ra-paths = { path = "../../crates/ra-paths" }
+serde_json = "1"
+toml = "0.8"

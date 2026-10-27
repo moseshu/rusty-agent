@@ -3,12 +3,12 @@
 
 use std::collections::BTreeMap;
 
-use ra_coding::config::HookEventsToml;
-use ra_coding::config::HookHandlerConfig;
-use ra_coding::config::HooksFile;
-use ra_coding::config::HooksToml;
-use ra_coding::config::ManagedHooksRequirementsToml;
-use ra_coding::config::MatcherGroup;
+use ra_config::HookEventsToml;
+use ra_config::HookHandlerConfig;
+use ra_config::HooksFile;
+use ra_config::HooksToml;
+use ra_config::ManagedHooksRequirementsToml;
+use ra_config::MatcherGroup;
 
 #[test]
 fn hooks_file_deserializes_existing_json_shape() {
@@ -227,7 +227,7 @@ command = "python3 /tmp/pre.py"
             },
             state: BTreeMap::from([(
                 "/tmp/hooks.json:pre_tool_use:0:0".to_string(),
-                ra_coding::config::HookStateToml {
+                ra_config::HookStateToml {
                     enabled: Some(false),
                     trusted_hash: Some("sha256:abc123".to_string()),
                 },

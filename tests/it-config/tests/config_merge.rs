@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Upstream raw-TOML merge fixtures; typed product projection is validated separately.
 
-use ra_coding::config::{build_cli_overrides_layer, merge_toml_values};
+use ra_config::{build_cli_overrides_layer, merge_toml_values};
 use toml::Value as TomlValue;
 
 fn parse_toml(value: &str) -> TomlValue {
