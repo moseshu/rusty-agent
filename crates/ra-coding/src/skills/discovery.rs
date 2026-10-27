@@ -7,10 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::plugins::{
-    AbsolutePathBuf, discovery::DISCOVERABLE_PLUGIN_MANIFEST_PATHS, manifest::host_basename,
-};
+use crate::plugins::{AbsolutePathBuf, discovery::DISCOVERABLE_PLUGIN_MANIFEST_PATHS};
 use ra_core::error::{Error, Result};
+use ra_paths::PathUri;
 use ra_tools::skills_ns::{
     SkillProvider,
     catalog::{
@@ -398,7 +397,7 @@ fn namespace_at(root: &Path) -> Option<String> {
     Some(if name.trim().is_empty() {
         AbsolutePathBuf::try_from(root)
             .ok()
-            .and_then(|root| host_basename(&root))
+            .and_then(|root| PathUri::from_abs_path(&root).basename())
             .unwrap_or_else(|| name.into())
     } else {
         name.into()

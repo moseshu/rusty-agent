@@ -9,7 +9,7 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ### Product configuration sources and composition primitives
 
-`ra_coding::config` adds the Codex product source identities, metadata, source display,
+`ra_config` owns the product source identities, metadata, source display,
 `merge_toml_values`, `build_cli_overrides_layer`, shell-filter helpers and `version_for_toml`.
 These APIs compose explicitly supplied values. They do not discover files, construct an effective
 configuration stack, enforce requirements or configure a running host. Product loading remains
@@ -36,7 +36,7 @@ It is the ordinary config merge contract; requirements have separate field-speci
 are not implemented by this helper. Session dotted-path writes preserve input order. Fingerprints
 retain the exact `sha256:` encoding over recursively sorted JSON, including array order.
 
-`ra-coding` enables TOML's `preserve_order` feature as upstream does. Table iteration order is part
+`ra-config` enables TOML's `preserve_order` feature as upstream does. Table iteration order is part
 of the policy contract: when domain or filter keys normalize to the same key, the later declaration
 wins; case-insensitive filter lookup returns the first matching declaration. Using sorted tables
 instead can reverse allow/deny or include/exclude decisions even with identical merge code.
@@ -47,15 +47,16 @@ requirements parity.
 
 ### Product MCP and path prerequisites
 
-`ra_coding::config` now also owns the complete upstream MCP server input and transport
+`ra_config` also owns the upstream MCP server input and transport
 model, requirement provenance, sourced values, `Constrained` operations and MCP matching functions.
-`ra_protocol::server::protocol` owns `EnvironmentMcpPolicy` and its complete family of managed
-MCP identities, positional/value matchers and plugin requirements, following upstream
-`protocol/src/mcp_policy.rs`. Config re-exports the matcher/requirement types it consumes; it does
-not own or re-export environment policy. Executor/environment descriptors can carry these records
-without depending on the coding product. The protocol gate explicitly retains the three upstream
-public-field records and three closed deserialization unions; matching consumers must handle any
-future new union form explicitly. These are value-level prerequisites: they do not constitute
+`ra_config` owns `EnvironmentMcpPolicy` and its complete family of managed MCP identities,
+positional/value matchers and plugin requirements, ported from upstream `protocol/src/mcp_policy.rs`.
+`ra_protocol::server::protocol` retains its existing public paths as reverse re-exports. This
+ownership adapts the upstream lightweight protocol split: this repository's `ra-protocol` includes
+app-server/runtime/session dependencies, which must not be pulled into config, MCP or the executor
+by these value records. `ra-config` depends internally only on `ra-core` and `ra-paths`; moving
+records does not change fields, serde, schema or matching behavior. The public-field records and
+closed deserialization unions retain their upstream shape. These are value-level prerequisites: they do not constitute
 `ConfigToml`, requirements composition, `ConfigLayerStack`, filesystem source loading,
 plugin activation or runtime registration. `config::McpServerConfig` describes a file;
 `mcp::McpServerConfig` continues to own an explicitly constructed SDK server registration.
@@ -106,6 +107,86 @@ longer copied into coding. The permissive function retains logical paths when ca
 fails; `canonicalize_existing_preserving_symlinks` propagates those failures. Top-level system
 aliases still canonicalize. The earlier claim that these helpers had no consumer was incorrect.
 
+### Executor filesystems, direct environments and selected plugins
+
+Configuration values moved into `ra_config`, preserving their definitions and existing
+`ra_coding::config` exports. Environment services now consume the shared owner without depending
+on a product crate. No effective product loader or generic source migration is implied.
+
+`ra_filesystem` owns the source `ExecutorFileSystem` contract, read streams, URI permission
+profiles, sandbox contexts, environment access keys and ancestor searches. `ra_executor_protocol`
+owns the filesystem/discovery RPC records and selected capability roots. These internal records
+retain upstream serde fields and defaults; TS and JSON-schema exports are omitted. The earlier
+native additional-permission types in `ra_coding::permissions` remain the existing Host grant
+representation; they are not the URI executor policy and are not substituted at remote ingress.
+
+`ra_executor` supplies real configured environments, lazy connection ownership, stdio and
+WebSocket transports, session resume, bounded RPC, remote filesystem access, metadata request
+coalescing, read-stream cleanup, V1 discovery and its environment/sandbox-scoped cache. Successful
+and permanent discovery results retain their source cache lifetime; transient failures retry.
+Snapshots freeze actual discoveries in selected-root order. Missing environments and failed reads
+never fall back to a Host path. `environments.toml` and `CODEX_EXEC_SERVER_URL` retain source
+compatibility names. These explicit environment constructors do not install a global manager.
+
+`ra_exec::filesystem::LocalFileSystem::with_runtime_paths` launches a native FS helper for
+restricted operations. The new `ra-fs-helper` binary is the configured helper entry point.
+`LocalFileSystem::unsandboxed` refuses requests requiring an unavailable helper. macOS uses the
+source filesystem-only Seatbelt profile, read/write policy projection, protected metadata/daemon
+paths and descriptor handoff. Linux requires a caller-supplied compatible external
+`codex-linux-sandbox`; this repository does not ship that binary, and its existing bwrap entry
+point does not accept the same CLI. Restricted Linux filesystem operations are unavailable without
+that external helper; native launch has not been exercised on Linux. Windows native sandbox
+backends remain unported and restricted operations report an error. Foreign Windows/UNC URIs
+remain usable through a remote executor and are not interpreted by the orchestrator.
+
+`ra_http` supplies the source route-aware HTTP/WebSocket factory, custom CA handling, destination
+policy and system/environment proxy selection. ChatGPT cookie and account backend integration
+are excluded. The two native OS proxy modules keep scoped source FFI exceptions; `ra_exec`
+retains its separate native-process/descriptor exceptions. No workspace-wide unsafe allowance is
+introduced. `ra_tls` owns one copy of the original crypto provider initialization, used by HTTP and
+MCP adapters. Docker retains its existing ring-based initialization. Existing best-effort behavior for a preinstalled provider is unchanged.
+
+The workspace continues using crates.io tungstenite. The pinned fork's HTTP CONNECT, SOCKS5,
+SOCKS5h and environment proxy algorithms are copied into the WebSocket adapter. Fork-only proxy
+URL errors become typed inner I/O errors because crates.io lacks those variants; the unsupported
+scheme fallback still recognizes the typed cause. Both original MIT licenses are retained.
+Tokio now requires 1.53: native owned-descriptor registration uses its explicit safety contract
+instead of the deprecated `AsyncFd::new` API.
+
+`plugins::ExecutorPluginProvider` resolves selected roots through the actual environment-owned
+filesystem and retains that exact FS with each `ResolvedExecutorPlugin`. Ownership probes pipeline
+up to 256 metadata calls while consuming results in ancestor/manifest priority order. Malformed
+ancestor manifests still establish package ownership; discovery and metadata errors remain errors.
+Resource descriptors bind every manifest/resource URI to its environment and reject root escapes.
+Host and executor parsing share the original URI resolver and URI-keyed manifest cache.
+
+`PluginMcpProvider::load` reads declared/inline/default MCP configuration through the bound FS.
+`ra_mcp::plugin_config` ports the Host, executor and portable declaration parsers, including sibling
+error isolation, executor cwd containment, remote environment-variable ownership and rejection of
+plugin-selected enterprise authentication. `apply_configured_plugin_mcp_server_policies` retains
+the selected-plugin restriction formula. Parsing and policy projection do not start MCP servers.
+
+`executor_plugin_hook_sources` consumes discovery snapshots and the supplied enabled-tool catalog.
+Only source-allowlisted inline cleanup handlers survive. File-backed hooks remain excluded;
+source paths and environment attribution are retained. Browser routing requires the catalog's
+connector identity and `_codex_apps.resource_uri`, then routes to the configured local MCP
+endpoint with copied trusted metadata. This function admits declarations; execution still belongs
+to the Host hook engine. `McpToolInfo::with_connector_id` carries trusted catalog identity with the
+existing declaration, without extracting it from untrusted tool metadata.
+
+The environment port is the filesystem-facing direct-transport subset. Process/HTTP execution,
+Noise registry/provisioning and refresh, environment-config RPC, V2 discovery, shell snapshots,
+and product installation/PATH metadata are not implemented here. Local metadata advertises only
+implemented capabilities and reports the source unknown version. OTel metrics and remote span
+parent propagation, and observation-only sandbox integrity diagnostics, are omitted; RPC wire trace
+fields remain compatible. These omissions do not constitute a complete replacement of Codex's
+exec-server. Full product plugin loading, Host contributions and hook dispatch remain separate
+unfinished consumers; this change does not mark those tasks complete.
+
+Internal source records retain upstream documentation and field names with file-scoped
+`missing_docs` allowances. Specific lint allowances preserve original ownership signatures,
+policy tables, native ABI conversions and lifecycle structure; no Clippy group is disabled.
+
 ### Host hook configuration and parsing prerequisites
 
 `ra_coding::config` now owns the complete upstream hook declaration types, `HooksToml`,
@@ -152,9 +233,9 @@ versions or the existing TOML preserve_order setting.
 
 ### Explicit plugin configuration values
 
-`ra_coding::config` owns the Codex plugin and marketplace configuration value types in
-`config/types.rs`, and the shared `AppToolApproval` / `McpServerToolConfig` types in
-`config/mcp_types.rs`. Plugins consume these product configuration types. Values include optional
+`ra_config` owns plugin and marketplace configuration values in
+`types.rs`, and the shared `AppToolApproval` / `McpServerToolConfig` types in
+`mcp_types.rs`. `ra_coding::config` retains compatibility exports of these same types. Plugins consume these product configuration types. Values include optional
 activation overrides, `_default`, per-server and per-tool policy, and marketplace origin metadata,
 and can be deserialized from explicitly supplied TOML or JSON. This module does
 not discover configuration files, resolve layers or requirements, enable installed plugins, or load
@@ -839,3 +920,39 @@ defaults and error codes follow the OpenAI Agents SDK.
 | The integer inside `PtyProcessId` is private | Code that writes `PtyProcessId(n)` or reads `.0` | Use `PtyProcessId::new(n)` and `.get()` |
 | `UnsupportedScheme` and `EphemeralMountRemoval` have private fields | Code that reads them | Use `scheme()` on the former; build the latter only through `new` and its two constructors |
 | `SandboxErrorDetails` is `#[non_exhaustive]` | Code that matches it exhaustively | Add a wildcard arm |
+
+### Executor review corrections
+
+Linux filesystem-helper preparation now uses the source WSL1/bubblewrap support check,
+`linux_sandbox_arg0_override` and permission-profile argument lowering, specialized to the source
+filesystem-helper call with no managed network. The launcher preserves the helper working root,
+permission-policy cwd and sandbox override separately. MXC selection is rejected on non-Windows
+hosts. The repository does not build or bundle `codex-linux-sandbox`; restricted Linux filesystem
+operations remain unavailable unless the caller supplies a compatible external executable in
+`codex_linux_sandbox_exe`. The existing bwrap entry point does not implement that CLI. Linux and
+Windows `ra-exec` compilation is checked separately from native sandbox execution. Windows native
+restricted-token/elevated/MXC backends remain unported and return an explicit error.
+
+Rendezvous URLs selected by the source `role=harness` query rule are rejected before environment
+registration or dialing; relay framing is not implemented. Direct JSON-RPC is not used as a fallback.
+The hidden `test-api` facades expose the production algorithms to the external tests workspace.
+Enabling `test-api`, including through feature unification or `--all-features`, does not change
+ordinary client constructors: recovery remains 25 seconds. A feature-gated lazy-client constructor
+accepts a recovery duration for source fixtures, and that value is owned by the resulting client.
+WebSocket fixtures pass their 25ms heartbeat through the existing stream constructor parameter.
+The unused axum server constructor, its message adapter, server-only heartbeat constant and direct
+axum dependency are deferred with the server; ordinary client WebSockets retain the source's lack
+of periodic server-side pings. Environment snapshot records have one definition each, with
+feature-gated fixture construction/access instead of conditional copies. Passive selected-root
+inspection is ported without starting an environment. Process execution, Noise registry recovery/backoff, server-side
+file-handle registry and OTel propagation tests remain deferred with their implementations; the
+implementation record lists every omitted source case rather than treating them as covered.
+
+
+The native spawn ports also pass target-specific Clippy without changing the source error or
+ownership contract. Linux uses explicit raw pointers and checked bounded conversions; Windows
+retains native status/coordinate bit patterns, source command ownership and escaped diagnostics.
+Allowances for retained, uncalled source APIs are attached to the particular field, type,
+implementation or function; the port no longer suppresses dead code for entire modules. The
+unused filesystem-helper `seatbelt_network_policy.sbpl` is removed: the fixed restricted helper
+continues to use the same empty dynamic network-policy fragment as upstream's no-proxy call.

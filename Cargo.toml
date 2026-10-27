@@ -29,6 +29,12 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
+ra-tls = { path = "crates/ra-tls", version = "0.3.0" }
+ra-http = { path = "crates/ra-http", version = "0.3.0" }
+ra-executor = { path = "crates/ra-executor", version = "0.3.0" }
+ra-executor-protocol = { path = "crates/ra-executor-protocol", version = "0.3.0" }
+ra-filesystem = { path = "crates/ra-filesystem", version = "0.3.0" }
+ra-config = { path = "crates/ra-config", version = "0.3.0" }
 rusty-agent = { path = "crates/rusty-agent", version = "0.3.0" }
 # --- 内部 crate ---
 ra-paths = { path = "crates/ra-paths", version = "0.3.0" }
@@ -51,7 +57,7 @@ ra-coding = { path = "crates/ra-coding", version = "0.3.0" }
 ra-execpolicy = { path = "crates/ra-execpolicy", version = "0.3.0" }
 
 # --- 运行时 ---
-tokio = { version = "1", features = [
+tokio = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",
     "process",

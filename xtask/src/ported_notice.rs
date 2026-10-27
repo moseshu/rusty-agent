@@ -13,13 +13,18 @@ pub(crate) fn run() -> Outcome {
     let mut violations = Vec::new();
     for line in notice.lines().filter(|line| line.starts_with("| `")) {
         let fields: Vec<_> = line.split('|').map(str::trim).collect();
-        if fields.len() != 6 {
+        if fields.len() != 6 && fields.len() != 7 {
             violations.push(format!("invalid NOTICE record: {line}"));
             continue;
         }
         let path = fields[1].trim_matches('`').to_owned();
+        let license = if fields.len() == 7 {
+            fields[5]
+        } else {
+            "Apache-2.0"
+        };
         let header = format!(
-            "// Adapted from {} (Apache-2.0) @ {}, modified.",
+            "// Adapted from {} ({license}) @ {}, modified.",
             fields[2], fields[3]
         );
         if recorded.insert(path.clone(), header).is_some() {

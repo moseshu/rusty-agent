@@ -44,16 +44,16 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
-| `crates/ra-coding/src/config/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
-| `crates/ra-coding/src/config/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |
-| `crates/ra-coding/src/config/key_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/key_aliases.rs |
-| `crates/ra-coding/src/config/overrides.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/overrides.rs |
-| `crates/ra-coding/src/config/fingerprint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint.rs::version_for_toml (source-origin traversal awaits the real layer stack) |
-| `crates/ra-coding/src/config/domain.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs::normalize_host/normalize_dns_host_or_ip_literal/normalize_ip_literal |
+| `crates/ra-config/src/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
+| `crates/ra-config/src/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |
+| `crates/ra-config/src/key_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/key_aliases.rs |
+| `crates/ra-config/src/overrides.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/overrides.rs |
+| `crates/ra-config/src/fingerprint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint.rs::version_for_toml (source-origin traversal awaits the real layer stack) |
+| `crates/ra-config/src/domain.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs::normalize_host/normalize_dns_host_or_ip_literal/normalize_ip_literal |
 | `tests/it-coding/tests/config_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge_tests.rs (all 25 raw-TOML fixtures; three typed ConfigToml projection assertions await the product schema) |
 | `tests/it-coding/tests/config_primitives.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint_tests.rs; network-proxy/src/domain_matcher_tests.rs (host cases through public merge); config/src/{config_layer_source,merge,overrides}.rs (public contract regressions) |
-| `crates/ra-coding/src/config/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs::PluginsDefaultConfig/PluginsConfigToml/PluginConfig/PluginMcpServerConfig/MarketplaceConfig/MarketplaceSourceType (configuration values and pure policy operations only) |
-| `crates/ra-coding/src/config/mcp_types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types.rs (product MCP configuration and transport validation; OpenAI account authentication omitted) |
+| `crates/ra-config/src/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs::PluginsDefaultConfig/PluginsConfigToml/PluginConfig/PluginMcpServerConfig/MarketplaceConfig/MarketplaceSourceType (configuration values and pure policy operations only) |
+| `crates/ra-config/src/mcp_types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types.rs (product MCP configuration and transport validation; OpenAI account authentication omitted) |
 | `tests/it-coding/tests/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types_tests.rs::plugin_activation_inherits_defaults_without_explicit_enablement; mcp_types_tests.rs::app_tool_approval_restrictions_never_weaken_either_policy; core-plugins/src/loader_tests.rs::legacy_ema_policy_disables_installed_and_selected_plugin_servers (serialization assertions only); types.rs/mcp_types.rs (additional configuration-value regressions) |
 | `crates/ra-coding/src/plugins/materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::MaterializedMarketplacePluginSource/materialize_marketplace_plugin_source/materialize_marketplace_plugin_source_with_mode/clone_git_plugin_source/run_git/run_git_output |
 | `crates/ra-coding/src/plugins/materialize/test_api.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{loader,git_policy,npm_source,plugin_bundle_archive}.rs (thin external-test access to original helpers and error records) |
@@ -81,7 +81,7 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/plugins/command_migration.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration.rs |
 | `crates/ra-coding/src/plugins/command_migration/plugin.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration/plugin.rs |
 | `crates/ra-coding/src/plugins/command_migration/render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration/render.rs |
-| `crates/ra-coding/src/plugins/manifest/cache.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest/manifest_cache.rs (Host cache ownership/revision/LRU; native key adaptation) |
+| `crates/ra-coding/src/plugins/manifest/cache.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest/manifest_cache.rs (URI cache ownership/revision/LRU) |
 | `tests/it-coding/tests/plugin_store.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store_tests.rs (all non-account cases); store.rs (additional source-version/fallback/layout regressions) |
 | `tests/it-coding/tests/plugin_store_failures.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store.rs (staging/activation/rollback/cleanup error branches, using deterministic filesystem operation injection) |
 | `tests/it-coding/tests/plugin_command_migration.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/command_migration_tests.rs; manager_tests.rs (local command materialization and migration-error fixtures, without runtime inventory loading) |
@@ -90,14 +90,19 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/plugins/installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/installed.rs (version helpers; account install identity metadata excluded) |
 | `crates/ra-coding/src/permissions/path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs (shared native normalization, home expansion and guard via ra-paths); utils/path-uri/src/lib.rs (native POSIX permission adapters) |
 | `crates/ra-coding/src/plugins/model.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/manifest.rs |
-| `crates/ra-coding/src/config/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (shared declarations, per-handler state and managed requirements; committed plugin path remains a compatibility re-export) |
+| `crates/ra-coding/src/plugins/provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/provider.rs (authority-bound resource descriptors) |
+| `crates/ra-coding/src/plugins/bundled_hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/bundled_hooks.rs (temporary unsigned cleanup allowlist) |
+| `crates/ra-config/src/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hook_config.rs (shared declarations, per-handler state and managed requirements; committed plugin path remains a compatibility re-export) |
 | `crates/ra-coding/src/plugins/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (schema classification and Host finder); src/lib.rs::migrated_command_skills_root |
-| `crates/ra-coding/src/plugins/manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs; manifest/manifest_cache.rs (disabled-cache standalone load); codex-rs/utils/path-uri/src/lib.rs (native Host path subset); utils/absolute-path/src/lib.rs (checked absolute-path entry) |
+| `crates/ra-coding/src/plugins/manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs (shared Host/URI parsing); manifest/manifest_cache.rs (disabled-cache standalone load); utils/absolute-path/src/lib.rs (checked absolute-path entry) |
 | `crates/ra-coding/src/plugins/manifest/agent.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest.rs |
 | `tests/it-coding/tests/plugin_identity.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugin-common/src/plugin_id_tests.rs; plugin_id.rs (key/error regressions) |
 | `tests/it-coding/tests/plugin_installed.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/store_tests.rs (active version selection); core-plugin-common/src/installed.rs (read-only helper regressions) |
 | `tests/it-coding/tests/plugin_discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/plugin_namespace.rs (Host finder tests and schema classification) |
 | `tests/it-coding/tests/plugin_manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs (Host interface/version/keywords/alternate-path tests) |
+| `tests/it-coding/tests/plugin_resources.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/provider_tests.rs; provider.rs (foreign-authority containment regressions) |
+| `tests/it-coding/tests/plugin_uri_manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manifest.rs (URI path-convention/foreign-resource tests); agent_plugin_manifest.rs (foreign portable-extension regression) |
+| `tests/it-coding/tests/plugin_cleanup_allowlist.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/bundled_hooks.rs; core-plugins/src/executor_hooks_tests.rs (adapted admission cases without discovery/routing) |
 | `tests/it-coding/tests/plugin_agent_manifest.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_manifest_tests.rs |
 | `tests/it-coding/tests/plugin_hook_declarations.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (HooksFile JSON, MCP input, additional-context serialization, and Windows override TOML fixtures adapted to plugin JSON) |
 | `tests/it-coding/tests/plugin_manifest_boundaries.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/{manifest,agent_plugin_manifest}.rs; codex-rs/utils/path-uri/src/lib.rs (Host boundary regressions) |
@@ -159,11 +164,9 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-mcp/src/client/http/transport/sse.rs` | modelcontextprotocol/rust-sdk | 79437f291b2c44053d00dcd5db969fd0cca7c887 | crates/rmcp/src/transport/common/client_side_sse.rs |
 | `crates/ra-mcp/src/filter.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/tools.rs; src/connection_manager/tool_catalog.rs |
 | `crates/ra-mcp/src/in_process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/in_process_transport.rs |
-| `crates/ra-mcp/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `crates/ra-mcp/src/tool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; src/mcp_tool_exposure.rs |
 | `crates/ra-protocol/src/server/protocol/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/thread.rs |
 | `crates/ra-protocol/src/server/thread_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/thread_processor.rs; thread_read_state.rs; codex-rs/app-server/src/filters.rs |
-| `crates/ra-sandbox/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
 | `tests/it-mcp/tests/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager_tests.rs |
 | `tests/it-mcp/tests/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/tests/provider.rs; tests/preinstalled.rs |
 | `tests/it-protocol/tests/threads/thread_list.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/tests/suite/v2/thread_list.rs; thread_read_state.rs |
@@ -201,14 +204,14 @@ local upstream checkouts used for the port; each file lists its original source.
 | `tests/it-protocol/tests/threads/prompt_cache_key.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/prompt_cache_key.rs; codex-rs/core/src/session/session.rs (fork_cache_key) |
 | `tests/it-protocol/tests/threads/coding_tools.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/prompt_cache_key.rs; codex-rs/core/src/session/session.rs (fork routing and agent-control session identity) |
 | `crates/ra-paths/src/absolute_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs and absolutize.rs (native absolute paths, checked and explicit-base constructors, traversal, Deref/owned conversion, symlink-preserving canonicalization and synchronous base/home scopes) |
-| `crates/ra-coding/src/config/mcp_ema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_ema.rs (enterprise profile and immutable registration types, server registration and transport validation; stack provenance and OpenAI account scope are not included) |
-| `crates/ra-protocol/src/server/protocol/mcp_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/mcp_policy.rs |
-| `crates/ra-coding/src/config/mcp_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_requirements.rs |
-| `crates/ra-coding/src/config/constraint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/constraint.rs |
-| `crates/ra-coding/src/config/sourced.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs::ConstrainedWithSource/Sourced |
-| `crates/ra-coding/src/config/requirement_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs::RequirementSource |
-| `crates/ra-coding/src/config/redacted_string.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/redacted-string/src/lib.rs |
-| `crates/ra-coding/src/config/tool_exposure.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::ToolExposureSurface (without TypeScript export) |
+| `crates/ra-config/src/mcp_ema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_ema.rs (enterprise profile and immutable registration types, server registration and transport validation; stack provenance and OpenAI account scope are not included) |
+| `crates/ra-config/src/mcp_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/mcp_policy.rs |
+| `crates/ra-config/src/mcp_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_requirements.rs |
+| `crates/ra-config/src/constraint.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/constraint.rs |
+| `crates/ra-config/src/sourced.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs::ConstrainedWithSource/Sourced |
+| `crates/ra-config/src/requirement_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs::RequirementSource |
+| `crates/ra-config/src/redacted_string.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/redacted-string/src/lib.rs |
+| `crates/ra-config/src/tool_exposure.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::ToolExposureSurface (without TypeScript export) |
 | `crates/ra-paths/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/lib.rs (without TypeScript export; native absolute paths share the same crate) |
 | `crates/ra-paths/src/absolute_path_normalization.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/absolute_path_normalization.rs |
 | `crates/ra-paths/src/api_path_string.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-uri/src/api_path_string.rs (without TypeScript export) |
@@ -365,3 +368,150 @@ The eleven JSON files under tests/it-coding/tests/fixtures/hooks_output are copi
 unchanged from openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
 codex-rs/hooks/schema/generated/*.output.schema.json (Apache-2.0). They are fixed
 upstream expectations for output wire-schema verification, not locally refreshed snapshots.
+
+Executor filesystem, direct environment transport and selected plugin ports follow the same
+pinned Codex revision. The filesystem-helper Seatbelt SBPL files under
+crates/ra-exec/src/filesystem retain sandboxing/src/seatbelt_{base_policy,preferences_policy,read_only_platform_defaults}.sbpl. The proxy compatibility sources below
+retain their original MIT licenses in third_party/{tokio-tungstenite,tungstenite-rs}.LICENSE.
+An optional final license column overrides the default Apache-2.0 source license.
+
+| `crates/ra-coding/src/plugins/executor_hook_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/lib.rs::ExecutorPluginHookSource |
+| `crates/ra-coding/src/plugins/executor_hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/executor_hooks.rs |
+| `crates/ra-coding/src/plugins/executor_mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/mcp/src/plugin/provider.rs |
+| `crates/ra-coding/src/plugins/executor_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/executor_provider.rs (concrete resolver; metadata listing trait omitted) |
+| `crates/ra-coding/src/plugins/mcp_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::apply_configured_plugin_mcp_server_policies |
+| `crates/ra-config/src/scoped_skills.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/skills_config.rs::ScopedSkillsConfig |
+| `crates/ra-exec/src/filesystem/fs_helper.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_helper.rs |
+| `crates/ra-exec/src/filesystem/fs_helper_main.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_helper_main.rs |
+| `crates/ra-exec/src/filesystem/fs_sandbox.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_sandbox.rs |
+| `crates/ra-exec/src/filesystem/helper_seatbelt.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt.rs (filesystem-helper profile specialization) |
+| `crates/ra-exec/src/filesystem/local_file_system.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs |
+| `crates/ra-exec/src/filesystem/local_file_system_read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system_read.rs |
+| `crates/ra-exec/src/filesystem/no_follow.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/no_follow/mod.rs |
+| `crates/ra-exec/src/filesystem/no_follow/unix.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/no_follow/unix.rs |
+| `crates/ra-exec/src/filesystem/no_follow/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/no_follow/windows.rs |
+| `crates/ra-exec/src/filesystem/no_follow/windows_volume_fallback.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/no_follow/windows_volume_fallback.rs |
+| `crates/ra-exec/src/filesystem/regular_file.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/regular_file.rs |
+| `crates/ra-exec/src/filesystem/runtime_options.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/runtime_options.rs; sandboxing/src/lib.rs::LinuxSandboxPidNamespace |
+| `crates/ra-exec/src/filesystem/sandboxed_file_open.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/sandboxed_file_open.rs |
+| `crates/ra-exec/src/filesystem/sandboxed_file_system.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/sandboxed_file_system.rs |
+| `crates/ra-exec/src/filesystem/seatbelt_daemon.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_daemon.rs |
+| `crates/ra-exec/src/filesystem/seatbelt_scratch.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_scratch.rs |
+| `crates/ra-exec/src/filesystem/wire_error.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc.rs (wire error constructors) |
+| `crates/ra-exec/src/native_process/child.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/child.rs |
+| `crates/ra-exec/src/native_process/child_command.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/child_command.rs |
+| `crates/ra-exec/src/native_process/child_reaper.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/child_reaper.rs |
+| `crates/ra-exec/src/native_process/linux_fds.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/linux_fds.rs |
+| `crates/ra-exec/src/native_process/pipe.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/pipe.rs |
+| `crates/ra-exec/src/native_process/posix_child.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/posix_child.rs |
+| `crates/ra-exec/src/native_process/process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/process.rs |
+| `crates/ra-exec/src/native_process/pty.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/pty.rs |
+| `crates/ra-exec/src/native_process/spawn_helper.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/spawn_helper.rs |
+| `crates/ra-exec/src/native_process/spawn_helper_main.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/spawn_helper_main.rs |
+| `crates/ra-exec/src/native_process/unix_io.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/unix_io.rs |
+| `crates/ra-exec/src/native_process/win/conpty.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/win/conpty.rs |
+| `crates/ra-exec/src/native_process/win/job.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/win/job.rs |
+| `crates/ra-exec/src/native_process/win.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/win/mod.rs |
+| `crates/ra-exec/src/native_process/win/procthreadattr.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/win/procthreadattr.rs |
+| `crates/ra-exec/src/native_process/win/psuedocon.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/win/psuedocon.rs |
+| `crates/ra-exec/src/native_process/windows_input.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/windows_input.rs |
+| `crates/ra-exec/src/native_process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/lib.rs (descriptor-aware spawn dependency closure) |
+| `crates/ra-exec/src/process_group.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/pty/src/process_group.rs |
+| `crates/ra-exec/src/shell_detect.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/shell-command/src/shell_detect.rs |
+| `crates/ra-executor/src/capability_discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/capability_discovery.rs |
+| `crates/ra-executor/src/capability_discovery_cache.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/capability_discovery_cache.rs |
+| `crates/ra-executor/src/client/connection_failure.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client/connection_failure.rs |
+| `crates/ra-executor/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/{client,client_recovery,client_refresh}.rs (filesystem-facing direct transport subset) |
+| `crates/ra-executor/src/client_api.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client_api.rs |
+| `crates/ra-executor/src/client_inbound_request_limit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client_inbound_request_limit.rs |
+| `crates/ra-executor/src/client_transport.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client_transport.rs |
+| `crates/ra-executor/src/connection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/connection.rs |
+| `crates/ra-executor/src/environment/connect_options.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment/connect_options.rs |
+| `crates/ra-executor/src/environment/discovery_recovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment/discovery_recovery.rs |
+| `crates/ra-executor/src/environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment.rs |
+| `crates/ra-executor/src/environment_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment_provider.rs |
+| `crates/ra-executor/src/environment_toml.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment_toml.rs |
+| `crates/ra-executor/src/error.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client.rs::ExecServerError; exec-server/src/client_error.rs |
+| `crates/ra-executor/src/local_environment_info.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server-protocol/src/protocol.rs::EnvironmentInfo (native metadata; only implemented capability flags) |
+| `crates/ra-executor/src/remote_file_stream.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/remote_file_stream.rs |
+| `crates/ra-executor/src/remote_file_system.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/remote_file_system.rs |
+| `crates/ra-executor/src/rpc.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc.rs |
+| `crates/ra-executor/src/rpc_pending_request.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc_pending_request.rs |
+| `crates/ra-executor/src/rpc_server_requests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc_server_requests.rs |
+| `crates/ra-executor/src/rpc_timing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc_timing.rs |
+| `crates/ra-executor/src/shell_environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/shell_environment.rs (scoped child variable scrubbing) |
+| `crates/ra-executor-protocol/src/capabilities.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/capabilities.rs |
+| `crates/ra-executor-protocol/src/protocol.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server-protocol/src/protocol.rs |
+| `crates/ra-executor-protocol/src/rpc.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server-protocol/src/rpc.rs |
+| `crates/ra-filesystem/src/environment_accessor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/file-system/src/environment_accessor.rs |
+| `crates/ra-filesystem/src/exec_permission_profile_serde.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/file-system/src/exec_permission_profile_serde.rs |
+| `crates/ra-filesystem/src/find_up.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/file-system/src/find_up.rs |
+| `crates/ra-filesystem/src/legacy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs (legacy sandbox projection) |
+| `crates/ra-filesystem/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/file-system/src/lib.rs |
+| `crates/ra-filesystem/src/models.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/models.rs (permission profile closure) |
+| `crates/ra-filesystem/src/permissions/deny_read_validator.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/deny_read_validator.rs |
+| `crates/ra-filesystem/src/permissions/local_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/local_aliases.rs |
+| `crates/ra-filesystem/src/permissions/target.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/target.rs |
+| `crates/ra-filesystem/src/permissions/windows_glob.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions/windows_glob.rs |
+| `crates/ra-filesystem/src/permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions.rs |
+| `crates/ra-filesystem/src/sandbox.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/sandbox.rs; protocol/src/config_types.rs::WindowsSandboxLevel; windows-sandbox/src/lib.rs::WindowsSandboxProxySettingsMode |
+| `crates/ra-http/src/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/client.rs |
+| `crates/ra-http/src/client_builder.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/client_builder.rs |
+| `crates/ra-http/src/client_tls.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/client_tls.rs |
+| `crates/ra-http/src/custom_ca.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/custom_ca.rs |
+| `crates/ra-http/src/error.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/error.rs |
+| `crates/ra-http/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/lib.rs (non-account transport exports) |
+| `crates/ra-http/src/network_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/network_policy.rs |
+| `crates/ra-http/src/outbound_proxy/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/outbound_proxy/macos.rs |
+| `crates/ra-http/src/outbound_proxy/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/outbound_proxy/windows.rs |
+| `crates/ra-http/src/outbound_proxy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/outbound_proxy.rs |
+| `crates/ra-http/src/request.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/request.rs |
+| `crates/ra-http/src/request_builder.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/request_builder.rs |
+| `crates/ra-http/src/request_draft.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/request_draft.rs |
+| `crates/ra-http/src/response.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/response.rs |
+| `crates/ra-http/src/retry_after.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/retry_after.rs |
+| `crates/ra-http/src/route_aware_client_pool/execution.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/route_aware_client_pool/execution.rs |
+| `crates/ra-http/src/route_aware_client_pool.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/route_aware_client_pool.rs |
+| `crates/ra-http/src/route_aware_redirect.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/route_aware_redirect.rs |
+| `crates/ra-http/src/tls_backend_fallback.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/tls_backend_fallback.rs |
+| `crates/ra-http/src/transport.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/transport.rs |
+| `crates/ra-http/src/websocket/dialer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/websocket-client/src/dialer.rs (crates.io proxy error adapter) |
+| `crates/ra-http/src/websocket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/websocket-client/src/lib.rs (account cookie integration excluded) |
+| `crates/ra-http/src/websocket/proxy_async.rs` | openai-oss-forks/tokio-tungstenite | 0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186 | src/proxy.rs | MIT |
+| `crates/ra-http/src/websocket/proxy_config.rs` | openai-oss-forks/tungstenite-rs | 4fffad30fe373adbdcffab9545e9e9bf4f2fc19f | src/proxy.rs | MIT |
+| `crates/ra-http/src/windows_tls.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/windows_tls.rs |
+| `crates/ra-mcp/src/agent_plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/agent_plugin_config.rs |
+| `crates/ra-mcp/src/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/plugin_config.rs |
+| `crates/ra-paths/src/system_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs::normalize_system_aliases |
+| `crates/ra-tls/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
+| `tests/it-coding/tests/plugin_executor_hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/executor_hooks_tests.rs |
+| `tests/it-coding/tests/plugin_executor_mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/mcp/src/plugin/provider_tests.rs |
+| `tests/it-coding/tests/plugin_executor_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/executor_provider_tests.rs |
+| `tests/it-coding/tests/plugin_mcp_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/plugin_config_tests.rs |
+| `tests/it-executor/tests/environment_connect_options.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment/connect_options_tests.rs |
+| `tests/it-paths/tests/system_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs tests (system aliases) |
+
+| `tests/it-executor/tests/network_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/http-client/src/network_policy_tests.rs |
+| `tests/it-executor/tests/websocket_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/websocket-client/src/network_policy_tests.rs |
+
+| `crates/ra-sandbox/src/rustls_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/rustls-provider/src/lib.rs |
+| `crates/ra-exec/src/filesystem/helper_linux.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/{manager,landlock,bwrap}.rs (filesystem-helper specialization with managed_network=None) |
+| `crates/ra-executor/src/resolved_capability.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/resolved_capability.rs::SelectedCapabilityRootsStatus/inspect_selected_capability_roots (passive inspection only) |
+| `tests/it-executor/tests/source_fs_sandbox.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_sandbox.rs::tests (native Windows backend case deferred) |
+| `tests/it-executor/tests/source_rpc.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc.rs::tests (OTel-only tests deferred) |
+| `tests/it-executor/tests/source_local_uri.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system_path_uri_tests.rs |
+| `tests/it-executor/tests/source_server_requests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/rpc_server_requests_tests.rs (OTel-only test deferred) |
+| `tests/it-executor/tests/source_file_read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system_read_tests.rs |
+| `tests/it-executor/tests/source_environment_toml.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment_toml.rs::tests |
+| `tests/it-executor/tests/source_symlink_escape.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs::tests (Unix symlink escape) |
+| `tests/it-executor/tests/source_connection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/connection.rs::tests |
+| `tests/it-executor/tests/source_inbound_limits.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client_inbound_request_limit_tests.rs |
+| `tests/it-executor/tests/source_client_recovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client_recovery_tests.rs (implemented retry classifiers) |
+| `tests/it-executor/tests/source_sandbox_uri.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/sandboxed_file_system_path_uri_tests.rs |
+| `tests/it-executor/tests/source_linux_wrapper.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/manager_tests.rs; sandboxing/src/{landlock,bwrap}.rs (support/arg0/profile regression fixtures) |
+| `tests/it-executor/tests/source_environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/environment.rs::tests (filesystem-facing direct transport subset) |
+| `tests/it-executor/tests/source_remote_uri.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/remote_file_system_path_uri_tests.rs; exec-server/src/remote_file_system.rs::tests |
+| `tests/it-executor/tests/source_regular_file.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/regular_file_tests.rs |
+| `tests/it-executor/tests/source_client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client.rs::tests (filesystem-facing direct transport subset) |
+| `tests/it-executor/tests/source_walk.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs::walk_tests |
+| `tests/it-executor/tests/source_windows_symlinks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs::tests (Windows dangling directory symlink) |

@@ -1,0 +1,47 @@
+[package]
+name = "ra-executor"
+description = "Environment-owned filesystem and capability discovery transports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-api = []
+
+[dependencies]
+ra-http = { workspace = true }
+arc-swap = "1"
+bytes = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+ra-exec = { workspace = true }
+ra-filesystem = { workspace = true }
+ra-executor-protocol = { workspace = true }
+ra-config = { workspace = true }
+ra-paths = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+
+[dependencies.tokio-tungstenite]
+workspace = true
+features = ["rustls-tls-native-roots"]

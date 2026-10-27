@@ -178,7 +178,9 @@ impl RunTempDir {
             }
         }
         // Existing paths require a separate recovery authority. A name alone proves no ownership.
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

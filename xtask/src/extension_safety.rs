@@ -54,6 +54,10 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
     "McpServerIdentity",
     "McpServerValueMatcher",
     "McpServerRequirement",
+    // Native shell and PID isolation choices are closed source control-flow unions.
+    // Adding a variant must force each launch/detection backend to handle it.
+    "LinuxSandboxPidNamespace",
+    "ShellType",
     "FileMode",
 ];
 
@@ -70,17 +74,40 @@ const EXHAUSTIVE_ALLOWED: &[&str] = &[
 /// one so adding another is a decision somebody makes rather than a module-wide pass. Each entry
 /// names the upstream type it mirrors.
 const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
-    // Codex protocol/src/mcp_policy.rs records retain their field-for-field upstream shape.
+    // Private native records become nameable only through the feature-gated source-test facade.
+    // The launch request retains the filesystem-facing fields of Codex's sandbox ExecRequest;
+    // SandboxCwd and CancellableReader keep the source records used by the original tests.
     (
-        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
-        "EnvironmentMcpPolicy",
+        "crates/ra-exec/src/filesystem/fs_sandbox.rs",
+        "SandboxExecRequest",
+    ),
+    ("crates/ra-exec/src/filesystem/fs_sandbox.rs", "SandboxCwd"),
+    (
+        "crates/ra-exec/src/filesystem/local_file_system_read.rs",
+        "CancellableReader",
+    ),
+    // Source runtime options, shell results and per-server parser outcomes retain their records.
+    (
+        "crates/ra-exec/src/filesystem/runtime_options.rs",
+        "ExecServerRuntimeOptions",
+    ),
+    ("crates/ra-exec/src/shell_detect.rs", "DetectedShell"),
+    (
+        "crates/ra-mcp/src/plugin_config.rs",
+        "PluginMcpServerParseError",
     ),
     (
-        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
+        "crates/ra-mcp/src/plugin_config.rs",
+        "PluginMcpConfigParseOutcome",
+    ),
+    // Codex protocol/src/mcp_policy.rs records retain their field-for-field upstream shape.
+    ("crates/ra-config/src/mcp_policy.rs", "EnvironmentMcpPolicy"),
+    (
+        "crates/ra-config/src/mcp_policy.rs",
         "McpServerCommandMatcher",
     ),
     (
-        "crates/ra-protocol/src/server/protocol/mcp_policy.rs",
+        "crates/ra-config/src/mcp_policy.rs",
         "PluginMcpRequirements",
     ),
     // Codex ext/skills/src/required.rs::EnvironmentSkillRequirements is a borrowed public record.

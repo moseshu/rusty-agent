@@ -1,23 +1,28 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Host plugin manifest parsing. Resources remain lexically resolved absolute paths.
-//!
-//! The generic models preserve resource mapping, while executor URI parsing belongs to the
-//! environment-owned package adapter. This module neither installs nor activates a package.
+//! Plugin manifest parsing shared by native Host and environment-owned URI resources.
+//! Parsing performs no package I/O, activation, or hook execution.
 
-use super::AbsolutePathBuf;
-use super::discovery::{AGENT_PLUGIN_MANIFEST_RELATIVE_PATH, find_plugin_manifest_path};
-use super::hook_config::HooksFile;
+use super::discovery::AGENT_PLUGIN_MANIFEST_RELATIVE_PATH;
+use super::discovery::find_plugin_manifest_path;
+use crate::config::HooksFile;
+use ra_paths::AbsolutePathBuf;
+use ra_paths::PathConvention;
+use ra_paths::PathUri;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::{fs, io, path::Path};
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 
-mod agent;
 mod cache;
-use agent::parse_agent_plugin_manifest;
 pub(crate) use cache::ManifestCache;
-
 const MAX_DEFAULT_PROMPT_COUNT: usize = 3;
 const MAX_DEFAULT_PROMPT_LEN: usize = 128;
+
+mod agent;
+
+use agent::parse_agent_plugin_manifest_uri;
 
 /// A manifest with resources on the local host.
 pub type PluginManifest = super::model::PluginManifest<AbsolutePathBuf>;
@@ -30,6 +35,9 @@ pub type PluginManifestMcpServers = super::model::PluginManifestMcpServers<Absol
 /// Host component paths.
 pub type PluginManifestPaths = super::model::PluginManifestPaths<AbsolutePathBuf>;
 
+/// A manifest whose resources retain their source filesystem URI.
+pub type UriPluginManifest = super::model::PluginManifest<PathUri>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PluginManifestFormat {
     Legacy,
@@ -37,166 +45,8 @@ pub(crate) enum PluginManifestFormat {
 }
 
 pub(crate) struct LoadedPluginManifest {
-    pub(crate) manifest: PluginManifest,
-    pub(crate) format: PluginManifestFormat,
-}
-
-/// Loads a host manifest, returning no package for an absent or invalid selected manifest.
-#[must_use]
-pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
-    load_plugin_manifest_with_format(plugin_root).map(|loaded| loaded.manifest)
-}
-
-/// Whether the selected, successfully parsed package uses the portable format.
-#[must_use]
-pub fn is_agent_plugin_manifest(plugin_root: &Path) -> bool {
-    load_plugin_manifest_with_format(plugin_root)
-        .is_some_and(|loaded| loaded.format == PluginManifestFormat::AgentPlugin)
-}
-
-pub(crate) fn load_plugin_manifest_with_format(plugin_root: &Path) -> Option<LoadedPluginManifest> {
-    ManifestCache::disabled().load(plugin_root)
-}
-
-pub(crate) fn load_plugin_command_paths(
-    plugin_root: &Path,
-) -> io::Result<Option<Vec<std::path::PathBuf>>> {
-    let Some(manifest_path) = find_plugin_manifest_path(plugin_root) else {
-        return Ok(None);
-    };
-    let manifest =
-        serde_json::from_str::<RawPluginCommandManifest>(&fs::read_to_string(manifest_path)?)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let Some(commands) = manifest.commands else {
-        return Ok(None);
-    };
-    let plugin_root = host_absolute_path(plugin_root)?;
-    Ok(Some(
-        resolve_manifest_paths(&plugin_root, "commands", Some(&commands))
-            .into_iter()
-            .map(AbsolutePathBuf::into_path_buf)
-            .collect(),
-    ))
-}
-
-pub(crate) fn parse_plugin_manifest(
-    plugin_root: &Path,
-    manifest_path: &Path,
-    contents: &str,
-) -> Result<PluginManifest, serde_json::Error> {
-    parse_resolved_plugin_manifest(
-        &ManifestCache::disabled(),
-        plugin_root,
-        manifest_path,
-        contents,
-        None,
-    )
-}
-
-fn parse_resolved_plugin_manifest(
-    cache: &ManifestCache,
-    plugin_root: &Path,
-    manifest_path: &Path,
-    contents: &str,
-    overlay: Option<(&Path, &str)>,
-) -> Result<PluginManifest, serde_json::Error> {
-    let root = host_absolute_path(plugin_root).map_err(serde_json::Error::io)?;
-    let path = host_absolute_path(manifest_path).map_err(serde_json::Error::io)?;
-    let overlay = overlay
-        .map(|(path, contents)| host_absolute_path(path).map(|path| (path, contents)))
-        .transpose()
-        .map_err(serde_json::Error::io)?;
-    let overlay = overlay.as_ref().map(|(path, contents)| (path, *contents));
-    cache.parse(&root, &path, contents, overlay, || {
-        parse_manifest_contents(&root, &path, contents, overlay)
-    })
-}
-
-fn parse_manifest_contents(
-    root: &AbsolutePathBuf,
-    path: &AbsolutePathBuf,
-    contents: &str,
-    overlay: Option<(&AbsolutePathBuf, &str)>,
-) -> Result<PluginManifest, serde_json::Error> {
-    if host_path_url(root).is_none() {
-        return Err(compatibility_json_error("invalid file URI path"));
-    }
-    if path.as_path() == root.as_path().join(AGENT_PLUGIN_MANIFEST_RELATIVE_PATH) {
-        parse_agent_plugin_manifest(root, path, contents, overlay)
-    } else {
-        parse_legacy_plugin_manifest(root, path, contents)
-    }
-}
-
-#[derive(Deserialize)]
-struct RawPluginCommandManifest {
-    #[serde(default)]
-    commands: Option<RawPluginManifestPaths>,
-}
-
-pub(crate) fn host_absolute_path(path: &Path) -> io::Result<AbsolutePathBuf> {
-    let expanded = crate::permissions::path::expand_home_directory(path);
-    if !expanded.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path is not absolute: {}", path.display()),
-        ));
-    }
-    AbsolutePathBuf::from_absolute_path(expanded)
-}
-
-// Preserve the host subset of PathUri::from_abs_path: a URI that implies a different
-// convention, contains a null, or cannot represent the native path is opaque upstream.
-pub(crate) fn host_path_url(path: &AbsolutePathBuf) -> Option<url::Url> {
-    let mut url = url::Url::from_file_path(path.as_path()).ok()?;
-    if url.path().contains("%00") {
-        return None;
-    }
-    if url.host_str() == Some("localhost") {
-        url.set_host(None).ok()?;
-    }
-    let has_windows_drive = url
-        .path_segments()?
-        .find(|segment| !segment.is_empty())
-        .is_some_and(
-            |segment| matches!(segment.as_bytes(), [drive, b':'] | [drive, b'%', b'3', b'A' | b'a'] if drive.is_ascii_alphabetic()),
-        );
-    let is_windows = url.host_str().is_some() || has_windows_drive;
-    if has_windows_drive && url.host_str().is_none() {
-        let path = url.path();
-        let drive_start = path.bytes().position(|byte| byte != b'/')?;
-        let drive_letter = char::from(path.as_bytes()[drive_start]).to_ascii_uppercase();
-        let normalized = format!(
-            "{}{drive_letter}{}",
-            &path[..drive_start],
-            &path[drive_start + 1..]
-        );
-        url.set_path(&normalized);
-    }
-    (is_windows == cfg!(windows) && url.host_str() != Some("")).then_some(url)
-}
-
-pub(crate) fn host_basename(path: &AbsolutePathBuf) -> Option<String> {
-    let url = host_path_url(path)?;
-    let segment = url.path_segments()?.rfind(|segment| !segment.is_empty())?;
-    // As PathUri::basename does, retain the encoded spelling for non-UTF-8 names.
-    Some(
-        percent_encoding::percent_decode_str(segment)
-            .decode_utf8()
-            .map_or_else(|_| segment.to_owned(), std::borrow::Cow::into_owned),
-    )
-}
-
-fn parse_legacy_plugin_manifest(
-    root: &AbsolutePathBuf,
-    path: &AbsolutePathBuf,
-    contents: &str,
-) -> Result<PluginManifest, serde_json::Error> {
-    resolve_raw_plugin_manifest(
-        root,
-        path,
-        serde_json::from_str::<RawPluginManifest>(contents)?,
-    )
+    pub manifest: PluginManifest,
+    pub format: PluginManifestFormat,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -224,6 +74,12 @@ struct RawPluginManifest {
     interface: Option<RawPluginManifestInterface>,
     #[serde(default)]
     extensions: JsonValue,
+}
+
+#[derive(Deserialize)]
+struct RawPluginCommandManifest {
+    #[serde(default)]
+    commands: Option<RawPluginManifestPaths>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -305,13 +161,135 @@ enum RawPluginManifestHooks {
     Invalid(JsonValue),
 }
 
-// Keep the upstream parser's fallible signature and field resolution order.
-#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
-fn resolve_raw_plugin_manifest(
-    plugin_root: &AbsolutePathBuf,
-    manifest_path: &AbsolutePathBuf,
-    raw: RawPluginManifest,
+/// Loads the selected Host manifest, returning no package when absent or invalid.
+#[must_use]
+pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
+    load_plugin_manifest_with_format(plugin_root).map(|loaded| loaded.manifest)
+}
+
+/// Whether the selected, successfully parsed package uses the portable format.
+#[must_use]
+pub fn is_agent_plugin_manifest(plugin_root: &Path) -> bool {
+    load_plugin_manifest_with_format(plugin_root)
+        .is_some_and(|loaded| loaded.format == PluginManifestFormat::AgentPlugin)
+}
+
+pub(crate) fn load_plugin_manifest_with_format(plugin_root: &Path) -> Option<LoadedPluginManifest> {
+    // TODO: accept an owner-provided cache when these standalone loaders join a repeated workflow.
+    ManifestCache::disabled().load(plugin_root)
+}
+
+pub(crate) fn load_plugin_command_paths(plugin_root: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let Some(manifest_path) = find_plugin_manifest_path(plugin_root) else {
+        return Ok(None);
+    };
+    let manifest =
+        serde_json::from_str::<RawPluginCommandManifest>(&fs::read_to_string(manifest_path)?)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let Some(commands) = manifest.commands else {
+        return Ok(None);
+    };
+    let plugin_root = PathUri::from_host_native_path(plugin_root)?;
+    resolve_manifest_paths(&plugin_root, "commands", Some(&commands))
+        .into_iter()
+        .map(|path| Ok(path.to_abs_path()?.into_path_buf()))
+        .collect::<io::Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub(crate) fn parse_plugin_manifest(
+    plugin_root: &Path,
+    manifest_path: &Path,
+    contents: &str,
 ) -> Result<PluginManifest, serde_json::Error> {
+    parse_resolved_plugin_manifest(
+        &ManifestCache::disabled(),
+        plugin_root,
+        manifest_path,
+        contents,
+        /*overlay*/ None,
+    )
+}
+
+fn parse_resolved_plugin_manifest(
+    cache: &ManifestCache,
+    plugin_root: &Path,
+    manifest_path: &Path,
+    contents: &str,
+    overlay: Option<(&Path, &str)>,
+) -> Result<PluginManifest, serde_json::Error> {
+    let plugin_root_uri =
+        PathUri::from_host_native_path(plugin_root).map_err(serde_json::Error::io)?;
+    let manifest_path_uri =
+        PathUri::from_host_native_path(manifest_path).map_err(serde_json::Error::io)?;
+    let overlay = overlay
+        .map(|(path, contents)| {
+            PathUri::from_host_native_path(path)
+                .map(|path| (path, contents))
+                .map_err(serde_json::Error::io)
+        })
+        .transpose()?;
+    cache
+        .parse(
+            &plugin_root_uri,
+            &manifest_path_uri,
+            contents,
+            overlay.as_ref().map(|(path, contents)| (path, *contents)),
+            || {
+                parse_resolved_plugin_manifest_uri(
+                    &plugin_root_uri,
+                    &manifest_path_uri,
+                    contents,
+                    overlay.as_ref().map(|(path, contents)| (path, *contents)),
+                )
+            },
+        )?
+        .try_map_resources(|path| path.to_abs_path().map_err(serde_json::Error::io))
+}
+
+/// Parses supplied manifest text using the root URI's path convention.
+/// This does not read resources or resolve a filesystem authority.
+pub fn parse_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    contents: &str,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    parse_resolved_plugin_manifest_uri(plugin_root, manifest_path, contents, /*overlay*/ None)
+}
+
+pub(crate) fn parse_resolved_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    contents: &str,
+    overlay: Option<(&PathUri, &str)>,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    let root_manifest_path = plugin_root
+        .join(AGENT_PLUGIN_MANIFEST_RELATIVE_PATH)
+        .map_err(path_uri_json_error)?;
+    if manifest_path == &root_manifest_path {
+        return parse_agent_plugin_manifest_uri(plugin_root, manifest_path, contents, overlay);
+    }
+    parse_legacy_plugin_manifest_uri(plugin_root, manifest_path, contents)
+}
+
+fn parse_legacy_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    contents: &str,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    resolve_raw_plugin_manifest(
+        plugin_root,
+        manifest_path,
+        serde_json::from_str::<RawPluginManifest>(contents)?,
+    )
+}
+
+#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
+fn resolve_raw_plugin_manifest(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    raw: RawPluginManifest,
+) -> Result<UriPluginManifest, serde_json::Error> {
     let RawPluginManifest {
         name: raw_name,
         version,
@@ -324,7 +302,8 @@ fn resolve_raw_plugin_manifest(
         interface,
         extensions,
     } = raw;
-    let name = host_basename(plugin_root)
+    let name = plugin_root
+        .basename()
         .filter(|_| raw_name.trim().is_empty())
         .unwrap_or(raw_name);
     let manifest_path_for_warning = manifest_path.to_string();
@@ -430,10 +409,14 @@ fn compatibility_json_error(message: impl Into<String>) -> serde_json::Error {
     serde_json::Error::io(io::Error::new(io::ErrorKind::InvalidData, message.into()))
 }
 
+fn path_uri_json_error(error: impl std::fmt::Display) -> serde_json::Error {
+    compatibility_json_error(error.to_string())
+}
+
 fn resolve_manifest_hooks(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     hooks: Option<RawPluginManifestHooks>,
-) -> Option<super::model::PluginManifestHooks<AbsolutePathBuf>> {
+) -> Option<super::model::PluginManifestHooks<PathUri>> {
     match hooks? {
         RawPluginManifestHooks::Path(path) => {
             resolve_manifest_path(plugin_root, "hooks", Some(&path))
@@ -463,9 +446,9 @@ fn resolve_manifest_hooks(
 }
 
 fn resolve_manifest_mcp_servers(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     mcp_servers: Option<RawPluginManifestMcpServers>,
-) -> Option<super::model::PluginManifestMcpServers<AbsolutePathBuf>> {
+) -> Option<super::model::PluginManifestMcpServers<PathUri>> {
     match mcp_servers? {
         RawPluginManifestMcpServers::Path(path) => {
             resolve_manifest_path(plugin_root, "mcpServers", Some(&path))
@@ -489,10 +472,10 @@ fn resolve_manifest_mcp_servers(
 }
 
 fn resolve_interface_asset_path(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     field: &'static str,
     path: Option<&str>,
-) -> Option<AbsolutePathBuf> {
+) -> Option<PathUri> {
     resolve_manifest_path(plugin_root, field, path)
 }
 
@@ -575,9 +558,9 @@ fn warn_invalid_default_prompt(manifest_path: &str, field: &str, message: &str) 
 }
 
 fn resolve_openai_onboarding_skill(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     extension: Option<&JsonValue>,
-) -> Option<AbsolutePathBuf> {
+) -> Option<PathUri> {
     let path = extension
         .and_then(|extension| extension.get("onboardingSkill"))
         .and_then(JsonValue::as_str)?;
@@ -602,10 +585,10 @@ fn json_value_type(value: &JsonValue) -> &'static str {
 }
 
 fn resolve_manifest_paths(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     field: &'static str,
     paths: Option<&RawPluginManifestPaths>,
-) -> Vec<AbsolutePathBuf> {
+) -> Vec<PathUri> {
     match paths {
         Some(RawPluginManifestPaths::Path(path)) => {
             resolve_manifest_path(plugin_root, field, Some(path))
@@ -628,10 +611,10 @@ fn resolve_manifest_paths(
 }
 
 fn resolve_manifest_path(
-    plugin_root: &AbsolutePathBuf,
+    plugin_root: &PathUri,
     field: &'static str,
     path: Option<&str>,
-) -> Option<AbsolutePathBuf> {
+) -> Option<PathUri> {
     let path = path?;
     if path.is_empty() {
         return None;
@@ -644,53 +627,55 @@ fn resolve_manifest_path(
         tracing::warn!("ignoring {field}: path must not be `./`");
         return None;
     }
-    let has_parent_component = if cfg!(windows) {
-        relative_path
+
+    let convention = plugin_root.infer_path_convention();
+    let has_parent_component = match convention {
+        Some(PathConvention::Windows) => relative_path
             .split(['/', '\\'])
-            .any(|component| component == "..")
-    } else {
-        relative_path.split('/').any(|component| component == "..")
+            .any(|component| component == ".."),
+        Some(PathConvention::Posix) | None => {
+            relative_path.split('/').any(|component| component == "..")
+        }
     };
     if has_parent_component {
         tracing::warn!("ignoring {field}: path must not contain '..'");
         return None;
     }
-    let has_windows_root = cfg!(windows)
+
+    let has_windows_root = convention == Some(PathConvention::Windows)
         && (relative_path.starts_with('\\')
             || matches!(relative_path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic()));
     if relative_path.starts_with('/') || has_windows_root {
         tracing::warn!("ignoring {field}: path must stay within the plugin root");
         return None;
     }
-    if relative_path.contains('\0') {
-        tracing::warn!(
-            "ignoring {field}: path must resolve under plugin root: invalid file URI path"
-        );
-        return None;
-    }
-    if host_path_url(plugin_root).is_none() {
-        tracing::warn!(
-            "ignoring {field}: path must resolve under plugin root: invalid file URI path"
-        );
-        return None;
-    }
-    let resolved =
-        match AbsolutePathBuf::from_absolute_path(plugin_root.as_path().join(relative_path)) {
-            Ok(path) => path,
-            Err(err) => {
-                tracing::warn!("ignoring {field}: path must resolve under plugin root: {err}");
-                return None;
-            }
-        };
-    if host_path_url(&resolved).is_none() || !resolved.as_path().starts_with(plugin_root.as_path())
-    {
+
+    let resolved = match plugin_root.join(relative_path) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::warn!("ignoring {field}: path must resolve under plugin root: {err}");
+            return None;
+        }
+    };
+    if !resolved.starts_with(plugin_root) {
         tracing::warn!("ignoring {field}: path must stay within the plugin root");
         return None;
     }
     Some(resolved)
 }
 
-/// Access to synchronous path resolution for the external integration-test workspace.
+pub(crate) fn host_absolute_path(path: &Path) -> io::Result<AbsolutePathBuf> {
+    let expanded = crate::permissions::path::expand_home_directory(path);
+    if !expanded.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not absolute: {}", path.display()),
+        ));
+    }
+    AbsolutePathBuf::from_absolute_path(expanded)
+}
+
+/// External test access to native resources and the owner-scoped manifest cache.
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
 pub mod test_api {
@@ -700,8 +685,10 @@ pub mod test_api {
     /// Resolves a resource using the same checked root and path validation as Host parsing.
     #[must_use]
     pub fn resolve_resource(plugin_root: &Path, path: &str) -> Option<AbsolutePathBuf> {
-        let plugin_root = super::host_absolute_path(plugin_root).ok()?;
-        super::resolve_manifest_path(&plugin_root, "skills", Some(path))
+        let plugin_root = super::PathUri::from_host_native_path(plugin_root).ok()?;
+        super::resolve_manifest_path(&plugin_root, "skills", Some(path))?
+            .to_abs_path()
+            .ok()
     }
 
     /// An owner-scoped cache bridge; the release API remains crate-internal.
@@ -730,19 +717,23 @@ pub mod test_api {
             overlay: Option<(&Path, &str)>,
             before_parse: impl FnOnce(),
         ) -> Result<super::PluginManifest, serde_json::Error> {
-            let root = super::host_absolute_path(root).map_err(serde_json::Error::io)?;
-            let path = super::host_absolute_path(path).map_err(serde_json::Error::io)?;
+            let root =
+                super::PathUri::from_host_native_path(root).map_err(serde_json::Error::io)?;
+            let path =
+                super::PathUri::from_host_native_path(path).map_err(serde_json::Error::io)?;
             let overlay = overlay
                 .map(|(path, contents)| {
-                    super::host_absolute_path(path).map(|path| (path, contents))
+                    super::PathUri::from_host_native_path(path).map(|path| (path, contents))
                 })
                 .transpose()
                 .map_err(serde_json::Error::io)?;
             let overlay = overlay.as_ref().map(|(path, contents)| (path, *contents));
-            self.0.parse(&root, &path, contents, overlay, || {
-                before_parse();
-                super::parse_manifest_contents(&root, &path, contents, overlay)
-            })
+            self.0
+                .parse(&root, &path, contents, overlay, || {
+                    before_parse();
+                    super::parse_resolved_plugin_manifest_uri(&root, &path, contents, overlay)
+                })?
+                .try_map_resources(|path| path.to_abs_path().map_err(serde_json::Error::io))
         }
     }
 }

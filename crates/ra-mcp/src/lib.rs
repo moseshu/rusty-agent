@@ -28,3 +28,5 @@ pub use server::McpServer;
 
 // Protocol types stay in this adapter crate; hosts can implement an in-process MCP handler.
 pub use rmcp;
+
+pub mod plugin_config;

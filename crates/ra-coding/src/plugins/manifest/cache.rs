@@ -3,12 +3,12 @@
 //! Store clones share the cache; independently created stores do not share entries or warnings.
 
 use super::LoadedPluginManifest;
-use super::PluginManifest;
 use super::PluginManifestFormat;
+use super::UriPluginManifest;
 use super::parse_resolved_plugin_manifest;
-use crate::plugins::AbsolutePathBuf;
 use crate::plugins::discovery::AGENT_PLUGIN_MANIFEST_RELATIVE_PATH;
 use crate::plugins::discovery::find_plugin_manifest_path;
+use ra_paths::PathUri;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -26,14 +26,14 @@ pub(crate) struct ManifestCache {
 
 #[derive(Default)]
 struct ManifestCacheState {
-    entries: HashMap<(CachePath, CachePath), Entry>,
-    recency: VecDeque<(CachePath, CachePath)>,
+    entries: HashMap<(PathUri, PathUri), Entry>,
+    recency: VecDeque<(PathUri, PathUri)>,
 }
 
 struct Entry {
     contents_digest: [u8; 32],
-    overlay: Option<(CachePath, [u8; 32])>,
-    manifest: PluginManifest,
+    overlay: Option<(PathUri, [u8; 32])>,
+    manifest: UriPluginManifest,
 }
 
 impl std::fmt::Debug for ManifestCache {
@@ -99,12 +99,12 @@ impl ManifestCache {
 
     pub(crate) fn parse(
         &self,
-        root: &AbsolutePathBuf,
-        path: &AbsolutePathBuf,
+        root: &PathUri,
+        path: &PathUri,
         contents: &str,
-        overlay: Option<(&AbsolutePathBuf, &str)>,
-        parse: impl FnOnce() -> Result<PluginManifest, serde_json::Error>,
-    ) -> Result<PluginManifest, serde_json::Error> {
+        overlay: Option<(&PathUri, &str)>,
+        parse: impl FnOnce() -> Result<UriPluginManifest, serde_json::Error>,
+    ) -> Result<UriPluginManifest, serde_json::Error> {
         let Some(state) = &self.state else {
             return parse();
         };
@@ -116,7 +116,7 @@ impl ManifestCache {
             state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(cache_path(root), cache_path(path)));
+                .remove(&(root.clone(), path.clone()));
             // Unbounded inputs must not serialize unrelated parses behind the cache lock.
             return parse();
         }
@@ -130,7 +130,7 @@ impl ManifestCache {
 }
 
 impl ManifestCacheState {
-    fn remove(&mut self, key: &(CachePath, CachePath)) -> Option<Entry> {
+    fn remove(&mut self, key: &(PathUri, PathUri)) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
         self.recency.retain(|existing| existing != key);
         Some(entry)
@@ -138,17 +138,17 @@ impl ManifestCacheState {
 
     fn parse(
         &mut self,
-        root: &AbsolutePathBuf,
-        path: &AbsolutePathBuf,
+        root: &PathUri,
+        path: &PathUri,
         contents: &str,
-        overlay: Option<(&AbsolutePathBuf, &str)>,
-        parse: impl FnOnce() -> Result<PluginManifest, serde_json::Error>,
-    ) -> Result<PluginManifest, serde_json::Error> {
-        let key = (cache_path(root), cache_path(path));
+        overlay: Option<(&PathUri, &str)>,
+        parse: impl FnOnce() -> Result<UriPluginManifest, serde_json::Error>,
+    ) -> Result<UriPluginManifest, serde_json::Error> {
+        let key = (root.clone(), path.clone());
         let previous = self.remove(&key);
         let contents_digest = Sha256::digest(contents.as_bytes()).into();
         let overlay = overlay
-            .map(|(path, contents)| (cache_path(path), Sha256::digest(contents.as_bytes()).into()));
+            .map(|(path, contents)| (path.clone(), Sha256::digest(contents.as_bytes()).into()));
         if let Some(entry) = previous
             && entry.contents_digest == contents_digest
             && entry.overlay == overlay
@@ -174,23 +174,5 @@ impl ManifestCacheState {
             },
         );
         Ok(manifest)
-    }
-}
-
-// Native paths keep opaque byte identity. Representable Windows paths use the source URI's
-// ASCII case-insensitive identity, including drive/UNC normalization, without a public URI API.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum CachePath {
-    Native(AbsolutePathBuf),
-    WindowsUri(String),
-}
-
-fn cache_path(path: &AbsolutePathBuf) -> CachePath {
-    if cfg!(windows)
-        && let Some(uri) = super::host_path_url(path)
-    {
-        CachePath::WindowsUri(uri.to_string().to_ascii_lowercase())
-    } else {
-        CachePath::Native(path.clone())
     }
 }

@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Product configuration source identity, precedence and materialized metadata.
 
-use ra_execpolicy::AbsolutePathBuf;
+use ra_paths::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 
 /// Provenance for one layer in the effective product configuration.

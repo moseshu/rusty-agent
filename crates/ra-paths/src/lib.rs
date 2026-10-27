@@ -29,6 +29,7 @@ mod api_path_string;
 mod config_path;
 mod native_path_bytes;
 mod platform;
+mod system_aliases;
 
 use absolute_path_normalization::path_uri_from_segments;
 

@@ -10,9 +10,11 @@
 //! manifest fields are `Evolving` (platform backends will be added).
 
 pub mod command;
+pub mod filesystem;
 pub mod fs;
 pub mod job;
 pub mod output;
+pub mod process_group;
 pub mod sandbox;
 pub mod session;
 pub mod tmpdir;
@@ -20,3 +22,8 @@ pub mod tmpdir;
 /// Default schema version for process execution structures.
 pub const EXEC_SCHEMA_VERSION: ra_core::compat::SchemaVersion =
     ra_core::compat::SchemaVersion::new(1);
+
+mod native_process;
+
+#[allow(unsafe_code)]
+pub mod shell_detect;

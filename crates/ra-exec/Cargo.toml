@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Only this crate permits a reviewed local unsafe exception.
+# Native process and filesystem modules permit reviewed local unsafe exceptions.
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
@@ -32,7 +32,7 @@ missing_panics_doc = "allow"
 # `docker` 依赖外部 daemon，保持显式 opt-in。
 default = ["seatbelt", "bwrap"]
 seatbelt = []
-bwrap = ["dep:seccompiler", "dep:libc"]
+bwrap = ["dep:seccompiler"]
 docker = []
 # 只给 tests/ workspace 用：把「过不了 pub 的东西」开一扇窄门，而不是把它们设成 pub。
 # 本 crate 的 Linux 沙箱里有两样东西在 macOS 上根本不编译（BPF 过滤器与它的描述符传递），
@@ -40,8 +40,18 @@ docker = []
 test-api = []
 
 [dependencies]
+which = "8"
+anyhow = { workspace = true }
+portable-pty = { workspace = true }
+regex-lite = { workspace = true }
+dunce = { workspace = true }
+base64 = { workspace = true }
+ra-paths = { workspace = true }
+ra-filesystem = { workspace = true }
+ra-executor-protocol = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 ra-core = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -51,9 +61,19 @@ cap-std = { workspace = true }
 cap-primitives = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 ra-uds = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["net"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = { version = "0.5", optional = true }
-libc = { version = "0.2", optional = true }
+
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+
+filedescriptor = "0.8.3"
+lazy_static = "1"
+log = "0.4"
+shared_library = "0.1.9"
+winapi = { version = "0.3.9", features = ["std", "handleapi", "jobapi", "jobapi2", "libloaderapi", "minwinbase", "processthreadsapi", "synchapi", "winbase", "wincon", "winerror", "winnt"] }

@@ -65,6 +65,17 @@ impl McpToolInfo {
         self.namespace_description = description.filter(|text| !text.trim().is_empty());
         self
     }
+    /// Associates the tool with the connector identity supplied by its trusted catalog.
+    #[must_use]
+    pub fn with_connector_id(mut self, connector_id: Option<String>) -> Self {
+        self.connector_id = connector_id;
+        self
+    }
+    /// Connector identity from the trusted catalog, independent of the tool declaration.
+    #[must_use]
+    pub fn connector_id(&self) -> Option<&str> {
+        self.connector_id.as_deref()
+    }
     /// Raw routing name of the server.
     #[must_use]
     pub fn server_name(&self) -> &str {

@@ -5,9 +5,21 @@
 //! The Store installs only explicitly supplied local directories; it does not enable plugins.
 //! Explicit materialization runs Git/npm and owns temporary source files through the returned value.
 //! Plugin activation and marketplace configuration values belong to [`crate::config`].
-//! Host resources use the existing absolute-path type; generic manifest resource mapping remains
-//! available without claiming executor filesystem or URI authority support.
+//! Host resources use native absolute paths. URI parsing and inert environment-bound descriptors
+//! preserve resource ownership without selecting or connecting an executor filesystem.
 
+mod bundled_hooks;
+mod executor_hook_source;
+mod executor_hooks;
+mod executor_mcp;
+mod executor_provider;
+pub use executor_hook_source::ExecutorPluginHookSource;
+pub use executor_hooks::executor_plugin_hook_sources;
+pub use executor_mcp::{PluginMcpProvider, PluginMcpProviderError};
+pub use executor_provider::{
+    ExecutorPluginProvider, ExecutorPluginProviderError, PluginRootOwnership,
+    ResolvedExecutorPlugin,
+};
 pub mod command_migration;
 pub mod discovery;
 mod git_policy;
@@ -22,9 +34,14 @@ pub mod model;
 mod npm_source;
 mod plugin_bundle_archive;
 mod process;
+mod provider;
 pub mod store;
 
+pub use bundled_hooks::is_allowlisted_bundled_cleanup_hook;
 pub use identity::{PluginId, PluginIdError};
+pub use provider::{
+    PluginResourceLocator, ResolvedPlugin, ResolvedPluginError, ResolvedPluginLocation,
+};
 /// The existing native absolute-path representation used by host package resources.
 pub use ra_execpolicy::AbsolutePathBuf;
 
@@ -38,3 +55,14 @@ pub(crate) fn join_absolute_path(
     AbsolutePathBuf::from_absolute_path(base.as_path().join(expanded))
         .expect("joining an absolute path preserves its root")
 }
+
+mod mcp_policy;
+pub use mcp_policy::apply_configured_plugin_mcp_server_policies;
+
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use executor_provider::test_api as executor_provider_test_api;
+
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use executor_mcp::test_api as executor_mcp_test_api;

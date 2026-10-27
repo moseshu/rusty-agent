@@ -72,6 +72,12 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-exec", Layer::Service),
     ("ra-execpolicy", Layer::Service),
     ("ra-paths", Layer::Service),
+    ("ra-config", Layer::Service),
+    ("ra-filesystem", Layer::Service),
+    ("ra-executor-protocol", Layer::Service),
+    ("ra-executor", Layer::Service),
+    ("ra-http", Layer::Service),
+    ("ra-tls", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
     ("ra-mcp", Layer::Service),
@@ -140,7 +146,16 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-context", &["ra-core"]),
     // Socket location is shared with transports so every sandbox hides the same directory.
     ("ra-uds", &[]),
-    ("ra-exec", &["ra-core", "ra-uds"]),
+    (
+        "ra-exec",
+        &[
+            "ra-core",
+            "ra-uds",
+            "ra-paths",
+            "ra-filesystem",
+            "ra-executor-protocol",
+        ],
+    ),
     // Codex's command execution policy: Starlark rules files, their evaluation and amendments. It
     // needs nothing from the framework — a decision is about command tokens, not tools or runs —
     // and stays a crate of its own so the Starlark interpreter is a dependency of the one product
@@ -148,6 +163,22 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-execpolicy", &["ra-paths"]),
     // Native and executor URI paths contain no framework or product dependencies.
     ("ra-paths", &[]),
+    ("ra-config", &["ra-core", "ra-paths"]),
+    ("ra-filesystem", &["ra-paths"]),
+    ("ra-http", &["ra-tls"]),
+    ("ra-tls", &[]),
+    ("ra-executor-protocol", &["ra-paths", "ra-filesystem"]),
+    (
+        "ra-executor",
+        &[
+            "ra-exec",
+            "ra-paths",
+            "ra-filesystem",
+            "ra-config",
+            "ra-executor-protocol",
+            "ra-http",
+        ],
+    ),
     // The sandbox backends. `ra-core` alone: the local backend spawns its own processes — one-shot
     // and interactive alike — rather than going through `ra-exec`, because the environment policy,
     // resource ceilings and per-command fence that crate applies are this product's, not the
@@ -156,13 +187,20 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // tools live in `ra-tools` and reach a session only through `ra-core`'s protocol.
     ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
-    ("ra-mcp", &["ra-core"]),
+    ("ra-mcp", &["ra-core", "ra-config", "ra-paths", "ra-tls"]),
     // `ra-runtime` for the live thread whose turns the app server starts, steers and interrupts, as
     // Codex's app-server drives `codex-core`'s `CodexThread`. The server still runs no loop of its
     // own: the thread does, and the host builds it.
     (
         "ra-protocol",
-        &["ra-core", "ra-runtime", "ra-session", "ra-uds", "ra-paths"],
+        &[
+            "ra-config",
+            "ra-core",
+            "ra-runtime",
+            "ra-session",
+            "ra-uds",
+            "ra-paths",
+        ],
     ),
     (
         "ra-eval",
@@ -198,6 +236,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     (
         "ra-coding",
         &[
+            "ra-config",
+            "ra-executor",
             "ra-core",
             "ra-model",
             "ra-runtime",

@@ -1,19 +1,19 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Portable metadata validation and Codex overlay precedence.
 
-use super::super::AbsolutePathBuf;
 use super::super::discovery::AGENT_PLUGIN_SCHEMA_PREFIX;
 use super::super::discovery::AGENT_PLUGIN_SCHEMA_URI;
 use super::super::discovery::SUPPORTED_AGENT_PLUGIN_SCHEMA_URIS;
-use super::PluginManifest;
 use super::RawPluginManifest;
 use super::RawPluginManifestInterface;
 use super::RawPluginManifestMcpServers;
 use super::RawPluginManifestPaths;
+use super::UriPluginManifest;
 use super::compatibility_json_error;
-use super::parse_legacy_plugin_manifest;
+use super::parse_legacy_plugin_manifest_uri;
 use super::resolve_openai_onboarding_skill;
 use super::resolve_raw_plugin_manifest;
+use ra_paths::PathUri;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
@@ -66,12 +66,12 @@ struct RawAgentPluginAuthor {
 
 // Preserve the upstream portable-field and overlay precedence in one parsing pass.
 #[allow(clippy::too_many_lines)]
-pub(super) fn parse_agent_plugin_manifest(
-    plugin_root: &AbsolutePathBuf,
-    manifest_path: &AbsolutePathBuf,
+pub(super) fn parse_agent_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
     contents: &str,
-    overlay: Option<(&AbsolutePathBuf, &str)>,
-) -> Result<PluginManifest, serde_json::Error> {
+    overlay: Option<(&PathUri, &str)>,
+) -> Result<UriPluginManifest, serde_json::Error> {
     let value = serde_json::from_str::<JsonValue>(contents)?;
     let JsonValue::Object(mut object) = value else {
         return Err(compatibility_json_error(
@@ -208,12 +208,12 @@ fn non_empty_trimmed(value: String) -> Option<String> {
 }
 
 fn apply_codex_agent_plugin_extension(
-    resolved: &mut PluginManifest,
-    plugin_root: &AbsolutePathBuf,
-    source_path: &AbsolutePathBuf,
+    resolved: &mut UriPluginManifest,
+    plugin_root: &PathUri,
+    source_path: &PathUri,
     contents: &str,
 ) -> Result<(), serde_json::Error> {
-    let extension = parse_legacy_plugin_manifest(plugin_root, source_path, contents)?;
+    let extension = parse_legacy_plugin_manifest_uri(plugin_root, source_path, contents)?;
     resolved.paths.apps = extension.paths.apps;
     resolved.paths.hooks = extension.paths.hooks;
     resolved.paths.onboarding_skill = extension.paths.onboarding_skill;

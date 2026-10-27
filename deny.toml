@@ -70,6 +70,13 @@ allow = ["BSL-1.0"]
 crate = "foldhash"
 allow = ["Zlib"]
 
+# ra-paths / ra-filesystem / ra-coding -> dirs 6.0.0 -> dirs-sys 0.5.0 -> option-ext 0.2.0（用户主目录定位）。
+# codex 的 deny.toml 全局允许 MPL-2.0；这里只放行这一个 crate 的这一个版本，不进全局白名单。
+# 2026-10-27 由维护者明确允许；dirs-sys 换掉它或版本变化时重新决定。
+[[licenses.exceptions]]
+crate = "option-ext@0.2.0"
+allow = ["MPL-2.0"]
+
 [bans]
 # 重复版本只警告：传递依赖的版本收敛不在我们控制之内，报错会让 CI 长期红着，
 # 而长期红着的门禁等于没有门禁。

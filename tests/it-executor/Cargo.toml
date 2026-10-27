@@ -1,0 +1,35 @@
+[package]
+name = "it-executor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[dev-dependencies]
+ra-executor = { path = "../../crates/ra-executor", features = ["test-api"] }
+ra-exec = { path = "../../crates/ra-exec", features = ["test-api"] }
+ra-executor-protocol = { path = "../../crates/ra-executor-protocol" }
+ra-filesystem = { path = "../../crates/ra-filesystem" }
+ra-config = { path = "../../crates/ra-config" }
+ra-http = { path = "../../crates/ra-http", features = ["test-api"] }
+ra-paths = { path = "../../crates/ra-paths" }
+ra-coding = { path = "../../crates/ra-coding" }
+futures = "0.3"
+http = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.29"
+tempfile = "3"
+
+url = "2"
+base64 = "0.22"
+
+anyhow = "1"
+test-case = "3"
+rstest = "0.23"
+serde = { version = "1", features=["derive"] }
+toml = "0.8"
+tokio-util = { version = "0.7", features=["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features=["env-filter"] }
+zstd = "0.14.3"
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
