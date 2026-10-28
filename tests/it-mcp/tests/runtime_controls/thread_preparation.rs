@@ -6,7 +6,7 @@ async fn agent_preparation_returns_while_uncached_startup_is_shared_with_discove
     use ra_coding::{agent::build_agent_with_host, host::CodingHost};
     let probe = Probe::new("docs");
     probe.block_connect.store(true, Ordering::SeqCst);
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     let host = CodingHost::open(std::env::temp_dir())
         .unwrap()
         .with_mcp_runtime(runtime.clone());

@@ -279,7 +279,7 @@ async fn names(runtime: &CodingMcpRuntime) -> Vec<String> {
 #[tokio::test]
 async fn toggle_and_reconnect_refresh_next_model_surface_and_close_old_session() {
     let server = Probe::new("docs");
-    let runtime = runtime(&[server.clone()]);
+    let runtime = runtime(std::slice::from_ref(&server));
     assert_eq!(
         runtime.get_mcp_status()[0].runtime_status(),
         Some(Status::NotStarted)
@@ -391,7 +391,7 @@ async fn parallel_startup_publishes_healthy_status_while_other_server_waits() {
 #[tokio::test]
 async fn cancelled_toggle_waiter_keeps_cleanup_owned_and_serializes_enable() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     probe.block_cleanup.store(true, Ordering::SeqCst);
     let task = tokio::spawn({
@@ -418,7 +418,7 @@ async fn cancelled_toggle_waiter_keeps_cleanup_owned_and_serializes_enable() {
 #[tokio::test]
 async fn cleanup_failure_keeps_phase_and_blocks_second_connection() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     probe.fail_cleanup.store(true, Ordering::SeqCst);
     runtime.reconnect_mcp_server(None, false).await.unwrap();
@@ -748,7 +748,7 @@ async fn actual_stdio_control_closes_and_replaces_the_transport_session() {
 #[tokio::test]
 async fn inventory_failure_retains_capabilities_and_detail_skips_resource_requests() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     let inventory = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false).await;
     assert_eq!(inventory.runtime_status(), Some(Status::Connected));
@@ -774,7 +774,7 @@ async fn inventory_failure_retains_capabilities_and_detail_skips_resource_reques
 #[tokio::test]
 async fn closed_transport_is_reported_without_waiting_and_can_be_retried() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     assert_eq!(names(&runtime).await, ["echo_1"]);
     probe.current_client().unwrap().cleanup().await.unwrap();
@@ -873,7 +873,7 @@ async fn actual_http_control_reconnects_and_shutdown_closes_current_session() {
 async fn coding_host_installs_the_same_runtime_for_live_discovery() {
     use ra_coding::{agent::build_agent_with_host, host::CodingHost};
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     let host = CodingHost::open(std::env::temp_dir())
         .unwrap()
         .with_mcp_runtime(runtime.clone());

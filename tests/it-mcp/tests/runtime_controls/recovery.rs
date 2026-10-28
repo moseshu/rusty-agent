@@ -8,7 +8,7 @@ async fn default_failed_startup_waits_for_explicit_recovery() {
     for background in [false, true] {
         let probe = Probe::new("docs");
         probe.failures.store(1, Ordering::SeqCst);
-        let runtime = runtime(&[probe.clone()]);
+        let runtime = runtime(std::slice::from_ref(&probe));
         if background {
             runtime.start_background();
         } else {

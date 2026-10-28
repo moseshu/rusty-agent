@@ -76,7 +76,7 @@ async fn startup_notifications_preserve_failure_details_and_timeout_recovery_hin
 async fn starting_clears_old_failure_and_disabled_cleanup_failure_stays_disabled() {
     let probe = Probe::new("docs");
     probe.failures.store(1, Ordering::SeqCst);
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     let mut changes = McpRuntimeControl::subscribe(runtime.as_ref());
     runtime.reconnect_mcp_server(None, true).await.unwrap();

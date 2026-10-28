@@ -187,3 +187,6 @@ async fn connection_identity_tracks_transport_and_referenced_environment() {
         first
     );
 }
+
+#[path = "product_runtime_binding/policy.rs"]
+mod policy;

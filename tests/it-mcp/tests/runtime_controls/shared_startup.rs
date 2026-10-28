@@ -30,7 +30,7 @@ async fn uncached_discovery_waits_for_explicit_startup_and_lists_the_new_session
         Control::Enable,
     ] {
         let probe = Probe::new("docs");
-        let runtime = runtime(&[probe.clone()]);
+        let runtime = runtime(std::slice::from_ref(&probe));
         runtime.connect_all().await.unwrap();
         probe.started.notified().await;
         probe.current_client().unwrap().cleanup().await.unwrap();
@@ -70,7 +70,7 @@ async fn cached_calls_join_explicit_failure_without_starting_an_implicit_retry()
         Control::Enable,
     ] {
         let probe = Probe::new("docs");
-        let runtime = runtime(&[probe.clone()]);
+        let runtime = runtime(std::slice::from_ref(&probe));
         runtime.connect_all().await.unwrap();
         assert_eq!(names(&runtime).await, ["echo_1"]);
         probe.started.notified().await;

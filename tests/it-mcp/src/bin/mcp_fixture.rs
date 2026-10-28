@@ -22,7 +22,27 @@ async fn main() {
     if args.iter().any(|arg| arg == "--delay-init") {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
-    let fixture = support::Fixture::new("stdio");
+    let mut fixture = support::Fixture::new("stdio");
+    if args.iter().any(|arg| arg == "--policy-fixture") {
+        fixture.tools_override = Some(
+            [
+                ("wait", serde_json::json!({})),
+                ("record", serde_json::json!({})),
+                ("call_count", serde_json::json!({"readOnlyHint": true})),
+                ("env", serde_json::json!({"readOnlyHint": true})),
+                ("read_only", serde_json::json!({"readOnlyHint": true})),
+                ("destructive", serde_json::json!({"readOnlyHint": true, "destructiveHint": true})),
+                ("safe_write", serde_json::json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false})),
+                ("unknown", serde_json::json!({})),
+            ].into_iter().map(|(name, annotations)| {
+                serde_json::from_value(serde_json::json!({
+                    "name": name,
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": annotations,
+                })).unwrap()
+            }).collect(),
+        );
+    }
     if let Some(wire) = args.iter().find_map(|arg| arg.strip_prefix("--wire=")) {
         // Deliberately independent codec fixtures: no production transcoder is reused here.
         let wire = wire.to_owned();

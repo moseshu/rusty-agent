@@ -6,7 +6,7 @@ use super::*;
 async fn blocked_inventory_does_not_hold_up_toggle_from_another_connection() {
     for params in [json!({}), json!({"detail":"toolsAndAuthOnly"})] {
         let probe = Probe::new("docs");
-        let runtime = runtime(&[probe.clone()]);
+        let runtime = runtime(std::slice::from_ref(&probe));
         runtime.connect_all().await.unwrap();
         probe.inventory_gate.blocked.store(true, Ordering::SeqCst);
         let server = AppServer::new("/tmp/mcp-inventory-order")
@@ -58,7 +58,7 @@ async fn blocked_inventory_does_not_hold_up_toggle_from_another_connection() {
 #[tokio::test]
 async fn inventory_captures_its_generation_before_the_returned_future_is_polled() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     let pending = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false);
     runtime.reconnect_mcp_server(None, false).await.unwrap();
@@ -101,7 +101,7 @@ async fn reload_keeps_healthy_session_and_frozen_tool_binding() {
 #[tokio::test]
 async fn registry_scope_orders_requests_from_different_connections() {
     let probe = Probe::new("docs");
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     let server = AppServer::new("/tmp/mcp-registry-order")
         .unwrap()
@@ -177,7 +177,7 @@ fn reload_wire_params_follow_codex_optional_unit_contract() {
 async fn reload_then_list_without_waiting_observes_completed_reload() {
     let probe = Probe::new("docs");
     probe.failures.store(1, Ordering::SeqCst);
-    let runtime = runtime(&[probe.clone()]);
+    let runtime = runtime(std::slice::from_ref(&probe));
     runtime.connect_all().await.unwrap();
     probe.started.notified().await;
     probe.block_connect.store(true, Ordering::SeqCst);

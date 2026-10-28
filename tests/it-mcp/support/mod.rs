@@ -21,6 +21,7 @@ impl ServerHandler for RejectInitialize {
 
 #[derive(Clone)]
 pub struct Fixture {
+    pub calls: Arc<AtomicUsize>,
     pub label: String,
     pub tools_override: Option<Vec<Tool>>,
     pub mode: &'static str,
@@ -32,6 +33,7 @@ pub struct Fixture {
 impl Fixture {
     pub fn new(label: &str) -> Self {
         Self {
+            calls: Arc::default(),
             label: label.to_owned(),
             tools_override: None,
             mode: "normal",
@@ -200,6 +202,12 @@ impl ServerHandler for Fixture {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let result = match request.name.as_ref() {
+            "record" => CallToolResult::success(vec![ContentBlock::text(
+                self.calls.fetch_add(1, Ordering::SeqCst).to_string(),
+            )]),
+            "call_count" => CallToolResult::success(vec![ContentBlock::text(
+                self.calls.load(Ordering::SeqCst).to_string(),
+            )]),
             "wait" => {
                 self.entered.notify_one();
                 context.ct.cancelled().await;
