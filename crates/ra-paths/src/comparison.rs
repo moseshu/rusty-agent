@@ -76,6 +76,7 @@ fn ascii_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::needless_pass_by_value)] // Share the source's owned signature with the non-Linux identity variant.
 fn lower_ascii_path(path: PathBuf) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
