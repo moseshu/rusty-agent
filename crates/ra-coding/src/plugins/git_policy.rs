@@ -7,7 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 // Require explicit selection before Git uses a bare repository.
-const SAFE_BARE_REPOSITORY_CONFIG: &str = "safe.bareRepository=explicit";
+pub(crate) const SAFE_BARE_REPOSITORY_CONFIG: &str = "safe.bareRepository=explicit";
 
 // These variables can redirect Git to an untrusted repository or inject command-scoped settings.
 pub(crate) const REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES: &[&str] = &[

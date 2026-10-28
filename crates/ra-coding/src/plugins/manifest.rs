@@ -38,9 +38,12 @@ pub type PluginManifestPaths = super::model::PluginManifestPaths<AbsolutePathBuf
 /// A manifest whose resources retain their source filesystem URI.
 pub type UriPluginManifest = super::model::PluginManifest<PathUri>;
 
+/// Package layout a manifest was read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PluginManifestFormat {
+pub enum PluginManifestFormat {
+    /// The legacy `.codex-plugin` layout.
     Legacy,
+    /// The Agent Plugins layout.
     AgentPlugin,
 }
 

@@ -30,3 +30,33 @@ pub use server::McpServer;
 pub use rmcp;
 
 pub mod plugin_config;
+
+mod registration_catalog;
+pub use registration_catalog::{
+    McpCatalogBuilder, McpEnvironmentAuthority, McpPluginAttribution, McpServerConflict,
+    McpServerConflictAction, McpServerRegistration, McpServerSource, ResolvedMcpCatalog,
+    ResolvedMcpServer,
+};
+
+/// Credential authority supplied by the owner of a server registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum McpCredentialPolicy {
+    /// The controller may resolve credentials from its own environment.
+    HostFallbackAllowed,
+    /// Only the executor owning the selected source may resolve credentials.
+    ExecutorOnly,
+}
+
+/// Session-selected MCP compatibility policy, retained with registration snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpProtocolMode {
+    /// Use standard SDK MCP initialization and OAuth negotiation.
+    #[default]
+    Legacy,
+    /// Explicitly request the upstream discovery and request lifecycle extension.
+    V20260728,
+}
+
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use registration_catalog::test_api as registration_test_api;

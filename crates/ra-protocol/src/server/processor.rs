@@ -148,6 +148,7 @@ impl std::fmt::Debug for ThreadFactorySlot {
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     pub(crate) mcp: super::mcp::McpControlSlot,
+    pub(crate) plugins: super::plugin_management::PluginControlSlot,
     codex_home: PathBuf,
     thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
@@ -183,6 +184,7 @@ impl MessageProcessor {
             ),
             outgoing,
             mcp: super::mcp::McpControlSlot::default(),
+            plugins: super::plugin_management::PluginControlSlot::default(),
             codex_home,
             thread_manager,
             request_serialization_queues: RequestSerializationQueues::default(),
@@ -417,7 +419,7 @@ impl MessageProcessor {
 
         let serialization_key = client_request
             .serialization_scope()
-            .map(RequestSerializationQueueKey::from);
+            .map(RequestSerializationQueueKey::from_scope);
         let error_request_id = request_id.clone();
         let processor = Arc::clone(self);
         let rpc_gate = Arc::clone(&session.rpc_gate);
@@ -434,9 +436,9 @@ impl MessageProcessor {
                 .await;
         });
 
-        if let Some(key) = serialization_key {
+        if let Some((key, access)) = serialization_key {
             self.request_serialization_queues
-                .enqueue(key, request)
+                .enqueue(key, access, request)
                 .await;
         } else {
             tokio::spawn(request.run());
@@ -451,6 +453,17 @@ impl MessageProcessor {
         client_request: ClientRequest,
         rpc_gate: Arc<ConnectionRpcGate>,
     ) {
+        if let Some(request) = client_request.plugin_request() {
+            let result = match self.plugins.get() {
+                Ok(control) => control.handle(request).await,
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(response) => self.send_response(request_id, response).await,
+                Err(err) => self.outgoing.send_error(request_id, err).await,
+            }
+            return;
+        }
         match client_request {
             ClientRequest::McpServerStatusList { params, .. } => {
                 let result = match self.mcp.get() {
@@ -495,6 +508,23 @@ impl MessageProcessor {
                     Ok(()) => self.send_response(request_id, serde_json::json!({})).await,
                     Err(error) => self.outgoing.send_error(request_id, error).await,
                 }
+            }
+            ClientRequest::SkillsList { .. }
+            | ClientRequest::SkillsExtraRootsSet { .. }
+            | ClientRequest::HooksList { .. }
+            | ClientRequest::MarketplaceAdd { .. }
+            | ClientRequest::MarketplaceRemove { .. }
+            | ClientRequest::MarketplaceUpgrade { .. }
+            | ClientRequest::PluginList { .. }
+            | ClientRequest::PluginInstalled { .. }
+            | ClientRequest::PluginRead { .. }
+            | ClientRequest::PluginInstall { .. }
+            | ClientRequest::PluginUninstall { .. }
+            | ClientRequest::SkillsConfigWrite { .. }
+            | ClientRequest::ConfigRead { .. }
+            | ClientRequest::ConfigValueWrite { .. }
+            | ClientRequest::ConfigBatchWrite { .. } => {
+                unreachable!("plugin operations are delegated before internal dispatch")
             }
             ClientRequest::Initialize { .. } => {
                 // `handle_client_request` answers `initialize` before anything is dispatched.

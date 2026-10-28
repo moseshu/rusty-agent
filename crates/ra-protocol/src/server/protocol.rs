@@ -38,12 +38,14 @@
 //! capabilities listed on [`InitializeCapabilities`] — still connects. The one exception is
 //! [`RequestPermissionProfile`], which refuses them as Codex does.
 
+mod config;
 mod dynamic_tools;
 mod hooks;
 mod item;
 mod mcp;
 mod mcp_policy;
 mod permissions;
+mod plugin_management;
 mod plugins;
 mod server_request;
 mod settings;
@@ -59,11 +61,37 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
-pub use self::hooks::HookTrustStatus;
+pub use self::config::{
+    AllowDenyRequirement, AnalyticsConfig, BrowserUseConfig, BrowserUseOriginPolicyConfig,
+    ComputerUseConfig, ComputerUseMacosConfig, ComputerUseWindowsConfig,
+    ComputerUseWindowsExeConfig, Config, ConfigBatchWriteParams, ConfigEdit, ConfigLayer,
+    ConfigLayerMetadata, ConfigLayerSource, ConfigReadParams, ConfigReadResponse,
+    ConfigValueWriteParams, ConfigWriteErrorCode, ConfigWriteResponse, MergeStrategy,
+    OverriddenMetadata, SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse,
+    ToolsV2, WriteStatus,
+};
+pub use self::hooks::{
+    HookCompletedEvent, HookExecutionMode, HookHandlerType, HookOutputEntry, HookOutputEntryKind,
+    HookRunStatus, HookRunSummary, HookScope, HookSource, HookStartedEvent, HookTrustStatus,
+};
 pub use self::mcp::*;
 pub use self::mcp_policy::{
     EnvironmentMcpPolicy, McpServerCommandMatcher, McpServerIdentity, McpServerRequirement,
     McpServerValueMatcher, PluginMcpRequirements,
+};
+pub use self::plugin_management::{
+    HookErrorInfo, HookHandlerMetadata, HookMetadata, HooksListEntry, HooksListParams,
+    HooksListResponse, MarketplaceAddParams, MarketplaceAddResponse, MarketplaceInterface,
+    MarketplaceLoadErrorInfo, MarketplaceRemoveParams, MarketplaceRemoveResponse,
+    MarketplaceUpgradeErrorInfo, MarketplaceUpgradeParams, MarketplaceUpgradeResponse,
+    PluginDetail, PluginHookSummary, PluginInstallParams, PluginInstallPolicySource,
+    PluginInstallResponse, PluginInstalledParams, PluginInstalledResponse, PluginInterface,
+    PluginListMarketplaceKind, PluginListParams, PluginListResponse, PluginMarketplaceEntry,
+    PluginReadParams, PluginReadResponse, PluginSource, PluginSummary, PluginUninstallParams,
+    PluginUninstallResponse, ScheduledTaskSchedule, ScheduledTaskSummary, ScheduledTaskWeekday,
+    SkillDependencies, SkillErrorInfo, SkillInterface, SkillMetadata, SkillScope, SkillSummary,
+    SkillToolDependency, SkillsChangedNotification, SkillsExtraRootsSetParams,
+    SkillsExtraRootsSetResponse, SkillsListEntry, SkillsListParams, SkillsListResponse,
 };
 pub use self::plugins::{PluginAuthPolicy, PluginInstallPolicy, Product};
 pub use self::streaming::*;
@@ -160,6 +188,142 @@ pub fn experimental_required_message(reason: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum ClientRequest {
+    /// Handles the selected product's `skills/list` operation.
+    #[serde(rename = "skills/list")]
+    SkillsList {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: SkillsListParams,
+    },
+    /// Handles the selected product's `skills/extraRoots/set` operation.
+    #[serde(rename = "skills/extraRoots/set")]
+    SkillsExtraRootsSet {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: SkillsExtraRootsSetParams,
+    },
+    /// Handles the selected product's `hooks/list` operation.
+    #[serde(rename = "hooks/list")]
+    HooksList {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: HooksListParams,
+    },
+    /// Handles the selected product's `marketplace/add` operation.
+    #[serde(rename = "marketplace/add")]
+    MarketplaceAdd {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: MarketplaceAddParams,
+    },
+    /// Handles the selected product's `marketplace/remove` operation.
+    #[serde(rename = "marketplace/remove")]
+    MarketplaceRemove {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: MarketplaceRemoveParams,
+    },
+    /// Handles the selected product's `marketplace/upgrade` operation.
+    #[serde(rename = "marketplace/upgrade")]
+    MarketplaceUpgrade {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: MarketplaceUpgradeParams,
+    },
+    /// Handles the selected product's `plugin/list` operation.
+    #[serde(rename = "plugin/list")]
+    PluginList {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: PluginListParams,
+    },
+    /// Handles the selected product's `plugin/installed` operation.
+    #[serde(rename = "plugin/installed")]
+    PluginInstalled {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: PluginInstalledParams,
+    },
+    /// Handles the selected product's `plugin/read` operation.
+    #[serde(rename = "plugin/read")]
+    PluginRead {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: PluginReadParams,
+    },
+    /// Handles the selected product's `plugin/install` operation.
+    #[serde(rename = "plugin/install")]
+    PluginInstall {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: PluginInstallParams,
+    },
+    /// Handles the selected product's `plugin/uninstall` operation.
+    #[serde(rename = "plugin/uninstall")]
+    PluginUninstall {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: PluginUninstallParams,
+    },
+    /// Handles the selected product's `skills/config/write` operation.
+    #[serde(rename = "skills/config/write")]
+    SkillsConfigWrite {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: SkillsConfigWriteParams,
+    },
+    /// Reads the selected product's effective configuration.
+    #[serde(rename = "config/read")]
+    ConfigRead {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: ConfigReadParams,
+    },
+    /// Writes one value to the selected product's user configuration layer.
+    #[serde(rename = "config/value/write")]
+    ConfigValueWrite {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: ConfigValueWriteParams,
+    },
+    /// Writes ordered edits to the selected product's user configuration layer.
+    #[serde(rename = "config/batchWrite")]
+    ConfigBatchWrite {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Source-compatible operation arguments.
+        params: ConfigBatchWriteParams,
+    },
+
     /// Lists configured servers and their current inventory.
     #[serde(rename = "mcpServerStatus/list")]
     McpServerStatusList {
@@ -429,7 +593,22 @@ impl ClientRequest {
     #[must_use]
     pub const fn id(&self) -> &RequestId {
         match self {
-            Self::McpServerStatusList { request_id, .. }
+            Self::SkillsList { request_id, .. }
+            | Self::SkillsExtraRootsSet { request_id, .. }
+            | Self::HooksList { request_id, .. }
+            | Self::MarketplaceAdd { request_id, .. }
+            | Self::MarketplaceRemove { request_id, .. }
+            | Self::MarketplaceUpgrade { request_id, .. }
+            | Self::PluginList { request_id, .. }
+            | Self::PluginInstalled { request_id, .. }
+            | Self::PluginRead { request_id, .. }
+            | Self::PluginInstall { request_id, .. }
+            | Self::PluginUninstall { request_id, .. }
+            | Self::SkillsConfigWrite { request_id, .. }
+            | Self::ConfigRead { request_id, .. }
+            | Self::ConfigValueWrite { request_id, .. }
+            | Self::ConfigBatchWrite { request_id, .. }
+            | Self::McpServerStatusList { request_id, .. }
             | Self::McpServerRefresh { request_id, .. }
             | Self::McpServerReconnect { request_id, .. }
             | Self::McpServerToggle { request_id, .. }
@@ -465,6 +644,22 @@ impl ClientRequest {
     #[must_use]
     pub const fn method_name(&self) -> &'static str {
         match self {
+            Self::SkillsList { .. } => "skills/list",
+            Self::SkillsExtraRootsSet { .. } => "skills/extraRoots/set",
+            Self::HooksList { .. } => "hooks/list",
+            Self::MarketplaceAdd { .. } => "marketplace/add",
+            Self::MarketplaceRemove { .. } => "marketplace/remove",
+            Self::MarketplaceUpgrade { .. } => "marketplace/upgrade",
+            Self::PluginList { .. } => "plugin/list",
+            Self::PluginInstalled { .. } => "plugin/installed",
+            Self::PluginRead { .. } => "plugin/read",
+            Self::PluginInstall { .. } => "plugin/install",
+            Self::PluginUninstall { .. } => "plugin/uninstall",
+            Self::SkillsConfigWrite { .. } => "skills/config/write",
+            Self::ConfigRead { .. } => "config/read",
+            Self::ConfigValueWrite { .. } => "config/value/write",
+            Self::ConfigBatchWrite { .. } => "config/batchWrite",
+
             Self::McpServerStatusList { .. } => "mcpServerStatus/list",
             Self::McpServerRefresh { .. } => "config/mcpServer/reload",
             Self::McpServerReconnect { .. } => "mcpServer/reconnect",
@@ -508,7 +703,22 @@ impl ClientRequest {
     #[must_use]
     pub fn experimental_reason(&self) -> Option<&'static str> {
         match self {
-            Self::McpServerStatusList { .. }
+            Self::SkillsList { .. }
+            | Self::SkillsExtraRootsSet { .. }
+            | Self::HooksList { .. }
+            | Self::MarketplaceAdd { .. }
+            | Self::MarketplaceRemove { .. }
+            | Self::MarketplaceUpgrade { .. }
+            | Self::PluginList { .. }
+            | Self::PluginInstalled { .. }
+            | Self::PluginRead { .. }
+            | Self::PluginInstall { .. }
+            | Self::PluginUninstall { .. }
+            | Self::SkillsConfigWrite { .. }
+            | Self::ConfigRead { .. }
+            | Self::ConfigValueWrite { .. }
+            | Self::ConfigBatchWrite { .. }
+            | Self::McpServerStatusList { .. }
             | Self::McpServerRefresh { .. }
             | Self::McpServerReconnect { .. }
             | Self::McpServerToggle { .. }
@@ -548,6 +758,8 @@ impl ClientRequest {
 pub(crate) enum ClientRequestSerializationScope {
     /// One exclusive registry shared by all client connections.
     Global(&'static str),
+    /// Consecutive read-only global requests may run together.
+    GlobalSharedRead(&'static str),
     /// One thread shared by all client connections.
     Thread {
         /// The thread's protocol identity.
@@ -560,6 +772,26 @@ impl ClientRequest {
     #[must_use]
     pub(crate) fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
         let thread_id = match self {
+            // Product configuration, plugin and skill reads share the `config` queue with its
+            // writes, as in Codex.
+            Self::SkillsList { .. } | Self::HooksList { .. } | Self::ConfigRead { .. } => {
+                return Some(ClientRequestSerializationScope::GlobalSharedRead("config"));
+            }
+            Self::SkillsExtraRootsSet { .. }
+            | Self::MarketplaceAdd { .. }
+            | Self::MarketplaceRemove { .. }
+            | Self::MarketplaceUpgrade { .. }
+            | Self::PluginInstall { .. }
+            | Self::PluginUninstall { .. }
+            | Self::SkillsConfigWrite { .. }
+            | Self::ConfigValueWrite { .. }
+            | Self::ConfigBatchWrite { .. } => {
+                return Some(ClientRequestSerializationScope::Global("config"));
+            }
+            // Codex runs catalog reads unserialized.
+            Self::PluginList { .. } | Self::PluginInstalled { .. } | Self::PluginRead { .. } => {
+                return None;
+            }
             Self::McpServerStatusList { .. }
             | Self::McpServerRefresh { .. }
             | Self::McpServerReconnect { .. }
@@ -904,4 +1136,93 @@ impl MockExperimentalMethodResponse {
     pub fn echoed(&self) -> Option<&str> {
         self.echoed.as_deref()
     }
+}
+
+impl ClientRequest {
+    pub(crate) fn plugin_request(&self) -> Option<PluginManagementRequest> {
+        match self {
+            Self::SkillsList { params, .. } => {
+                Some(PluginManagementRequest::SkillsList(params.clone()))
+            }
+            Self::SkillsExtraRootsSet { params, .. } => {
+                Some(PluginManagementRequest::SkillsExtraRootsSet(params.clone()))
+            }
+            Self::HooksList { params, .. } => {
+                Some(PluginManagementRequest::HooksList(params.clone()))
+            }
+            Self::MarketplaceAdd { params, .. } => {
+                Some(PluginManagementRequest::MarketplaceAdd(params.clone()))
+            }
+            Self::MarketplaceRemove { params, .. } => {
+                Some(PluginManagementRequest::MarketplaceRemove(params.clone()))
+            }
+            Self::MarketplaceUpgrade { params, .. } => {
+                Some(PluginManagementRequest::MarketplaceUpgrade(params.clone()))
+            }
+            Self::PluginList { params, .. } => {
+                Some(PluginManagementRequest::PluginList(params.clone()))
+            }
+            Self::PluginInstalled { params, .. } => {
+                Some(PluginManagementRequest::PluginInstalled(params.clone()))
+            }
+            Self::PluginRead { params, .. } => {
+                Some(PluginManagementRequest::PluginRead(params.clone()))
+            }
+            Self::PluginInstall { params, .. } => {
+                Some(PluginManagementRequest::PluginInstall(params.clone()))
+            }
+            Self::PluginUninstall { params, .. } => {
+                Some(PluginManagementRequest::PluginUninstall(params.clone()))
+            }
+            Self::SkillsConfigWrite { params, .. } => {
+                Some(PluginManagementRequest::SkillsConfigWrite(params.clone()))
+            }
+            Self::ConfigRead { params, .. } => {
+                Some(PluginManagementRequest::ConfigRead(params.clone()))
+            }
+            Self::ConfigValueWrite { params, .. } => {
+                Some(PluginManagementRequest::ConfigValueWrite(params.clone()))
+            }
+            Self::ConfigBatchWrite { params, .. } => {
+                Some(PluginManagementRequest::ConfigBatchWrite(params.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Typed operations handled by an explicitly installed coding-product service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginManagementRequest {
+    /// `skills/list`.
+    SkillsList(SkillsListParams),
+    /// `skills/extraRoots/set`.
+    SkillsExtraRootsSet(SkillsExtraRootsSetParams),
+    /// `hooks/list`.
+    HooksList(HooksListParams),
+    /// `marketplace/add`.
+    MarketplaceAdd(MarketplaceAddParams),
+    /// `marketplace/remove`.
+    MarketplaceRemove(MarketplaceRemoveParams),
+    /// `marketplace/upgrade`.
+    MarketplaceUpgrade(MarketplaceUpgradeParams),
+    /// `plugin/list`.
+    PluginList(PluginListParams),
+    /// `plugin/installed`.
+    PluginInstalled(PluginInstalledParams),
+    /// `plugin/read`.
+    PluginRead(PluginReadParams),
+    /// `plugin/install`.
+    PluginInstall(PluginInstallParams),
+    /// `plugin/uninstall`.
+    PluginUninstall(PluginUninstallParams),
+    /// `skills/config/write`.
+    SkillsConfigWrite(SkillsConfigWriteParams),
+    /// `config/read`.
+    ConfigRead(ConfigReadParams),
+    /// `config/value/write`.
+    ConfigValueWrite(ConfigValueWriteParams),
+    /// `config/batchWrite`.
+    ConfigBatchWrite(ConfigBatchWriteParams),
 }

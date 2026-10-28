@@ -41,6 +41,7 @@ pub struct McpHttpParams {
     ignore_initialized_notification_failure: bool,
     auth: Option<Auth>,
     client_factory: Option<ClientFactory>,
+    route_factory: Option<ra_http::HttpClientFactory>,
 }
 impl McpHttpParams {
     /// Selects an MCP endpoint. HTTP connect and stream read timeouts default to 5 and 300 seconds.
@@ -56,8 +57,17 @@ impl McpHttpParams {
             ignore_initialized_notification_failure: false,
             auth: None,
             client_factory: None,
+            route_factory: None,
         }
     }
+    /// Explicitly routes product requests through the owner's destination and proxy policy.
+    /// Authentication callbacks still prepare each request; the selected factory owns transport.
+    #[must_use]
+    pub fn with_route_factory(mut self, factory: ra_http::HttpClientFactory) -> Self {
+        self.route_factory = Some(factory);
+        self
+    }
+
     /// Supplies static headers.
     #[must_use]
     pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {

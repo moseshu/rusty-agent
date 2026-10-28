@@ -54,6 +54,7 @@ pub struct CodingHost {
     skill_roots: BTreeMap<String, Workspace>,
     skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig,
     skill_discovery: Option<crate::skills::SkillDiscoveryConfig>,
+    plugin_skills: Option<Arc<crate::plugins::PluginServices>>,
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
     collaboration: Option<Collaboration>,
@@ -119,6 +120,7 @@ impl CodingHost {
             skill_roots: BTreeMap::new(),
             skill_catalog_prompt: crate::skills::SkillCatalogPromptConfig::default(),
             skill_discovery: None,
+            plugin_skills: None,
             user_input: None,
             request_user_input: false,
             collaboration: None,
@@ -229,6 +231,16 @@ impl CodingHost {
         self
     }
 
+    /// Lists Host skills from explicitly selected plugin services on each run: the effective
+    /// user, project, bundled and plugin skills for the workspace root, with configuration rules
+    /// applied. A configuration or plugin change reaches the next run. This replaces
+    /// [`Self::with_skill_discovery`]; configuring both fails agent assembly.
+    #[must_use]
+    pub fn with_plugin_skills(mut self, services: Arc<crate::plugins::PluginServices>) -> Self {
+        self.plugin_skills = Some(services);
+        self
+    }
+
     /// Configures the namespace catalog's model-window lookup, optional token override and usage
     /// instructions, and optional environment skill prerequisites. The window is resolved for
     /// each run, including its model override.
@@ -253,6 +265,7 @@ impl CodingHost {
         if self.uses_skills_namespace() {
             crate::skills::SkillToolSurface::Namespace
         } else if self.skill_discovery.is_some()
+            || self.plugin_skills.is_some()
             || self
                 .skill_providers
                 .as_ref()
@@ -429,6 +442,21 @@ impl CodingHost {
     ) -> ra_core::error::Result<Option<crate::skills::SkillCatalogCapability>> {
         let budget = ToolResultBudget::default();
         let mut providers = self.skill_providers.clone().unwrap_or_default();
+        if self.skill_discovery.is_some() && self.plugin_skills.is_some() {
+            return Err(ra_core::error::Error::config(
+                "configure either Host skill discovery or plugin skills, not both",
+            ));
+        }
+        if let Some(services) = &self.plugin_skills {
+            let cwd = ra_paths::AbsolutePathBuf::from_absolute_path(self.workspace.root())
+                .map_err(|error| {
+                    ra_core::error::Error::config("workspace root must be absolute")
+                        .with_source(error)
+                })?;
+            providers = providers.with_host_provider(Arc::new(
+                crate::plugins::PluginSkillProvider::new(Arc::clone(services), cwd),
+            ));
+        }
         if let Some(config) = &self.skill_discovery {
             providers = providers.with_host_provider(Arc::new(crate::skills::HostSkillProvider {
                 config: config.clone(),

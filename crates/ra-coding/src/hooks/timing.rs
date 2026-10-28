@@ -4,8 +4,8 @@
 use ra_core::hook::HookEventName;
 use std::path::Path;
 
-const SESSION_END_DEFAULT_TIMEOUT_SEC: u64 = 1;
-const SESSION_END_MAX_TIMEOUT_SEC: u64 = 3;
+pub(crate) const SESSION_END_DEFAULT_TIMEOUT_SEC: u64 = 1;
+pub(crate) const SESSION_END_MAX_TIMEOUT_SEC: u64 = 3;
 
 /// Normalizes hook timeouts. `SessionEnd` and Interrupt default to one second and are capped at three
 /// seconds; all other hooks keep the standard ten-minute default.

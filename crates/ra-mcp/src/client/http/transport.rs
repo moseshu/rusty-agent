@@ -68,6 +68,9 @@ impl HttpSession {
 #[derive(Clone)]
 pub(super) struct HttpClient {
     client: reqwest::Client,
+    routed: Option<ra_http::RouteAwareClientPool>,
+    // Validated static headers; the routed pool applies them as the client defaults would.
+    default_headers: HeaderMap,
     params: McpHttpParams,
     bearer: Option<String>,
     pub(super) session: Arc<HttpSession>,
@@ -113,6 +116,7 @@ impl HttpClient {
             })
             .transpose()?;
         crate::rustls_provider::ensure_rustls_crypto_provider();
+        let default_headers = headers.clone();
         let builder = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(params.timeout)
@@ -128,8 +132,22 @@ impl HttpClient {
                 "MCP HTTP client construction failed",
             )
         })?;
+        let routed = params.route_factory.clone().map(|factory| {
+            ra_http::RouteAwareClientPool::with_builder(
+                factory,
+                ra_http::ClientRouteClass::Api,
+                ra_http::HttpClientBuilder::new()
+                    .without_redirects()
+                    .without_request_logging()
+                    .connect_timeout(params.timeout)
+                    .read_timeout(params.sse_read_timeout),
+            )
+            .with_legacy_custom_ca_fallback()
+        });
         Ok(Self {
             client,
+            routed,
+            default_headers,
             params: params.clone(),
             bearer,
             session: Arc::default(),
@@ -167,6 +185,47 @@ impl HttpClient {
         }
         Ok(request)
     }
+    async fn send(&self, request: RequestBuilder) -> HttpResult<Response> {
+        let Some(pool) = &self.routed else {
+            return request.send().await.map_err(http_error);
+        };
+        let request = request.build().map_err(http_error)?;
+        // The routed pool does not see this client's default headers. Static headers fill only
+        // names the request does not set, as reqwest's defaults do, so session, hook and bearer
+        // values keep their precedence.
+        let mut headers = request.headers().clone();
+        for (name, value) in &self.default_headers {
+            if !headers.contains_key(name) {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+        let mut routed = pool
+            .request(request.method().clone(), request.url().as_str())
+            .headers(headers);
+        if let Some(body) = request.body() {
+            let body = body
+                .as_bytes()
+                .ok_or_else(|| failure("routed MCP requests require a buffered body"))?;
+            routed = routed.body(body.to_vec());
+        }
+        if let Some(timeout) = request.timeout() {
+            routed = routed.timeout(*timeout);
+        }
+        let response = routed
+            .send()
+            .await
+            .map_err(|_| failure("MCP HTTP request failed"))?;
+        let mut builder = http::Response::builder().status(response.status());
+        if let Some(headers) = builder.headers_mut() {
+            headers.clone_from(response.headers());
+        }
+        let body = reqwest::Body::wrap_stream(response.bytes_stream());
+        let response = builder
+            .body(body)
+            .map_err(|_| failure("MCP HTTP response adaptation failed"))?;
+        Ok(reqwest::Response::from(response))
+    }
+
     async fn post(
         &self,
         uri: Arc<str>,
@@ -187,7 +246,7 @@ impl HttpClient {
                 .request(Method::POST, &uri, session.as_deref(), headers)
                 .await?
                 .header(ACCEPT, "application/json, text/event-stream");
-            let response = request.json(&message).send().await.map_err(http_error)?;
+            let response = self.send(request.json(&message)).await?;
             let status = response.status();
             let session_id = response
                 .headers()
@@ -316,7 +375,7 @@ impl StreamableHttpClient for HttpClient {
         if let Some(last_id) = last_id {
             request = request.header("last-event-id", last_id);
         }
-        let response = request.send().await.map_err(http_error)?;
+        let response = self.send(request).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -338,12 +397,10 @@ impl StreamableHttpClient for HttpClient {
         if !self.params.terminate_on_close {
             return Ok(());
         }
-        let response = self
+        let request = self
             .request(Method::DELETE, &uri, Some(&session), headers)
-            .await?
-            .send()
-            .await
-            .map_err(http_error)?;
+            .await?;
+        let response = self.send(request).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }

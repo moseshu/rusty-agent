@@ -23,6 +23,7 @@ workspace = true
 test-api = []
 
 [dependencies]
+schemars = { workspace = true }
 ra-config = { workspace = true }
 ra-core = { workspace = true }
 ra-paths = { workspace = true }

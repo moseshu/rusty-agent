@@ -7,6 +7,68 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Reviewed native-process and MCP registration API
+
+The native `ra_exec::process` exports retain Codex's owned Child stdio handles and explicit
+ProcessMode choices. MCP catalog provenance, conflict and authority records retain the source
+surfaces. Their extension-safety exceptions are scoped to exact files and types, with source
+and adaptation reasons in the gate policy. McpCredentialPolicy requires an explicit authority
+choice; its added Default implementation was removed and the source Hash derive restored.
+Its visibility is public because the catalog and product adapter live in different crates here.
+
+The reviewed API reconciliation contains 52 additions in ra-exec, 70 in ra-mcp, and 462 additions
+plus 22 definition/reexport changes in ra-protocol. It accepts the recorded account exclusions
+and Rust representation adaptations, including retained protocol-mode labels; it does not claim
+support for unimplemented newer MCP lifecycles. Runtime gaps remain tracked separately.
+The exact accepted-item inventory has SHA-256
+`c87d8c1196b13e59941bd425346b8617f7f22bf33a07e069ddc7abd10e44fb3e`.
+
+
+### Public featured-plugin metadata and restored wire fields
+
+`plugin/list` again returns `featuredPluginIds` (default `[]`). The fetch trigger retains the
+source exact match for `openai-curated`. This product loads the API-key catalog named
+`openai-api-curated`, so its lists return `[]` and do not request the featured service.
+The ported fetch remains available for the exact-name branch and requests
+`/plugins/featured?platform=codex` from the configured service base URL.
+The fetch uses the application's route-aware HTTP factory, the source 10-second timeout and a
+3-hour success cache keyed by the base URL. Failures log a warning and return `[]` without caching
+the failure. `forceRefetch` retains the source featured cache behavior; it does not bypass this cache.
+The API-key catalog name is not an alias for this trigger. The source remote-global branch is
+not installed.
+
+The source `chatgpt_base_url` key is restored for public metadata, defaulting to
+`https://chatgpt.com/backend-api/`. Existing project-layer filtering still prevents repository
+configuration from overriding this endpoint. No account authentication, account cookies or remote
+plugin mutation services are introduced. Request originator and User-Agent use this product's name.
+
+`PluginSummary` restores nullable `installPolicySource` and `mustShowInstallationInterstitial`;
+`PluginDetail` restores nullable `scheduledTasks` and the source schedule value types. The local
+converters return `None`, as upstream does. Restoring these protocol records does not install a
+scheduled-task execution service or an account workspace policy service.
+
+
+### Protocol record exceptions and consumer reconciliation access
+
+The plugin/config/hook wire records in `ra_protocol::server::protocol` retain the ported
+public-field and enum surfaces. The extension-safety gate now identifies upstream exceptions by
+exact source file and type, for both structs and enums; a same-named type in another file does
+not inherit an exception. This does not promise Rust source compatibility when upstream adds a
+field or enum variant. Wire compatibility and the public API baseline remain separate reviews.
+
+The unreleased product `ConsumerReconcile` now exposes read-only `generation()`, `unavailable()`
+and `error()` accessors instead of public fields. Consumer observations keep the same values;
+construction remains with the service. The test-only `SerializationAccess` enum is now
+`non_exhaustive`.
+
+Policy values are owned by `ra_config` and remain available through their existing public
+`ra_protocol::server::protocol` reexports. The underlying definition crate and reflected type
+names change. The API reconciliation accepts this owner move while preserving the public reexports,
+variant payloads, wire defaults, aliases and custom deserialization. The shared SandboxMode
+also gains the upstream configuration value's Default(ReadOnly) implementation and schema derive.
+Code depending on reflected `type_name` strings must account for the new definition owner. This review does not close the
+remaining product runtime capability gaps.
+
 ### Product configuration sources and composition primitives
 
 `ra_config` owns the product source identities, metadata, source display,
@@ -41,9 +103,9 @@ of the policy contract: when domain or filter keys normalize to the same key, th
 wins; case-insensitive filter lookup returns the first matching declaration. Using sorted tables
 instead can reverse allow/deny or include/exclude decisions even with identical merge code.
 
-The three typed ConfigToml assertions associated with the ported merge fixtures remain pending
-until that schema exists. Passing raw-value tests does not establish loader, trust or
-requirements parity.
+The three typed ConfigToml assertions associated with the ported merge fixtures are restored
+alongside the schema and explicit product loader. Raw-value merge tests alone do not establish
+loader, trust or requirements parity; those paths have separate integration coverage.
 
 ### Product MCP and path prerequisites
 

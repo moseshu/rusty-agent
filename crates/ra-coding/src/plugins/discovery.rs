@@ -1,6 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Host manifest discovery and format precedence from Codex.
 
+use ra_filesystem::{EnvironmentAccess, EnvironmentAccessExt, GetMetadataOptions, ReadFileOptions};
+use ra_paths::PathUri;
 use std::path::{Path, PathBuf};
 
 /// Legacy manifest candidates, highest precedence first.
@@ -96,4 +98,43 @@ pub fn migrated_command_skills_root(
     plugin_root: &super::AbsolutePathBuf,
 ) -> super::AbsolutePathBuf {
     super::join_absolute_path(plugin_root, ".codex-plugin/migrated-command-skills")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPluginManifestName {
+    #[serde(default)]
+    name: String,
+}
+
+/// Returns the plugin manifest `name` defined directly below `plugin_root`.
+pub async fn plugin_namespace_for_root_uri(
+    fs: &dyn EnvironmentAccess,
+    plugin_root: &PathUri,
+) -> Option<String> {
+    let mut manifest_path = None;
+    for relative_path in DISCOVERABLE_PLUGIN_MANIFEST_PATHS {
+        let candidate = plugin_root.join(relative_path).ok()?;
+        match fs
+            .get_metadata(&candidate, GetMetadataOptions::default())
+            .await
+        {
+            Ok(metadata) if metadata.is_file => {
+                manifest_path = Some(candidate);
+                break;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let contents = fs
+        .read_file_text(&manifest_path?, ReadFileOptions::default())
+        .await
+        .ok()?;
+    let RawPluginManifestName { name: raw_name } = serde_json::from_str(&contents).ok()?;
+    Some(
+        plugin_root
+            .basename()
+            .filter(|_| raw_name.trim().is_empty())
+            .unwrap_or(raw_name),
+    )
 }

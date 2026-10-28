@@ -35,6 +35,10 @@ that license. Source: https://github.com/openai/codex
 The stdio transcoding transport also adapts child cleanup from
 modelcontextprotocol/rust-sdk (Apache-2.0): https://github.com/modelcontextprotocol/rust-sdk
 
+The bundled system skills in crates/ra-coding/src/skills/assets/samples/ are copied from
+openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
+codex-rs/skills/src/assets/samples/ (Apache-2.0), together with any license files they carry.
+
 The native lexical absolute-path operations retain Codex's adaptation of
 path-absolutize 3.1.1, Copyright (c) 2018 magiclen.org (Ron Li), under the MIT
 license retained in third_party/path-absolutize.LICENSE.
@@ -52,7 +56,6 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-config/src/domain.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs::normalize_host/normalize_dns_host_or_ip_literal/normalize_ip_literal |
 | `tests/it-config/tests/config_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge_tests.rs (all 25 raw-TOML fixtures; three typed ConfigToml projection assertions await the product schema) |
 | `tests/it-config/tests/config_primitives.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/fingerprint_tests.rs; network-proxy/src/domain_matcher_tests.rs (host cases through public merge); config/src/{config_layer_source,merge,overrides}.rs (public contract regressions) |
-| `crates/ra-config/src/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs::PluginsDefaultConfig/PluginsConfigToml/PluginConfig/PluginMcpServerConfig/MarketplaceConfig/MarketplaceSourceType (configuration values and pure policy operations only) |
 | `crates/ra-config/src/mcp_types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_types.rs (product MCP configuration and transport validation; OpenAI account authentication omitted) |
 | `tests/it-config/tests/plugin_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types_tests.rs::plugin_activation_inherits_defaults_without_explicit_enablement; mcp_types_tests.rs::app_tool_approval_restrictions_never_weaken_either_policy; core-plugins/src/loader_tests.rs::legacy_ema_policy_disables_installed_and_selected_plugin_servers (serialization assertions only); types.rs/mcp_types.rs (additional configuration-value regressions) |
 | `crates/ra-coding/src/plugins/materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs::MaterializedMarketplacePluginSource/materialize_marketplace_plugin_source/materialize_marketplace_plugin_source_with_mode/clone_git_plugin_source/run_git/run_git_output |
@@ -60,7 +63,6 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/plugins/git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/git_policy.rs; git-utils/src/lib.rs::SAFE_BARE_REPOSITORY_CONFIG; utils/absolute-path/src/lib.rs::canonicalize |
 | `crates/ra-coding/src/plugins/npm_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/npm_source.rs |
 | `crates/ra-coding/src/plugins/plugin_bundle_archive.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/plugin_bundle_archive.rs (generic local bundle codec; no sharing or account transport) |
-| `crates/ra-coding/src/plugins/process.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/process/src/lib.rs::background_command |
 | `tests/it-coding/tests/plugin_materialize.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader_tests.rs (both Git materialization cases); loader.rs (ownership, failure, mode and Store integration regressions) |
 | `tests/it-coding/tests/plugin_git_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/startup_sync_tests.rs::git_command_sanitizes_ambient_repository_environment; git_policy.rs (Manual/Automatic and trusted-repository regressions) |
 | `tests/it-coding/tests/plugin_npm_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/npm_source_tests.rs (all npm source fixtures) |
@@ -70,8 +72,6 @@ local upstream checkouts used for the port; each file lists its original source.
 | `tests/it-coding/tests/plugin_background_command.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/process/src/background_command_tests.rs (Windows detached-parent console and std/Tokio output fixture) |
 | `crates/ra-coding/src/plugins/marketplace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace.rs (Host catalogs, policies, source descriptors and fallback metadata) |
 | `crates/ra-coding/src/plugins/marketplace/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/git-utils/src/info.rs::get_git_repo_root/find_ancestor_git_entry |
-| `crates/ra-coding/src/plugins/marketplace_add.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add.rs::MarketplaceAddError (no registration or config writes) |
-| `crates/ra-coding/src/plugins/marketplace_add/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/source.rs (Local/Git parser and staging admission; no clone implementation) |
 | `crates/ra-protocol/src/server/protocol/plugins.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/plugin.rs::PluginInstallPolicy/PluginAuthPolicy; protocol/src/protocol.rs::Product |
 | `tests/it-coding/tests/plugin_marketplace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_tests.rs (all 36 tests) |
 | `tests/it-coding/tests/plugin_marketplace_source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/source.rs (all 13 parser/admission tests) |
@@ -518,3 +518,209 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-executor/tests/source_client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/client.rs::tests (filesystem-facing direct transport subset) |
 | `tests/it-executor/tests/source_walk.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs::walk_tests |
 | `tests/it-executor/tests/source_windows_symlinks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs::tests (Windows dangling directory symlink) |
+| `crates/ra-paths/src/write.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-utils/src/lib.rs::SymlinkWritePaths,resolve_symlink_write_paths,write_atomically |
+| `crates/ra-config/src/plugin_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/plugin_edit.rs |
+| `crates/ra-config/src/marketplace_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/marketplace_edit.rs |
+| `tests/it-config/tests/plugin_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/plugin_edit.rs::tests |
+| `tests/it-config/tests/marketplace_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/marketplace_edit.rs::tests |
+| `crates/ra-coding/src/plugins/toggles.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/toggles.rs |
+| `tests/it-coding/tests/plugin_toggles.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/toggles.rs::tests |
+| `tests/it-paths/tests/config_write_paths.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-utils/src/path_utils_tests.rs::symlinks |
+| `crates/ra-config/src/layer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/state.rs::ConfigLayerEntry |
+| `crates/ra-config/src/profile_name.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::ProfileV2Name |
+| `crates/ra-config/src/path_context.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/path_context.rs |
+| `crates/ra-config/src/policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs::AskForApproval,SandboxPolicy;protocol/src/config_types.rs::ApprovalsReviewer,SandboxMode (existing wire representation retained) |
+| `crates/ra-config/src/web_search.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::WebSearchMode |
+| `crates/ra-config/src/reasoning.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models.rs::ReasoningEffort |
+| `crates/ra-config/src/provider_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::ModelProviderAuthInfo |
+| `crates/ra-config/src/model_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider-info/src/lib.rs::provider schema and validation (OpenAI account machinery excluded) |
+| `crates/ra-config/src/provider_capabilities.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider-info/src/capabilities.rs |
+| `crates/ra-config/src/provider_gateway_oauth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider-info/src/gateway_oauth.rs |
+| `crates/ra-config/src/browser_use.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/browser_use.rs |
+| `crates/ra-config/src/computer_use.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/computer_use.rs |
+| `crates/ra-config/src/application_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/application_requirements.rs |
+| `crates/ra-config/src/in_app_browser_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/in_app_browser_requirements.rs |
+| `crates/ra-config/src/browser_computer_use_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/browser_computer_use_requirements.rs |
+| `crates/ra-config/src/network_values.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/{config,mitm_hook,credential_broker/provider_config}.rs::configuration records |
+| `crates/ra-config/src/permissions_toml.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/permissions_toml.rs (proxy construction consumer deferred) |
+| `crates/ra-config/src/features.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/features/src/lib.rs (account auth predicate and app-server warning event delivery excluded) |
+| `crates/ra-config/src/features/legacy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/features/src/legacy.rs |
+| `crates/ra-config/src/features/feature_configs.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/features/src/feature_configs.rs |
+| `crates/ra-config/src/scalar_values.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/{config_types,guardian_transcript,openai_models/guardian_v2}.rs::configuration values |
+| `crates/ra-config/src/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/types.rs (OpenAI login settings excluded; existing plugin value docs retained) |
+| `crates/ra-config/src/tui_keymap.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/tui_keymap.rs |
+| `crates/ra-config/src/tui_effects.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/tui_effects.rs |
+| `crates/ra-config/src/tui_rendering.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/tui_rendering.rs |
+| `crates/ra-config/src/tui_mouse_scroll.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/tui_mouse_scroll.rs |
+| `crates/ra-config/src/skills_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/skills_config.rs (ScopedSkillsConfig retains its existing owner) |
+| `crates/ra-config/src/config_toml.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_toml.rs (OpenAI account identity and login fields excluded) |
+| `crates/ra-config/src/profile_toml.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/profile_toml.rs (OpenAI account backend URL excluded) |
+| `crates/ra-config/src/shell_environment_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/shell_environment_policy.rs |
+| `crates/ra-config/src/shell_values.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/config_types.rs::shell environment policy |
+| `crates/ra-config/src/schema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/schema.rs |
+| `crates/ra-config/src/project_trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/project_trust.rs |
+| `crates/ra-config/src/granular_approval.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs::GranularApprovalConfig |
+| `crates/ra-config/src/config_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs (existing source/constraint wrappers reused; OpenAI login requirements excluded) |
+| `crates/ra-config/src/requirements_exec_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_exec_policy.rs |
+| `crates/ra-paths/src/comparison.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-utils/src/{lib,env}.rs::native path comparison and WSL detection |
+| `crates/ra-config/src/state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/state.rs (ConfigLayerEntry retains its shared module; OpenAI login override excluded) |
+| `crates/ra-config/src/path_resolution.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/mod.rs::resolve_relative_paths_in_config_toml,copy_shape_from_original |
+| `crates/ra-config/src/cloud_config_layers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/cloud_config_layers.rs |
+| `crates/ra-config/src/cloud_config_bundle.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/cloud_config_bundle.rs |
+| `crates/ra-config/src/filesystem_constraints.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/filesystem_constraints.rs |
+| `crates/ra-config/src/model_provider_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/model_provider_requirements.rs |
+| `crates/ra-config/src/diagnostics.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/diagnostics.rs |
+| `crates/ra-config/src/strict_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/strict_config.rs |
+| `crates/ra-config/src/host_name.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/host_name.rs |
+| `crates/ra-config/src/requirements_layers/stack.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/stack.rs (OpenAI login requirements excluded) |
+| `crates/ra-config/src/requirements_layers/layer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/layer.rs |
+| `crates/ra-config/src/requirements_layers/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/hooks.rs |
+| `crates/ra-config/src/requirements_layers/models.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/models.rs |
+| `crates/ra-config/src/requirements_layers/permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/permissions.rs |
+| `crates/ra-config/src/requirements_layers/rules.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/rules.rs |
+| `crates/ra-config/src/requirements_layers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/mod.rs |
+| `crates/ra-config/src/git_trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/git-utils/src/trust.rs |
+| `crates/ra-config/src/credential_sources.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/credential_broker/{environment,providers/github,providers/openai}.rs::provider environment-key projection |
+| `crates/ra-config/src/loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/mod.rs (confirmed product namespaces; native preference/Windows accessors delegate to ra-exec) |
+| `crates/ra-config/src/loader/application.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/application.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/layer_io.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/layer_io.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/local.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/local.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/managed_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/managed_requirements.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/project_discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/project_discovery.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/windows.rs (confirmed product namespaces; OpenAI login override excluded) |
+| `crates/ra-config/src/loader/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos.rs (confirmed product namespace; native accessor delegated to ra-exec) |
+| `crates/ra-config/src/thread_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/thread_config.rs (account backend implementation excluded; typed source/lifecycle retained) |
+| `crates/ra-config/src/project_root_markers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/project_root_markers.rs |
+| `crates/ra-exec/src/platform_config/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos.rs::native preferences |
+| `crates/ra-exec/src/platform_config/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/mod.rs::windows_program_data_dir_from_known_folder |
+| `crates/ra-exec/src/platform_config/windows_acl.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/windows-sandbox-rs/src/{acl,winutil}.rs::read-only owner, mutation ACE and SID inspection |
+| `tests/it-config/tests/config_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/state_tests.rs |
+| `tests/it-config/tests/model_provider_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/model_provider_requirements_tests.rs |
+| `tests/it-config/tests/requirements_composition.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/stack_tests.rs (OpenAI account requirements case excluded) |
+| `tests/it-config/src/fixture_fs.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/tests.rs |
+| `tests/it-config/tests/config_loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/tests.rs |
+| `tests/it-config/src/support.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/test_support.rs |
+| `tests/it-config/tests/projectless_directory_tests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/projectless_directory_tests.rs |
+| `tests/it-config/tests/managed_project_discovery_tests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/managed_project_discovery_tests.rs |
+| `crates/ra-config/src/shell_environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/shell_environment.rs |
+| `tests/it-config/tests/path_context.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/path_context_tests.rs |
+| `tests/it-exec/tests/managed_preferences.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos_tests.rs |
+| `tests/it-config/tests/requirements_values.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs |
+| `crates/ra-config/src/home.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/home-dir/src/lib.rs |
+| `tests/it-config/tests/home.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/home-dir/src/lib.rs |
+| `tests/it-config/src/path_support.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/lib.rs |
+| `tests/it-config/tests/project_trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/project_trust_tests.rs |
+| `tests/it-config/tests/skills_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/skills_config_tests.rs |
+| `tests/it-config/tests/cloud_config_bundle.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/cloud_config_bundle_tests.rs |
+| `tests/it-config/tests/cloud_config_layers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/cloud_config_layers_tests.rs |
+| `tests/it-config/tests/shell_environment_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/shell_environment_policy_tests.rs |
+| `tests/it-config/tests/browser_computer_use_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/browser_computer_use_requirements_tests.rs |
+| `tests/it-config/tests/application_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/application_requirements_tests.rs |
+| `tests/it-config/tests/in_app_browser_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/in_app_browser_requirements_tests.rs |
+| `tests/it-config/tests/strict_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/strict_config_tests.rs |
+| `tests/it-config/tests/test_support.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/test_support_tests.rs |
+| `crates/ra-coding/src/plugins/installed_marketplaces.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/installed_marketplaces.rs |
+| `crates/ra-coding/src/plugins/marketplace_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_policy.rs |
+| `crates/ra-coding/src/plugins/marketplace_remove.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_remove.rs |
+| `crates/ra-coding/src/plugins/marketplace_upgrade.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_upgrade.rs |
+| `crates/ra-coding/src/plugins/marketplace_upgrade/activation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_upgrade/activation.rs |
+| `crates/ra-coding/src/plugins/marketplace_upgrade/git.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_upgrade/git.rs |
+| `crates/ra-coding/src/plugins/marketplace_add.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add.rs |
+| `crates/ra-coding/src/plugins/marketplace_add/install.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/install.rs |
+| `crates/ra-coding/src/plugins/marketplace_add/metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/metadata.rs |
+| `crates/ra-coding/src/plugins/marketplace_add/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add/source.rs |
+| `crates/ra-coding/src/plugins/http_client_selector.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/http_client_selector.rs |
+| `crates/ra-exec/src/system_commands.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-utils/src/system_commands.rs |
+| `crates/ra-coding/src/plugins/startup_sync.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/startup_sync.rs |
+| `crates/ra-coding/src/plugins/startup_sync/http_client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/startup_sync/http_client.rs |
+| `tests/it-coding/tests/marketplace_add_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_add.rs |
+| `tests/it-coding/tests/marketplace_remove_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_remove.rs |
+| `tests/it-exec/tests/system_commands.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/path-utils/src/system_commands_tests.rs |
+| `tests/it-coding/tests/plugin_startup_sync.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/startup_sync_tests.rs |
+| `tests/it-coding/tests/marketplace_upgrade.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_upgrade_tests.rs |
+| `crates/ra-coding/src/skills/model.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/model.rs |
+| `crates/ra-coding/src/skills/loading.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/loading.rs |
+| `crates/ra-coding/src/skills/interface.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/interface.rs |
+| `crates/ra-coding/src/skills/metadata_parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/metadata.rs |
+| `crates/ra-coding/src/skills/mentions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/mentions.rs |
+| `crates/ra-coding/src/skills/selection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/selection.rs |
+| `crates/ra-coding/src/skills/name_counts.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/name_counts.rs |
+| `crates/ra-coding/src/plugins/skill_roots.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/plugins/src/lib.rs |
+| `crates/ra-coding/src/plugins/contributions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/lib.rs |
+| `crates/ra-coding/src/plugins/load_outcome.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/plugin/src/load_outcome.rs |
+| `crates/ra-coding/src/skills/host_loader/host.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/host.rs |
+| `crates/ra-coding/src/skills/host_loader/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/discovery.rs |
+| `crates/ra-coding/src/skills/host_loader/metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/metadata.rs |
+| `crates/ra-coding/src/skills/host_loader/namespace.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/namespace.rs |
+| `crates/ra-coding/src/skills/host_loader/host_merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/host_merge.rs |
+| `crates/ra-coding/src/skills/host_loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/loader/mod.rs |
+| `crates/ra-coding/src/skills/host_outcome.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_outcome.rs |
+| `crates/ra-coding/src/skills/host_snapshot.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_snapshot.rs |
+| `crates/ra-coding/src/skills/host_roots.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_roots.rs |
+| `crates/ra-coding/src/skills/host_service.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/host_service.rs |
+| `crates/ra-coding/src/skills/system.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/skills/src/lib.rs |
+| `crates/ra-coding/src/plugins/loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/loader.rs |
+| `crates/ra-coding/src/plugins/agent_plugin_mcp_overlay.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/agent_plugin_mcp_overlay.rs |
+| `crates/ra-coding/src/plugins/app_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/connectors/src/plugin_config.rs |
+| `crates/ra-coding/src/plugins/manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manager.rs |
+| `crates/ra-coding/src/plugins/marketplace_context.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/marketplace_context.rs |
+| `crates/ra-coding/src/plugins/skill_snapshots.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/skill_snapshots.rs |
+| `crates/ra-coding/src/hooks/declarations.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/declarations.rs |
+| `crates/ra-coding/src/hooks/registry.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/registry.rs |
+| `crates/ra-coding/src/hooks/config_rules.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/config_rules.rs |
+| `crates/ra-coding/src/hooks/legacy_notify.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/legacy_notify.rs |
+| `crates/ra-coding/src/hooks/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/mcp.rs |
+| `crates/ra-coding/src/hooks/output_spill.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/output_spill.rs |
+| `crates/ra-coding/src/hooks/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/types.rs |
+| `crates/ra-coding/src/hooks/engine.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/mod.rs |
+| `crates/ra-coding/src/hooks/engine/command_runner.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/command_runner.rs |
+| `crates/ra-coding/src/hooks/engine/mcp_runner.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/mcp_runner.rs |
+| `crates/ra-coding/src/hooks/engine/schema_loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/schema_loader.rs |
+| `crates/ra-coding/src/hooks/engine/dispatcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/dispatcher.rs |
+| `crates/ra-coding/src/hooks/engine/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs |
+| `crates/ra-coding/src/hooks/events.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/mod.rs |
+| `crates/ra-coding/src/hooks/events/common.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/common.rs |
+| `crates/ra-coding/src/hooks/events/pre_tool_use.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/pre_tool_use.rs |
+| `crates/ra-coding/src/hooks/events/post_tool_use.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/post_tool_use.rs |
+| `crates/ra-coding/src/hooks/events/permission_request.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/permission_request.rs |
+| `crates/ra-coding/src/hooks/events/session_start.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/session_start.rs |
+| `crates/ra-coding/src/hooks/events/session_end.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/session_end.rs |
+| `crates/ra-coding/src/hooks/events/user_prompt_submit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/user_prompt_submit.rs |
+| `crates/ra-coding/src/hooks/events/stop.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/stop.rs |
+| `crates/ra-coding/src/hooks/events/compact.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/compact.rs |
+| `crates/ra-coding/src/hooks/events/interrupt.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/interrupt.rs |
+| `crates/ra-coding/src/hooks/schema.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/schema.rs |
+| `crates/ra-exec/src/background_command.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/process/src/lib.rs::background_command |
+| `tests/it-coding/tests/source_hooks_engine.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/mod_tests.rs |
+| `tests/it-coding/tests/support/source_executable.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/cargo-bin/src/executable.rs |
+| `crates/ra-config/src/managed_features.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/managed_features.rs |
+| `crates/ra-mcp/src/registration_catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/catalog.rs |
+| `tests/it-config/tests/mcp_ema_sources.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/mcp_ema_tests.rs |
+| `tests/it-mcp/tests/registration_catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/catalog_tests.rs |
+| `crates/ra-coding/src/plugins/runtime_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs |
+| `tests/it-coding/tests/source_plugin_manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manager_tests.rs |
+| `tests/it-coding/tests/support/source_paths.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/absolute-path/src/test_support.rs |
+| `crates/ra-coding/src/plugins/mentions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/mentions.rs |
+| `tests/it-coding/tests/plugin_mentions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/mentions_tests.rs |
+| `tests/it-coding/tests/plugin_render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/render_tests.rs |
+| `crates/ra-coding/src/plugins/render.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/render.rs; codex-rs/core/src/context/available_plugins_instructions.rs; codex-rs/utils/string/src/lib.rs |
+| `crates/ra-coding/src/plugins/services.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/plugin_config_reload.rs; codex-rs/app-server/src/effective_plugin_change.rs; codex-rs/app-server/src/request_processors/plugins/local.rs; codex-rs/core/src/plugins/injection.rs |
+| `crates/ra-protocol/src/server/protocol/plugin_management.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/plugin.rs |
+| `crates/ra-coding/src/plugins/protocol.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_processors/plugins.rs; codex-rs/app-server-protocol/src/protocol/v2/plugin.rs |
+| `crates/ra-config/src/config_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/edit.rs; codex-rs/core/src/config/mod.rs |
+| `crates/ra-config/src/config_edit/document_helpers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/edit/document_helpers.rs |
+| `crates/ra-config/src/config_validation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs |
+| `tests/it-config/tests/config_edit.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/edit_tests.rs |
+| `crates/ra-protocol/src/server/protocol/config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/config.rs; codex-rs/app-server-protocol/src/protocol/v2/browser_use_config.rs; codex-rs/app-server-protocol/src/protocol/v2/computer_use_config.rs; codex-rs/app-server-protocol/src/protocol/v2/plugin.rs |
+| `crates/ra-coding/src/config_manager_service.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager_service.rs |
+| `crates/ra-coding/src/config_manager_service/credential_edits.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager_service_credential_edits.rs |
+| `tests/it-coding/tests/config_manager_service.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager_service_tests.rs |
+| `tests/it-protocol/tests/request_serialization_shared_reads.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_serialization.rs::tests |
+| `crates/ra-coding/src/mcp/product.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs; codex-rs/codex-mcp/src/server.rs; codex-rs/codex-mcp/src/rmcp_client.rs; codex-rs/rmcp-client/src/utils.rs; codex-rs/network-proxy/src/certs.rs |
+| `crates/ra-coding/src/hooks/user_hook_bridge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/hook_runtime.rs; codex-rs/core/src/tools/hook_names.rs |
+| `crates/ra-coding/src/plugins/skill_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/provider/host.rs |
+| `crates/ra-protocol/src/server/request_serialization.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_serialization.rs |
+
+| `crates/ra-coding/src/plugins/remote.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/remote.rs (public service transport; account mechanisms excluded) |
+| `crates/ra-coding/src/plugins/remote_legacy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/remote_legacy.rs (anonymous featured-plugin fetch and errors) |
+| `tests/it-coding/tests/plugin_featured.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manager_tests.rs; codex-rs/core-plugins/src/remote_legacy.rs; codex-rs/app-server/tests/suite/v2/plugin_list.rs |

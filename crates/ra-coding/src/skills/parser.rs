@@ -24,27 +24,39 @@ struct SkillFrontmatterMetadata {
 
 /// Validated metadata parsed from a `SKILL.md` frontmatter block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ParsedSkillFrontmatter {
+pub struct ParsedSkillFrontmatter {
+    /// Skill name.
     pub name: String,
+    /// Model-visible purpose.
     pub description: String,
+    /// Optional concise purpose.
     pub short_description: Option<String>,
 }
 
 /// Error produced while parsing or validating `SKILL.md` metadata.
 #[derive(Debug, Error)]
-pub(super) enum SkillParseError {
+pub enum SkillParseError {
+    /// No frontmatter block was found.
     #[error("missing YAML frontmatter delimited by ---")]
     MissingFrontmatter,
+    /// The frontmatter is not valid YAML.
     #[error("invalid YAML: {0}")]
     InvalidYaml(#[source] serde_yaml::Error),
+    /// A required field is absent.
     #[error("missing field `{0}`")]
     MissingField(&'static str),
+    /// A field failed validation.
     #[error("invalid {field}: {reason}")]
-    InvalidField { field: &'static str, reason: String },
+    InvalidField {
+        /// The field name.
+        field: &'static str,
+        /// Why the value was rejected.
+        reason: String,
+    },
 }
 
 /// Parses and validates the metadata frontmatter from `SKILL.md` contents.
-pub(super) fn parse_skill_frontmatter_metadata(
+pub fn parse_skill_frontmatter_metadata(
     contents: &str,
     default_name: impl FnOnce() -> String,
 ) -> Result<ParsedSkillFrontmatter, SkillParseError> {

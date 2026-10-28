@@ -18,3 +18,9 @@ pub use ra_config::{
     merge_toml_values, shell_environment_filter_entry, validate_mcp_server_requirement,
     version_for_toml,
 };
+
+pub use ra_config::{
+    CONFIG_TOML_FILE, MarketplaceConfigUpdate, PluginConfigEdit, RemoveMarketplaceConfigOutcome,
+    apply_user_plugin_config_edits, clear_user_plugin, record_user_marketplace,
+    remove_user_marketplace, remove_user_marketplace_config, set_user_plugin_enabled,
+};

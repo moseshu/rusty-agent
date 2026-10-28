@@ -1,9 +1,10 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Plugin policy and product labels from the upstream coding-product protocol.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[non_exhaustive]
 /// Declared installation availability, independent of installed or enabled state.
 pub enum PluginInstallPolicy {
@@ -18,7 +19,7 @@ pub enum PluginInstallPolicy {
     InstalledByDefault,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[non_exhaustive]
 /// Declared authentication timing; this metadata performs no authentication.
 pub enum PluginAuthPolicy {

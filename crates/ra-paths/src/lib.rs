@@ -1099,3 +1099,9 @@ pub mod test_api {
         super::containment_path_segments(&path.0, convention).is_some()
     }
 }
+
+mod write;
+pub use write::{SymlinkWritePaths, resolve_symlink_write_paths, write_atomically};
+
+mod comparison;
+pub use comparison::{is_wsl, normalize_for_path_comparison, paths_match_after_normalization};

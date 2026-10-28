@@ -68,3 +68,81 @@ pub use executor_provider::test_api as executor_provider_test_api;
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
 pub use executor_mcp::test_api as executor_mcp_test_api;
+
+/// Activation candidates extracted from explicit configuration writes.
+pub mod toggles;
+
+mod http_client_selector;
+pub mod installed_marketplaces;
+mod marketplace_policy;
+pub mod marketplace_remove;
+pub mod marketplace_upgrade;
+pub mod remote;
+pub mod remote_legacy;
+pub mod startup_sync;
+pub(crate) use git_policy::{PluginGitMode, configure_trusted_git_repository};
+pub use marketplace_policy::allowed_configured_marketplace_names;
+
+/// Name of the curated marketplace snapshot synchronized at startup.
+pub const OPENAI_CURATED_MARKETPLACE_NAME: &str = "openai-curated";
+/// Name of the curated marketplace used by API-key product installs.
+pub const OPENAI_API_CURATED_MARKETPLACE_NAME: &str = "openai-api-curated";
+/// Name of the marketplace bundled with the product package.
+pub const OPENAI_BUNDLED_MARKETPLACE_NAME: &str = "openai-bundled";
+pub(crate) const OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME: &str = "openai-bundled-alpha";
+pub(crate) const OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME: &str = "openai-primary-runtime";
+/// Whether `name` is one of the curated marketplace names.
+#[must_use]
+pub fn is_openai_curated_marketplace_name(name: &str) -> bool {
+    name == OPENAI_CURATED_MARKETPLACE_NAME || name == OPENAI_API_CURATED_MARKETPLACE_NAME
+}
+
+mod skill_roots;
+pub use crate::skills::SkillDiscoveryMode;
+pub use discovery::{
+    DISCOVERABLE_PLUGIN_MANIFEST_PATHS, migrated_command_skills_root, plugin_namespace_for_root_uri,
+};
+pub use skill_roots::{PluginIdentity, PluginSkillRoot};
+
+mod contributions;
+mod load_outcome;
+pub use contributions::{
+    AppConnectorId, AppDeclaration, PluginCapabilitySummary, PluginHookSource,
+    app_connector_ids_from_declarations,
+};
+pub use load_outcome::{LoadedPlugin, PluginLoadOutcome, prompt_safe_plugin_description};
+
+mod app_config;
+pub mod loader;
+
+mod manager;
+#[cfg(feature = "test-api")]
+pub use manager::test_api as manager_test_api;
+mod skill_snapshots;
+pub use manager::{
+    ConfiguredMarketplace, ConfiguredMarketplaceListOutcome, ConfiguredMarketplacePlugin,
+    EffectivePluginsChange, EffectivePluginsChangedCallback, PluginDetail,
+    PluginDetailsUnavailableReason, PluginHookSummary, PluginInstallError, PluginInstallOutcome,
+    PluginInstallRequest, PluginMarketplaceContext, PluginMarketplaceScope, PluginReadOutcome,
+    PluginReadRequest, PluginUninstallError, PluginsConfigInput, PluginsManager,
+};
+
+mod runtime_config;
+pub use runtime_config::PluginRuntimeConfig;
+
+mod mentions;
+mod render;
+pub use mentions::{
+    CollectedToolMentions, collect_explicit_app_ids, collect_explicit_plugin_ids,
+    collect_explicit_plugin_mentions, collect_tool_mentions_from_messages,
+};
+pub use render::{render_explicit_plugin_instructions, render_plugins_section};
+
+mod services;
+pub use services::{
+    ConsumerBinding, ConsumerReconcile, PluginConfigManager, PluginServices, PluginSnapshot,
+};
+mod skill_provider;
+pub use skill_provider::PluginSkillProvider;
+
+mod protocol;

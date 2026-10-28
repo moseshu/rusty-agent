@@ -28,7 +28,7 @@ use crate::native_process::child::ChildKind;
     dead_code,
     reason = "Retain this source process API for the unported execution backend."
 )]
-pub(crate) enum ProcessMode {
+pub enum ProcessMode {
     /// Keep the parent's session, process group, and controlling terminal.
     Inherit,
     /// Create a process group led by the child, keeping the parent's session and
@@ -87,7 +87,7 @@ pub(crate) enum ChildStdin {
 }
 
 /// A local command whose complete launch contract is known to both backends.
-pub(crate) struct Command {
+pub struct Command {
     pub(crate) inner: tokio::process::Command,
     #[cfg(unix)]
     saw_nul: bool,
@@ -121,7 +121,8 @@ pub(crate) struct Command {
 }
 
 impl Command {
-    pub(crate) fn new(program: impl AsRef<OsStr>) -> Self {
+    /// Constructs a child command with the source empty environment and piped stdio defaults.
+    pub fn new(program: impl AsRef<OsStr>) -> Self {
         let program = program.as_ref();
         let mut inner = tokio::process::Command::new(program);
         inner
@@ -154,7 +155,8 @@ impl Command {
         }
     }
 
-    pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+    /// Appends one argument without shell interpretation.
+    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
         let arg = arg.as_ref();
         #[cfg(unix)]
         {
@@ -164,7 +166,8 @@ impl Command {
         self
     }
 
-    pub(crate) fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> &mut Self {
+    /// Appends arguments without shell interpretation.
+    pub fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> &mut Self {
         for arg in args {
             self.arg(arg);
         }
@@ -175,12 +178,14 @@ impl Command {
         dead_code,
         reason = "Retain this source process API for the unported execution backend."
     )]
-    pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+    /// Adds or replaces one explicit environment value.
+    pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.inner.env(key, value);
         self
     }
 
-    pub(crate) fn envs<K, V>(&mut self, env: impl IntoIterator<Item = (K, V)>) -> &mut Self
+    /// Adds explicit environment values in iteration order.
+    pub fn envs<K, V>(&mut self, env: impl IntoIterator<Item = (K, V)>) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -189,7 +194,8 @@ impl Command {
         self
     }
 
-    pub(crate) fn current_dir(&mut self, cwd: impl AsRef<Path>) -> &mut Self {
+    /// Selects the child working directory.
+    pub fn current_dir(&mut self, cwd: impl AsRef<Path>) -> &mut Self {
         let cwd = cwd.as_ref();
         #[cfg(unix)]
         {
@@ -203,7 +209,8 @@ impl Command {
         dead_code,
         reason = "Retain this source process API for the unported execution backend."
     )]
-    pub(crate) fn process_mode(&mut self, mode: ProcessMode) -> &mut Self {
+    /// Selects the child session and process-group policy.
+    pub fn process_mode(&mut self, mode: ProcessMode) -> &mut Self {
         self.process_mode = mode;
         self
     }
@@ -318,7 +325,7 @@ impl Command {
     }
 
     /// Launch with native platform settings and the existing compatibility fallback.
-    pub(crate) fn spawn(mut self) -> io::Result<Child> {
+    pub fn spawn(mut self) -> io::Result<Child> {
         #[cfg(unix)]
         self.validate()?;
         #[cfg(unix)]

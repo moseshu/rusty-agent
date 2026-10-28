@@ -24,3 +24,4 @@ tracing = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 strum_macros = "0.28"
+schemars = { workspace = true }

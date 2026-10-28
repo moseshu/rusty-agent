@@ -24,6 +24,7 @@ pub(crate) mod capabilities;
 pub(crate) mod closeout;
 pub mod command_canonicalization;
 pub mod config;
+pub mod config_manager_service;
 pub mod dangerous_action;
 pub mod doctor;
 pub mod exec_policy;

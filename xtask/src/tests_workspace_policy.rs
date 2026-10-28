@@ -6,7 +6,8 @@
 /// manifests, a different package, or a different checkout do not satisfy the host requirement.
 #[must_use]
 pub fn has_path_dependency(manifest: &str, crate_name: &str) -> bool {
-    let Ok(manifest) = manifest.parse::<toml::Value>() else {
+    // A manifest is a TOML document, which parses as a table rather than as a value.
+    let Ok(manifest) = manifest.parse::<toml::Table>() else {
         return false;
     };
     let expected_path = format!("../../crates/{crate_name}");

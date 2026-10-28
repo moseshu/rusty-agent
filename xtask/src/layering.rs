@@ -163,7 +163,16 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-execpolicy", &["ra-paths"]),
     // Native and executor URI paths contain no framework or product dependencies.
     ("ra-paths", &[]),
-    ("ra-config", &["ra-core", "ra-paths"]),
+    (
+        "ra-config",
+        &[
+            "ra-core",
+            "ra-paths",
+            "ra-filesystem",
+            "ra-execpolicy",
+            "ra-exec",
+        ],
+    ),
     ("ra-filesystem", &["ra-paths"]),
     ("ra-http", &["ra-tls"]),
     ("ra-tls", &[]),
@@ -187,7 +196,10 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // tools live in `ra-tools` and reach a session only through `ra-core`'s protocol.
     ("ra-sandbox", &["ra-core"]),
     ("ra-session", &["ra-core"]),
-    ("ra-mcp", &["ra-core", "ra-config", "ra-paths", "ra-tls"]),
+    (
+        "ra-mcp",
+        &["ra-core", "ra-config", "ra-paths", "ra-tls", "ra-http"],
+    ),
     // `ra-runtime` for the live thread whose turns the app server starts, steers and interrupts, as
     // Codex's app-server drives `codex-core`'s `CodexThread`. The server still runs no loop of its
     // own: the thread does, and the host builds it.
@@ -237,6 +249,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
         "ra-coding",
         &[
             "ra-config",
+            "ra-http",
+            "ra-filesystem",
             "ra-executor",
             "ra-core",
             "ra-model",

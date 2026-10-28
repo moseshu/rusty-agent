@@ -5,14 +5,14 @@
     reason = "Keep the upstream native descriptor and process launch boundary isolated."
 )]
 mod child;
-pub(crate) use child::Child;
+pub use child::Child;
 mod child_command;
 pub(crate) use child_command::ChildStdin;
-pub(crate) use child_command::Command;
+pub use child_command::Command;
 #[cfg(unix)]
 pub(crate) use child_command::DescriptorPolicy;
 #[cfg(unix)]
-pub(crate) use child_command::ProcessMode;
+pub use child_command::ProcessMode;
 pub(crate) use child_command::SpawnFallback;
 #[cfg(target_os = "linux")]
 mod linux_fds;
@@ -51,7 +51,7 @@ pub(crate) type ExecCommandSession = ProcessHandle;
 )]
 pub(crate) type SpawnedPty = SpawnedProcess;
 #[cfg(windows)]
-pub(crate) use win::JobObject;
+pub use win::JobObject;
 #[cfg(windows)]
 pub(crate) use windows_input::WindowsTtyInputNormalizer;
 

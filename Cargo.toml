@@ -124,7 +124,9 @@ serde_yaml = "0.9.34"
 schemars = "0.8"
 # Runtime validation for caller-supplied output schemas; local references only.
 jsonschema = { version = "0.58.6", default-features = false }
-toml = "0.8"
+toml = "0.9.5"
+toml_edit = "0.24.0"
+indexmap = "2"
 sha2 = "0.10"
 semver = "1"
 percent-encoding = "2"

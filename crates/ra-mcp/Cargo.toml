@@ -11,12 +11,15 @@ repository.workspace = true
 workspace = true
 
 [features]
+test-api = []
 default = ["stdio"]
 # Process spawning uses tokio directly; the transcoding pump wraps the SDK async-rw transport.
 stdio = ["dep:encoding_rs"]
-http = ["dep:ra-tls", "dep:reqwest", "dep:rustls", "dep:sse-stream", "rmcp/transport-streamable-http-client"]
+http = ["dep:ra-http", "dep:http", "dep:ra-tls", "dep:reqwest", "dep:rustls", "dep:sse-stream", "rmcp/transport-streamable-http-client"]
 
 [dependencies]
+ra-http = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 ra-tls = { workspace = true, optional = true }
 ra-config = { workspace = true }
 ra-paths = { workspace = true }

@@ -27,3 +27,23 @@ mod native_process;
 
 #[allow(unsafe_code)]
 pub mod shell_detect;
+
+/// Native managed preferences and system-directory discovery.
+pub mod platform_config;
+
+/// Trusted installed helper discovery for automatic product work.
+pub mod system_commands;
+
+/// Safe native process operations shared by product command consumers.
+mod background_command;
+/// Native process ownership, cancellation and platform process-tree cleanup.
+pub mod process {
+    pub use crate::background_command::background_command;
+    #[cfg(windows)]
+    pub use crate::native_process::JobObject;
+    #[cfg(unix)]
+    pub use crate::native_process::ProcessMode;
+    pub use crate::native_process::{Child, Command};
+    #[cfg(unix)]
+    pub use crate::process_group::kill_process_group;
+}

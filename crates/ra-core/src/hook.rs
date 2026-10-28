@@ -32,7 +32,7 @@ use crate::{
 
 /// Lifecycle boundaries understood by host hooks.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
     /// A host session opens or resumes.

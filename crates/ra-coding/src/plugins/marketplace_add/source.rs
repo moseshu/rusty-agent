@@ -1,6 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Local/Git marketplace source parsing; no clone or registration is performed here.
-
+#![allow(
+    missing_docs,
+    reason = "Preserve source plugin management records and operations."
+)]
 use super::MarketplaceAddError;
 use crate::plugins::identity::validate_plugin_segment;
 use crate::plugins::marketplace::validate_marketplace_root;
@@ -8,28 +10,20 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Public only through the feature-gated external test bridge; the owning module is private.
-#[allow(unreachable_pub)]
-/// A parsed Local/Git marketplace origin without registration or materialization.
+#[allow(
+    unreachable_pub,
+    reason = "The source parser type is also exposed through the external test facade."
+)]
 pub enum MarketplaceSource {
-    /// A normalized Git origin and optional reference.
     Git {
-        /// The normalized origin URL.
         url: String,
-        /// The optional source or explicit reference.
         ref_name: Option<String>,
     },
-    /// An existing, canonical local directory.
     Local {
-        /// The canonical local path.
         path: PathBuf,
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "The marketplace policy and registration consumers are not wired yet"
-)]
 pub(crate) fn parse_marketplace_source(
     source: &str,
     explicit_ref: Option<String>,
@@ -79,8 +73,6 @@ pub(crate) fn parse_marketplace_source(
     ))
 }
 
-// Used by the later source materialization and registration consumers.
-#[allow(dead_code)]
 pub(super) fn stage_marketplace_source<F>(
     source: &MarketplaceSource,
     sparse_paths: &[String],
@@ -106,10 +98,6 @@ where
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "The registration consumer that validates staged marketplace roots is not wired yet"
-)]
 pub(super) fn validate_marketplace_source_root(root: &Path) -> Result<String, MarketplaceAddError> {
     let marketplace_name = validate_marketplace_root(root)
         .map_err(|err| MarketplaceAddError::InvalidRequest(err.to_string()))?;
@@ -137,8 +125,10 @@ fn non_empty_ref(ref_name: &str) -> Option<String> {
     (!ref_name.is_empty()).then(|| ref_name.to_string())
 }
 
-// The upstream URL suffix is case-sensitive; this is not a filesystem extension check.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "The source compares the URL suffix exactly."
+)]
 fn normalize_git_url(url: &str) -> String {
     let url = url.trim_end_matches('/');
     if url.starts_with("https://github.com/") && !url.ends_with(".git") {
@@ -226,10 +216,6 @@ fn is_github_shorthand_segment(segment: &str) -> bool {
 }
 
 impl MarketplaceSource {
-    #[allow(
-        dead_code,
-        reason = "Source diagnostics are retained for marketplace policy and registration consumers"
-    )]
     pub(crate) fn display(&self) -> String {
         match self {
             Self::Git { url, ref_name } => match ref_name {
@@ -241,7 +227,6 @@ impl MarketplaceSource {
     }
 }
 
-/// Source-parser bridges for the external integration-test workspace.
 #[cfg(feature = "test-api")]
 pub mod test_api {
     use super::MarketplaceAddError;

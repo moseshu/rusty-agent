@@ -97,7 +97,9 @@ mod user_input_requests;
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
 pub use self::mcp::McpRuntimeControl;
+mod plugin_management;
 pub use self::permission_requests::ThreadServerRequests;
+pub use self::plugin_management::PluginManagement;
 pub use self::session_source::{
     InternalSessionSource, SessionSource, SessionSourceArgs, SubAgentSource,
 };
@@ -380,6 +382,13 @@ impl AppServer {
         self
     }
 
+    /// Installs source-backed plugin management and capability-change notifications.
+    #[must_use]
+    pub fn with_plugin_management(self, control: Arc<dyn PluginManagement>) -> Self {
+        self.processor.plugins.set(control);
+        self
+    }
+
     /// Installs the host's MCP controls and broadcasts their status changes to initialized clients.
     #[must_use]
     pub fn with_mcp_runtime(self, control: Arc<dyn McpRuntimeControl>) -> Self {
@@ -443,6 +452,7 @@ impl AppServer {
 
         let outbound_handle = tokio::spawn(run_outbound_router(outbound_control_rx, outgoing_rx));
         let mcp_forwarder = processor.mcp.forward(Arc::clone(processor.outgoing()));
+        let plugin_forwarder = processor.plugins.forward(Arc::clone(processor.outgoing()));
 
         let (transport_shutdown, mut signals) = match graceful_restart {
             Some(GracefulRestart {
@@ -597,6 +607,7 @@ impl AppServer {
         if let Ok(control) = processor.mcp.get() {
             control.shutdown().await;
         }
+        drop(plugin_forwarder);
         drop(mcp_forwarder);
         drop(outbound_control_tx);
         let _ = outbound_handle.await;
@@ -814,6 +825,71 @@ pub mod test_api {
     };
 
     pub use super::ReviewDecision;
+
+    /// Codex's request serialization queues, so their unit tests can be ported without a server.
+    #[derive(Clone, Debug, Default)]
+    pub struct SerializationQueues(super::request_serialization::RequestSerializationQueues);
+
+    /// How a queued test request holds its key.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum SerializationAccess {
+        /// Runs alone.
+        Exclusive,
+        /// Runs together with neighbouring shared reads.
+        SharedRead,
+    }
+
+    impl SerializationQueues {
+        /// Queues `future` under the global key `key`, behind its connection's open gate.
+        pub async fn enqueue(
+            &self,
+            key: &'static str,
+            access: SerializationAccess,
+            future: impl Future<Output = ()> + Send + 'static,
+        ) {
+            use super::request_serialization::RequestSerializationAccess;
+            let access = match access {
+                SerializationAccess::Exclusive => RequestSerializationAccess::Exclusive,
+                SerializationAccess::SharedRead => RequestSerializationAccess::SharedRead,
+            };
+            self.0
+                .enqueue(
+                    super::request_serialization::RequestSerializationQueueKey::Global(key),
+                    access,
+                    super::request_serialization::QueuedInitializedRequest::new(
+                        Arc::new(ConnectionRpcGate::new()),
+                        future,
+                    ),
+                )
+                .await;
+        }
+
+        /// Queues `future` under the key and access that `request` declares. Returns whether the
+        /// request is serialized at all; an unserialized request is not queued.
+        pub async fn enqueue_request(
+            &self,
+            request: &super::protocol::ClientRequest,
+            future: impl Future<Output = ()> + Send + 'static,
+        ) -> bool {
+            let Some(scope) = request.serialization_scope() else {
+                return false;
+            };
+            let (key, access) =
+                super::request_serialization::RequestSerializationQueueKey::from_scope(scope);
+            self.0
+                .enqueue(
+                    key,
+                    access,
+                    super::request_serialization::QueuedInitializedRequest::new(
+                        Arc::new(ConnectionRpcGate::new()),
+                        future,
+                    ),
+                )
+                .await;
+            true
+        }
+    }
 
     /// What the server receives for one of its requests: the client's answer, or nothing if the
     /// request was withdrawn without one.

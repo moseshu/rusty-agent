@@ -42,6 +42,7 @@ pub struct HttpClientBuilder {
     follow_redirects: bool,
     pub(crate) redirect_observed: Option<Arc<AtomicBool>>,
     connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
     pub(crate) request_logging: RequestLogging,
     tls_backend: TlsBackend,
     tls: HttpClientTlsConfig,
@@ -152,6 +153,13 @@ impl HttpClientBuilder {
     #[must_use]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Limits inactivity between body reads without imposing a whole-stream deadline.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
         self
     }
 
@@ -378,6 +386,9 @@ impl HttpClientBuilder {
                 reqwest::redirect::Policy::default().redirect(attempt)
             }));
         }
+        if let Some(read_timeout) = self.read_timeout {
+            builder = builder.read_timeout(read_timeout);
+        }
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
         }
@@ -394,6 +405,7 @@ impl Default for HttpClientBuilder {
             follow_redirects: true,
             redirect_observed: None,
             connect_timeout: None,
+            read_timeout: None,
             request_logging: RequestLogging::Enabled,
             tls_backend: TlsBackend::TransportDefault,
             tls: HttpClientTlsConfig::default(),

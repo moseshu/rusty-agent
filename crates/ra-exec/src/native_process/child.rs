@@ -21,11 +21,14 @@ pub(super) mod posix;
 pub(super) mod reaper;
 
 /// A local subprocess with owned stdio and cancellation-safe exit handling.
-pub(crate) struct Child {
+pub struct Child {
     pub(super) inner: ChildKind,
-    pub(crate) stdin: Option<ChildStdin>,
-    pub(crate) stdout: Option<ChildStdout>,
-    pub(crate) stderr: Option<ChildStderr>,
+    /// Writable stdin pipe, owned by the child until taken.
+    pub stdin: Option<ChildStdin>,
+    /// Readable stdout pipe, owned by the child until taken.
+    pub stdout: Option<ChildStdout>,
+    /// Readable stderr pipe, owned by the child until taken.
+    pub stderr: Option<ChildStderr>,
 }
 
 pub(super) enum ChildKind {
@@ -44,7 +47,8 @@ impl Child {
         dead_code,
         reason = "Retain this source process API for the unported execution backend."
     )]
-    pub(crate) fn id(&self) -> Option<u32> {
+    /// Returns the operating-system process identifier while retained.
+    pub fn id(&self) -> Option<u32> {
         match &self.inner {
             ChildKind::Tokio(child) => child.id(),
             #[cfg(unix)]
@@ -57,7 +61,7 @@ impl Child {
     }
 
     /// Close retained stdin and wait without giving up ownership on cancellation.
-    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.stdin.take();
         match &mut self.inner {
             ChildKind::Tokio(child) => child.wait().await,
@@ -75,7 +79,7 @@ impl Child {
     }
 
     /// Drain both output pipes while waiting, retaining the configured drop policy on cancellation.
-    pub(crate) async fn wait_with_output(mut self) -> io::Result<std::process::Output> {
+    pub async fn wait_with_output(mut self) -> io::Result<std::process::Output> {
         let mut stdout = self.stdout.take();
         let mut stderr = self.stderr.take();
         let mut output = Vec::new();
@@ -111,7 +115,7 @@ impl Child {
         dead_code,
         reason = "Retain this source process API for the unported execution backend."
     )]
-    pub(crate) async fn kill(&mut self) -> io::Result<()> {
+    pub async fn kill(&mut self) -> io::Result<()> {
         self.stdin.take();
         match &mut self.inner {
             ChildKind::Tokio(child) => child.kill().await,

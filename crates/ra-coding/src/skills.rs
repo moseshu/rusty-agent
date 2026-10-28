@@ -199,3 +199,39 @@ pub(crate) enum SkillToolSurface {
     Namespace,
     Host,
 }
+
+mod host_loader;
+mod host_outcome;
+mod host_roots;
+mod host_service;
+mod host_snapshot;
+mod interface;
+mod loading;
+mod mentions;
+mod metadata_parser;
+mod model;
+mod name_counts;
+mod selection;
+mod system;
+pub use host_outcome::SkillLoadOutcome;
+pub use host_service::{HostSkillsLoadInput, HostSkillsRequest, HostSkillsService};
+pub use host_snapshot::HostSkillsSnapshot;
+pub use interface::{SkillInterfaceAssetPolicy, SkillInterfaceFile, resolve_skill_interface};
+pub use loading::{
+    ImplicitSkillLookup, LoadedSkillRoot, LoadedSkills, SkillError, SkillLoadFuture,
+    SkillRootLoadRequest, SkillRootLoader, SkillRootSnapshotCache, SkillRootSnapshots,
+};
+pub use mentions::{
+    ToolMentionKind, ToolMentions, app_id_from_path, extract_tool_mentions,
+    extract_tool_mentions_with_sigil, normalize_skill_path, plugin_config_name_from_path,
+    tool_kind_for_path,
+};
+pub use metadata_parser::{ParsedSkillMetadata, parse_skill_metadata};
+pub use model::{
+    EnvironmentSkillMetadata, SkillDependencies, SkillInterface, SkillMetadata, SkillPolicy,
+    SkillToolDependency,
+};
+pub use name_counts::build_skill_name_counts;
+pub use parser::{ParsedSkillFrontmatter, SkillParseError, parse_skill_frontmatter_metadata};
+pub use selection::{ExplicitSkillLookup, collect_explicit_skill_mentions};
+pub use system::{SystemSkillsError, install_system_skills, system_cache_root_dir};

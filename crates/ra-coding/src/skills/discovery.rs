@@ -31,7 +31,7 @@ const MAX_SKILLS_DIRS_PER_ROOT: usize = 2_000;
 const MAX_SKILLS_ENTRIES_PER_ROOT: usize = 20_000;
 
 /// Whether a plugin root discovers every nested skill or only immediate child skills.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SkillDiscoveryMode {
     /// Recursively discover skills using the upstream depth and traversal limits.

@@ -29,42 +29,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    ApprovalsReviewer, AskForApproval, DynamicToolSpec, SandboxPolicy, SortDirection, Thread,
-    ThreadHistoryMode, Turn, TurnItemsView, settings::double_option,
+    ApprovalsReviewer, AskForApproval, DynamicToolSpec, SortDirection, Thread, ThreadHistoryMode,
+    Turn, TurnItemsView, settings::double_option,
 };
 
-/// Codex's coarse sandbox selection for a new, resumed or forked thread: `SandboxMode`.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxMode {
-    /// Reads anywhere, writes nowhere, no network.
-    ReadOnly,
-    /// Writes in the workspace, no network.
-    WorkspaceWrite,
-    /// Unrestricted.
-    DangerFullAccess,
-}
-
-impl SandboxMode {
-    /// The policy the mode selects, with Codex's defaults for what the mode leaves open: no
-    /// network and no writable roots beyond the workspace.
-    #[must_use]
-    pub fn to_policy(self) -> SandboxPolicy {
-        match self {
-            Self::ReadOnly => SandboxPolicy::ReadOnly {
-                network_access: false,
-            },
-            Self::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            },
-            Self::DangerFullAccess => SandboxPolicy::DangerFullAccess,
-        }
-    }
-}
+pub use ra_config::SandboxMode;
 
 /// Why a thread was started: Codex's `ThreadStartSource`.
 #[non_exhaustive]

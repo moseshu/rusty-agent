@@ -89,7 +89,7 @@ impl Entry {
             && state
                 .cached_catalog
                 .as_ref()
-                .is_some_and(|catalog| catalog.allows_deferred_startup(&self.filter))
+                .is_some_and(|catalog| catalog.allows_deferred_startup(&self.filter()))
     }
 
     pub(super) fn start_background(self: &Arc<Self>) {

@@ -37,7 +37,7 @@ unsafe extern "system" {
 
 /// Owns a Windows Job Object used to terminate a spawned process tree.
 #[derive(Debug)]
-pub(crate) struct JobObject {
+pub struct JobObject {
     handle: OwnedHandle,
     // A mutex makes the state check, Job Object API call, and state update
     // atomic with respect to concurrent preserve and terminate requests.
@@ -210,7 +210,7 @@ impl JobObject {
         dead_code,
         reason = "Retain this source Windows contained-process operation for the unported execution backend."
     )]
-    pub(crate) fn spawn_background(command: &mut Command) -> io::Result<(Child, Option<Self>)> {
+    pub fn spawn_background(command: &mut Command) -> io::Result<(Child, Option<Self>)> {
         Self::spawn_background_with_job(command, Self::create())
     }
 
@@ -264,7 +264,7 @@ impl JobObject {
     /// object. Calls race safely with [`Self::terminate`]: whichever operation
     /// acquires the state lock first determines whether the process tree is
     /// preserved or terminated.
-    pub(crate) fn preserve_descendants(&self) -> io::Result<()> {
+    pub fn preserve_descendants(&self) -> io::Result<()> {
         let mut preserve_descendants = self
             .preserve_descendants
             .lock()
@@ -283,7 +283,7 @@ impl JobObject {
         dead_code,
         reason = "Retain this source process API for the unported execution backend."
     )]
-    pub(crate) fn terminate(&self) -> io::Result<()> {
+    pub fn terminate(&self) -> io::Result<()> {
         let preserve_descendants = self
             .preserve_descendants
             .lock()

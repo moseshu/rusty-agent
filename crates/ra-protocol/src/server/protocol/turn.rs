@@ -430,6 +430,24 @@ pub enum UserInput {
 }
 
 impl UserInput {
+    /// An explicit plugin, app, or other structured capability mention.
+    #[must_use]
+    pub fn mention(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::Mention {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
+    /// An explicitly selected skill path, independent of its display label.
+    #[must_use]
+    pub fn skill(name: impl Into<String>, path: impl Into<std::path::PathBuf>) -> Self {
+        Self::Skill {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
     /// Plain text.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {

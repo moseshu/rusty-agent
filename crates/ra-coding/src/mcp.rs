@@ -38,7 +38,9 @@ use ra_protocol::{
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
+mod product;
 mod startup;
+pub use product::{ProductMcpServers, product_mcp_servers};
 use startup::{DeferredClient, startup_error_display};
 
 /// A configured server whose current initialized session can be captured for a model call.
@@ -54,6 +56,7 @@ pub struct McpServerConfig {
     cached_catalog: Option<McpToolCatalog>,
     lazy_startup: bool,
     automatic_retry: bool,
+    identity: Option<String>,
 }
 impl McpServerConfig {
     /// Registers a reconnectable server without opening its transport.
@@ -66,7 +69,26 @@ impl McpServerConfig {
             cached_catalog: None,
             lazy_startup: false,
             automatic_retry: false,
+            identity: None,
         }
+    }
+    /// The connection identity this registration carries, if any.
+    #[must_use]
+    pub fn connection_identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+    /// The registered server's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.server.name()
+    }
+    /// Names the connection inputs this registration was built from. A later
+    /// [`CodingMcpRuntime::replace_mcp_servers`] keeps the live entry of a same-named server whose
+    /// identity is unchanged; registrations without an identity are always replaced.
+    #[must_use]
+    pub fn with_connection_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
     }
     /// Seeds a complete cache with the configured server's approval, guardrails and filters.
     #[must_use]
@@ -112,7 +134,10 @@ impl McpServerConfig {
 struct Entry {
     server: Arc<dyn McpRuntimeServer>,
     manager: McpServerManager,
-    filter: ToolFilter,
+    // A replacement with the same connection identity may change only the per-run filter.
+    filter: Mutex<ToolFilter>,
+    identity: Option<String>,
+    configured_enabled: bool,
     operation: tokio::sync::Mutex<()>,
     state: Mutex<EntryState>,
     changes: broadcast::Sender<McpServerStatus>,
@@ -141,77 +166,116 @@ struct EntryState {
 /// A shared, explicitly selected coding-product MCP runtime and per-model-call tool resolver.
 /// The host must await shutdown while its Tokio runtime is still alive.
 pub struct CodingMcpRuntime {
-    entries: Vec<Arc<Entry>>,
+    // Readers capture one published set; replacement publishes a new one under `registry`.
+    entries: std::sync::RwLock<Arc<Vec<Arc<Entry>>>>,
     changes: broadcast::Sender<McpServerStatus>,
     discovery: McpDiscoveryOptions,
     registry: Arc<tokio::sync::Mutex<()>>,
+    // Whether the host has asked for startup; replacement starts new entries only after that.
+    started: std::sync::atomic::AtomicBool,
 }
 impl CodingMcpRuntime {
     /// Creates a name-addressed product registry; duplicates fail before any connection opens.
     pub fn new(configs: Vec<McpServerConfig>, discovery: McpDiscoveryOptions) -> Result<Arc<Self>> {
-        let mut names = BTreeSet::new();
+        validate_configs(&configs)?;
         let (changes, _) = broadcast::channel(256);
-        let mut entries = Vec::new();
-        for config in configs {
-            if !names.insert(config.server.name().to_owned()) {
-                return Err(Error::config("MCP runtime server names must be unique"));
-            }
-            if config
-                .cached_catalog
-                .as_ref()
-                .is_some_and(|catalog| catalog.server_name() != config.server.name())
-            {
-                return Err(Error::config(
-                    "cached MCP catalog belongs to a different server",
-                ));
-            }
-            let server: Arc<dyn McpServer> = config.server.clone();
-            let options = config
-                .options
-                .with_connect_in_parallel(true)
-                .with_strict(false)
-                .with_drop_failed_servers(true)
-                .with_suppress_cancelled_error(false);
-            entries.push(Arc::new(Entry {
-                server: config.server,
-                manager: McpServerManager::with_options([server], options),
-                filter: config.filter,
-                operation: tokio::sync::Mutex::new(()),
-                state: Mutex::new(EntryState {
-                    enabled: config.enabled,
-                    generation: 0,
-                    status: if config.enabled {
-                        Status::NotStarted
-                    } else {
-                        Status::Disabled
-                    },
-                    failure: None,
-                    cleanup_failed: false,
-                    tools_error: None,
-                    cached_catalog: config.cached_catalog,
-                    stopped: false,
-                    epoch: 0,
-                    pending: None,
-                    startup_cancel: CancellationToken::new(),
-                    consecutive_failures: 0,
-                    retry_not_before: None,
-                }),
-                changes: changes.clone(),
-                lazy_startup: config.lazy_startup,
-                automatic_retry: config.automatic_retry,
-                startup_trigger: watch::channel(false).0,
-            }));
-        }
+        let entries = configs
+            .into_iter()
+            .map(|config| Entry::new(config, changes.clone()))
+            .collect();
         Ok(Arc::new(Self {
-            entries,
+            entries: std::sync::RwLock::new(Arc::new(entries)),
             changes,
             discovery,
             registry: Arc::new(tokio::sync::Mutex::new(())),
+            started: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    fn entries(&self) -> Arc<Vec<Arc<Entry>>> {
+        self.entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Reconciles the registry with a new set of registrations, as the source's connection set
+    /// does on refresh. A same-named enabled server with an unchanged connection identity keeps
+    /// its entry, connection, status and pending startup and takes the new tool filter; every
+    /// other previous entry is stopped and released, and new entries start in the background
+    /// once the host has started the runtime. Order follows `configs`. Each server's failure
+    /// stays its own; the accepted replacement finishes even if the caller stops waiting.
+    pub async fn replace_mcp_servers(
+        &self,
+        configs: Vec<McpServerConfig>,
+    ) -> Result<Vec<McpServerStatus>> {
+        validate_configs(&configs)?;
+        // Hold the registry from reading the current set until the replaced entries are stopped,
+        // so concurrent replacements and lifecycle commands see one consistent set.
+        let registry = Arc::clone(&self.registry).lock_owned().await;
+        let previous = self.entries();
+        let mut retained = std::collections::HashSet::new();
+        let mut next = Vec::with_capacity(configs.len());
+        let mut added = Vec::new();
+        for config in configs {
+            // A registration enabled by configuration again gets a fresh entry; a runtime toggle
+            // of a retained entry survives the refresh.
+            let existing = (config.enabled && config.identity.is_some())
+                .then(|| {
+                    previous.iter().find(|entry| {
+                        entry.configured_enabled
+                            && entry.server.name() == config.server.name()
+                            && entry.identity == config.identity
+                    })
+                })
+                .flatten();
+            if let Some(entry) = existing {
+                *entry.filter.lock().unwrap_or_else(PoisonError::into_inner) = config.filter;
+                retained.insert(Arc::as_ptr(entry).addr());
+                next.push(entry.clone());
+            } else {
+                let entry = Entry::new(config, self.changes.clone());
+                added.push(entry.clone());
+                next.push(entry);
+            }
+        }
+        let removed = previous
+            .iter()
+            .filter(|entry| !retained.contains(&Arc::as_ptr(entry).addr()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let started = self.started.load(std::sync::atomic::Ordering::Acquire);
+        let published = Arc::new(next);
+        {
+            // Publish before the old entries are stopped so no model call captures a removed one.
+            *self.entries.write().unwrap_or_else(PoisonError::into_inner) = published;
+        }
+        tokio::spawn(async move {
+            let _registry = registry;
+            let mut failure = None;
+            for result in
+                join_all(removed.into_iter().map(|entry| run(entry, Operation::Stop))).await
+            {
+                if let Err(error) = result {
+                    failure.get_or_insert(error);
+                }
+            }
+            if started {
+                for entry in &added {
+                    entry.start_background();
+                }
+            }
+            failure.map_or(Ok(()), Err)
+        })
+        .await
+        .map_err(|error| Error::config("MCP registry replacement failed").with_source(error))??;
+        Ok(self.get_mcp_status())
     }
 
     /// Connects enabled servers concurrently, retaining each server's independent outcome.
     pub async fn connect_all(&self) -> Result<Vec<McpServerStatus>> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
         self.apply(None, Operation::Connect).await
     }
 
@@ -219,7 +283,9 @@ impl CodingMcpRuntime {
     /// A usable catalog defers transport startup until invocation; otherwise discovery waits
     /// for this attempt. Preparing another thread reuses startup and respects recovery backoff.
     pub fn start_background(&self) {
-        for entry in &self.entries {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        for entry in self.entries().iter() {
             entry.start_background();
         }
     }
@@ -233,7 +299,10 @@ impl CodingMcpRuntime {
     /// Reads detached connection snapshots without network I/O or lifecycle locks.
     #[must_use]
     pub fn get_mcp_status(&self) -> Vec<McpServerStatus> {
-        self.entries.iter().map(|entry| entry.snapshot()).collect()
+        self.entries()
+            .iter()
+            .map(|entry| entry.snapshot())
+            .collect()
     }
 
     /// Retries one or all enabled servers; failed-only defaults belong to the caller's API.
@@ -256,12 +325,12 @@ impl CodingMcpRuntime {
 
     /// Cleans connections in reverse registry order, recording failures and keeping ownership.
     pub async fn shutdown(&self) -> Result<Vec<McpServerStatus>> {
-        let entries = self.entries.clone();
+        let entries = self.entries();
         let registry = self.registry.clone();
         tokio::spawn(async move {
             let _registry = registry.lock().await;
-            for entry in entries.into_iter().rev() {
-                run(entry, Operation::Stop).await?;
+            for entry in entries.iter().rev() {
+                run(entry.clone(), Operation::Stop).await?;
             }
             Ok::<(), Error>(())
         })
@@ -273,7 +342,7 @@ impl CodingMcpRuntime {
     /// Original lifecycle failures for host diagnostics, including their phase and source.
     #[must_use]
     pub fn errors(&self) -> Vec<(String, &'static str, Arc<Error>)> {
-        self.entries
+        self.entries()
             .iter()
             .filter_map(|entry| {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -296,7 +365,7 @@ impl CodingMcpRuntime {
         operation: Operation,
     ) -> Result<Vec<McpServerStatus>> {
         let targets: Vec<_> = self
-            .entries
+            .entries()
             .iter()
             .filter(|entry| name.is_none_or(|name| entry.server.name() == name))
             .cloned()
@@ -357,7 +426,72 @@ async fn run(entry: Arc<Entry>, operation: Operation) -> Result<()> {
     .map_err(|error| Error::config("MCP control task failed").with_source(error))
 }
 
+fn validate_configs(configs: &[McpServerConfig]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for config in configs {
+        if !names.insert(config.server.name().to_owned()) {
+            return Err(Error::config("MCP runtime server names must be unique"));
+        }
+        if config
+            .cached_catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.server_name() != config.server.name())
+        {
+            return Err(Error::config(
+                "cached MCP catalog belongs to a different server",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Entry {
+    fn new(config: McpServerConfig, changes: broadcast::Sender<McpServerStatus>) -> Arc<Self> {
+        let server: Arc<dyn McpServer> = config.server.clone();
+        let options = config
+            .options
+            .with_connect_in_parallel(true)
+            .with_strict(false)
+            .with_drop_failed_servers(true)
+            .with_suppress_cancelled_error(false);
+        Arc::new(Self {
+            server: config.server,
+            manager: McpServerManager::with_options([server], options),
+            filter: Mutex::new(config.filter),
+            identity: config.identity,
+            configured_enabled: config.enabled,
+            operation: tokio::sync::Mutex::new(()),
+            state: Mutex::new(EntryState {
+                enabled: config.enabled,
+                generation: 0,
+                status: if config.enabled {
+                    Status::NotStarted
+                } else {
+                    Status::Disabled
+                },
+                failure: None,
+                cleanup_failed: false,
+                tools_error: None,
+                cached_catalog: config.cached_catalog,
+                stopped: false,
+                epoch: 0,
+                pending: None,
+                startup_cancel: CancellationToken::new(),
+                consecutive_failures: 0,
+                retry_not_before: None,
+            }),
+            changes,
+            lazy_startup: config.lazy_startup,
+            automatic_retry: config.automatic_retry,
+            startup_trigger: watch::channel(false).0,
+        })
+    }
+    fn filter(&self) -> ToolFilter {
+        self.filter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
     fn snapshot(&self) -> McpServerStatus {
         self.snapshot_with_generation().0
     }
@@ -528,7 +662,7 @@ impl Entry {
                 .unwrap_or_else(PoisonError::into_inner)
                 .cached_catalog
                 .as_ref()
-                .is_some_and(|catalog| catalog.allows_deferred_startup(&self.filter));
+                .is_some_and(|catalog| catalog.allows_deferred_startup(&self.filter()));
             if can_defer {
                 let pending = self.launch_startup(true, false);
                 return if self.startup_is_dormant() {
@@ -590,7 +724,7 @@ impl Drop for CodingMcpRuntime {
     fn drop(&mut self) {
         // Deferred bindings and recovery tasks may still retain an entry. The runtime's owner
         // must nevertheless cancel startup and release its connections, as Codex's owner does.
-        for entry in &self.entries {
+        for entry in self.entries().iter() {
             entry.invalidate_startup(true);
             entry.manager.request_shutdown();
         }
@@ -603,7 +737,7 @@ impl CodingMcpRuntime {
         // Codex advertises resource helpers whenever MCP servers are configured and lets each
         // request wait for its connection. A connected session is captured as is; any other
         // enabled server gets the same deferred binding as cached function tools.
-        self.entries
+        self.entries()
             .iter()
             .filter_map(|entry| {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -638,7 +772,8 @@ impl ToolResolver for CodingMcpRuntime {
         reserved: &BTreeSet<String>,
     ) -> Result<Vec<Arc<dyn Tool>>> {
         let _ = self.get_mcp_status();
-        let catalogs = join_all(self.entries.iter().map(|entry| async {
+        let entries = self.entries();
+        let catalogs = join_all(entries.iter().map(|entry| async {
             entry.wait_for_catalog().await;
             let (enabled, stopped, status, cached, epoch, generation) = {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -678,7 +813,7 @@ impl ToolResolver for CodingMcpRuntime {
                         Some((
                             catalog,
                             Arc::new(client) as Arc<dyn McpToolClientSource>,
-                            entry.filter.clone(),
+                            entry.filter(),
                         ))
                     }
                     Err(error) => {
@@ -700,7 +835,7 @@ impl ToolResolver for CodingMcpRuntime {
                             epoch,
                             resolved: tokio::sync::OnceCell::new(),
                         }) as Arc<dyn McpToolClientSource>,
-                        entry.filter.clone(),
+                        entry.filter(),
                     )
                 })
             }
@@ -739,7 +874,7 @@ impl McpRuntimeControl for CodingMcpRuntime {
     }
     fn inventory(&self, name: &str, full: bool) -> BoxFuture<'static, McpServerStatus> {
         let Some(entry) = self
-            .entries
+            .entries()
             .iter()
             .find(|entry| entry.server.name() == name)
             .cloned()
