@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! What the server makes of the client's answers to its requests: the decoding in Codex's handlers
 //! of each request (`app-server/src/bespoke_event_handling.rs`, `app-server/src/dynamic_tools.rs`).
 //!
@@ -80,6 +81,7 @@ fn deny(message: &str) -> ReviewDecision {
 pub(crate) struct ApprovalAnswer {
     pub(crate) decision: ReviewDecision,
     pub(crate) resolution: ApprovalResolution,
+    mcp_tool_approval: bool,
 }
 
 impl ApprovalAnswer {
@@ -87,6 +89,7 @@ impl ApprovalAnswer {
         Self {
             decision,
             resolution,
+            mcp_tool_approval: false,
         }
     }
 
@@ -94,6 +97,155 @@ impl ApprovalAnswer {
     pub(crate) fn failed() -> Self {
         Self::new(deny(APPROVAL_REQUEST_FAILED), ApprovalResolution::Failed)
     }
+    pub(crate) fn run_answer(&self) -> super::approvals::RunAnswer {
+        if self.mcp_tool_approval {
+            match self.decision {
+                ReviewDecision::ApprovedMcpPolicyAmendment => {
+                    return super::approvals::RunAnswer::Approve;
+                }
+                // Codex skips a cancelled MCP call and returns its result to the model.
+                ReviewDecision::Abort => {
+                    return super::approvals::RunAnswer::Reject(
+                        "user cancelled MCP tool call".into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.decision.run_answer()
+    }
+}
+
+fn parse_mcp_tool_approval_response(
+    response: Option<&ToolRequestUserInputResponse>,
+    question_id: &str,
+) -> ReviewDecision {
+    let answers = response
+        .and_then(|response| response.answers().get(question_id))
+        .map(super::protocol::ToolRequestUserInputAnswer::answers);
+    match answers {
+        Some(answers)
+            if answers
+                .iter()
+                .any(|answer| answer == "Allow for this session") =>
+        {
+            ReviewDecision::ApprovedForSession
+        }
+        Some(answers)
+            if answers
+                .iter()
+                .any(|answer| answer == "Allow and don't ask me again") =>
+        {
+            ReviewDecision::ApprovedMcpPolicyAmendment
+        }
+        Some(answers) if answers.iter().any(|answer| answer == "Allow") => ReviewDecision::Approved,
+        _ => ReviewDecision::Abort,
+    }
+}
+
+/// Source MCP tool-approval response parsing. Prompt/Writes never inherit a remember answer.
+pub(crate) fn mcp_tool_approval_answer(
+    answer: ClientAnswer,
+    question_id: &str,
+    elicitation: bool,
+    remember: bool,
+) -> Option<ApprovalAnswer> {
+    use super::protocol::{McpServerElicitationAction, McpServerElicitationRequestResponse};
+    let value = match Outcome::from(answer) {
+        Outcome::Answered(value) => Some(value),
+        Outcome::TurnTransition => return None,
+        Outcome::Failed => None,
+    };
+    let mut decision = if elicitation {
+        match value.and_then(|value| {
+            serde_json::from_value::<McpServerElicitationRequestResponse>(value).ok()
+        }) {
+            Some(response) => match response.action {
+                McpServerElicitationAction::Accept => match response
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("persist"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("session") => ReviewDecision::ApprovedForSession,
+                    Some("always") => ReviewDecision::ApprovedMcpPolicyAmendment,
+                    _ => {
+                        let converted = response
+                            .content
+                            .as_ref()
+                            .and_then(serde_json::Value::as_object)
+                            .map(|content| {
+                                content
+                                    .iter()
+                                    .filter_map(|(id, value)| {
+                                        let answers = match value {
+                                            serde_json::Value::String(answer) => {
+                                                vec![answer.clone()]
+                                            }
+                                            serde_json::Value::Array(answers) => answers
+                                                .iter()
+                                                .filter_map(|answer| {
+                                                    answer.as_str().map(str::to_owned)
+                                                })
+                                                .collect(),
+                                            _ => return None,
+                                        };
+                                        Some((id.clone(), serde_json::json!({"answers":answers})))
+                                    })
+                                    .collect::<serde_json::Map<_, _>>()
+                            });
+                        let parsed = parse_mcp_tool_approval_response(
+                            converted
+                                .and_then(|answers| {
+                                    serde_json::from_value::<ToolRequestUserInputResponse>(
+                                        serde_json::json!({"answers":answers}),
+                                    )
+                                    .ok()
+                                })
+                                .as_ref(),
+                            question_id,
+                        );
+                        if matches!(parsed, ReviewDecision::Abort) {
+                            ReviewDecision::Approved
+                        } else {
+                            parsed
+                        }
+                    }
+                },
+                McpServerElicitationAction::Decline => {
+                    ReviewDecision::denied("user rejected MCP tool call")
+                }
+                McpServerElicitationAction::Cancel => ReviewDecision::Abort,
+            },
+            // The source app-server maps malformed/failed elicitation responses to Decline.
+            None => ReviewDecision::denied("user rejected MCP tool call"),
+        }
+    } else {
+        parse_mcp_tool_approval_response(
+            value
+                .and_then(|value| {
+                    serde_json::from_value::<ToolRequestUserInputResponse>(value).ok()
+                })
+                .as_ref(),
+            question_id,
+        )
+    };
+    if !remember
+        && matches!(
+            decision,
+            ReviewDecision::ApprovedForSession | ReviewDecision::ApprovedMcpPolicyAmendment
+        )
+    {
+        decision = ReviewDecision::Approved;
+    }
+    let resolution = match decision {
+        ReviewDecision::Abort => ApprovalResolution::Cancelled,
+        ReviewDecision::Denied { .. } => ApprovalResolution::Declined,
+        _ => ApprovalResolution::Approved,
+    };
+    let mut answer = ApprovalAnswer::new(decision, resolution);
+    answer.mcp_tool_approval = true;
+    Some(answer)
 }
 
 /// The decision a command approval's answer carries: Codex's

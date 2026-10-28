@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Product MCP connection controls built on the Python-compatible lifecycle manager.
 //!
 //! Registry names are unique because UI commands address names. This does not constrain the
@@ -38,7 +39,53 @@ use ra_protocol::{
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
+mod approval;
 mod product;
+pub(crate) use approval::{McpApprovalKey, McpApprovalState};
+pub use approval::{McpPermissionPromptAutoApproveContext, mcp_permission_prompt_is_auto_approved};
+
+pub(crate) fn configure_approval_sources(
+    servers: &mut [McpServerConfig],
+    stack: &ra_config::ConfigLayerStack,
+    user_file: Option<&ra_paths::AbsolutePathBuf>,
+    elicitation: bool,
+) {
+    for server in servers {
+        let name = server.server.name();
+        let Some(policy) = &mut server.product_policy else {
+            continue;
+        };
+        let policy = Arc::make_mut(policy);
+        policy.elicitation = elicitation;
+        let project_file = stack.layers_high_to_low().find_map(|layer| {
+            if !matches!(layer.name, ra_config::ConfigLayerSource::Project { .. }) {
+                return None;
+            }
+            let servers: std::collections::HashMap<String, ra_config::McpServerConfig> =
+                layer.config.get("mcp_servers")?.clone().try_into().ok()?;
+            if !servers.contains_key(name) {
+                return None;
+            }
+            Some(layer.config_folder()?.join("config.toml").to_path_buf())
+        });
+        let user_configured = stack
+            .effective_user_config()
+            .as_ref()
+            .and_then(|value| value.get("mcp_servers"))
+            .cloned()
+            .and_then(|servers| {
+                servers
+                    .try_into::<std::collections::HashMap<String, ra_config::McpServerConfig>>()
+                    .ok()
+            })
+            .is_some_and(|servers| servers.contains_key(name));
+        policy.persist_path = project_file.or_else(|| {
+            (user_configured || policy.plugin_id.is_some())
+                .then(|| user_file.map(ra_paths::AbsolutePathBuf::to_path_buf))
+                .flatten()
+        });
+    }
+}
 mod startup;
 pub use product::{ProductMcpServers, product_mcp_servers};
 use startup::{DeferredClient, startup_error_display};
@@ -57,6 +104,8 @@ pub struct McpServerConfig {
     lazy_startup: bool,
     automatic_retry: bool,
     identity: Option<String>,
+    binding_options: Option<ra_mcp::client::McpClientOptions>,
+    product_policy: Option<Arc<approval::ProductMcpPolicy>>,
 }
 impl McpServerConfig {
     /// Registers a reconnectable server without opening its transport.
@@ -70,6 +119,8 @@ impl McpServerConfig {
             lazy_startup: false,
             automatic_retry: false,
             identity: None,
+            binding_options: None,
+            product_policy: None,
         }
     }
     /// The connection identity this registration carries, if any.
@@ -122,6 +173,13 @@ impl McpServerConfig {
         self.filter = filter;
         self
     }
+    /// Captures product request deadlines and tool approval policy independently of the
+    /// reusable connection. Previously discovered tools retain their captured policy.
+    #[must_use]
+    pub fn with_binding_options(mut self, options: ra_mcp::client::McpClientOptions) -> Self {
+        self.binding_options = Some(options);
+        self
+    }
     /// Selects independent connect and cleanup deadlines. Scheduling and failure isolation are
     /// product-owned; the remaining manager policy switches are not used by this registry.
     #[must_use]
@@ -134,8 +192,7 @@ impl McpServerConfig {
 struct Entry {
     server: Arc<dyn McpRuntimeServer>,
     manager: McpServerManager,
-    // A replacement with the same connection identity may change only the per-run filter.
-    filter: Mutex<ToolFilter>,
+    view: Mutex<BindingView>,
     identity: Option<String>,
     configured_enabled: bool,
     operation: tokio::sync::Mutex<()>,
@@ -144,6 +201,28 @@ struct Entry {
     lazy_startup: bool,
     automatic_retry: bool,
     startup_trigger: watch::Sender<bool>,
+}
+
+/// The source's per-step view is separate from connection identity and lifecycle ownership.
+#[derive(Clone)]
+struct BindingView {
+    filter: ToolFilter,
+    options: Option<ra_mcp::client::McpClientOptions>,
+    product_policy: Option<Arc<approval::ProductMcpPolicy>>,
+}
+impl BindingView {
+    fn client(&self, client: ra_mcp::client::McpClient) -> ra_mcp::client::McpClient {
+        match &self.options {
+            Some(options) => client.with_binding_options(options.clone()),
+            None => client,
+        }
+    }
+    fn catalog(&self, catalog: McpToolCatalog) -> McpToolCatalog {
+        match &self.options {
+            Some(options) => catalog.with_binding_options(options.clone()),
+            None => catalog,
+        }
+    }
 }
 type StartupResult = std::result::Result<ra_mcp::client::McpClient, Arc<Error>>;
 type StartupAttempt = watch::Receiver<Option<StartupResult>>;
@@ -201,7 +280,7 @@ impl CodingMcpRuntime {
 
     /// Reconciles the registry with a new set of registrations, as the source's connection set
     /// does on refresh. A same-named enabled server with an unchanged connection identity keeps
-    /// its entry, connection, status and pending startup and takes the new tool filter; every
+    /// its healthy connection or compatible pending startup and takes the new binding policy; every
     /// other previous entry is stopped and released, and new entries start in the background
     /// once the host has started the runtime. Order follows `configs`. Each server's failure
     /// stays its own; the accepted replacement finishes even if the caller stops waiting.
@@ -217,6 +296,7 @@ impl CodingMcpRuntime {
         let mut retained = std::collections::HashSet::new();
         let mut next = Vec::with_capacity(configs.len());
         let mut added = Vec::new();
+        let mut view_updates = Vec::new();
         for config in configs {
             // A registration enabled by configuration again gets a fresh entry; a runtime toggle
             // of a retained entry survives the refresh.
@@ -226,11 +306,19 @@ impl CodingMcpRuntime {
                         entry.configured_enabled
                             && entry.server.name() == config.server.name()
                             && entry.identity == config.identity
+                            && entry.can_reuse(&config)
                     })
                 })
                 .flatten();
             if let Some(entry) = existing {
-                *entry.filter.lock().unwrap_or_else(PoisonError::into_inner) = config.filter;
+                view_updates.push((
+                    entry.clone(),
+                    BindingView {
+                        filter: config.filter,
+                        options: config.binding_options,
+                        product_policy: config.product_policy,
+                    },
+                ));
                 retained.insert(Arc::as_ptr(entry).addr());
                 next.push(entry.clone());
             } else {
@@ -248,7 +336,11 @@ impl CodingMcpRuntime {
         let published = Arc::new(next);
         {
             // Publish before the old entries are stopped so no model call captures a removed one.
-            *self.entries.write().unwrap_or_else(PoisonError::into_inner) = published;
+            let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+            for (entry, view) in view_updates {
+                *entry.view.lock().unwrap_or_else(PoisonError::into_inner) = view;
+            }
+            *entries = published;
         }
         tokio::spawn(async move {
             let _registry = registry;
@@ -457,7 +549,11 @@ impl Entry {
         Arc::new(Self {
             server: config.server,
             manager: McpServerManager::with_options([server], options),
-            filter: Mutex::new(config.filter),
+            view: Mutex::new(BindingView {
+                filter: config.filter,
+                options: config.binding_options,
+                product_policy: config.product_policy,
+            }),
             identity: config.identity,
             configured_enabled: config.enabled,
             operation: tokio::sync::Mutex::new(()),
@@ -487,10 +583,42 @@ impl Entry {
         })
     }
     fn filter(&self) -> ToolFilter {
-        self.filter
+        self.view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .filter
+            .clone()
+    }
+    fn binding_view(&self) -> BindingView {
+        self.view
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+    fn can_reuse(&self, desired: &McpServerConfig) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Runtime disable survives config refresh. A failed cleanup must keep its manager
+        // worker so refresh cannot open another transport over unconfirmed cleanup.
+        if !state.enabled || state.cleanup_failed {
+            return true;
+        }
+        if state.stopped {
+            return false;
+        }
+        if state.status == Status::Connected {
+            return self
+                .server
+                .current_client()
+                .is_ok_and(|client| !client.is_closed());
+        }
+        if let Some(pending) = &state.pending {
+            return pending.borrow().is_none()
+                && !self.startup_is_dormant()
+                && !state.startup_cancel.is_cancelled()
+                && self.manager.connect_timeout() == desired.options.connect_timeout();
+        }
+        state.status == Status::NotStarted
+            && self.manager.connect_timeout() == desired.options.connect_timeout()
     }
     fn snapshot(&self) -> McpServerStatus {
         self.snapshot_with_generation().0
@@ -732,14 +860,37 @@ impl Drop for CodingMcpRuntime {
 }
 
 impl CodingMcpRuntime {
+    fn product_tool(
+        bindings: &[(Arc<Entry>, BindingView)],
+        tool: Arc<ra_mcp::tool::McpTool>,
+    ) -> Arc<dyn Tool> {
+        let policy = bindings
+            .iter()
+            .find(|(entry, _)| entry.server.name() == tool.info().server_name())
+            .and_then(|(_, view)| view.product_policy.clone());
+        match policy {
+            Some(policy) => Arc::new(approval::ProductMcpTool::new(tool, policy)),
+            None => tool,
+        }
+    }
+    fn bindings(&self) -> Vec<(Arc<Entry>, BindingView)> {
+        self.entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|entry| (entry.clone(), entry.binding_view()))
+            .collect()
+    }
     /// Resource-helper sources for one model call.
-    fn resource_sources(&self) -> Vec<(String, Arc<dyn McpToolClientSource>)> {
+    fn resource_sources(
+        bindings: &[(Arc<Entry>, BindingView)],
+    ) -> Vec<(String, Arc<dyn McpToolClientSource>)> {
         // Codex advertises resource helpers whenever MCP servers are configured and lets each
         // request wait for its connection. A connected session is captured as is; any other
         // enabled server gets the same deferred binding as cached function tools.
-        self.entries()
+        bindings
             .iter()
-            .filter_map(|entry| {
+            .filter_map(|(entry, view)| {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
                 if !state.enabled || state.stopped {
                     return None;
@@ -748,11 +899,12 @@ impl CodingMcpRuntime {
                     .then(|| entry.server.current_client().ok())
                     .flatten();
                 let source = match connected {
-                    Some(client) => Arc::new(client) as Arc<dyn McpToolClientSource>,
+                    Some(client) => Arc::new(view.client(client)) as Arc<dyn McpToolClientSource>,
                     None => Arc::new(DeferredClient {
                         entry: entry.clone(),
                         epoch: state.epoch,
                         resolved: tokio::sync::OnceCell::new(),
+                        view: view.clone(),
                     }),
                 };
                 Some((entry.server.name().to_owned(), source))
@@ -772,8 +924,9 @@ impl ToolResolver for CodingMcpRuntime {
         reserved: &BTreeSet<String>,
     ) -> Result<Vec<Arc<dyn Tool>>> {
         let _ = self.get_mcp_status();
-        let entries = self.entries();
-        let catalogs = join_all(entries.iter().map(|entry| async {
+        let bindings = self.bindings();
+        let resource_sources = Self::resource_sources(&bindings);
+        let catalogs = join_all(bindings.iter().map(|(entry, view)| async {
             entry.wait_for_catalog().await;
             let (enabled, stopped, status, cached, epoch, generation) = {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -796,7 +949,7 @@ impl ToolResolver for CodingMcpRuntime {
             }
             if status == Status::Connected {
                 let client = match entry.server.current_client() {
-                    Ok(client) => client,
+                    Ok(client) => view.client(client),
                     Err(error) => {
                         entry.fail("session", Arc::new(error));
                         return None;
@@ -813,7 +966,7 @@ impl ToolResolver for CodingMcpRuntime {
                         Some((
                             catalog,
                             Arc::new(client) as Arc<dyn McpToolClientSource>,
-                            entry.filter(),
+                            view.filter.clone(),
                         ))
                     }
                     Err(error) => {
@@ -829,13 +982,14 @@ impl ToolResolver for CodingMcpRuntime {
             } else {
                 cached.map(|catalog| {
                     (
-                        catalog,
+                        view.catalog(catalog),
                         Arc::new(DeferredClient {
                             entry: entry.clone(),
                             epoch,
                             resolved: tokio::sync::OnceCell::new(),
+                            view: view.clone(),
                         }) as Arc<dyn McpToolClientSource>,
-                        entry.filter(),
+                        view.filter.clone(),
                     )
                 })
             }
@@ -844,7 +998,6 @@ impl ToolResolver for CodingMcpRuntime {
         .into_iter()
         .flatten()
         .collect::<Vec<McpToolCatalogSource>>();
-        let resource_sources = self.resource_sources();
         let mut tools = discover_catalog_tools(
             &catalogs,
             &self.discovery,
@@ -854,7 +1007,7 @@ impl ToolResolver for CodingMcpRuntime {
         )
         .await?
         .into_iter()
-        .map(|tool| tool as Arc<dyn Tool>)
+        .map(|tool| Self::product_tool(&bindings, tool))
         .collect::<Vec<_>>();
         // Resource helpers are ordinary advertised tools, independent of server tool filtering,
         // tools/list failures and deferred function discovery. Their sessions share the same owner.

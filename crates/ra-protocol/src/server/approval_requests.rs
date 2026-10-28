@@ -1,7 +1,10 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The approval requests of a turn whose run stopped on approvals: the approval arms of Codex's
 //! `apply_bespoke_event_handling` (`ExecApprovalRequest`, `ApplyPatchApprovalRequest`) and their
 //! response handlers (`on_command_execution_request_approval_response`,
 //! `on_file_change_request_approval_response`).
+//! Product MCP approvals also use this batch: the source elicitation form or blocking
+//! request-user-input question is decoded with its captured remember scope before resumption.
 //!
 //! # The batch
 //!
@@ -45,7 +48,10 @@ use ra_core::{
 use ra_runtime::thread::ThreadEvent;
 
 use super::{
-    answers::{ApprovalAnswer, command_execution_approval_answer, file_change_approval_answer},
+    answers::{
+        ApprovalAnswer, command_execution_approval_answer, file_change_approval_answer,
+        mcp_tool_approval_answer,
+    },
     approvals::{ReviewDecision, RunAnswer},
     outgoing::{ServerNotification, ThreadScopedOutgoingMessageSender, now_unix_timestamp_ms},
     protocol::{ServerRequestPayload, WARNING_METHOD, WarningNotification},
@@ -55,10 +61,46 @@ use super::{
 };
 
 /// The method an approval's answer is read for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ApprovalMethod {
     CommandExecution,
     FileChange,
+    Mcp {
+        question_id: String,
+        elicitation: bool,
+        remember: bool,
+    },
+}
+
+impl ApprovalMethod {
+    async fn guard(
+        &self,
+        watch: &Arc<ThreadWatchManager>,
+        thread_id: &ra_core::session::SessionId,
+    ) -> super::thread_status::ThreadWatchActiveGuard {
+        if matches!(
+            self,
+            Self::Mcp {
+                elicitation: false,
+                ..
+            }
+        ) {
+            watch.note_user_input_requested(thread_id).await
+        } else {
+            watch.note_permission_requested(thread_id).await
+        }
+    }
+    fn answer(self, answer: super::outgoing::ClientAnswer) -> Option<ApprovalAnswer> {
+        match self {
+            ApprovalMethod::CommandExecution => command_execution_approval_answer(answer),
+            ApprovalMethod::FileChange => file_change_approval_answer(answer),
+            ApprovalMethod::Mcp {
+                question_id,
+                elicitation,
+                remember,
+            } => mcp_tool_approval_answer(answer, &question_id, elicitation, remember),
+        }
+    }
 }
 
 /// Asks the client about the calls the run of `turn_id` stopped on, and settles them once
@@ -127,11 +169,7 @@ async fn run_approval_batch(
             continue;
         };
         let guard = match target {
-            ApprovalTarget::Parent => Some(
-                thread_watch
-                    .note_permission_requested(loaded.thread_id())
-                    .await,
-            ),
+            ApprovalTarget::Parent => Some(method.guard(thread_watch, loaded.thread_id()).await),
             ApprovalTarget::Spawned { .. } => None,
         };
         let (request_id, answer) = outgoing.send_request(request).await;
@@ -140,10 +178,7 @@ async fn run_approval_batch(
         waiting.push(async move {
             let answer = outgoing.wait_for_answer(request_id, answer).await;
             drop(guard);
-            let answer = match method {
-                ApprovalMethod::CommandExecution => command_execution_approval_answer(answer),
-                ApprovalMethod::FileChange => file_change_approval_answer(answer),
-            };
+            let answer = method.answer(answer);
             (item, answer)
         });
     }
@@ -228,6 +263,42 @@ fn approval_request(
     let pending = PendingApproval::new(thread_id, turn_id, now_unix_timestamp_ms(), approval);
     let request = loaded.adapter.as_ref()?.approval_request(config, pending)?;
     match request {
+        ServerRequestPayload::ToolRequestUserInput(ref params) => {
+            let question = params.questions().first()?;
+            if !question.id().starts_with("mcp_tool_call_approval_") {
+                return None;
+            }
+            let method = ApprovalMethod::Mcp {
+                question_id: question.id().to_owned(),
+                elicitation: false,
+                remember: question.options().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option.label() == "Allow for this session")
+                }),
+            };
+            Some((method, request))
+        }
+        ServerRequestPayload::McpServerElicitationRequest(ref params) => {
+            let super::protocol::McpServerElicitationRequest::Form { meta, .. } = params.request();
+            let remember = meta
+                .as_ref()
+                .and_then(|meta| meta.get("persist"))
+                .is_some_and(|value| {
+                    value == "session"
+                        || value
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|value| value == "session"))
+                });
+            Some((
+                ApprovalMethod::Mcp {
+                    question_id: format!("mcp_tool_call_approval_{}", approval.call_id()),
+                    elicitation: true,
+                    remember,
+                },
+                request,
+            ))
+        }
         request @ ServerRequestPayload::CommandExecutionRequestApproval(_) => {
             Some((ApprovalMethod::CommandExecution, request))
         }
@@ -255,7 +326,7 @@ async fn apply_answer(
     if !record(loaded, state, item, answer.resolution, target) {
         return false;
     }
-    let settled = match answer.decision.run_answer() {
+    let settled = match answer.run_answer() {
         RunAnswer::Approve => state.approve(item, false),
         RunAnswer::Reject(message) => state.reject_with_message(item, false, message),
         RunAnswer::Abort => {

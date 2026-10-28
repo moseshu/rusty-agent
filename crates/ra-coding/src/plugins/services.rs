@@ -596,11 +596,21 @@ impl PluginServices {
         cwd: AbsolutePathBuf,
     ) -> ConsumerBinding {
         let fallback_cwd = cwd.clone();
+        let user_file = self.config_manager.user_config_path().ok();
         self.bind_consumer(runtime, cwd, move |runtime, snapshot| {
-            let plan = crate::mcp::product_mcp_servers(
+            let mut plan = crate::mcp::product_mcp_servers(
                 &snapshot.mcp_catalog,
                 fallback_cwd.as_path(),
                 &snapshot.config.http_client_factory,
+            );
+            crate::mcp::configure_approval_sources(
+                &mut plan.servers,
+                &snapshot.config.config_layer_stack,
+                user_file.as_ref(),
+                snapshot
+                    .config
+                    .features
+                    .enabled(ra_config::Feature::ToolCallMcpElicitation),
             );
             async move {
                 let error = runtime

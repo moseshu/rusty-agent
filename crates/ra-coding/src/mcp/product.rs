@@ -109,7 +109,10 @@ fn product_mcp_server(
     let tool_timeout = config.tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT);
     let filter = tool_filter(config);
     // The registry applies the filter per run, so it can change without reconnecting.
-    let options = McpClientOptions::default().with_tool_timeout(tool_timeout);
+    let options = McpClientOptions::default()
+        .with_tool_timeout(tool_timeout)
+        .with_require_approval(approval_policy(config));
+    let binding_options = options.clone();
     let runtime_server: Arc<dyn super::McpRuntimeServer> = match &config.transport {
         McpServerTransportConfig::Stdio {
             command,
@@ -169,11 +172,61 @@ fn product_mcp_server(
     };
     let lifecycle =
         McpServerManagerOptions::default().with_connect_timeout(Some(startup_timeout))?;
-    Ok(McpServerConfig::new(runtime_server)
+    let mut registration = McpServerConfig::new(runtime_server)
         .with_enabled(config.enabled)
         .with_filter(filter)
         .with_lifecycle_options(lifecycle)
-        .with_connection_identity(connection_identity(server, local_process_cwd)))
+        .with_binding_options(binding_options)
+        .with_connection_identity(connection_identity(server, local_process_cwd));
+    registration.product_policy = Some(Arc::new(super::approval::ProductMcpPolicy::new(server)));
+    Ok(registration)
+}
+
+fn approval_policy(config: &ProductServerConfig) -> ra_mcp::approval::RequireApprovalSetting {
+    use ra_config::AppToolApproval;
+    use ra_mcp::approval::RequireApprovalSetting;
+    let default_mode = config.default_tools_approval_mode.unwrap_or_default();
+    let overrides = config
+        .tools
+        .iter()
+        .filter_map(|(name, config)| config.approval_mode.map(|mode| (name.clone(), mode)))
+        .collect::<BTreeMap<_, _>>();
+    if overrides.is_empty() {
+        match default_mode {
+            AppToolApproval::Prompt => return RequireApprovalSetting::Always,
+            AppToolApproval::Approve => return RequireApprovalSetting::Never,
+            AppToolApproval::Auto | AppToolApproval::Writes => {}
+        }
+    }
+    RequireApprovalSetting::dynamic_sync(move |_, _, tool| {
+        let mode = overrides
+            .get(tool.name.as_ref())
+            .copied()
+            .unwrap_or(default_mode);
+        let annotations = tool.annotations.as_ref();
+        let read_only = annotations
+            .and_then(|value| value.read_only_hint)
+            .unwrap_or(false);
+        let requires_approval = match mode {
+            AppToolApproval::Prompt => true,
+            AppToolApproval::Approve => false,
+            AppToolApproval::Writes => !read_only,
+            AppToolApproval::Auto => {
+                let destructive = annotations.and_then(|value| value.destructive_hint);
+                if destructive == Some(true) {
+                    true
+                } else if read_only {
+                    false
+                } else {
+                    destructive.unwrap_or(true)
+                        || annotations
+                            .and_then(|value| value.open_world_hint)
+                            .unwrap_or(true)
+                }
+            }
+        };
+        Ok(requires_approval)
+    })
 }
 
 fn tool_filter(config: &ProductServerConfig) -> ToolFilter {

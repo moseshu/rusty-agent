@@ -260,6 +260,7 @@ pub(super) struct DeferredClient {
     pub(super) entry: Arc<Entry>,
     pub(super) epoch: u64,
     pub(super) resolved: tokio::sync::OnceCell<ra_mcp::client::McpClient>,
+    pub(super) view: super::BindingView,
 }
 
 // Adapter primary messages are already sanitized. Keep host display labels and the original
@@ -355,6 +356,6 @@ impl McpToolClientSource for DeferredClient {
                 result.map_err(startup_failure)
             })
             .await?;
-        Ok(client.clone())
+        Ok(self.view.client(client.clone()))
     }
 }

@@ -52,6 +52,8 @@
 //! the form it is decided and cached in, with the reason and command-prefix rule its kept decision
 //! gives; a patch with `item/fileChange/requestApproval`. An answer is applied to the thread's
 //! approval cache and, approving a rule, to its rules home, whose failure is the user's warning.
+//! Product MCP calls use the source form elicitation or blocking question. Only Auto decisions
+//! can populate their server/plugin/tool session cache; Prompt and Writes stay invocation-local.
 //!
 //! Permissions `request_permissions` granted the turn or the session are added to every later
 //! command that stays in the sandbox, as Codex's `apply_granted_turn_permissions` adds them: having
@@ -141,6 +143,7 @@ use std::{
 /// A policy captured by one model step and its tools.
 #[derive(Clone, Debug)]
 pub struct CodingThreadSettings {
+    pub(crate) mcp_approvals: Arc<Mutex<std::collections::BTreeSet<crate::mcp::McpApprovalKey>>>,
     cwd: PathBuf,
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
@@ -326,6 +329,9 @@ impl CodingThreadSettings {
             return None;
         }
         let approval = pending.approval();
+        if let Some(state) = crate::mcp::McpApprovalState::from_approval(approval) {
+            return Some(state.request(pending));
+        }
         if approval.namespace().is_some() {
             return None;
         }
@@ -528,6 +534,7 @@ impl CodingThreadSettingsAdapter {
                 command_decisions: Arc::new(CommandDecisions::default()),
                 approvals: Arc::default(),
                 permissions: Arc::default(),
+                mcp_approvals: Arc::default(),
             },
             profiles,
             file_system_read_profiles: BTreeMap::new(),
@@ -625,6 +632,7 @@ impl CodingThreadSettingsAdapter {
         settings.base_permission = config.permission().clone();
         settings.approvals = Arc::default();
         settings.permissions = Arc::default();
+        settings.mcp_approvals = Arc::default();
         install(config, settings)
     }
 
@@ -745,6 +753,10 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         let settings = config
             .app_context()
             .and_then(|value| value.downcast_ref::<CodingThreadSettings>())?;
+        if let Some(state) = crate::mcp::McpApprovalState::from_approval(approval) {
+            state.apply(settings, decision).await;
+            return None;
+        }
         settings.cache_review_decision(approval, decision);
         settings
             .persist_approved_execpolicy_amendment(decision)

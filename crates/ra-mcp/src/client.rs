@@ -214,23 +214,25 @@ pub struct McpClient {
     session: Arc<ClientSessionServer>,
     transport_failed: Arc<AtomicBool>,
     pub(crate) tools: Arc<crate::server::tools::ToolsCache>,
+    // A model step may retain its own policy while sharing the owned transport and cache.
+    binding_options: Option<Arc<McpClientOptions>>,
 }
 
 impl McpClient {
-    /// Server-wide input guardrail declarations, copied into each discovered tool.
+    /// Input guardrail declarations captured by this view, copied into each discovered tool.
     #[must_use]
     pub fn tool_input_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
-        &self.session.options.tool_input_guardrails
+        &self.options().tool_input_guardrails
     }
-    /// Server-wide output guardrail declarations, copied into each discovered tool.
+    /// Output guardrail declarations captured by this view, copied into each discovered tool.
     #[must_use]
     pub fn tool_output_guardrails(&self) -> &[ra_core::tool::ToolGuardrailId] {
-        &self.session.options.tool_output_guardrails
+        &self.options().tool_output_guardrails
     }
-    /// The server's local approval policy, shared by every discovered tool on this session.
+    /// The local approval policy captured by this view and its discovered tools.
     #[must_use]
     pub fn require_approval(&self) -> &crate::approval::RequireApprovalSetting {
-        &self.session.options.require_approval
+        &self.options().require_approval
     }
     #[cfg(any(feature = "stdio", feature = "http"))]
     /// Connects a configured transport through the same initialized session implementation.
@@ -275,6 +277,7 @@ impl McpClient {
         })?;
         Ok(Self {
             server_name: name.into(),
+            binding_options: None,
             transport_failed: Arc::default(),
             tools: Arc::new(crate::server::tools::ToolsCache::new(
                 options.cache_tools_list,
@@ -325,10 +328,20 @@ impl McpClient {
                 .is_none_or(|service| service.is_closed() || service.peer().is_transport_closed())
         })
     }
-    /// Session timeouts captured when connecting.
+    /// Request and tool policy captured by this client view.
     #[must_use]
     pub fn options(&self) -> &McpClientOptions {
-        &self.session.options
+        self.binding_options
+            .as_deref()
+            .unwrap_or(&self.session.options)
+    }
+    /// Captures request and tool policy for a model step while retaining the same transport,
+    /// cleanup owner and unfiltered tool cache. Other client clones keep their previous policy.
+    /// Initialization and transport-level settings are unaffected.
+    #[must_use]
+    pub fn with_binding_options(mut self, options: McpClientOptions) -> Self {
+        self.binding_options = Some(Arc::new(options));
+        self
     }
     async fn peer(&self) -> Result<Peer<RoleClient>> {
         self.session

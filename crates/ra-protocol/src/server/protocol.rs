@@ -43,6 +43,7 @@ mod dynamic_tools;
 mod hooks;
 mod item;
 mod mcp;
+mod mcp_elicitation;
 mod mcp_policy;
 mod permissions;
 mod plugin_management;
@@ -59,6 +60,10 @@ mod turn;
 
 use std::path::{Path, PathBuf};
 
+pub use mcp_elicitation::{
+    McpServerElicitationAction, McpServerElicitationRequest, McpServerElicitationRequestParams,
+    McpServerElicitationRequestResponse,
+};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
 pub use self::config::{

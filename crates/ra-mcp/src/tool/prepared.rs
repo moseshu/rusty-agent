@@ -97,6 +97,12 @@ impl McpToolCatalog {
         self.instructions = Some(instructions.into());
         self
     }
+    /// Captures the policy for a new model step without changing a retained catalog's policy.
+    #[must_use]
+    pub fn with_binding_options(mut self, options: McpClientOptions) -> Self {
+        self.options = options;
+        self
+    }
     /// Original registry identity.
     #[must_use]
     pub fn server_name(&self) -> &str {

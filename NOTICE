@@ -716,7 +716,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/config_manager_service/credential_edits.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager_service_credential_edits.rs |
 | `tests/it-coding/tests/config_manager_service.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager_service_tests.rs |
 | `tests/it-protocol/tests/request_serialization_shared_reads.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_serialization.rs::tests |
-| `crates/ra-coding/src/mcp/product.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs; codex-rs/codex-mcp/src/server.rs; codex-rs/codex-mcp/src/rmcp_client.rs; codex-rs/rmcp-client/src/utils.rs; codex-rs/network-proxy/src/certs.rs |
+| `crates/ra-coding/src/mcp/product.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs; codex-rs/codex-mcp/src/server.rs; codex-rs/codex-mcp/src/rmcp_client.rs; codex-rs/rmcp-client/src/utils.rs; codex-rs/network-proxy/src/certs.rs; codex-rs/core/src/mcp_tool_call.rs |
 | `crates/ra-coding/src/hooks/user_hook_bridge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/hook_runtime.rs; codex-rs/core/src/tools/hook_names.rs |
 | `crates/ra-coding/src/plugins/skill_provider.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/ext/skills/src/provider/host.rs |
 | `crates/ra-protocol/src/server/request_serialization.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/request_serialization.rs |
@@ -724,3 +724,18 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/plugins/remote.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/remote.rs (public service transport; account mechanisms excluded) |
 | `crates/ra-coding/src/plugins/remote_legacy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/remote_legacy.rs (anonymous featured-plugin fetch and errors) |
 | `tests/it-coding/tests/plugin_featured.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manager_tests.rs; codex-rs/core-plugins/src/remote_legacy.rs; codex-rs/app-server/tests/suite/v2/plugin_list.rs |
+
+| `crates/ra-coding/src/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs (connection reuse and per-step policy; SDK manager retains worker ownership) |
+| `tests/it-mcp/tests/product_runtime_binding/policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs; codex-rs/core/src/mcp_tool_call_tests.rs; codex-rs/codex-mcp/src/connection_manager_tests.rs (real-loader and transport acceptance adaptations) |
+
+| `crates/ra-coding/src/mcp/approval.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call.rs; codex-rs/codex-mcp/src/mcp/mod.rs; codex-rs/protocol/src/mcp_approval_meta.rs |
+
+| `crates/ra-protocol/src/server/protocol/mcp_elicitation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/mcp.rs (product-generated approval form projection; schema retained as JSON) |
+
+| `crates/ra-protocol/src/server/answers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call.rs; codex-rs/app-server/src/bespoke_event_handling.rs |
+
+| `crates/ra-protocol/src/server/approval_requests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call.rs; codex-rs/app-server/src/bespoke_event_handling.rs |
+
+| `crates/ra-protocol/src/server/protocol/server_request.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/common.rs |
+
+| `tests/it-mcp/tests/product_approvals.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call_tests.rs; codex-rs/codex-mcp/src/mcp/mod_tests.rs (real app-server, checkpoint and counted stdio acceptance adaptations) |

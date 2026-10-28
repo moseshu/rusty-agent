@@ -29,6 +29,12 @@ impl Default for McpServerManagerOptions {
 }
 
 impl McpServerManagerOptions {
+    /// The configured startup deadline, or `None` when startup is unbounded.
+    #[must_use]
+    pub const fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
     /// Sets the connect deadline; `None` disables it and zero is rejected.
     pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Result<Self> {
         validate_timeout(timeout)?;

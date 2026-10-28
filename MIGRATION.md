@@ -7,6 +7,60 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Product MCP approval requests and automatic approval
+
+Coding app-server threads now ask the client before product MCP calls execute. The effective
+`tool_call_mcp_elicitation` feature selects `mcpServer/elicitation/request` (the upstream default)
+or the blocking `item/tool/requestUserInput` fallback. The fallback refuses non-root agent calls
+with the upstream parent-agent handoff message. MCP forms report waiting on approval; fallback
+questions report waiting on user input. Declines and cancellations skip only the current call;
+the model receives the rejection or `user cancelled MCP tool call` result and the turn continues.
+Malformed or failed MCP form responses become declines; malformed or failed question responses
+cancel only the call. Explicit turn interruption still withdraws the request, and a late answer
+cannot approve another turn.
+
+Only Auto can remember a decision for the session. Prompt/Writes downgrade session and persistent
+answers to approval of the current invocation. Product approval happens inside the tool through
+the existing recoverable interruption contract, so SDK `always_approve` cannot suppress a later
+Prompt/Writes question. The generic SDK's approval behavior is unchanged.
+
+The upstream never-policy automatic-approval check uses the effective shared PermissionProfile:
+Disabled, External and managed full-disk-write profiles allow the call; restricted profiles refuse
+calls that still require approval. Approve mode allows without a product prompt. The coding
+adapter lowers its selected legacy policy through the executor's existing profile implementation,
+including protected paths; listing a writable root alone does not imply unrestricted authority.
+
+Auto's persistent choice uses the captured project/user/plugin configuration source, falling back
+to a session grant if persistence fails. This does not implement the pending general loaded-thread
+configuration hot-update capability. Refresh before initial startup now compares the startup
+deadline as well as identity, so the first connection uses the newly selected manager budget.
+
+The new elicitation wire records cover the product-generated standard approval form. Its empty
+schema is JSON rather than the upstream general form-schema type; constructors/accessors retain
+Rust public-record evolution safety. Arbitrary MCP-server forms, URL flows and OAuth/EMA lifecycle
+are still separate, unimplemented transport capabilities. This change adds no account machinery.
+
+### Product MCP policy and connection refresh corrections
+
+The plugin MCP catalog now applies managed plugin requirements before registration, including
+per-server command/URL matching and the global empty MCP allowlist. It retains upstream's
+requirements-layer emptiness rules: a document containing only empty plugin maps is elided;
+empty plugin maps in a retained document deny their servers.
+
+Product MCP registrations now consume `auto`, `prompt`, `writes`, `approve` and per-tool approval
+overrides. The SDK's explicitly registered servers retain their original `require_approval`
+defaults. A reused healthy connection captures updated deadlines and approval policy for new
+model steps; already discovered tools and resource bindings retain their previous policy.
+`McpClient::with_binding_options` and `McpToolCatalog::with_binding_options` expose immutable
+policy views over shared transport/catalog state. They do not create another cleanup owner or
+change transport initialization. `McpServerManagerOptions::connect_timeout()` exposes the configured
+deadline for pending-startup reconciliation.
+
+Refresh replaces ordinary failed or closed connections and retains only compatible active
+startups. Runtime disables remain disabled. A failed cleanup retains its lifecycle worker so
+refresh cannot create a second connection over unconfirmed cleanup. These corrections do not
+implement the remaining OAuth, EMA, executor transport or runtime context-injection gaps.
+
 ### Reviewed native-process and MCP registration API
 
 The native `ra_exec::process` exports retain Codex's owned Child stdio handles and explicit
