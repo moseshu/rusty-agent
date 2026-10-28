@@ -509,7 +509,12 @@ async fn methods_before_initialize_are_not_initialized() {
 async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     let server = Server::start();
     let mut connection = server.open(1).await;
-    let unknown = "Invalid request: unknown variant `config/read`, expected one of \
+    let unknown = "Invalid request: unknown variant `configRequirements/read`, expected one of \
+                   `skills/list`, `skills/extraRoots/set`, `hooks/list`, `marketplace/add`, \
+                   `marketplace/remove`, `marketplace/upgrade`, `plugin/list`, \
+                   `plugin/installed`, `plugin/read`, `plugin/install`, `plugin/uninstall`, \
+                   `skills/config/write`, `config/read`, `config/value/write`, \
+                   `config/batchWrite`, \
                    `mcpServerStatus/list`, `config/mcpServer/reload`, \
                    `mcpServer/reconnect`, `mcpServer/toggle`, \
                    `initialize`, `thread/start`, `thread/resume`, `thread/fork`, \
@@ -522,7 +527,9 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
                    `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
                    `turn/interrupt`, `mock/experimentalMethod`";
 
-    let answer = server.call(&mut connection, 1, "config/read", None).await;
+    let answer = server
+        .call(&mut connection, 1, "configRequirements/read", None)
+        .await;
     assert_eq!(answer, error(1, unknown));
     let answer = server.call(&mut connection, 2, "initialize", None).await;
     assert_eq!(answer, error(2, "Invalid request: missing field `params`"));
@@ -544,7 +551,9 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
     assert_eq!(answer, error(4, "Invalid request: missing field `version`"));
 
     server.initialize(&mut connection, "client", None).await;
-    let answer = server.call(&mut connection, 5, "config/read", None).await;
+    let answer = server
+        .call(&mut connection, 5, "configRequirements/read", None)
+        .await;
     assert_eq!(answer, error(5, unknown));
 }
 

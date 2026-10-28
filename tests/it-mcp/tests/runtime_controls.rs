@@ -938,3 +938,6 @@ mod resources;
 
 #[path = "runtime_controls/configured_host.rs"]
 mod configured_host;
+
+#[path = "runtime_controls/replacement.rs"]
+mod replacement;

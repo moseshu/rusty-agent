@@ -1,8 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Upstream raw-TOML merge fixtures; typed product projection is validated separately.
-
-use ra_config::{build_cli_overrides_layer, merge_toml_values};
-use toml::Value as TomlValue;
+use ra_config::config_toml::AgentsToml;
+use ra_config::config_toml::ConfigToml;
+use ra_config::types::MemoriesToml;
+use ra_config::{TomlValue, merge_toml_values};
 
 fn parse_toml(value: &str) -> TomlValue {
     toml::from_str(value).expect("TOML should parse")
@@ -32,6 +32,15 @@ disable_on_external_context = true
 "#,
     );
     assert_eq!(base, expected);
+
+    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
+    assert_eq!(
+        config.memories,
+        Some(MemoriesToml {
+            disable_on_external_context: Some(true),
+            ..Default::default()
+        })
+    );
 }
 
 #[test]
@@ -58,6 +67,15 @@ disable_on_external_context = true
 "#,
     );
     assert_eq!(base, expected);
+
+    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
+    assert_eq!(
+        config.memories,
+        Some(MemoriesToml {
+            disable_on_external_context: Some(true),
+            ..Default::default()
+        })
+    );
 }
 
 #[test]
@@ -106,6 +124,15 @@ max_concurrent_threads_per_session = 7
 "#,
     );
     assert_eq!(base, expected);
+
+    let config: ConfigToml = base.try_into().expect("merged config should deserialize");
+    assert_eq!(
+        config.agents,
+        Some(AgentsToml {
+            max_concurrent_threads_per_session: Some(7),
+            ..Default::default()
+        })
+    );
 }
 
 #[test]
@@ -223,7 +250,7 @@ fn multi_agent_v2_cli_overrides_preserve_boolean_and_nested_configuration() {
             vec![enabled.clone(), feature_table.clone()],
             vec![feature_table, enabled],
         ] {
-            assert_eq!(build_cli_overrides_layer(&overrides), expected);
+            assert_eq!(ra_config::build_cli_overrides_layer(&overrides), expected);
         }
     }
 }
@@ -249,7 +276,7 @@ fn code_mode_overrides_preserve_enabled_state_and_cell_overhead() {
                 vec![toggle.clone(), overhead.clone()],
                 vec![overhead, toggle],
             ] {
-                assert_eq!(build_cli_overrides_layer(&overrides), expected);
+                assert_eq!(ra_config::build_cli_overrides_layer(&overrides), expected);
             }
 
             let boolean_layer = parse_toml(&format!("[{feature_path}]\ncode_mode = {enabled}\n"));
@@ -282,7 +309,7 @@ fn sleep_tool_overrides_preserve_disabled_state_and_mode() {
             "[{feature_path}.sleep_tool]\nenabled = false\nmode = \"always_on\"\n",
         ));
         for overrides in [vec![disabled.clone(), mode.clone()], vec![mode, disabled]] {
-            assert_eq!(build_cli_overrides_layer(&overrides), expected);
+            assert_eq!(ra_config::build_cli_overrides_layer(&overrides), expected);
         }
 
         let boolean_layer = parse_toml(&format!("[{feature_path}]\nsleep_tool = false\n"));
@@ -313,7 +340,7 @@ fn network_proxy_feature_overrides_preserve_credential_broker_configuration() {
         parse_toml("[features.network_proxy]\nenabled = true\ncredential_broker = true\n");
 
     for overrides in [vec![enabled.clone(), broker.clone()], vec![broker, enabled]] {
-        assert_eq!(build_cli_overrides_layer(&overrides), expected);
+        assert_eq!(ra_config::build_cli_overrides_layer(&overrides), expected);
     }
 
     let mut base = parse_toml("[features]\nnetwork_proxy = true\n");
@@ -416,11 +443,11 @@ fn multi_agent_v2_cli_compatibility_excludes_opaque_desktop_paths() {
     let feature_table = (path, parse_toml("custom = true\n"));
 
     assert_eq!(
-        build_cli_overrides_layer(&[enabled.clone(), feature_table.clone()]),
+        ra_config::build_cli_overrides_layer(&[enabled.clone(), feature_table.clone()]),
         parse_toml("[desktop.features.multi_agent_v2]\ncustom = true\n")
     );
     assert_eq!(
-        build_cli_overrides_layer(&[feature_table, enabled]),
+        ra_config::build_cli_overrides_layer(&[feature_table, enabled]),
         parse_toml("[desktop.features]\nmulti_agent_v2 = true\n")
     );
 }

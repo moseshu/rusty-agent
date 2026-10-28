@@ -15,7 +15,12 @@ insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = "1"
+dunce = "1"
 tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 ra-uds = { path = "../../crates/ra-uds" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-foundation = "0.9"
+base64 = "0.22"

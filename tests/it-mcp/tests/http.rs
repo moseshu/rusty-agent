@@ -858,3 +858,40 @@ async fn cancelling_failed_initialize_cleanup_keeps_the_in_flight_delete() {
     assert_eq!(fixture.requests("DELETE").len(), 2);
     assert_eq!(delete_auths.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn routed_requests_keep_static_header_precedence_and_session_lifecycle() {
+    let fixture = Server::new().await;
+    let params = fixture
+        .params()
+        .with_route_factory(ra_http::HttpClientFactory::new(
+            ra_http::OutboundProxyPolicy::ReqwestDefault,
+        ))
+        .with_headers(std::collections::BTreeMap::from([
+            ("x-static".into(), "static".into()),
+            ("authorization".into(), "Bearer static".into()),
+        ]))
+        .with_auth(|request| async move {
+            Ok(request
+                .basic_auth("user", Some("password"))
+                .header("x-auth", "hook"))
+        });
+    let server = McpServerStreamableHttp::new(params);
+    server.connect().await.unwrap();
+    server.list_tools().await.unwrap();
+    fixture.wait_for("GET", 1).await;
+    server.cleanup().await.unwrap();
+
+    let seen = fixture.state.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    for request in seen.iter() {
+        assert_eq!(request.headers["x-static"], "static");
+        assert_eq!(request.headers["x-auth"], "hook");
+        assert_eq!(
+            request.headers["authorization"], "Basic dXNlcjpwYXNzd29yZA==",
+            "{}",
+            request.method
+        );
+    }
+    assert!(seen.iter().any(|request| request.method == Method::DELETE));
+}
