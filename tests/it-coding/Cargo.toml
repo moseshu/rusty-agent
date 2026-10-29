@@ -9,6 +9,9 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+dirs = "6"
+indexmap = { version = "2", features = ["serde"] }
+ra-filesystem = { path = "../../crates/ra-filesystem" }
 ra-executor = { path = "../../crates/ra-executor", features = ["test-api"] }
 ra-http = { path = "../../crates/ra-http" }
 ra-mcp = { path = "../../crates/ra-mcp" }

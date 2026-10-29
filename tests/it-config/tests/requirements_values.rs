@@ -95,6 +95,7 @@ fn composite_requirement_source_flattens_and_deduplicates_sources() {
 
 fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
     let ConfigRequirementsToml {
+        chatgpt_base_url,
         sqlite_home,
         log_dir,
         model_catalog_json,
@@ -136,6 +137,8 @@ fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSo
         guardian_extra_policy,
     } = toml;
     ConfigRequirementsWithSources {
+        chatgpt_base_url: chatgpt_base_url
+            .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         sqlite_home: sqlite_home.map(|value| Sourced::new(value, RequirementSource::Unknown)),
         log_dir: log_dir.map(|value| Sourced::new(value, RequirementSource::Unknown)),
         model_catalog_json: model_catalog_json
@@ -656,6 +659,7 @@ fn merge_unset_fields_copies_every_field_and_sets_sources() {
     // Intentionally constructed without `..Default::default()` so adding a new field to
     // `ConfigRequirementsToml` forces this test to be updated.
     let other = ConfigRequirementsToml {
+        chatgpt_base_url: Some("https://managed.example.test/".to_string()),
         sqlite_home: Some(sqlite_home.clone()),
         log_dir: Some(log_dir.clone()),
         model_catalog_json: Some(model_catalog_json.clone()),
@@ -702,6 +706,10 @@ fn merge_unset_fields_copies_every_field_and_sets_sources() {
     assert_eq!(
         target,
         ConfigRequirementsWithSources {
+            chatgpt_base_url: Some(Sourced::new(
+                "https://managed.example.test/".to_string(),
+                source.clone()
+            )),
             sqlite_home: Some(Sourced::new(sqlite_home, source.clone())),
             log_dir: Some(Sourced::new(log_dir, source.clone())),
             model_catalog_json: Some(Sourced::new(model_catalog_json, source.clone())),
