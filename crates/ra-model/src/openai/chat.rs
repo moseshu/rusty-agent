@@ -167,7 +167,7 @@ impl OpenAiChatProvider {
             auth: Arc::new(auth),
             client,
             default_model,
-            quirks: ProviderQuirks::new(),
+            quirks: ProviderQuirks::new().with_developer_role(true),
             options: ChatLoweringOptions::new(),
             replay: ReasoningReplayPolicy::default(),
             terminator: Terminator::default(),
@@ -294,7 +294,7 @@ impl OpenAiChatModel {
             codec: ChatCodec {
                 model,
                 base_url: auth.base_url().to_owned(),
-                quirks: ProviderQuirks::new(),
+                quirks: ProviderQuirks::new().with_developer_role(true),
                 options: ChatLoweringOptions::new(),
                 replay: ReasoningReplayPolicy::default(),
                 terminator: Terminator::default(),

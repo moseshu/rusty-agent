@@ -50,6 +50,7 @@ impl PendingInput {
     }
 
     /// Queues `messages` for the run's next model-call boundary.
+    /// The runtime emits `UserPromptSubmit` once at delivery; hosts must not emit it when pushing.
     ///
     /// # Errors
     ///
@@ -92,6 +93,11 @@ impl PendingInput {
         let mut state = self.lock();
         state.closed = true;
         std::mem::take(&mut state.messages)
+    }
+
+    /// Stops accepting new input while leaving already accepted messages available to settlement.
+    pub(crate) fn seal(&self) {
+        self.lock().closed = true;
     }
 
     /// Takes everything pending, leaving the queue open.

@@ -290,8 +290,11 @@ impl MessageAccumulator {
         }
     }
     async fn message(&mut self, message: &Message) -> Result<()> {
+        if message.is_selection_only() {
+            return Ok(());
+        }
         let role = match message.role() {
-            MessageRole::User => "user",
+            MessageRole::User | MessageRole::Developer => "user",
             MessageRole::Assistant => ASSISTANT_ROLE,
             MessageRole::System => {
                 return Err(Error::caller(
@@ -305,7 +308,12 @@ impl MessageAccumulator {
             }
         };
         let mut blocks = Vec::with_capacity(message.content().len());
-        for block in message.content() {
+        for block in message.content().iter().filter(|block| {
+            !matches!(
+                block,
+                ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+            )
+        }) {
             blocks.push(lower_content(block, message.role()).await?);
         }
         self.push(role, blocks);

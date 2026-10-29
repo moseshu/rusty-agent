@@ -8,10 +8,9 @@
 //! `PermissionRequest` decision becomes a grant or denial, and a Stop or `SubagentStop` block becomes
 //! a continuation prompt.
 //!
-//! The runtime decision set has no channel for the other source effects: additional model
-//! context, rewritten tool input, stop-processing requests and `PostToolUse` feedback. They are not
-//! applied. Each one is kept as an [`UnappliedHookEffect`] and logged, so a host can see what a
-//! hook asked for; this bridge does not claim them as delivered.
+//! Context is delivered through the run-owned history queue; native argument rewrites and
+//! model-visible result replacements are applied at the runtime admission boundaries.
+//! Session stop-processing is returned as a host-owned prompt rejection.
 //!
 //! Completed hook runs, including background handlers that finish later, are published on
 //! [`ProductHookRuntime::subscribe_completed`]. Refreshing the configuration keeps running
@@ -23,10 +22,11 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use async_trait::async_trait;
 use ra_config::AskForApproval;
 use ra_core::error::Result;
+use ra_core::hook::HookContextQueue;
 use ra_core::hook::{
     HookDecision, HookEvent, HookEventName, ToolHookData, UserHook, UserHookContext,
 };
-use ra_core::item::{MessageRole, ModelInputItem};
+use ra_core::item::{Message, MessageRole, ModelInputItem};
 use ra_core::session::SessionId;
 use ra_paths::AbsolutePathBuf;
 use ra_protocol::server::protocol::HookCompletedEvent;
@@ -38,7 +38,7 @@ use super::events::permission_request::{PermissionRequestDecision, PermissionReq
 use super::events::post_tool_use::PostToolUseRequest;
 use super::events::pre_tool_use::PreToolUseRequest;
 use super::events::session_end::SessionEndRequest;
-use super::events::session_start::{SessionStartRequest, SessionStartSource, StartHookTarget};
+use super::events::session_start::{SessionStartRequest, StartHookTarget};
 use super::events::stop::{StopHookTarget, StopRequest};
 use super::events::user_prompt_submit::UserPromptSubmitRequest;
 use super::{Hooks, HooksConfig};
@@ -99,6 +99,7 @@ pub struct ProductHookRuntime {
     completed: broadcast::Sender<HookCompletedEvent>,
     unapplied: Mutex<Vec<UnappliedHookEffect>>,
     forwarder: tokio::task::JoinHandle<()>,
+    context_delivery: Arc<Mutex<ContextDelivery>>,
 }
 
 impl ProductHookRuntime {
@@ -115,8 +116,26 @@ impl ProductHookRuntime {
         let (hooks, background) = Hooks::new(config, session.session_id.clone(), mcp_executor)?;
         let (completed, _) = broadcast::channel(256);
         let forward = completed.clone();
+        let context_delivery = Arc::new(Mutex::new(ContextDelivery::default()));
+        let delivery = Arc::clone(&context_delivery);
         let forwarder = tokio::spawn(async move {
             while let Ok(event) = background.recv().await {
+                let messages = event
+                    .run
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.kind,
+                            ra_protocol::server::protocol::HookOutputEntryKind::Context
+                        )
+                    })
+                    .map(|entry| Message::developer(entry.text.clone()))
+                    .collect();
+                delivery
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .deliver_to(event.turn_id.as_deref(), messages, true);
                 let _ = forward.send(event);
             }
         });
@@ -126,6 +145,7 @@ impl ProductHookRuntime {
             completed,
             unapplied: Mutex::new(Vec::new()),
             forwarder,
+            context_delivery,
         }))
     }
 
@@ -150,7 +170,8 @@ impl ProductHookRuntime {
         self.completed.subscribe()
     }
 
-    /// Removes and returns the effects recorded since the last call.
+    /// Legacy diagnostic drain retained for source compatibility. Implemented effects are applied
+    /// directly and no longer appear here.
     pub fn take_unapplied_effects(&self) -> Vec<UnappliedHookEffect> {
         std::mem::take(
             &mut *self
@@ -174,14 +195,17 @@ impl ProductHookRuntime {
             HookEventName::SubagentStop,
         ]
         .into_iter()
-        .fold(UserHooks::default(), |hooks, event| {
-            hooks.with_hook(UserHookRegistration::new(
-                event,
-                Arc::new(ProductHook {
-                    runtime: Arc::clone(self),
-                }),
-            ))
-        })
+        .fold(
+            UserHooks::default().with_session_id(self.session.session_id.clone()),
+            |hooks, event| {
+                hooks.with_hook(UserHookRegistration::new(
+                    event,
+                    Arc::new(ProductHook {
+                        runtime: Arc::clone(self),
+                    }),
+                ))
+            },
+        )
     }
 
     fn publish(&self, events: Vec<HookCompletedEvent>) {
@@ -190,21 +214,15 @@ impl ProductHookRuntime {
         }
     }
 
-    fn record(&self, effect: UnappliedHookEffect) {
-        tracing::warn!(
-            ?effect,
-            "hook effect is not applied by the runtime dispatcher"
-        );
-        self.unapplied
+    fn record_contexts(&self, context: &UserHookContext<'_>, contexts: Vec<String>) {
+        self.context_delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(effect);
-    }
-
-    fn record_contexts(&self, event: HookEventName, contexts: Vec<String>) {
-        if !contexts.is_empty() {
-            self.record(UnappliedHookEffect::AdditionalContext { event, contexts });
-        }
+            .deliver_to(
+                Some(context.run().run_id().as_str()),
+                contexts.into_iter().map(Message::developer).collect(),
+                false,
+            );
     }
 
     fn permission_mode(&self) -> String {
@@ -220,29 +238,24 @@ impl ProductHookRuntime {
         let session = &self.session;
         let turn_id = context.run().run_id().to_string();
         match *event {
-            HookEvent::SessionStart { resumed, .. } => {
+            HookEvent::SessionStart { source, .. } => {
                 let request = SessionStartRequest {
                     session_id: session.session_id.clone(),
                     cwd: session.cwd.clone(),
                     transcript_path: session.transcript_path.clone(),
                     model: session.model.clone(),
                     permission_mode: self.permission_mode(),
-                    target: StartHookTarget::SessionStart {
-                        source: if resumed {
-                            SessionStartSource::Resume
-                        } else {
-                            SessionStartSource::Startup
-                        },
-                    },
+                    target: StartHookTarget::SessionStart { source },
                 };
                 let outcome = hooks.run_session_start(request, None).await;
                 self.publish(outcome.hook_events);
-                self.record_contexts(HookEventName::SessionStart, outcome.additional_contexts);
+                self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_stop {
-                    self.record(UnappliedHookEffect::StopProcessing {
-                        event: HookEventName::SessionStart,
-                        reason: outcome.stop_reason,
-                    });
+                    return HookDecision::Deny {
+                        message: outcome
+                            .stop_reason
+                            .unwrap_or_else(|| "Hook stopped prompt processing".to_owned()),
+                    };
                 }
                 HookDecision::Continue
             }
@@ -256,6 +269,7 @@ impl ProductHookRuntime {
                     })
                     .await;
                 self.publish(outcome.hook_events);
+                hooks.shutdown().await;
                 HookDecision::Continue
             }
             HookEvent::UserPromptSubmit { input } => {
@@ -272,12 +286,13 @@ impl ProductHookRuntime {
                     })
                     .await;
                 self.publish(outcome.hook_events);
-                self.record_contexts(HookEventName::UserPromptSubmit, outcome.additional_contexts);
+                self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_stop {
-                    self.record(UnappliedHookEffect::StopProcessing {
-                        event: HookEventName::UserPromptSubmit,
-                        reason: outcome.stop_reason,
-                    });
+                    return HookDecision::Deny {
+                        message: outcome
+                            .stop_reason
+                            .unwrap_or_else(|| "Hook stopped prompt processing".to_owned()),
+                    };
                 }
                 HookDecision::Continue
             }
@@ -296,22 +311,26 @@ impl ProductHookRuntime {
                         tool_name: tool.name.clone(),
                         matcher_aliases: tool.matcher_aliases.clone(),
                         tool_use_id: tool_use_id.clone(),
-                        tool_input: call.arguments().clone(),
+                        tool_input: hook_input(&call),
                     })
                     .await;
                 self.publish(outcome.hook_events);
-                self.record_contexts(HookEventName::PreToolUse, outcome.additional_contexts);
+                self.record_contexts(context, outcome.additional_contexts);
                 if !outcome.should_block {
-                    if let Some(input) = outcome.updated_input {
-                        self.record(UnappliedHookEffect::UpdatedInput { tool_use_id, input });
-                    }
-                    return HookDecision::Continue;
+                    return outcome
+                        .updated_input
+                        .map_or(HookDecision::Continue, |input| {
+                            match native_input(&call, input) {
+                                Ok(input) => HookDecision::UpdateInput { input },
+                                Err(message) => HookDecision::Deny { message },
+                            }
+                        });
                 }
                 let Some(reason) = outcome.block_reason else {
                     return HookDecision::Continue;
                 };
                 HookDecision::Deny {
-                    message: blocked_tool_message(&tool, call.arguments(), &reason),
+                    message: blocked_tool_message(&tool, &hook_input(&call), &reason),
                 }
             }
             HookEvent::PermissionRequest(call) => {
@@ -328,7 +347,7 @@ impl ProductHookRuntime {
                         tool_name: tool.name,
                         matcher_aliases: tool.matcher_aliases,
                         run_id_suffix: call.call_id().to_string(),
-                        tool_input: call.arguments().clone(),
+                        tool_input: hook_input(&call),
                     })
                     .await;
                 self.publish(outcome.hook_events);
@@ -342,7 +361,6 @@ impl ProductHookRuntime {
             }
             HookEvent::PostToolUse { call, output } => {
                 let tool = HookToolName::for_call(&call);
-                let tool_use_id = call.call_id().to_string();
                 let tool_response = output.as_text().map_or_else(
                     || serde_json::to_value(output).unwrap_or(Value::Null),
                     |text| Value::String(text.to_owned()),
@@ -358,20 +376,25 @@ impl ProductHookRuntime {
                         permission_mode: self.permission_mode(),
                         tool_name: tool.name,
                         matcher_aliases: tool.matcher_aliases,
-                        tool_use_id: tool_use_id.clone(),
-                        tool_input: call.arguments().clone(),
+                        tool_use_id: call.call_id().to_string(),
+                        tool_input: hook_input(&call),
                         tool_response,
                     })
                     .await;
                 self.publish(outcome.hook_events);
-                self.record_contexts(HookEventName::PostToolUse, outcome.additional_contexts);
-                if outcome.should_block || outcome.feedback_message.is_some() {
-                    self.record(UnappliedHookEffect::PostToolUseFeedback {
-                        tool_use_id,
-                        message: outcome.feedback_message,
-                    });
+                self.record_contexts(context, outcome.additional_contexts);
+                if outcome.should_block {
+                    return HookDecision::Deny {
+                        message: outcome.feedback_message.unwrap_or_else(|| {
+                            "PostToolUse hook blocked the tool result".to_owned()
+                        }),
+                    };
                 }
-                HookDecision::Continue
+                outcome
+                    .feedback_message
+                    .map_or(HookDecision::Continue, |message| {
+                        HookDecision::ReplaceOutput { message }
+                    })
             }
             HookEvent::Stop(delivery) | HookEvent::SubagentStop { delivery, .. } => {
                 let event_name = event.name();
@@ -402,21 +425,26 @@ impl ProductHookRuntime {
                     .await;
                 self.publish(std::mem::take(&mut outcome.hook_events));
                 if outcome.should_stop {
-                    self.record(UnappliedHookEffect::StopProcessing {
-                        event: event_name,
-                        reason: outcome.stop_reason.clone(),
-                    });
+                    return HookDecision::Deny {
+                        message: outcome
+                            .stop_reason
+                            .unwrap_or_else(|| "Stop hook stopped processing".to_owned()),
+                    };
                 }
                 if !outcome.should_block {
                     return HookDecision::Continue;
                 }
-                // The source records each fragment as a hook-prompt item keyed by its run; the
-                // dispatcher takes one plain continuation prompt, so the texts are joined in order.
                 let prompt = outcome
                     .continuation_fragments
                     .iter()
                     .filter(|fragment| !fragment.hook_run_id.trim().is_empty())
-                    .map(|fragment| fragment.text.as_str())
+                    .map(|fragment| {
+                        format!(
+                            "<hook_prompt hook_run_id=\"{}\">{}</hook_prompt>",
+                            escape_xml(&fragment.hook_run_id),
+                            escape_xml(&fragment.text)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 HookDecision::Block { prompt }
@@ -440,6 +468,23 @@ struct ProductHook {
 impl UserHook for ProductHook {
     fn name(&self) -> &'static str {
         "product hooks"
+    }
+
+    fn bind_context(&self, run: &ra_core::context::RunContext, output: &HookContextQueue) {
+        let mut delivery = self
+            .runtime
+            .context_delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        delivery.queues.retain(|_, queue| !queue.is_closed());
+        delivery
+            .queues
+            .insert(run.run_id().to_string(), output.clone());
+        if run.parent_run_id().is_none() {
+            delivery.root = Some(output.clone());
+            let pending = std::mem::take(&mut delivery.pending);
+            delivery.deliver_to(Some(run.run_id().as_str()), pending, true);
+        }
     }
 
     async fn call(
@@ -522,4 +567,85 @@ fn user_prompt(input: &[ModelInputItem]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Default)]
+struct ContextDelivery {
+    queues: std::collections::HashMap<String, HookContextQueue>,
+    root: Option<HookContextQueue>,
+    pending: Vec<Message>,
+}
+impl ContextDelivery {
+    fn deliver_to(&mut self, turn_id: Option<&str>, messages: Vec<Message>, background: bool) {
+        if messages.is_empty() {
+            return;
+        }
+        let queue = turn_id
+            .and_then(|id| self.queues.get(id))
+            .or(self.root.as_ref());
+        let remaining = match queue {
+            Some(queue) => {
+                let result = if background {
+                    queue.push_background(messages)
+                } else {
+                    queue.push(messages)
+                };
+                result.err().unwrap_or_default()
+            }
+            None => messages,
+        };
+        self.pending.extend(remaining);
+    }
+}
+
+fn hook_input(call: &ToolHookData<'_>) -> Value {
+    if call.origin().namespace().is_none() {
+        match call.origin().name() {
+            "exec_command" => {
+                return serde_json::json!({"command": call.arguments().get("cmd").cloned().unwrap_or(Value::Null)});
+            }
+            "apply_patch" => {
+                return serde_json::json!({"command": call.arguments().as_str().map(str::to_owned).or_else(|| call.arguments().get("patch").and_then(Value::as_str).map(str::to_owned))});
+            }
+            _ => {}
+        }
+    }
+    call.arguments().clone()
+}
+fn native_input(call: &ToolHookData<'_>, input: Value) -> std::result::Result<Value, String> {
+    if call.origin().namespace().is_none()
+        && matches!(call.origin().name(), "exec_command" | "apply_patch")
+    {
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "hook input rewrite requires a string command".to_owned())?;
+        if call.origin().name() == "apply_patch" {
+            return match call.arguments() {
+                Value::String(_) => Ok(Value::String(command.to_owned())),
+                Value::Object(_) => {
+                    let mut native = call.arguments().clone();
+                    native["patch"] = Value::String(command.to_owned());
+                    Ok(native)
+                }
+                _ => Err(
+                    "hook input rewrite requires string or object apply_patch arguments".to_owned(),
+                ),
+            };
+        }
+        let mut native = call.arguments().clone();
+        native
+            .as_object_mut()
+            .ok_or_else(|| "hook input rewrite requires exec_command arguments".to_owned())?
+            .insert("cmd".to_owned(), Value::String(command.to_owned()));
+        return Ok(native);
+    }
+    Ok(input)
+}
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }

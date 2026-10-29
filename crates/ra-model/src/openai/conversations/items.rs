@@ -6,8 +6,8 @@ use ra_core::{
     item::{
         Base64FileSource, CallId, ContentBlock, FileBlock, FileSource, ImageBlock, ImageDetail,
         ImageSource, InputItemDigest, ItemId, McpApprovalRequest, McpApprovalResponse, Message,
-        MessageRole, OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind, TextBlock,
-        ToolCallKind, ToolCallOutput,
+        MessageRole, ModelInputItem, OutputPhase, RawProviderItem, Reasoning, RunItem, RunItemKind,
+        TextBlock, ToolCallKind, ToolCallOutput,
     },
     model::ProviderKey,
     tool::{ToolOutput, ToolOutputBlock},
@@ -103,6 +103,9 @@ pub(super) async fn lower_for_conversation(items: &[RunItem]) -> Result<Vec<Valu
                 item.id()
             ))
         })?;
+        if matches!(&input, ModelInputItem::Message(message) if message.is_selection_only()) {
+            continue;
+        }
         let value = sanitize(lower_input_item(&input, &[]).await?);
         if !is_unpersistable(&value) {
             lowered.push(value);
@@ -195,8 +198,8 @@ fn lift_message(item: &Value) -> Result<Message> {
     let role = match required_str(item, "role", "conversation message")? {
         "user" => MessageRole::User,
         "assistant" => MessageRole::Assistant,
-        // The neutral model has one instruction role; `developer` is the newer name for it.
-        "system" | "developer" => MessageRole::System,
+        "system" => MessageRole::System,
+        "developer" => MessageRole::Developer,
         other => {
             return Err(behavior_error(format!(
                 "unexpected OpenAI conversation message role `{other}`"

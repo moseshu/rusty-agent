@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(16);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(18);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -204,9 +204,19 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          rules and asks again. An older runtime cannot read a session rule that carries an owner.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(16),
         "Persisted accepted input awaiting contextual contributions. An older runtime may infer \
          without completing those contributions after a cancelled preparation.",
+    ),
+    (
+        SchemaVersion::new(17),
+        "Persisted contextual hook history waiting for a complete tool batch. Older runtimes \
+         retain this field but cannot deliver its messages after approval recovery.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted background context follow-up intent separately from synchronous hook history. \
+         Older runtimes cannot preserve a background wakeup when resumed tools conclude the run.",
     ),
 ];
 
@@ -1091,6 +1101,10 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_input_contributions: Vec<ModelInputItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_hook_context: Vec<crate::item::Message>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pending_hook_context_follow_up: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     generated_items: Vec<RunItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     model_responses: Vec<ModelResponse>,
@@ -1219,6 +1233,10 @@ struct RunStateRecord {
     original_input: Vec<ModelInputItem>,
     #[serde(default)]
     pending_input_contributions: Vec<ModelInputItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_hook_context: Vec<crate::item::Message>,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pending_hook_context_follow_up: bool,
     #[serde(default)]
     generated_items: Vec<RunItem>,
     #[serde(default)]
@@ -1305,6 +1323,8 @@ impl TryFrom<RunStateRecord> for RunState {
             current_agent,
             original_input,
             pending_input_contributions,
+            pending_hook_context,
+            pending_hook_context_follow_up,
             generated_items,
             model_responses,
             pending_interruptions,
@@ -1456,6 +1476,8 @@ impl TryFrom<RunStateRecord> for RunState {
             current_agent,
             original_input,
             pending_input_contributions,
+            pending_hook_context,
+            pending_hook_context_follow_up,
             generated_items,
             model_responses,
             pending_interruptions,
@@ -1525,6 +1547,8 @@ impl RunState {
             current_agent: None,
             original_input: Vec::new(),
             pending_input_contributions: Vec::new(),
+            pending_hook_context: Vec::new(),
+            pending_hook_context_follow_up: false,
             generated_items: Vec::new(),
             model_responses: Vec::new(),
             pending_interruptions: Vec::new(),
@@ -1950,6 +1974,31 @@ impl RunState {
     #[must_use]
     pub fn original_input(&self) -> &[ModelInputItem] {
         &self.original_input
+    }
+
+    /// Context awaiting delivery after interrupted tools have all settled.
+    pub fn queue_hook_context(&mut self, messages: Vec<crate::item::Message>) {
+        self.queue_hook_context_with_follow_up(messages, false);
+    }
+    /// Retains contextual history and whether background completion needs follow-up sampling.
+    pub fn queue_hook_context_with_follow_up(
+        &mut self,
+        messages: Vec<crate::item::Message>,
+        follow_up: bool,
+    ) {
+        self.pending_hook_context_follow_up |= follow_up && !messages.is_empty();
+        self.pending_hook_context.extend(messages);
+    }
+    /// Takes contextual history without invoking input contributors.
+    pub fn take_hook_context(&mut self) -> Vec<crate::item::Message> {
+        self.take_hook_context_with_follow_up().0
+    }
+    /// Takes contextual history with its durable background follow-up intent.
+    pub fn take_hook_context_with_follow_up(&mut self) -> (Vec<crate::item::Message>, bool) {
+        (
+            std::mem::take(&mut self.pending_hook_context),
+            std::mem::take(&mut self.pending_hook_context_follow_up),
+        )
     }
 
     /// Accepted input whose contextual contributors have not committed yet.

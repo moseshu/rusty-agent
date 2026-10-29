@@ -1698,7 +1698,12 @@ async fn run_once(
     let mut request = match request {
         Ok(request) => request
             .with_config(environment.config.clone())
-            .with_services(environment.services.clone())
+            .with_services(
+                environment
+                    .services
+                    .clone()
+                    .with_hook_context(ra_core::hook::HookContextQueue::default()),
+            )
             .with_agent_control(handle.clone()),
         Err(error) => {
             handle.run_finished(&Err(error));

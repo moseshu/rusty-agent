@@ -19,6 +19,9 @@ pub(super) async fn lower_items(items: &[RunItem], provider: &ProviderKey) -> Re
     let mut wire = Vec::with_capacity(items.len());
     for item in items {
         if let Some(input) = item.to_model_input() {
+            if matches!(&input, ModelInputItem::Message(message) if message.is_selection_only()) {
+                continue;
+            }
             wire.push(lower_item(&input, provider).await?);
         }
     }

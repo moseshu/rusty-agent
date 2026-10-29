@@ -302,6 +302,9 @@ pub(crate) async fn lower_input(request: &ModelRequest) -> Result<Vec<Value>> {
         })?;
     let mut input = Vec::with_capacity(normalized.entries().len());
     for entry in normalized.entries() {
+        if matches!(entry.item(), ModelInputItem::Message(message) if message.is_selection_only()) {
+            continue;
+        }
         input.push(lower_input_item(entry.item(), request.handoffs()).await?);
     }
     Ok(input)
@@ -489,7 +492,12 @@ fn lower_reasoning(reasoning: &ra_core::item::Reasoning) -> Value {
 
 async fn lower_message(message: &Message) -> Result<Value> {
     let mut content = Vec::with_capacity(message.content().len());
-    for block in message.content() {
+    for block in message.content().iter().filter(|block| {
+        !matches!(
+            block,
+            ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+        )
+    }) {
         content.push(lower_content(block, message.role()).await?);
     }
     let mut value = json!({

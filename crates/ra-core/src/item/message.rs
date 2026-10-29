@@ -20,6 +20,8 @@ pub const MODEL_RESPONSE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 pub enum MessageRole {
     /// Stable or dynamic system instructions.
     System,
+    /// Instructions supplied by the application within conversation history.
+    Developer,
     /// User input.
     User,
     /// Model output.
@@ -32,6 +34,7 @@ impl MessageRole {
     pub const fn label(self) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Developer => "developer",
             Self::User => "user",
             Self::Assistant => "assistant",
         }
@@ -64,6 +67,18 @@ impl Message {
         }
     }
 
+    /// Whether this message contains only host selections and contributes no model content.
+    #[must_use]
+    pub fn is_selection_only(&self) -> bool {
+        !self.content.is_empty()
+            && self.content.iter().all(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+                )
+            })
+    }
+
     /// Creates a message containing one text block.
     #[must_use]
     pub fn text(role: MessageRole, text: impl Into<String>) -> Self {
@@ -80,6 +95,12 @@ impl Message {
     #[must_use]
     pub fn system(text: impl Into<String>) -> Self {
         Self::text(MessageRole::System, text)
+    }
+
+    /// Creates a developer instruction message.
+    #[must_use]
+    pub fn developer(text: impl Into<String>) -> Self {
+        Self::text(MessageRole::Developer, text)
     }
 
     /// Creates an assistant text message with an output phase.

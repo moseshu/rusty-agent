@@ -154,11 +154,18 @@ fn insert_thinking(
 fn lower_messages(request: &ModelRequest) -> Result<Vec<Value>> {
     let mut messages = Vec::new();
     for item in request.input() {
+        if matches!(item, ModelInputItem::Message(message) if message.is_selection_only()) {
+            continue;
+        }
         match item {
             ModelInputItem::Message(message) => match message.role() {
-                MessageRole::User | MessageRole::Assistant => {
+                MessageRole::User | MessageRole::Developer | MessageRole::Assistant => {
                     messages.push(LoweredMessage::message(
-                        message.role().label(),
+                        if message.role() == MessageRole::Developer {
+                            "user"
+                        } else {
+                            message.role().label()
+                        },
                         lower_message_content(message.content())?,
                     ));
                 }
@@ -265,6 +272,12 @@ impl LoweredMessage {
 fn lower_message_content(blocks: &[ContentBlock]) -> Result<Vec<Value>> {
     blocks
         .iter()
+        .filter(|block| {
+            !matches!(
+                block,
+                ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+            )
+        })
         .map(|block| match block {
             ContentBlock::Text(text) => Ok(json!({"type": "text", "text": text.text()})),
             _ => Err(Error::caller(format!(

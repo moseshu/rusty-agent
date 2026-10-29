@@ -29,6 +29,7 @@ pub struct ProviderQuirks {
     multimodal_tool_output: bool,
     reasoning_content: bool,
     thinking_blocks: bool,
+    developer_role: bool,
 }
 
 impl ProviderQuirks {
@@ -43,7 +44,20 @@ impl ProviderQuirks {
             multimodal_tool_output: false,
             reasoning_content: false,
             thinking_blocks: false,
+            developer_role: false,
         }
+    }
+
+    /// Declares that a Chat endpoint accepts the developer instruction role.
+    #[must_use]
+    pub const fn with_developer_role(mut self, supported: bool) -> Self {
+        self.developer_role = supported;
+        self
+    }
+    /// Whether developer messages remain developer on the Chat wire.
+    #[must_use]
+    pub const fn developer_role(self) -> bool {
+        self.developer_role
     }
 
     /// Declares that this endpoint honours a top-level `prompt_cache_key`.

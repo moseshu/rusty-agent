@@ -25,27 +25,7 @@ use crate::hooks::schema::NullableString;
 use crate::hooks::schema::SessionStartCommandInput;
 use crate::hooks::schema::SubagentStartCommandInput;
 
-#[derive(Debug, Clone, Copy)]
-pub enum SessionStartSource {
-    Startup,
-    Resume,
-    Clear,
-    Compact,
-    Fork,
-}
-
-impl SessionStartSource {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Startup => "startup",
-            Self::Resume => "resume",
-            Self::Clear => "clear",
-            Self::Compact => "compact",
-            Self::Fork => "fork",
-        }
-    }
-}
+pub use ra_core::hook::SessionStartSource;
 
 #[derive(Debug, Clone)]
 pub struct SessionStartRequest {

@@ -739,3 +739,5 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-protocol/src/server/protocol/server_request.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/common.rs |
 
 | `tests/it-mcp/tests/product_approvals.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call_tests.rs; codex-rs/codex-mcp/src/mcp/mod_tests.rs (real app-server, checkpoint and counted stdio acceptance adaptations) |
+
+| `crates/ra-coding/src/plugins/input_contributor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/injection.rs; codex-rs/core/src/session/turn.rs (accepted-input contributor adaptation) |

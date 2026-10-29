@@ -616,7 +616,7 @@ fn is_fork_turn_boundary(item: &ModelInputItem) -> bool {
 fn keep_forked_item(item: &ModelInputItem) -> bool {
     match item {
         ModelInputItem::Message(message) => match message.role() {
-            MessageRole::System => true,
+            MessageRole::System | MessageRole::Developer => true,
             MessageRole::User => InterAgentMessageKind::of(message).is_none(),
             MessageRole::Assistant => message.phase() == Some(OutputPhase::Final),
         },

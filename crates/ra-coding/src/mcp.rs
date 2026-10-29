@@ -873,6 +873,24 @@ impl CodingMcpRuntime {
             None => tool,
         }
     }
+    pub(crate) async fn visible_server_names(&self, context: &RunContext) -> Result<Vec<String>> {
+        let bindings = self.bindings();
+        let catalogs = self.tool_catalogs(&bindings).await;
+        let tools = discover_catalog_tools(
+            &catalogs,
+            &self.discovery,
+            &BTreeSet::new(),
+            Some(context),
+            Some(context.agent()),
+        )
+        .await?;
+        Ok(tools
+            .iter()
+            .map(|tool| tool.info().server_name().to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
     fn bindings(&self) -> Vec<(Arc<Entry>, BindingView)> {
         self.entries
             .read()
@@ -926,78 +944,7 @@ impl ToolResolver for CodingMcpRuntime {
         let _ = self.get_mcp_status();
         let bindings = self.bindings();
         let resource_sources = Self::resource_sources(&bindings);
-        let catalogs = join_all(bindings.iter().map(|(entry, view)| async {
-            entry.wait_for_catalog().await;
-            let (enabled, stopped, status, cached, epoch, generation) = {
-                let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
-                (
-                    state.enabled,
-                    state.stopped,
-                    state.status,
-                    state.cached_catalog.clone().filter(|_| {
-                        matches!(state.status, Status::NotStarted | Status::Starting)
-                            || (entry.automatic_retry
-                                && matches!(state.status, Status::Failed | Status::Cancelled)
-                                && !state.cleanup_failed)
-                    }),
-                    state.epoch,
-                    state.generation,
-                )
-            };
-            if !enabled || stopped {
-                return None;
-            }
-            if status == Status::Connected {
-                let client = match entry.server.current_client() {
-                    Ok(client) => view.client(client),
-                    Err(error) => {
-                        entry.fail("session", Arc::new(error));
-                        return None;
-                    }
-                };
-                match McpToolCatalog::fetch(&client).await {
-                    Ok(catalog) => {
-                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.generation != generation {
-                            return None;
-                        }
-                        state.cached_catalog = Some(catalog.clone());
-                        state.tools_error = None;
-                        Some((
-                            catalog,
-                            Arc::new(client) as Arc<dyn McpToolClientSource>,
-                            view.filter.clone(),
-                        ))
-                    }
-                    Err(error) => {
-                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.generation == generation {
-                            state.tools_error = Some(Arc::new(error));
-                        }
-                        drop(state);
-                        let _ = entry.changes.send(entry.snapshot());
-                        None
-                    }
-                }
-            } else {
-                cached.map(|catalog| {
-                    (
-                        view.catalog(catalog),
-                        Arc::new(DeferredClient {
-                            entry: entry.clone(),
-                            epoch,
-                            resolved: tokio::sync::OnceCell::new(),
-                            view: view.clone(),
-                        }) as Arc<dyn McpToolClientSource>,
-                        view.filter.clone(),
-                    )
-                })
-            }
-        }))
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<McpToolCatalogSource>>();
+        let catalogs = self.tool_catalogs(&bindings).await;
         let mut tools = discover_catalog_tools(
             &catalogs,
             &self.discovery,
@@ -1177,4 +1124,85 @@ async fn catalogs(
         }
     }
     Ok((resources, templates))
+}
+
+impl CodingMcpRuntime {
+    /// Captures the same available catalogs for plugin hints and model tool discovery.
+    async fn tool_catalogs(
+        &self,
+        bindings: &[(Arc<Entry>, BindingView)],
+    ) -> Vec<McpToolCatalogSource> {
+        join_all(bindings.iter().map(|(entry, view)| async {
+            entry.wait_for_catalog().await;
+            let (enabled, stopped, status, cached, epoch, generation) = {
+                let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    state.enabled,
+                    state.stopped,
+                    state.status,
+                    state.cached_catalog.clone().filter(|_| {
+                        matches!(state.status, Status::NotStarted | Status::Starting)
+                            || (entry.automatic_retry
+                                && matches!(state.status, Status::Failed | Status::Cancelled)
+                                && !state.cleanup_failed)
+                    }),
+                    state.epoch,
+                    state.generation,
+                )
+            };
+            if !enabled || stopped {
+                return None;
+            }
+            if status == Status::Connected {
+                let client = match entry.server.current_client() {
+                    Ok(client) => view.client(client),
+                    Err(error) => {
+                        entry.fail("session", Arc::new(error));
+                        return None;
+                    }
+                };
+                match McpToolCatalog::fetch(&client).await {
+                    Ok(catalog) => {
+                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        if state.generation != generation {
+                            return None;
+                        }
+                        state.cached_catalog = Some(catalog.clone());
+                        state.tools_error = None;
+                        Some((
+                            catalog,
+                            Arc::new(client) as Arc<dyn McpToolClientSource>,
+                            view.filter.clone(),
+                        ))
+                    }
+                    Err(error) => {
+                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        if state.generation == generation {
+                            state.tools_error = Some(Arc::new(error));
+                        }
+                        drop(state);
+                        let _ = entry.changes.send(entry.snapshot());
+                        None
+                    }
+                }
+            } else {
+                cached.map(|catalog| {
+                    (
+                        view.catalog(catalog),
+                        Arc::new(DeferredClient {
+                            entry: entry.clone(),
+                            epoch,
+                            resolved: tokio::sync::OnceCell::new(),
+                            view: view.clone(),
+                        }) as Arc<dyn McpToolClientSource>,
+                        view.filter.clone(),
+                    )
+                })
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<McpToolCatalogSource>>()
+    }
 }

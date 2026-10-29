@@ -5,9 +5,9 @@
 //! errors or unsupported control effects are reported and ignored. Cancellation of the enclosing
 //! operation still propagates. Reports use the existing host event sink and sequence allocator.
 //!
-//! A session owner binds this dispatcher to emit session-start/end and user-prompt events. The
-//! runner cannot infer those events from a new run or a resumed model-input projection. The same
-//! bound port reaches context processors for actual compaction events.
+//! A session owner emits initialization/end and initial prompt events. The runtime inspects each
+//! steered message at delivery and re-establishes a supplied session identity after compaction.
+//! A new run or resumed model-input projection alone never implies session startup.
 
 use std::{sync::Arc, time::Duration};
 
@@ -76,9 +76,20 @@ impl std::fmt::Debug for UserHookRegistration {
 #[derive(Debug, Clone, Default)]
 pub struct UserHooks {
     registrations: Arc<Vec<UserHookRegistration>>,
+    session_id: Option<ra_core::session::SessionId>,
 }
 
 impl UserHooks {
+    /// Supplies the session owner identity used for context re-establishment after compaction.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: ra_core::session::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+    pub(crate) fn session_id(&self) -> Option<&ra_core::session::SessionId> {
+        self.session_id.as_ref()
+    }
+
     /// Appends a registration. Display names may repeat; no lookup by name takes place.
     #[must_use]
     pub fn with_hook(mut self, registration: UserHookRegistration) -> Self {
@@ -100,6 +111,11 @@ impl UserHooks {
         cancel: CancelScope,
         services: ToolServices,
     ) -> BoundUserHooks {
+        if let Some(output) = services.hook_context() {
+            for registration in self.registrations.iter() {
+                registration.hook.bind_context(&run, output);
+            }
+        }
         BoundUserHooks {
             hooks: self.clone(),
             run,
@@ -134,8 +150,11 @@ impl BoundUserHooks {
         let mut allow = false;
         let mut denial = None;
         let mut prompts = Vec::new();
+        let mut replacement = HookDecision::Continue;
         for decision in outcomes {
             match decision? {
+                decision @ (HookDecision::UpdateInput { .. }
+                | HookDecision::ReplaceOutput { .. }) => replacement = decision,
                 HookDecision::Allow => allow = true,
                 HookDecision::Deny { message } if denial.is_none() => denial = Some(message),
                 HookDecision::Block { prompt } => prompts.push(prompt),
@@ -152,7 +171,7 @@ impl BoundUserHooks {
         } else if allow {
             HookDecision::Allow
         } else {
-            HookDecision::Continue
+            replacement
         })
     }
 
@@ -262,9 +281,17 @@ fn validate_decision(event: HookEventName, decision: &HookDecision) -> Option<&'
             None
         }
         (
-            HookEventName::PreToolUse | HookEventName::PermissionRequest,
+            HookEventName::SessionStart
+            | HookEventName::UserPromptSubmit
+            | HookEventName::PreToolUse
+            | HookEventName::PostToolUse
+            | HookEventName::PermissionRequest
+            | HookEventName::Stop
+            | HookEventName::SubagentStop,
             HookDecision::Deny { message },
         ) if !message.trim().is_empty() => None,
+        (HookEventName::PreToolUse, HookDecision::UpdateInput { .. })
+        | (HookEventName::PostToolUse, HookDecision::ReplaceOutput { .. }) => None,
         (HookEventName::Stop | HookEventName::SubagentStop, HookDecision::Block { prompt }) => {
             prompt
                 .trim()

@@ -179,6 +179,15 @@ pub enum ThreadItem {
         /// The input.
         content: Vec<UserInput>,
     },
+    /// Continuation requested by a stop hook, attributed to each handler run.
+    #[non_exhaustive]
+    #[serde(rename_all = "camelCase")]
+    HookPrompt {
+        /// History item identity.
+        id: String,
+        /// The handler prompts in execution order.
+        fragments: Vec<super::hooks::HookPromptFragment>,
+    },
     /// A message from the agent.
     #[non_exhaustive]
     #[serde(rename_all = "camelCase")]
@@ -349,6 +358,7 @@ impl ThreadItem {
     pub fn id(&self) -> &str {
         match self {
             Self::UserMessage { id, .. }
+            | Self::HookPrompt { id, .. }
             | Self::AgentMessage { id, .. }
             | Self::Reasoning { id, .. }
             | Self::CommandExecution { id, .. }

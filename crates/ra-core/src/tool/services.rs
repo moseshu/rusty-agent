@@ -42,6 +42,7 @@ pub struct ToolServices {
     output_projector: Option<Arc<dyn ToolOutputProjector>>,
     agent_control: Option<Arc<dyn AgentControlPort>>,
     user_input: Option<Arc<dyn UserInputPort>>,
+    hook_context: Option<crate::hook::HookContextQueue>,
 }
 
 impl ToolServices {
@@ -52,6 +53,7 @@ impl ToolServices {
             output_projector: None,
             agent_control: None,
             user_input: None,
+            hook_context: None,
         }
     }
 
@@ -87,6 +89,17 @@ impl ToolServices {
     pub fn with_user_input(mut self, user_input: Arc<dyn UserInputPort>) -> Self {
         self.user_input = Some(user_input);
         self
+    }
+
+    /// Installs the contextual history destination shared by hooks and their host.
+    pub fn with_hook_context(mut self, output: crate::hook::HookContextQueue) -> Self {
+        self.hook_context = Some(output);
+        self
+    }
+    /// The contextual history destination, when bound to a run.
+    #[must_use]
+    pub const fn hook_context(&self) -> Option<&crate::hook::HookContextQueue> {
+        self.hook_context.as_ref()
     }
 
     /// The host event sink for this run, when the host installed one.

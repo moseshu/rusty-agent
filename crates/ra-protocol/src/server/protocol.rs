@@ -75,6 +75,7 @@ pub use self::config::{
     OverriddenMetadata, SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse,
     ToolsV2, WriteStatus,
 };
+pub use self::hooks::HookPromptFragment;
 pub use self::hooks::{
     HookCompletedEvent, HookExecutionMode, HookHandlerType, HookOutputEntry, HookOutputEntryKind,
     HookRunStatus, HookRunSummary, HookScope, HookSource, HookStartedEvent, HookTrustStatus,

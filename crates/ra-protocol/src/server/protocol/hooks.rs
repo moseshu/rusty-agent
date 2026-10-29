@@ -127,3 +127,13 @@ pub struct HookCompletedEvent {
     pub turn_id: Option<String>,
     pub run: HookRunSummary,
 }
+
+/// A stop-hook continuation prompt and the handler run that produced it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HookPromptFragment {
+    /// Model-facing continuation request.
+    pub text: String,
+    /// Identity of the completed hook run.
+    pub hook_run_id: String,
+}

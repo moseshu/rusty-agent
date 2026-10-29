@@ -98,7 +98,10 @@ use ra_core::{
     session::{
         InterruptedTurnHistoryMarker, SessionId,
         interrupt::is_interrupt,
-        rollout::{PersistContext, RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded},
+        rollout::{
+            PersistContext, RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
+            RolloutRunStarted,
+        },
     },
     state::{EventSeqAllocator, RunId, RunState},
     tool::ToolServices,
@@ -500,6 +503,7 @@ pub struct AgentThreadBuilder {
     config: RunConfig,
     services: ToolServices,
     history: Vec<ModelInputItem>,
+    session_start_source: ra_core::hook::SessionStartSource,
     rollout: Option<Arc<dyn RolloutRecorder>>,
     agent_control: Option<AgentControl>,
 }
@@ -541,6 +545,16 @@ impl AgentThreadBuilder {
     /// history rebuilt from it. A thread with a rollout recorder takes it as already recorded.
     pub fn with_history(mut self, history: Vec<ModelInputItem>) -> Self {
         self.history = history;
+        self.session_start_source = ra_core::hook::SessionStartSource::Resume;
+        self
+    }
+
+    /// Sets the lifecycle source after selecting the initial history.
+    pub const fn with_session_start_source(
+        mut self,
+        source: ra_core::hook::SessionStartSource,
+    ) -> Self {
+        self.session_start_source = source;
         self
     }
 
@@ -599,6 +613,12 @@ impl AgentThreadBuilder {
     /// The thread, idle.
     #[must_use]
     pub fn build(self) -> AgentThread {
+        let hooks = self
+            .config
+            .user_hooks()
+            .clone()
+            .with_session_id(self.thread_id.clone());
+        let config = self.config.with_user_hooks(hooks);
         let (events, receiver) = mpsc::unbounded_channel();
         AgentThread {
             inner: Arc::new(ThreadInner {
@@ -611,9 +631,11 @@ impl AgentThreadBuilder {
                 agent_control: self.agent_control,
                 state: Mutex::new(ThreadState {
                     history: self.history,
-                    config: self.config,
+                    config,
                     active_turn: None,
                     shut_down: false,
+                    pending_session_start: Some(self.session_start_source),
+                    session_ended: false,
                 }),
                 turn_ended: Notify::new(),
                 events,
@@ -661,6 +683,8 @@ struct ThreadState {
     active_turn: Option<ActiveTurn>,
     /// Set by [`AgentThread::shutdown`]: no input is taken any more.
     shut_down: bool,
+    pending_session_start: Option<ra_core::hook::SessionStartSource>,
+    session_ended: bool,
 }
 
 /// The running turn: Codex's `ActiveTurn`.
@@ -711,6 +735,7 @@ impl AgentThread {
             config: RunConfig::new(),
             services: ToolServices::new(),
             history: Vec::new(),
+            session_start_source: ra_core::hook::SessionStartSource::Startup,
             rollout: None,
             agent_control: None,
         }
@@ -1140,6 +1165,25 @@ impl AgentThread {
             };
             ended.await;
         }
+        let end_hooks = {
+            let mut state = self.inner.lock();
+            let needed = !state.session_ended;
+            state.session_ended = true;
+            needed.then(|| state.config.user_hooks().clone())
+        };
+        if let Some(hooks) = end_hooks {
+            let run = Arc::new(ra_core::context::RunContext::new(
+                RunId::new(format!("session-end-{}", self.inner.thread_id)),
+                self.inner.agent.public(),
+            ));
+            let _ = hooks
+                .bind(run, CancelScope::root(), self.inner.services.clone())
+                .dispatch(ra_core::hook::HookEvent::SessionEnd {
+                    session_id: &self.inner.thread_id,
+                    reason: "other",
+                })
+                .await;
+        }
         if let Some(control) = &self.inner.agent_control {
             control.shutdown().await;
         }
@@ -1411,6 +1455,10 @@ impl RolloutRecorder for ThreadRecorder {
 }
 
 /// Runs a turn to its end and reports how it ended.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep turn acceptance, persistence and terminal event ordering together."
+)]
 async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let started = Instant::now();
     let StartedTurn {
@@ -1424,26 +1472,60 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         cancel,
     } = turn;
     let history_len = history.len();
-    let mut run_input = history;
-    run_input.extend(input.map(ModelInputItem::Message));
+    let run_input = history;
+    let submitted: Vec<_> = input.map(ModelInputItem::Message).into_iter().collect();
     let recorder = Arc::new(ThreadRecorder {
         thread: Arc::downgrade(&inner),
         turn_id: turn_id.clone(),
         store: inner.rollout.clone(),
         ending: Mutex::new(None),
     });
-    let (end, history) = run_to_end(
-        &inner,
-        &recorder,
-        config,
-        output_schema.as_ref(),
-        &pending,
-        &settings,
-        &cancel,
-        run_input,
-        history_len,
-    )
-    .await;
+    let (run_input, stopped, hook_context) =
+        prepare_host_input(&inner, &recorder, &config, &cancel, run_input, submitted).await;
+    let (end, history) = if stopped {
+        recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+            RunId::new(&turn_id),
+            inner.agent.public_id().clone(),
+        )));
+        for item in run_input.iter().skip(history_len) {
+            if let ModelInputItem::Message(message) = item {
+                recorder.record(RolloutItem::Item(RunItem::new(
+                    ItemId::new(uuid::Uuid::now_v7().to_string()),
+                    RunItemKind::Message(message.clone()),
+                )));
+            }
+        }
+        recorder.record(RolloutItem::RunEnded(RolloutRunEnded::new(
+            RunId::new(&turn_id),
+            if cancel.is_cancelled() {
+                RolloutRunEnd::Cancelled
+            } else {
+                RolloutRunEnd::Completed
+            },
+        )));
+        (
+            if cancel.is_cancelled() {
+                TurnEnd::Cancelled
+            } else {
+                TurnEnd::Completed(None)
+            },
+            run_input,
+        )
+    } else {
+        run_to_end(
+            &inner,
+            &recorder,
+            config,
+            output_schema.as_ref(),
+            &pending,
+            &hook_context,
+            &settings,
+            &cancel,
+            run_input,
+            history_len,
+        )
+        .await
+    };
     settings.close();
     // What the run never read is dropped if the turn was aborted, as Codex clears it; otherwise it
     // stays in the history, as Codex records what is left when its task finishes.
@@ -1525,6 +1607,7 @@ async fn run_to_end(
     mut config: RunConfig,
     output_schema: Option<&OutputSchema>,
     pending: &PendingInput,
+    hook_context: &ra_core::hook::HookContextQueue,
     settings: &LiveRunSettings,
     cancel: &CancelScope,
     input: Vec<ModelInputItem>,
@@ -1543,7 +1626,12 @@ async fn run_to_end(
     loop {
         request = request
             .with_config(config.clone())
-            .with_services(inner.services.clone())
+            .with_services(
+                inner
+                    .services
+                    .clone()
+                    .with_hook_context(hook_context.clone()),
+            )
             .with_pending_input(pending.clone());
         request = request.with_live_settings(settings.clone());
         if let Some(control) = &inner.agent_control {
@@ -1564,7 +1652,12 @@ async fn run_to_end(
         let result = match stream.finish().await {
             Ok(result) => result,
             Err(error) => {
-                let history = partial_history(fallback, &produced);
+                let mut history = partial_history(fallback, &produced);
+                let mut contexts = error
+                    .run_state()
+                    .map_or_else(Vec::new, |state| state.clone().take_hook_context());
+                contexts.extend(hook_context.close());
+                record_context_history(recorder, &mut history, contexts);
                 if cancel.is_cancelled() {
                     return (TurnEnd::Cancelled, history);
                 }
@@ -1582,6 +1675,7 @@ async fn run_to_end(
         // Paused for approval: the turn stays active until the host answers or interrupts.
         let state = result.state().clone();
         let run_id = state.run_id().clone();
+        let context_on_cancel = state.clone().take_hook_context();
         let (resume, answered) = oneshot::channel();
         let paused = inner.lock().active_turn.as_mut().map(|active| {
             active.paused = Some(PausedTurn {
@@ -1605,6 +1699,8 @@ async fn run_to_end(
             active.paused = None;
         }
         let Some((agent, state)) = answered else {
+            let mut history = history;
+            record_context_history(recorder, &mut history, context_on_cancel);
             let history = cancel_paused(recorder.as_ref(), &config, cancel, run_id, history);
             return (TurnEnd::Cancelled, history);
         };
@@ -1666,4 +1762,82 @@ fn unix_seconds() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
         .unwrap_or_default()
+}
+
+/// Session owners inspect new prompts before handing accepted input to the runner.
+async fn prepare_host_input(
+    inner: &ThreadInner,
+    recorder: &ThreadRecorder,
+    config: &RunConfig,
+    cancel: &CancelScope,
+    mut history: Vec<ModelInputItem>,
+    submitted: Vec<ModelInputItem>,
+) -> (Vec<ModelInputItem>, bool, ra_core::hook::HookContextQueue) {
+    use ra_core::hook::{HookContextQueue, HookDecision, HookEvent};
+    let queue = HookContextQueue::default();
+    let run = Arc::new(ra_core::context::RunContext::new(
+        RunId::new(&recorder.turn_id),
+        inner.agent.public(),
+    ));
+    let hooks = config.user_hooks().bind(
+        run,
+        cancel.clone(),
+        inner.services.clone().with_hook_context(queue.clone()),
+    );
+    history.extend(queue.take().into_iter().map(ModelInputItem::Message));
+    let source = {
+        let mut state = inner.lock();
+        state.pending_session_start.take()
+    };
+    let result: ra_core::error::Result<bool> = async {
+        if let Some(source) = source {
+            let decision = hooks
+                .dispatch(HookEvent::SessionStart {
+                    session_id: &inner.thread_id,
+                    resumed: source == ra_core::hook::SessionStartSource::Resume,
+                    source,
+                })
+                .await;
+            history.extend(queue.take().into_iter().map(ModelInputItem::Message));
+            if matches!(decision?, HookDecision::Deny { .. }) {
+                return Ok(true);
+            }
+        }
+        let decision = if submitted.is_empty() {
+            HookDecision::Continue
+        } else {
+            hooks
+                .dispatch(HookEvent::UserPromptSubmit { input: &submitted })
+                .await?
+        };
+        let stopped = matches!(decision, HookDecision::Deny { .. });
+        if !stopped {
+            history.extend(submitted);
+        }
+        Ok(stopped)
+    }
+    .await;
+    let stopped = result.unwrap_or_else(|error| {
+        tracing::warn!(turn_id = %recorder.turn_id, %error, "host input hooks were interrupted");
+        true
+    });
+    if stopped {
+        history.extend(queue.close().into_iter().map(ModelInputItem::Message));
+    }
+    (history, stopped, queue)
+}
+
+/// Retains context when a thread ends a run instead of resuming its checkpoint.
+fn record_context_history(
+    recorder: &ThreadRecorder,
+    history: &mut Vec<ModelInputItem>,
+    messages: Vec<Message>,
+) {
+    for message in messages {
+        recorder.record(RolloutItem::Item(RunItem::new(
+            ItemId::new(uuid::Uuid::now_v7().to_string()),
+            RunItemKind::Message(message.clone()),
+        )));
+        history.push(ModelInputItem::Message(message));
+    }
 }

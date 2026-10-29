@@ -168,15 +168,23 @@ async fn lower_message(
     message: &Message,
     codec: &ChatCodec,
 ) -> Result<()> {
+    if message.is_selection_only() {
+        return Ok(());
+    }
     match message.role() {
         MessageRole::Assistant => lower_assistant_message(accumulator, message, codec),
         role => {
             let mut parts = Vec::with_capacity(message.content().len());
-            for block in message.content() {
+            for block in message.content().iter().filter(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+                )
+            }) {
                 parts.push(lower_input_block(block, role).await?);
             }
             accumulator.push_message(json!({
-                "role": role.label(),
+                "role": if role == MessageRole::Developer && !codec.quirks.developer_role() { "system" } else { role.label() },
                 "content": text_or_parts(parts)
             }));
             Ok(())
@@ -192,7 +200,12 @@ fn lower_assistant_message(
     let mut draft = AssistantDraft::default();
     let mut texts = Vec::new();
     let mut thinking = Vec::new();
-    for block in message.content() {
+    for block in message.content().iter().filter(|block| {
+        !matches!(
+            block,
+            ContentBlock::Skill { .. } | ContentBlock::Mention { .. }
+        )
+    }) {
         match block {
             ContentBlock::Text(text) => {
                 if crate::openai::prompt_cache::breakpoint(text.provider_metadata()).is_some() {

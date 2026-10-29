@@ -82,6 +82,14 @@ impl SkillToolContext {
             })
             .flat_map(Message::content)
             .filter_map(|block| match block {
+                ContentBlock::Skill { name, path } => Some(SkillInput::Skill {
+                    name: name.clone(),
+                    path: path.clone(),
+                }),
+                ContentBlock::Mention { name, path } => Some(SkillInput::Mention {
+                    name: name.clone(),
+                    path: path.clone(),
+                }),
                 ContentBlock::Text(text) => Some(SkillInput::Text {
                     text: text.text().to_string(),
                 }),

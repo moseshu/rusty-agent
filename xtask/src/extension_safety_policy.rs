@@ -669,6 +669,11 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-protocol/src/server/protocol/hooks.rs",
         "HookCompletedEvent",
     ),
+    // Codex v2/item.rs retains the fragment DTO used by hook-prompt history.
+    (
+        "crates/ra-protocol/src/server/protocol/hooks.rs",
+        "HookPromptFragment",
+    ),
     // Codex v2/plugin.rs ScheduledTaskSummary retains all four source fields.
     (
         "crates/ra-protocol/src/server/protocol/plugin_management.rs",

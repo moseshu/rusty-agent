@@ -45,7 +45,7 @@ use crate::{
 };
 
 /// Current tool-output schema version.
-pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
+pub const TOOL_OUTPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(4);
 
 /// A provider-neutral tool result.
 #[non_exhaustive]
@@ -56,6 +56,8 @@ pub struct ToolOutput {
     metadata: ObservationMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_excerpt: Option<ModelExcerpt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_blocks: Option<Vec<ToolOutputBlock>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovered_tools: Option<Vec<ModelToolDefinition>>,
     #[serde(flatten, skip_serializing_if = "Unknown::is_empty")]
@@ -73,6 +75,8 @@ struct StructuredToolOutputWire {
     metadata: ObservationMetadata,
     #[serde(default)]
     model_excerpt: Option<ModelExcerpt>,
+    #[serde(default)]
+    original_blocks: Option<Vec<ToolOutputBlock>>,
     #[serde(default)]
     discovered_tools: Option<Vec<ModelToolDefinition>>,
     #[serde(flatten, default)]
@@ -168,6 +172,7 @@ impl ToolOutput {
             blocks,
             metadata: ObservationMetadata::new(),
             model_excerpt: None,
+            original_blocks: None,
             discovered_tools: None,
             unknown: Unknown::new(),
         })
@@ -191,6 +196,7 @@ impl ToolOutput {
             blocks: vec![block],
             metadata: ObservationMetadata::new(),
             model_excerpt: None,
+            original_blocks: None,
             discovered_tools: None,
             unknown: Unknown::new(),
         }
@@ -228,7 +234,9 @@ impl ToolOutput {
     /// duplicating untrimmed output; this field is absent until a projection actually differs.
     #[must_use]
     pub fn with_model_excerpt(mut self, model_excerpt: ModelExcerpt) -> Self {
-        self.model_excerpt = Some(model_excerpt);
+        if self.original_blocks.is_none() {
+            self.model_excerpt = Some(model_excerpt);
+        }
         self
     }
 
@@ -238,6 +246,9 @@ impl ToolOutput {
     /// projector cannot replace the result's blocks or overwrite metadata a tool already recorded.
     #[must_use]
     pub fn with_model_projection(mut self, projection: ToolOutputProjection) -> Self {
+        if self.original_blocks.is_some() {
+            return self;
+        }
         if let Some(model_excerpt) = projection.model_excerpt {
             self.model_excerpt = Some(model_excerpt);
         }
@@ -282,6 +293,12 @@ impl ToolOutput {
                 // No re-validation here: `ModelExcerpt` enforces its own invariants while being
                 // read, so an excerpt cannot reach this point in a shape its constructor rejects.
                 output.model_excerpt = wire.model_excerpt;
+                if wire.original_blocks.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(Error::caller(
+                        "stored original tool output must not be empty",
+                    ));
+                }
+                output.original_blocks = wire.original_blocks;
                 output.discovered_tools = wire.discovered_tools;
                 output.unknown = wire.unknown;
                 Ok(output)
@@ -305,7 +322,7 @@ impl ToolOutput {
     /// The result's blocks, in the order the tool produced them.
     #[must_use]
     pub fn blocks(&self) -> &[ToolOutputBlock] {
-        &self.blocks
+        self.original_blocks.as_deref().unwrap_or(&self.blocks)
     }
 
     /// Facts about this observation, for the host rather than for the model.
@@ -335,10 +352,35 @@ impl ToolOutput {
     /// silently lose the image blocks.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
-        match self.blocks.as_slice() {
+        match self.blocks() {
             [ToolOutputBlock::Text { text }] => Some(text),
             _ => None,
         }
+    }
+
+    /// Replaces only model-visible content, retaining complete blocks for the host.
+    #[must_use]
+    pub fn with_model_replacement(mut self, message: impl Into<String>) -> Self {
+        if self.original_blocks.is_none() {
+            self.original_blocks = Some(std::mem::take(&mut self.blocks));
+        }
+        // The understood blocks always contain the filtered result, so older readers cannot
+        // replay rejected content by ignoring the new original-output field.
+        self.blocks = vec![ToolOutputBlock::text(message)];
+        self.model_excerpt = None;
+        self
+    }
+
+    /// Model-visible content, excluding framework metadata and artifact locators.
+    /// Host-only original blocks are never returned by this accessor.
+    #[must_use]
+    pub fn model_content_blocks(&self) -> &[ToolOutputBlock] {
+        if self.original_blocks.is_some() {
+            return &self.blocks;
+        }
+        self.model_excerpt
+            .as_ref()
+            .map_or(self.blocks.as_slice(), ModelExcerpt::blocks)
     }
 
     /// The blocks a provider should be sent, metadata first.
@@ -348,6 +390,9 @@ impl ToolOutput {
     /// that may still add to the metadata.
     #[must_use]
     pub fn model_blocks(&self) -> Vec<ToolOutputBlock> {
+        if self.original_blocks.is_some() {
+            return self.blocks.clone();
+        }
         let source = self
             .model_excerpt
             .as_ref()

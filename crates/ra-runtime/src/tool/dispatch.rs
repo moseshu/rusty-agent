@@ -530,12 +530,12 @@ pub async fn dispatch_tool(request: ToolDispatchRequest) -> Result<ToolDispatchO
 /// decision it reached on the error itself, because the run it ends produces no result to read them
 /// from.
 pub(crate) async fn dispatch_tool_with_admission(
-    request: ToolDispatchRequest,
+    mut request: ToolDispatchRequest,
     admission: Option<&crate::turn::batch::ResourceAdmissionGate>,
     admission_started: Instant,
 ) -> Result<ToolDispatchOutcome> {
     let mut guardrails = ToolGuardrailRecords::default();
-    let result = run_chain(&request, admission, admission_started, &mut guardrails).await;
+    let result = run_chain(&mut request, admission, admission_started, &mut guardrails).await;
     if result.is_err()
         && let Some(committer) = &request.output_committer
     {
@@ -561,12 +561,13 @@ pub(crate) async fn dispatch_tool_with_admission(
 /// milestone exists to prevent.
 #[allow(clippy::too_many_lines)]
 async fn run_chain(
-    request: &ToolDispatchRequest,
+    request: &mut ToolDispatchRequest,
     admission: Option<&crate::turn::batch::ResourceAdmissionGate>,
     admission_started: Instant,
     records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
-    let tool = &request.tool;
+    let owned_tool = Arc::clone(&request.tool);
+    let tool = &owned_tool;
     let options = tool.options();
     let name = tool.origin().qualified_name().to_owned();
 
@@ -593,6 +594,31 @@ async fn run_chain(
     // after the tool has run.
     let input_guardrails = request.guardrails.resolve_input(&options, tool.origin())?;
     let output_guardrails = request.guardrails.resolve_output(&options, tool.origin())?;
+
+    // A resumed approval carries the effective arguments. Pre-tool hooks ran before that
+    // approval was issued, as they do before the upstream handler waits for authorization.
+    if !request.is_continuation()
+        && !request.approval_granted
+        && !matches!(
+            request.permission.fixed_decision(
+                options.action_classes(),
+                tool.origin(),
+                request.run.agent_id()
+            ),
+            Some(PermissionDecision::Deny)
+        )
+    {
+        match run_user_hook(request, HookEvent::PreToolUse(tool_hook_data(request))).await? {
+            HookDecision::UpdateInput { input } => request.arguments = input,
+            HookDecision::Deny { message } => {
+                return Ok(ToolDispatch::Refused(ToolRefusal::new(
+                    pre_invocation_rejection(request, message)?,
+                    PRE_TOOL_USE_HOOK_CODE,
+                )));
+            }
+            _ => {}
+        }
+    }
 
     // Typed function tools are decoded exactly once at the common invocation boundary. A tool
     // implementation receives the checked value from its context instead of each implementation
@@ -817,7 +843,7 @@ async fn run_chain(
         }
     };
 
-    run_user_hook(
+    let post_decision = run_user_hook(
         request,
         HookEvent::PostToolUse {
             call: tool_hook_data(request),
@@ -840,7 +866,21 @@ async fn run_chain(
     // 9. Context projection happens after the guardrail has inspected the complete observation
     // and immediately before the record is made.  The stored ToolOutput retains those complete
     // blocks; only its model-facing excerpt changes.
-    finish_output(request, output, None, false).await
+    match post_decision {
+        HookDecision::Deny { message } => {
+            finish_output(
+                request,
+                output.with_model_replacement(message),
+                Some("hook.post_tool_use"),
+                true,
+            )
+            .await
+        }
+        HookDecision::ReplaceOutput { message } => {
+            finish_output(request, output.with_model_replacement(message), None, true).await
+        }
+        _ => finish_output(request, output, None, false).await,
+    }
 }
 
 fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
@@ -913,16 +953,6 @@ async fn admit_permission(
 ) -> Result<Option<ToolDispatch>> {
     let tool = &request.tool;
     let permission = resolve_permission(tool, options, request).await?;
-    // A policy denial is final; no hook grant is consulted on that path.
-    if !matches!(permission, PermissionDecision::Deny)
-        && let HookDecision::Deny { message } =
-            run_user_hook(request, HookEvent::PreToolUse(tool_hook_data(request))).await?
-    {
-        return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-            pre_invocation_rejection(request, message)?,
-            PRE_TOOL_USE_HOOK_CODE,
-        ))));
-    }
     match permission {
         PermissionDecision::Allow => Ok(None),
         PermissionDecision::Deny => {
@@ -1276,7 +1306,7 @@ async fn finish_output(
     };
     if matches!(
         failure_code,
-        Some("tool.timeout" | TOOL_OUTPUT_GUARDRAIL_CODE)
+        Some("tool.timeout" | TOOL_OUTPUT_GUARDRAIL_CODE | "hook.post_tool_use")
     ) {
         observation.output = observation.output.with_error(true);
     }

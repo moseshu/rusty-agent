@@ -94,6 +94,9 @@ impl RoleCapabilities {
         if host.request_user_input_enabled() {
             declared.push(Arc::new(ControlCapability::user_input(mode)?));
         }
+        if let Some(contributor) = host.plugin_input_contributor()? {
+            declared.push(contributor);
+        }
         declared.extend(host.capabilities().iter().cloned());
         // A spawned agent is assembled without the collaboration tools unless the host says its
         // model takes them, as Codex plans a sub-agent session's tools; the family is then

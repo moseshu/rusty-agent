@@ -612,7 +612,12 @@ impl AgentTool {
             input,
         )
         .with_config(config)
-        .with_services(context.services().clone())
+        .with_services(
+            context
+                .services()
+                .clone()
+                .with_hook_context(ra_core::hook::HookContextQueue::default()),
+        )
         .with_agent_tree(parent.agent_tree().cloned())
         // Every call the nested run pays for is billed on the parent as well, as the reference
         // shares one usage object between them. Inheriting the parent's configuration inherits its

@@ -67,6 +67,7 @@ pub struct Hooks {
     // and remove the environment plumbing from `Hooks` and `from_config`.
     environment: Arc<Vec<(OsString, OsString)>>,
     after_agent: Arc<[Hook]>,
+    stopped_turns: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     engine: ClaudeHooksEngine,
     plugin_hook_sources: Arc<[PluginHookSource]>,
     plugin_hook_load_warnings: Arc<[String]>,
@@ -101,12 +102,14 @@ impl Hooks {
     /// Preserve in-flight background hooks while applying a refreshed configuration.
     #[must_use]
     pub fn reconfigured(&self, config: HooksConfig) -> Self {
-        Self::from_config(
+        let mut next = Self::from_config(
             config,
             Arc::clone(&self.engine.mcp_executor),
             Arc::clone(&self.environment),
             |shell| self.engine.command_runtime.reconfigured(shell),
-        )
+        );
+        next.stopped_turns = Arc::clone(&self.stopped_turns);
+        next
     }
 
     pub fn matches_plugin_hooks<'a>(
@@ -153,6 +156,7 @@ impl Hooks {
         Self {
             environment,
             after_agent,
+            stopped_turns: Arc::default(),
             engine,
             plugin_hook_sources: config.plugin_hook_sources.into(),
             plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
@@ -176,6 +180,15 @@ impl Hooks {
     }
 
     pub async fn dispatch(&self, hook_payload: HookPayload) -> Vec<HookResponse> {
+        let HookEvent::AfterAgent { event } = &hook_payload.hook_event;
+        if self
+            .stopped_turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&event.turn_id)
+        {
+            return Vec::new();
+        }
         let hooks = self.hooks_for_event(&hook_payload.hook_event);
         let mut outcomes = Vec::with_capacity(hooks.len());
         for hook in hooks {
@@ -301,7 +314,15 @@ impl Hooks {
     }
 
     pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
-        self.engine.run_stop(request).await
+        let turn_id = request.turn_id.clone();
+        let outcome = self.engine.run_stop(request).await;
+        if outcome.should_stop && !self.after_agent.is_empty() {
+            self.stopped_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(turn_id);
+        }
+        outcome
     }
 
     #[must_use]

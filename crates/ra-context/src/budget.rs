@@ -148,7 +148,7 @@ impl ToolResultBudget {
 
         // Measured after the early return, not before it: the overwhelming majority of results fit,
         // and that path must not pay for a text join and a serialization of every image it discards.
-        let complete = measure(output.blocks())?;
+        let complete = measure(output.model_content_blocks())?;
         let causes = exceeded_causes(
             model_source.bytes > self.max_bytes,
             model_source.tokens > self.max_tokens,
@@ -162,7 +162,7 @@ impl ToolResultBudget {
 
         // The excerpt is built from the measurement rather than re-deriving it: a second pass would
         // serialize every image again, and the two passes could only ever agree by coincidence.
-        let excerpt = self.build_excerpt(output.blocks(), &complete, overhead);
+        let excerpt = self.build_excerpt(output.model_content_blocks(), &complete, overhead);
         let projection = ToolOutputProjection::new()
             .with_truncation(Truncation::new(
                 TruncationStage::ContextBudget,

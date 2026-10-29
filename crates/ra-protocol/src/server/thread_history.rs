@@ -171,6 +171,12 @@ impl ItemProjector {
 /// The user's input a user message carries, or `None` for one that is not the user's own: the
 /// skill context, the marker an interrupt leaves, or a message with nothing to show.
 fn user_message(id: &str, message: &Message) -> Option<ThreadItem> {
+    if let Some(fragments) = hook_prompt_fragments(message) {
+        return Some(ThreadItem::HookPrompt {
+            id: id.to_owned(),
+            fragments,
+        });
+    }
     if is_contextual_user_message(message) {
         return None;
     }
@@ -182,6 +188,21 @@ fn user_message(id: &str, message: &Message) -> Option<ThreadItem> {
 /// becomes a message. Codex keeps the client's input as it was sent, with the spans the client
 /// marked in its text; a message here keeps only what reaches the model, so the spans are gone.
 fn user_input(block: &ContentBlock) -> Option<UserInput> {
+    match block {
+        ContentBlock::Skill { name, path } => {
+            return Some(UserInput::Skill {
+                name: name.clone(),
+                path: path.clone(),
+            });
+        }
+        ContentBlock::Mention { name, path } => {
+            return Some(UserInput::Mention {
+                name: name.clone(),
+                path: path.clone(),
+            });
+        }
+        _ => {}
+    }
     if let Some(text) = block.as_text() {
         return Some(UserInput::text(text));
     }
@@ -732,4 +753,42 @@ impl HistorySources {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+}
+
+fn hook_prompt_fragments(message: &Message) -> Option<Vec<super::protocol::HookPromptFragment>> {
+    #[derive(serde::Deserialize)]
+    struct Fragments {
+        #[serde(rename = "hook_prompt")]
+        fragments: Vec<Fragment>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fragment {
+        #[serde(rename = "@hook_run_id")]
+        hook_run_id: String,
+        #[serde(rename = "$text", default)]
+        text: String,
+    }
+    let text = message.text_content();
+    if !text.trim_start().starts_with("<hook_prompt ") {
+        return None;
+    }
+    let parsed: Fragments = quick_xml::de::from_str(&format!("<root>{text}</root>")).ok()?;
+    if parsed.fragments.is_empty()
+        || parsed
+            .fragments
+            .iter()
+            .any(|fragment| fragment.hook_run_id.trim().is_empty())
+    {
+        return None;
+    }
+    Some(
+        parsed
+            .fragments
+            .into_iter()
+            .map(|fragment| super::protocol::HookPromptFragment {
+                text: fragment.text,
+                hook_run_id: fragment.hook_run_id,
+            })
+            .collect(),
+    )
 }

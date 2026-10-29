@@ -631,9 +631,7 @@ impl TrimSource {
     /// of the output it asked for. The metadata is not lost by leaving it out here: it is carried
     /// over whole by [`trimmed_structured_output`] and rendered again on the way to the provider.
     fn from_structured(output: &ToolOutput) -> Result<Self> {
-        let blocks = output
-            .model_excerpt()
-            .map_or_else(|| output.blocks(), ModelExcerpt::blocks);
+        let blocks = output.model_content_blocks();
         let text = source_text(blocks);
         let model_blocks = output.model_blocks();
         let mut output_chars = source_text(&model_blocks).chars().count();

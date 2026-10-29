@@ -286,6 +286,28 @@ impl CodingHost {
         self
     }
 
+    pub(crate) fn plugin_input_contributor(
+        &self,
+    ) -> ra_core::error::Result<Option<Arc<dyn Capability>>> {
+        self.plugin_skills
+            .as_ref()
+            .map(|services| {
+                let cwd = ra_paths::AbsolutePathBuf::from_absolute_path(self.workspace.root())
+                    .map_err(|error| {
+                        ra_core::error::Error::config("workspace root must be absolute")
+                            .with_source(error)
+                    })?;
+                Ok(Arc::new(
+                    crate::plugins::input_contributor::PluginInputContributor::new(
+                        Arc::clone(services),
+                        cwd,
+                        self.mcp.clone(),
+                    )?,
+                ) as Arc<dyn Capability>)
+            })
+            .transpose()
+    }
+
     pub(crate) fn capabilities(&self) -> &[Arc<dyn Capability>] {
         &self.capabilities
     }

@@ -52,6 +52,20 @@ pub const CONTENT_BLOCK_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ContentBlock {
+    /// A structured skill selection consumed by the host, never sent to a model.
+    Skill {
+        /// Selected skill name.
+        name: String,
+        /// Selected skill source path.
+        path: PathBuf,
+    },
+    /// A structured resource mention consumed by the host, never sent to a model.
+    Mention {
+        /// Display name of the selected resource.
+        name: String,
+        /// Resource URI or path.
+        path: String,
+    },
     /// UTF-8 text.
     Text(TextBlock),
     /// Model reasoning together with its replay signature.
@@ -111,6 +125,8 @@ impl ContentBlock {
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
+            Self::Skill { .. } => "skill",
+            Self::Mention { .. } => "mention",
             Self::Text(_) => "text",
             Self::Thinking(_) => "thinking",
             Self::Image(_) => "image",

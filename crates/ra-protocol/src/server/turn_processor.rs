@@ -548,12 +548,8 @@ fn input_content(input: Vec<UserInput>) -> Result<Vec<ContentBlock>, JsonRpcErro
             UserInput::Audio { .. } | UserInput::LocalAudio { .. } => Err(
                 JsonRpcErrorObject::invalid_request("audio input is not supported"),
             ),
-            UserInput::Skill { .. } => Err(JsonRpcErrorObject::invalid_request(
-                "skill input is not supported",
-            )),
-            UserInput::Mention { .. } => Err(JsonRpcErrorObject::invalid_request(
-                "mention input is not supported",
-            )),
+            UserInput::Skill { name, path } => Ok(ContentBlock::Skill { name, path }),
+            UserInput::Mention { name, path } => Ok(ContentBlock::Mention { name, path }),
         })
         .collect()
 }

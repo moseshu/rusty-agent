@@ -187,7 +187,13 @@ impl ThreadRequestProcessor {
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
             })?;
-        let builder = install_user_input(builder, &self.outgoing);
+        let source = match params.session_start_source {
+            Some(super::protocol::ThreadStartSource::Clear) => {
+                ra_core::hook::SessionStartSource::Clear
+            }
+            _ => ra_core::hook::SessionStartSource::Startup,
+        };
+        let builder = install_user_input(builder, &self.outgoing).with_session_start_source(source);
         attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
         let builder = match &store {
             Some(store) => {
@@ -524,6 +530,7 @@ impl ThreadRequestProcessor {
                 Vec::new(),
             )
         };
+        let builder = builder.with_session_start_source(ra_core::hook::SessionStartSource::Fork);
         let source_name = source
             .name()
             .map(str::trim)

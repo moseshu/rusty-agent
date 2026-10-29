@@ -1087,3 +1087,94 @@ Allowances for retained, uncalled source APIs are attached to the particular fie
 implementation or function; the port no longer suppresses dead code for entire modules. The
 unused filesystem-helper `seatbelt_network_policy.sbpl` is removed: the fixed restricted helper
 continues to use the same empty dynamic network-policy fragment as upstream's no-proxy call.
+
+## Contextual hook history and structured selections
+
+`MessageRole::Developer` preserves application instructions in conversation history. OpenAI Responses
+and first-party Chat Completions send `developer`. Compatible Chat endpoints declare support with
+`ProviderQuirks::with_developer_role`; undeclared endpoints lower it to `system`. Anthropic lowers
+these messages to user text at the adapter boundary, while stored history retains Developer.
+
+Opt-in `UserHook`s can append messages through `UserHookContext::context_output`. Hosts can share the
+same `HookContextQueue` through `ToolServices::with_hook_context`. Context is committed after the
+complete tool batch, before the next model request, without user-input guardrails, prompt hooks or
+input contributors. The default `UserHook::bind_context` method lets an adapter bind background
+results before an event executes. Child runs receive independent destinations. A closed queue
+returns ownership of rejected messages so a host can retain them for its next turn.
+
+`HookDecision::UpdateInput` applies only to PreToolUse and replaces native execution arguments before
+decoding, permissions, approval and input guardrails. The original model call remains unchanged in
+history. Approval records retain the effective arguments, and recovery does not repeat PreToolUse.
+PostToolUse accepts `Deny` for an error result and `ReplaceOutput` for successful replacement text.
+Complete original output remains available to host readers through `ToolOutput::blocks` and
+`as_text`; providers use `model_blocks`. Ordinary SDK lifecycle observers remain observational.
+
+Thread owners emit initial SessionStart, initial UserPromptSubmit and SessionEnd. The runtime emits
+UserPromptSubmit for steered input and SessionStart after successful compaction with an identified
+session owner, for root runs only; a child run (agent-as-tool or spawned agent) that compacts does not
+re-run the parent session's SessionStart hooks. A session/prompt hook can return
+`Deny` to stop accepting that submission; the rejected prompt is not recorded or sampled, while
+context remains durable. At Stop/SubagentStop, `Deny` ends processing and prevents late queued input
+from triggering another model request. Already accepted late input is inspected and retained with
+its contributions before closing; new pushes are refused for the host to submit as a new turn.
+Stop continuation is projected as a `HookPrompt` item with handler-run
+attribution. Developer context remains hidden from the user-message projection.
+
+RunState schema 17 introduced `pending_hook_context`, retained during approval and cancellation
+recovery. Schema 18 additionally preserves background follow-up intent; see the review corrections
+below.
+ToolOutput schema 4 adds `original_blocks`: serialized `blocks` contain the replacement, so a reader
+that ignores the new field still receives filtered content. Projections cannot overwrite a hook
+replacement. Existing versions remain readable by this build. `ContentBlock` adds tagged `skill`
+and `mention` selections, persisted with the original user message and omitted from all provider
+content, including selection-only messages. Existing message and individual content-block record
+versions stay unchanged; older builds cannot interpret the new role and selection discriminators.
+Use this build when resuming histories or checkpoints containing these additions.
+
+For thread hosts, `RunRequest::with_recorded_input` also bounds newly accepted input sent to
+contributors. Prior conversation history remains model-visible but cannot retrigger skill/plugin
+injection. This applies even when no rollout recorder is installed.
+
+
+## Context injection review corrections
+
+Model-facing retention code must use `ToolOutput::model_content_blocks` for content-only previews
+or `model_blocks` when metadata and locators are needed. `blocks` and `as_text` expose complete
+host-visible original results and must not feed model previews. Old-result eviction now previews
+only the hook replacement, including replacements longer than the default 500-character threshold.
+
+`HookContextQueue::push` records synchronous context without requesting another model call.
+Completed background work uses `push_background`; only that lane requests follow-up when a run
+would otherwise conclude. This preserves SDK StopAtTools/StopOnFirstTool delivery. Both kinds of
+context remain durable and bypass contributors and input guardrails.
+
+The runtime emits `UserPromptSubmit` once for each message delivered from `PendingInput`, including
+standalone Runner requests. SDK hosts should emit the event for their initial prompt only and must
+remove any event dispatch they previously performed when enqueueing steer input. A delivered batch
+with rejected prompts and no accepted prompt ends the turn without another sampling request, even
+when tools just produced output. Mixed accepted/rejected batches continue for the accepted prompts.
+
+`HookEvent::SessionStart` now carries `source: SessionStartSource`, with startup, resume, clear,
+compact and fork variants. Callers constructing the event must supply this field; the existing
+`resumed` flag remains available to legacy observers but is not the hook-selection source.
+Although the event enum is non-exhaustive, adding a field still changes existing struct-variant
+construction sites. `AgentThreadBuilder::with_session_start_source` preserves explicit clear/fork
+origins after initial history selection. Protocol clear starts and both fork storage paths pass
+these sources; resume continues to use Resume, including explicitly empty history.
+
+Successful context compaction emits SessionStart with Compact before the next model request and
+appends the hook's restored context to both that request and authoritative history. A rejection
+stops sampling while retaining the compaction and hook context. AgentThread and ProductHookRuntime
+supply the owner identity; standalone hosts can use `UserHooks::with_session_id` or a Session port.
+A session identity is never inferred from the run ID.
+
+The hook bridge retains native apply_patch argument shape when rewriting: freeform strings stay
+strings and object calls replace their `patch` field. It does not replace a JSON call with a string.
+
+
+RunState schema 18 adds `pending_hook_context_follow_up`. Background messages retain their sampling
+intent across serialized approval recovery, while synchronous messages retain only their history
+content. Queue drains transfer messages and the follow-up flag atomically, so a concurrent result
+cannot lose its wakeup between a separate flag check and message drain. Older checkpoints default
+this absent flag to false; older runtimes cannot honor the new follow-up marker. Resume schema 18
+checkpoints with this build when background follow-up matters.

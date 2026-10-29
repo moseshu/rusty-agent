@@ -1,12 +1,13 @@
 //! Optional host hooks, following the Codex event surface rather than SDK lifecycle observers.
 //!
-//! Only pre-tool, permission-request, stop, and subagent-stop events accept control decisions.
+//! Session/prompt acceptance, tool, permission-request and stop events accept control decisions.
 //! The runtime validates a returned decision against its event; unsupported decisions are reported
 //! and ignored. Hooks cannot override a permission-policy denial. No hooks are installed by default.
 //!
-//! This is an in-process contract. Command discovery, JSON/exit-code parsing, input rewrites, and
-//! Codex-specific context injection belong to host adapters. Session events are explicitly emitted
-//! by the session owner: a run is not a session. Subagent identity must likewise be supplied by the
+//! This is an in-process contract. Command discovery, JSON/exit-code parsing and provider-specific
+//! input translation belong to host adapters. Context messages use a dedicated history queue and
+//! never pass through input contributors. Session initialization/end belong to the host: a run is
+//! not a session. After successful compaction the runtime re-establishes the identified session. Subagent identity must likewise be supplied by the
 //! host, never guessed from an agent name. Stop continuation uses ordinary user-role history and
 //! the existing run budget, not a separate retry budget.
 //!
@@ -35,13 +36,13 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
-    /// A host session opens or resumes.
+    /// A host session opens, resumes, or re-establishes context after compaction.
     SessionStart,
     /// A host session closes.
     SessionEnd,
     /// A host accepts a new user prompt.
     UserPromptSubmit,
-    /// Before an admitted tool call executes.
+    /// Before native argument decoding and permission admission.
     PreToolUse,
     /// After a tool successfully produces its complete output.
     PostToolUse,
@@ -196,16 +197,49 @@ impl<'a> StopHookData<'a> {
     }
 }
 
+/// Why a host session starts or its context is re-established, following Codex.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartSource {
+    /// A new conversation.
+    Startup,
+    /// Previously stored or explicitly supplied history.
+    Resume,
+    /// A fresh conversation created by clearing another conversation.
+    Clear,
+    /// Context re-establishment after successful compaction.
+    Compact,
+    /// History copied from a parent thread.
+    Fork,
+}
+impl SessionStartSource {
+    /// Stable hook matcher label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Resume => "resume",
+            Self::Clear => "clear",
+            Self::Compact => "compact",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 /// Typed input for one host event. Runtime-only references never become model input implicitly.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum HookEvent<'a> {
-    /// Emitted by the session owner, not for every runner invocation.
+    /// Emitted by the session owner at initialization and by the runtime after compaction.
+    /// The owner identity must be supplied; an ordinary runner invocation is not session startup.
     SessionStart {
         /// Session identity supplied by its owner.
         session_id: &'a SessionId,
-        /// Whether this opens a previously stored session.
+        /// Whether the source is Resume; retained for legacy observers.
         resumed: bool,
+        /// The actual lifecycle source; use this for hook selection.
+        source: SessionStartSource,
     },
     /// Emitted by the session owner when the session really ends.
     SessionEnd {
@@ -214,12 +248,15 @@ pub enum HookEvent<'a> {
         /// Host-provided reason the session closed.
         reason: &'a str,
     },
-    /// Emitted by the host for the new prompt alone, not a resumed transcript projection.
+    /// Inspects newly submitted user input, excluding prior history and contextual messages.
+    /// The session host emits this for initial input. The runtime emits it once per steered
+    /// message when delivering `PendingInput`, including for standalone `Runner` requests.
+    /// Hosts must not also emit this event when enqueueing steered messages.
     UserPromptSubmit {
         /// Newly submitted input, excluding prior conversation history.
         input: &'a [ModelInputItem],
     },
-    /// May deny this call, but may not grant permission.
+    /// May rewrite or deny this call, but may not grant permission.
     PreToolUse(ToolHookData<'a>),
     /// Observes complete successful output before output guardrails or context projection.
     PostToolUse {
@@ -306,9 +343,19 @@ pub enum HookDecision {
     /// No control effect; an approval remains pending.
     #[default]
     Continue,
+    /// Replaces native tool arguments before decoding, permission and input guardrails.
+    UpdateInput {
+        /// Complete replacement arguments, supported only for pre-tool events.
+        input: serde_json::Value,
+    },
+    /// Replaces the model-facing successful tool result while retaining the original output.
+    ReplaceOutput {
+        /// Replacement text, supported only for post-tool events.
+        message: String,
+    },
     /// Grants this one pending permission request only.
     Allow,
-    /// Denies a pre-tool or permission request, returning this message to the model.
+    /// Rejects a tool result/request or host input. At stop, ends processing without continuation.
     Deny {
         /// Model-facing explanation of the refused call.
         message: String,
@@ -325,6 +372,7 @@ pub struct UserHookContext<'a> {
     run: &'a RunContext,
     cancel: &'a CancelScope,
     services: &'a ToolServices,
+    context_output: Option<&'a HookContextQueue>,
 }
 
 impl<'a> UserHookContext<'a> {
@@ -339,7 +387,19 @@ impl<'a> UserHookContext<'a> {
             run,
             cancel,
             services,
+            context_output: services.hook_context(),
         }
+    }
+    /// Selects the run-owned context destination without changing callback construction.
+    #[must_use]
+    pub const fn with_context_output(mut self, output: &'a HookContextQueue) -> Self {
+        self.context_output = Some(output);
+        self
+    }
+    /// Context destination shared with the host for background results.
+    #[must_use]
+    pub const fn context_output(&self) -> Option<&'a HookContextQueue> {
+        self.context_output
     }
     /// The public agent and current run accounting.
     #[must_use]
@@ -367,6 +427,10 @@ impl<'a> UserHookContext<'a> {
 pub trait UserHook: Send + Sync + 'static {
     /// Display label for reports. It is not a registry lookup key.
     fn name(&self) -> &str;
+    /// Binds background context delivery to the active run without executing an event.
+    /// Hosts retain results rejected by a closed destination for the next run.
+    fn bind_context(&self, _run: &RunContext, _output: &HookContextQueue) {}
+
     /// Handles a selected event. Returning Continue observes it without changing control flow.
     async fn call(
         &self,
@@ -473,5 +537,138 @@ impl HookReport {
     #[must_use]
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
+    }
+}
+
+/// Run-owned contextual history, separate from steered user input.
+///
+/// Accepted entries are drained into authoritative history after tool outputs. Closing and
+/// accepting are atomic, so a host can retain late background results for the next run.
+#[derive(Debug, Clone, Default)]
+pub struct HookContextQueue {
+    state: std::sync::Arc<std::sync::Mutex<HookContextState>>,
+}
+
+#[derive(Debug, Default)]
+struct HookContextState {
+    closed: bool,
+    messages: Vec<Message>,
+    follow_up: bool,
+}
+
+impl HookContextQueue {
+    /// Records synchronous context without requesting follow-up sampling.
+    /// Returns ownership when the run no longer accepts messages.
+    pub fn push(&self, messages: Vec<Message>) -> std::result::Result<(), Vec<Message>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(messages);
+        }
+        state.messages.extend(messages);
+        Ok(())
+    }
+    /// Queues a completed background result and requests follow-up sampling when necessary.
+    pub fn push_background(&self, messages: Vec<Message>) -> std::result::Result<(), Vec<Message>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(messages);
+        }
+        if !messages.is_empty() {
+            state.follow_up = true;
+        }
+        state.messages.extend(messages);
+        Ok(())
+    }
+    /// Whether pending background context requires another model request.
+    #[must_use]
+    pub fn requires_follow_up(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .follow_up
+    }
+    /// Takes accepted context without closing the destination.
+    #[must_use]
+    pub fn take(&self) -> Vec<Message> {
+        self.take_with_follow_up().0
+    }
+    /// Atomically drains context and its background follow-up intent.
+    #[must_use]
+    pub fn take_with_follow_up(&self) -> (Vec<Message>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let follow_up = std::mem::take(&mut state.follow_up);
+        (std::mem::take(&mut state.messages), follow_up)
+    }
+    /// Whether the run no longer accepts context through this handle.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
+    }
+
+    /// Whether context is waiting for delivery.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .messages
+            .is_empty()
+    }
+    /// Closes atomically when no accepted context remains.
+    #[must_use]
+    pub fn close_if_empty(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.messages.is_empty() {
+            state.closed = true;
+        }
+        state.closed
+    }
+    /// Closes this lane and another input lane under one acceptance boundary.
+    /// The other lane must close only when empty and return whether it closed.
+    #[must_use]
+    pub fn close_if_empty_with(&self, close_other: impl FnOnce() -> bool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.messages.is_empty() {
+            return false;
+        }
+        if close_other() {
+            state.closed = true;
+        }
+        state.closed
+    }
+
+    /// Closes and takes any undelivered entries for checkpoint persistence.
+    #[must_use]
+    pub fn close(&self) -> Vec<Message> {
+        self.close_with_follow_up().0
+    }
+    /// Closes acceptance and atomically drains messages with their persisted wakeup intent.
+    #[must_use]
+    pub fn close_with_follow_up(&self) -> (Vec<Message>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        let follow_up = std::mem::take(&mut state.follow_up);
+        (std::mem::take(&mut state.messages), follow_up)
     }
 }

@@ -1195,8 +1195,9 @@ impl RunRequest {
     /// from that rollout followed by the new input, and passes the history's length; a spawned
     /// agent's run starts on the agent's history followed by its mail. Without it, the history is
     /// recorded again as the run's input, and a later rebuild repeats it. A count beyond the input
-    /// counts all of it. It has no effect on a run without a rollout recorder, and none on a run
-    /// continued from its checkpoint, whose input is recorded as the base it continues on.
+    /// counts all of it. The same boundary excludes prior history from input contributors, even
+    /// without a recorder. It does not affect resumed contributors, whose pending input is already
+    /// retained in the checkpoint, or remove any model-facing history.
     pub const fn with_recorded_input(mut self, count: usize) -> Self {
         self.recorded_input = count;
         self
@@ -1568,6 +1569,7 @@ struct TurnLoopProgress {
     session_compaction_usage: std::sync::Mutex<Usage>,
     /// Whether this segment has recorded its turn context in the run's rollout.
     turn_context_recorded: bool,
+    stop_processing: bool,
 }
 
 impl TurnLoopProgress {
@@ -1989,7 +1991,7 @@ async fn run_loop_inner(
         agent_tree: _,
         nested_spend: _,
         rollout,
-        recorded_input: _,
+        recorded_input,
         session,
         pending_input,
         live_settings,
@@ -2000,6 +2002,14 @@ async fn run_loop_inner(
     } else {
         state.set_max_turns(config.max_turns());
     }
+    let services = if services
+        .hook_context()
+        .is_some_and(|queue| !queue.is_closed())
+    {
+        services
+    } else {
+        services.with_hook_context(ra_core::hook::HookContextQueue::default())
+    };
     let services = match &agent_handle {
         Some(handle) => services.with_agent_control(Arc::new(
             handle.clone().with_pending_input(pending_input.clone()),
@@ -2084,7 +2094,7 @@ async fn run_loop_inner(
     let mut new_turn_input = if resuming {
         Vec::new()
     } else {
-        requested_input.clone()
+        requested_input[recorded_input.min(requested_input.len())..].to_vec()
     };
     // A segment that answers questions the last one stopped on finishes that turn rather than
     // starting a new one, which is what the agent tree's budget reminder is keyed to.
@@ -2224,6 +2234,7 @@ async fn run_loop_inner(
         nested_usage: Usage::default(),
         session_compaction_usage: std::sync::Mutex::new(Usage::default()),
         turn_context_recorded: false,
+        stop_processing: false,
     };
     let permission = config
         .permission()
@@ -2268,6 +2279,11 @@ async fn run_loop_inner(
         continues_turn,
         session: session.as_deref(),
     };
+    let _bound_hooks = config.user_hooks().bind(
+        Arc::new(live_context(&context, &agent, &state)),
+        cancel.clone(),
+        services.clone(),
+    );
     // The stage runs once per run, on the segment that opens it. A continuation does not repeat
     // the caller's opening input, so a check written against that input has nothing new to look
     // at — and the reference implementation gates the same way, on being the run's first turn.
@@ -2290,7 +2306,7 @@ async fn run_loop_inner(
     // the match below is what keeps the translation underneath a single statement of the rule
     // rather than three copies to keep in step — a deadline that expired while a blocking check
     // was still thinking is the same budget stop it would have been one line later.
-    let stepped = async {
+    let mut stepped = async {
         state.snapshot_event_seq(&event_seqs);
         session_persistence::resume_pending_session_write(
             context.session,
@@ -2408,7 +2424,21 @@ async fn run_loop_inner(
                 let end = progress.segment_items(&state).len();
                 progress.resumed_conclusion = Some(resumed_from.min(end)..end);
                 let outcome = RunOutcome::Completed { reason };
-                if !continue_from_stop_hook(&context, &agent, &mut state, &mut progress, &outcome)
+                if !continue_for_pending_input(
+                    &context,
+                    &agent,
+                    &mut state,
+                    &mut progress,
+                    &outcome,
+                )
+                .await?
+                    && !continue_from_stop_hook(
+                        &context,
+                        &agent,
+                        &mut state,
+                        &mut progress,
+                        &outcome,
+                    )
                     .await?
                 {
                     return Ok(outcome);
@@ -2441,6 +2471,38 @@ async fn run_loop_inner(
         .await
     }
     .await;
+
+    if progress.stop_processing {
+        if let Some(pending) = context.pending_input {
+            pending.seal();
+        }
+        let accepted =
+            deliver_pending_input(&context, &agent, &mut state, &progress, &cancel, true).await;
+        let settlement = match accepted {
+            Ok(Some(true)) => {
+                contribute_turn_input(
+                    &context,
+                    &agent,
+                    &mut state,
+                    progress.reference_turn(),
+                    &cancel,
+                )
+                .await
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = settlement {
+            stepped = Err(error);
+        }
+    }
+    if let Some(queue) = context.services.hook_context() {
+        let (messages, follow_up) = queue.close_with_follow_up();
+        state.queue_hook_context_with_follow_up(messages, follow_up);
+    }
+    if matches!(&stepped, Ok(RunOutcome::Completed { .. })) {
+        deliver_hook_context(&context, &mut state);
+    }
 
     // Whatever the loop's agent-tool calls spent before it stopped belongs in the ledger the result,
     // the checkpoint and an error handler read, whichever way it stopped — including a stage that
@@ -4417,6 +4479,10 @@ fn record_terminal_error(span: &tracing::Span, error: &Error, scope: &CancelScop
 ///
 /// `input_check`, when present, is raced against the **first** turn. See
 /// [`race_input_guardrails`] for what that race decides and what it deliberately does not.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep input acceptance and stop delivery ordering visible in one loop."
+)]
 async fn run_turns(
     context: &TurnLoopContext<'_>,
     agent: &mut AgentBinding,
@@ -4549,9 +4615,11 @@ async fn run_turns(
             .await?;
         }
         if let Some(outcome) = &step
-            && (continue_for_pending_input(context, progress, outcome)
+            && !progress.stop_processing
+            && (continue_for_pending_input(context, agent, state, progress, outcome).await?
                 || continue_from_stop_hook(context, agent, state, progress, outcome).await?
-                || continue_for_late_pending_input(context, progress, outcome))
+                || continue_for_late_pending_input(context, agent, state, progress, outcome)
+                    .await?)
         {
             step = None;
         }
@@ -4593,6 +4661,9 @@ async fn continue_from_stop_hook(
     progress: &mut TurnLoopProgress,
     outcome: &RunOutcome,
 ) -> Result<bool> {
+    if progress.stop_processing {
+        return Ok(false);
+    }
     let Some(reason) = outcome
         .finish_reason()
         .filter(|reason| reason.is_complete())
@@ -4636,6 +4707,10 @@ async fn continue_from_stop_hook(
             .dispatch(event)
             .await?
     };
+    if matches!(decision, HookDecision::Deny { .. }) {
+        progress.stop_processing = true;
+        return Ok(false);
+    }
     let HookDecision::Block { prompt } = decision else {
         return Ok(false);
     };
@@ -4848,12 +4923,21 @@ async fn run_one_turn(
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
     // Both before the model call, so whatever arrived during the last one is answered by this
     // one; either delivery is persisted once it is recorded.
+    deliver_hook_context(context, state);
     let delivered_mail = deliver_agent_mail(context, state, progress, turn_scope);
-    let delivered_input = deliver_pending_input(context, state, progress, turn_scope);
+    let delivered_input =
+        deliver_pending_input(context, agent, state, progress, turn_scope, false).await?;
+    deliver_hook_context(context, state);
+    if delivered_input == Some(false) {
+        progress.stop_processing = true;
+        return Ok(Some(RunOutcome::Completed {
+            reason: FinishReason::Final,
+        }));
+    }
     contribute_turn_input(context, agent, state, progress.reference_turn(), turn_scope)
         .await
         .map_err(|error| error.with_run_state(state.clone()))?;
-    if (delivered_mail || delivered_input)
+    if (delivered_mail || delivered_input == Some(true))
         && let Some(rollout) = context.events.rollout
     {
         persist_rollout(rollout, context.run_id, PersistContext::SteeredUserInput).await;
@@ -4905,23 +4989,17 @@ async fn run_one_turn(
         context.tool_guardrails.preflight(prepared.tools())?;
     }
     let sandbox_processors = context.sandbox.context_processors(agent).await;
-    let (prepared, context_records, context_responses) = process_context_processors(
-        context,
-        &sandbox_processors,
-        progress,
-        turn_scope,
-        prepared,
-        &turn_input,
-        preparation_context,
-    )
-    .await?;
-    // The filter chain runs last, on whatever the coarse transforms produced. A context processor
-    // reprojects whole regions of history; running a filter before it would only trim items the
-    // processor's own output then replaced with the untouched originals.
-    let (prepared, context_filter_reports) =
-        apply_context_filters(config, state, progress.reference_turn(), prepared)?;
-    let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
-
+    let (prepared, context_records, context_responses, compact_stopped) =
+        process_context_processors(
+            context,
+            &sandbox_processors,
+            progress,
+            turn_scope,
+            prepared,
+            &turn_input,
+            preparation_context,
+        )
+        .await?;
     let first_item = progress.segment_items(state).len();
     let context_usage = context_responses
         .iter()
@@ -4940,6 +5018,19 @@ async fn run_one_turn(
         }
         state.record_generated_items(context_records);
     }
+
+    if compact_stopped {
+        progress.stop_processing = true;
+        return Ok(Some(RunOutcome::Completed {
+            reason: FinishReason::Final,
+        }));
+    }
+    // The filter chain runs last, on whatever the coarse transforms produced. A context processor
+    // reprojects whole regions of history; running a filter before it would only trim items the
+    // processor's own output then replaced with the untouched originals.
+    let (prepared, context_filter_reports) =
+        apply_context_filters(config, state, progress.reference_turn(), prepared)?;
+    let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
 
     let streaming_dispatch = StreamedDispatchInput {
         agent_id: agent.public_id().clone(),
@@ -5509,21 +5600,41 @@ fn deliver_agent_mail(
 ///
 /// Delivered under the same rule as mail: not ahead of the input a request brought, which the
 /// first model call answers on its own, and not into a turn that is already cancelled.
-fn deliver_pending_input(
+async fn deliver_pending_input(
     context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
     state: &mut RunState,
     progress: &TurnLoopProgress,
     turn_scope: &CancelScope,
-) -> bool {
+    force: bool,
+) -> Result<Option<bool>> {
     let Some(pending) = context.pending_input else {
-        return false;
+        return Ok(None);
     };
-    if (progress.turns <= 1 && !context.deliver_mail_first) || turn_scope.is_cancelled() {
-        return false;
+    if (!force && progress.turns <= 1 && !context.deliver_mail_first) || turn_scope.is_cancelled() {
+        return Ok(None);
     }
-    let messages = pending.take();
+    let mut messages = Vec::new();
+    let submitted = pending.take();
+    let had_input = !submitted.is_empty();
+    for message in submitted {
+        let input = [ModelInputItem::Message(message.clone())];
+        let decision = context
+            .config
+            .user_hooks()
+            .bind(
+                Arc::new(live_context(context, agent, state)),
+                turn_scope.clone(),
+                context.services.clone(),
+            )
+            .dispatch(HookEvent::UserPromptSubmit { input: &input })
+            .await?;
+        if !matches!(decision, HookDecision::Deny { .. }) {
+            messages.push(message);
+        }
+    }
     if messages.is_empty() {
-        return false;
+        return Ok(had_input.then_some(false));
     }
     state.queue_input_contributions(messages.iter().cloned().map(ModelInputItem::Message));
     // Numbered by the whole run's turn, like mail, so a resumed segment does not collide with what
@@ -5534,7 +5645,10 @@ fn deliver_pending_input(
         .enumerate()
         .map(|(index, message)| {
             RunItem::new(
-                ItemId::new(format!("steered-input-{turn}-{index}")),
+                ItemId::new(format!(
+                    "steered-input-{turn}-{}-{index}",
+                    state.generated_items().len()
+                )),
                 RunItemKind::Message(message),
             )
         })
@@ -5543,7 +5657,7 @@ fn deliver_pending_input(
         emit(context.events, RunStreamEvent::Item(item.clone()));
     }
     state.record_generated_items(items);
-    true
+    Ok(Some(true))
 }
 
 /// Commits contextual input atomically, leaving accepted input retryable on failure or cancellation.
@@ -5587,37 +5701,59 @@ async fn contribute_turn_input(
 /// Whether a run that reached `outcome` carries on because input is pending: Codex's follow-up on
 /// pending input, which it decides before its stop hooks. Only a conclusion the run would deliver
 /// is overruled.
-fn continue_for_pending_input(
+async fn continue_for_pending_input(
     context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
     progress: &mut TurnLoopProgress,
     outcome: &RunOutcome,
-) -> bool {
-    let Some(pending) = context.pending_input else {
-        return false;
-    };
-    if pending.is_empty() || !concludes(outcome) {
-        return false;
+) -> Result<bool> {
+    if !concludes(outcome) {
+        return Ok(false);
+    }
+    let accepted =
+        deliver_pending_input(context, agent, state, progress, context.cancel, true).await?;
+    let contextual = deliver_hook_context(context, state);
+    if accepted == Some(false) {
+        progress.stop_processing = true;
+        return Ok(false);
+    }
+    if !(contextual || accepted == Some(true)) {
+        return Ok(false);
     }
     continue_after_conclusion(progress);
-    true
+    Ok(true)
 }
 
-/// Whether a run that is about to finish carries on because input arrived since
-/// [`continue_for_pending_input`] looked. Otherwise the queue is closed in the same step, so no
-/// input is accepted that the run will not read.
-fn continue_for_late_pending_input(
+/// Resolves late input before closing both acceptance lanes atomically. Rejected prompts do not
+/// cause a sampling request, even when they arrived while stop hooks were running.
+async fn continue_for_late_pending_input(
     context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &mut RunState,
     progress: &mut TurnLoopProgress,
     outcome: &RunOutcome,
-) -> bool {
-    let Some(pending) = context.pending_input else {
-        return false;
-    };
-    if !concludes(outcome) || pending.close_if_empty() {
-        return false;
+) -> Result<bool> {
+    if progress.stop_processing || !concludes(outcome) {
+        return Ok(false);
     }
-    continue_after_conclusion(progress);
-    true
+    loop {
+        if continue_for_pending_input(context, agent, state, progress, outcome).await? {
+            return Ok(true);
+        }
+        let close_input = || {
+            context
+                .pending_input
+                .is_none_or(PendingInput::close_if_empty)
+        };
+        let closed = context
+            .services
+            .hook_context()
+            .map_or_else(close_input, |queue| queue.close_if_empty_with(close_input));
+        if closed {
+            return Ok(false);
+        }
+    }
 }
 
 /// Whether `outcome` is a conclusion the run would deliver, which pending input may overrule.
@@ -5758,6 +5894,10 @@ fn absorb_nested_spend(
 /// Processors are deliberately generic here. The loop knows how to request a summary and append
 /// returned records, but it does not know whether a processor is compaction, redaction, or a
 /// product-specific retention policy.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep processor projections, record reconciliation and compact hook ordering together."
+)]
 async fn process_context_processors(
     context: &TurnLoopContext<'_>,
     sandbox_processors: &[Arc<dyn ContextProcessor>],
@@ -5766,7 +5906,7 @@ async fn process_context_processors(
     prepared: PreparedTurn,
     turn_input: &TurnInput,
     run: RunContext,
-) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>)> {
+) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>, bool)> {
     // Sandbox capabilities transform the current input even on caller-managed continuations,
     // as the reference's prepare_sandbox_input does. Only run-level processors require an
     // authoritative history decomposition.
@@ -5785,7 +5925,7 @@ async fn process_context_processors(
         )
         .collect();
     if processors.is_empty() {
-        return Ok((prepared, Vec::new(), Vec::new()));
+        return Ok((prepared, Vec::new(), Vec::new(), false));
     }
     let mut input = prepared.request().input().to_vec();
     // Without a reconstructible history, expose the caller's input as a prefix, not as records
@@ -5798,20 +5938,25 @@ async fn process_context_processors(
     let mut taken_ids: BTreeSet<ItemId> = history.iter().map(|item| item.id().clone()).collect();
     let mut model_responses = Vec::new();
     let summarizer = RunnerContextSummarizer::new(&prepared, turn_scope);
-    let hooks = (context
-        .config
-        .user_hooks()
-        .has_event(HookEventName::PreCompact)
-        || context
-            .config
-            .user_hooks()
-            .has_event(HookEventName::PostCompact))
+    // As in the source, only the root session re-runs SessionStart after compaction; a child
+    // run's own compaction does not re-establish the parent session's context.
+    let root_run = run.parent_run_id().is_none();
+    let hooks = [
+        HookEventName::PreCompact,
+        HookEventName::PostCompact,
+        HookEventName::SessionStart,
+    ]
+    .into_iter()
+    .any(|event| context.config.user_hooks().has_event(event))
     .then(|| {
-        Arc::new(context.config.user_hooks().bind(
-            Arc::new(run),
-            turn_scope.clone(),
-            context.services.clone(),
-        ))
+        Arc::new(CompactionHookDispatcher {
+            hooks: context.config.user_hooks().bind(
+                Arc::new(run),
+                turn_scope.clone(),
+                context.services.clone(),
+            ),
+            compacted: std::sync::atomic::AtomicBool::new(false),
+        })
     });
 
     for (index, processor) in processors.iter().enumerate() {
@@ -5845,10 +5990,97 @@ async fn process_context_processors(
             generated_items.push(item.clone());
         }
         model_responses.extend(result.model_responses().iter().cloned());
+        let notified = hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .compacted
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        });
+        let compacted = notified
+            || result.generated_items().iter().any(|item| {
+                matches!(
+                    item.kind(),
+                    RunItemKind::Compaction(_) | RunItemKind::ProviderCompaction(_)
+                )
+            });
+        if compacted && root_run {
+            let (items, stopped) = reestablish_compact_context(
+                context,
+                hooks.as_ref().map(|hooks| &hooks.hooks),
+                &format!("compact-hook-{}-{index}", progress.reference_turn()),
+            )
+            .await?;
+            input.extend(items.iter().filter_map(RunItem::to_model_input));
+            history.extend(items.iter().cloned());
+            generated_items.extend(items);
+            if stopped {
+                return Ok((
+                    prepared.map_request(|request| request.with_input(input)),
+                    generated_items,
+                    model_responses,
+                    true,
+                ));
+            }
+        }
     }
 
     let prepared = prepared.map_request(|request| request.with_input(input));
-    Ok((prepared, generated_items, model_responses))
+    Ok((prepared, generated_items, model_responses, false))
+}
+
+/// Captures successful compaction notifications even when a processor projects without records.
+struct CompactionHookDispatcher {
+    hooks: crate::hook::BoundUserHooks,
+    compacted: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl ra_core::hook::UserHookDispatcher for CompactionHookDispatcher {
+    async fn dispatch(&self, event: HookEvent<'_>) -> Result<HookDecision> {
+        let compacted = matches!(event, HookEvent::PostCompact { .. });
+        let decision = self.hooks.dispatch(event).await?;
+        if compacted {
+            self.compacted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(decision)
+    }
+}
+
+/// Re-establishes product context after compaction using the actual session owner's identity.
+async fn reestablish_compact_context(
+    context: &TurnLoopContext<'_>,
+    hooks: Option<&crate::hook::BoundUserHooks>,
+    record_prefix: &str,
+) -> Result<(Vec<RunItem>, bool)> {
+    let session_id = context
+        .config
+        .user_hooks()
+        .session_id()
+        .or_else(|| context.session.map(Session::session_id));
+    let (Some(hooks), Some(session_id)) = (hooks, session_id) else {
+        return Ok((Vec::new(), false));
+    };
+    let decision = hooks
+        .dispatch(HookEvent::SessionStart {
+            session_id,
+            resumed: false,
+            source: ra_core::hook::SessionStartSource::Compact,
+        })
+        .await?;
+    let messages = context
+        .services
+        .hook_context()
+        .map_or_else(Vec::new, ra_core::hook::HookContextQueue::take);
+    let items = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            RunItem::new(
+                ItemId::new(format!("{record_prefix}-{index}")),
+                RunItemKind::Message(message),
+            )
+        })
+        .collect();
+    Ok((items, matches!(decision, HookDecision::Deny { .. })))
 }
 
 /// What one turn's model input is built from: a base, and the records appended to it since.
@@ -7061,4 +7293,30 @@ fn emit(events: RunEvents<'_>, event: RunStreamEvent) {
     if let Some(sender) = events.stream {
         let _ = sender.send(event);
     }
+}
+
+/// Records context after the tool batch without treating it as accepted user input.
+fn deliver_hook_context(context: &TurnLoopContext<'_>, state: &mut RunState) -> bool {
+    let (messages, follow_up) = context.services.hook_context().map_or_else(
+        || (Vec::new(), false),
+        ra_core::hook::HookContextQueue::take_with_follow_up,
+    );
+    state.queue_hook_context_with_follow_up(messages, follow_up);
+    let (messages, follow_up) = state.take_hook_context_with_follow_up();
+    let offset = state.generated_items().len();
+    let items: Vec<_> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            RunItem::new(
+                ItemId::new(format!("hook-context-{offset}-{index}")),
+                RunItemKind::Message(message),
+            )
+        })
+        .collect();
+    for item in &items {
+        emit(context.events, RunStreamEvent::Item(item.clone()));
+    }
+    state.record_generated_items(items);
+    follow_up
 }
