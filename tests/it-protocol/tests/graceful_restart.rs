@@ -6,6 +6,10 @@
 //! and signals the process. The cases that wait for the turn give it seconds, against
 //! sub-second checks that the process is still there, so the checks cannot pass by a turn that
 //! ended early; they can only miss a server that left a little too late.
+//!
+//! As in Codex, a request that must be refused is sent only after that first check: `kill`
+//! returns once the signal is queued, and a request sent at once can reach the server before
+//! its signal task has closed turn admission.
 
 #![cfg(unix)]
 
@@ -276,12 +280,12 @@ async fn sigterm_waits_for_the_running_turn_before_exit() {
     let mut ws = connect_and_start_turn(&server).await;
 
     server.signal("-TERM");
+    server.assert_still_running_for(Duration::from_millis(300));
     send(&mut ws, 3, "turn/start", turn_start()).await;
     assert_eq!(
         answer(&mut ws, 3).await["error"],
         json!({"code": -32600, "message": "Server is draining; retry after reconnecting"})
     );
-    server.assert_still_running_for(Duration::from_millis(300));
 
     let status = server.wait_for_exit_within(PATIENCE);
     assert!(status.success(), "expected graceful exit, got {status}");
@@ -295,9 +299,9 @@ async fn a_second_sigint_forces_exit_while_the_turn_runs() {
     let mut ws = connect_and_start_turn(&server).await;
 
     server.signal("-INT");
+    server.assert_still_running_for(Duration::from_millis(300));
     send(&mut ws, 3, "turn/start", turn_start()).await;
     assert_eq!(answer(&mut ws, 3).await["error"]["code"], -32600);
-    server.assert_still_running_for(Duration::from_millis(300));
 
     server.signal("-INT");
     let status = server.wait_for_exit_within(Duration::from_secs(5));
@@ -312,11 +316,35 @@ async fn repeated_sighup_keeps_waiting_for_the_running_turn() {
     let mut ws = connect_and_start_turn(&server).await;
 
     server.signal("-HUP");
+    server.assert_still_running_for(Duration::from_millis(300));
     send(&mut ws, 3, "turn/start", turn_start()).await;
     assert_eq!(answer(&mut ws, 3).await["error"]["code"], -32600);
-    server.assert_still_running_for(Duration::from_millis(300));
     server.signal("-HUP");
     server.assert_still_running_for(Duration::from_millis(300));
+
+    let status = server.wait_for_exit_within(PATIENCE);
+    assert!(status.success(), "expected graceful exit, got {status}");
+    expect_disconnect(&mut ws).await;
+}
+
+/// Not a Codex case: a signal that arrives while the server is busy with other requests still
+/// starts the drain. The server's signal wait must outlive each turn of its event loop, as
+/// Codex's pinned `shutdown_signal_future` does; a wait made afresh in each `select!` is dropped
+/// whenever a request wins, and the signal is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signal_during_a_burst_of_requests_still_starts_the_drain() {
+    let mut server = ChildServer::start(Duration::from_secs(5));
+    let mut ws = connect_and_start_turn(&server).await;
+    for id in 100..1100 {
+        send(&mut ws, id, "no/such/method", json!({})).await;
+        if id == 600 {
+            server.signal("-HUP");
+        }
+    }
+    answer(&mut ws, 1099).await;
+    server.assert_still_running_for(Duration::from_millis(300));
+    send(&mut ws, 3, "turn/start", turn_start()).await;
+    assert_eq!(answer(&mut ws, 3).await["error"]["code"], -32600);
 
     let status = server.wait_for_exit_within(PATIENCE);
     assert!(status.success(), "expected graceful exit, got {status}");
