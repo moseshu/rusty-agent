@@ -87,6 +87,11 @@ impl PluginRuntimeConfig {
             config_layer_stack.requirements().mcp_servers.as_ref(),
         )
         .map_err(io::Error::other)?;
+        let model_provider_id = config_layer_stack
+            .required_model_provider()
+            .map(str::to_owned)
+            .or(cfg.model_provider)
+            .unwrap_or_else(|| "openai".to_owned());
         Ok(Self {
             config_layer_stack,
             features,
@@ -94,7 +99,7 @@ impl PluginRuntimeConfig {
             chatgpt_base_url: cfg
                 .chatgpt_base_url
                 .unwrap_or_else(|| super::remote::DEFAULT_CHATGPT_BASE_URL.to_string()),
-            model_provider_id: cfg.model_provider.unwrap_or_else(|| "openai".to_string()),
+            model_provider_id,
             mcp_servers,
             mcp_enterprise_managed_auth,
             startup_warnings,

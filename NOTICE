@@ -741,3 +741,19 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-mcp/tests/product_approvals.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call_tests.rs; codex-rs/codex-mcp/src/mcp/mod_tests.rs (real app-server, checkpoint and counted stdio acceptance adaptations) |
 
 | `crates/ra-coding/src/plugins/input_contributor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/plugins/injection.rs; codex-rs/core/src/session/turn.rs (accepted-input contributor adaptation) |
+
+| `crates/ra-config/src/permission_profiles.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permissions.rs (profile compiler; proxy runtime configuration remains in its adapter) |
+
+| `crates/ra-config/src/permission_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permission_path.rs |
+
+| `crates/ra-config/src/permission_selection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs; codex-rs/core/src/config/permission_profile_selection.rs (managed catalog, precedence and recovery selection) |
+
+| `tests/it-config/tests/permission_profile_paths.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permission_path_tests.rs |
+
+| `tests/it-config/tests/permission_profile_compiler.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permissions_tests.rs (compiler, inheritance, Windows glob-grammar and network TOML assertions) |
+
+| `tests/it-config/tests/permission_profile_selection.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permission_profile_selection_tests.rs |
+
+| `crates/ra-config/src/permission_profile_catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permission_profile_catalog.rs |
+
+| `tests/it-coding/tests/config_loader_permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_loader_tests.rs (layer-stack cases loaded without ConfigBuilder) |

@@ -1,12 +1,12 @@
-//! Ported from Codex's `core/src/exec_policy_tests.rs` and `exec_policy/executable_identity_tests.rs`.
+//! Ported from Codex's `core/src/exec_policy_tests.rs` and executable-identity tests.
 //!
-//! Codex's permission profiles map onto the filesystem sandbox kind the decisions read:
-//! `PermissionProfile::Disabled` is [`FileSystemSandboxKind::Unrestricted`], `read_only()` and
-//! `workspace_write()` are [`FileSystemSandboxKind::Restricted`], and `External` is
-//! [`FileSystemSandboxKind::ExternalSandbox`]. Codex's tests of its config layer stack — project
-//! trust, ignored user and project rules, a spawned agent reusing its parent's policy — have no
-//! counterpart: the host passes the folders to load. Its PowerShell, Windows sandbox level and
-//! managed profile cases are not ported.
+//! Rule sources come from the product layer stack through
+//! [`ExecPolicySources::from_config_layer_stack`], which stands in for Codex's
+//! `load_exec_policy(&ConfigLayerStack)`; stacks built by Codex's `ConfigBuilder` are loaded with
+//! `load_config_layers_state` and without host-managed sources. This file covers layer
+//! selection, trust, ignored rule sources, rule evaluation, approval decisions and recovery.
+//! Parent-policy reuse, PowerShell, Windows sandbox level and managed profile execution
+//! cases remain outside these tests.
 
 use std::{fs, path::Path, sync::Arc};
 
@@ -14,20 +14,27 @@ use ra_coding::{
     exec_policy::{
         AllowPrefixRules, ExecApprovalRequest, ExecApprovalRequirement, ExecPolicyError,
         ExecPolicyManager, ExecPolicySources, ExecPolicyUpdateError, FileSystemSandboxKind,
-        SandboxPermissions, UnmatchedCommandContext, collect_policy_files,
-        commands_for_exec_policy, default_policy_path, derive_rejected_prompt_reason,
-        derive_requested_execpolicy_amendment_from_prefix_rule,
+        SandboxPermissions, UnmatchedCommandContext, check_execpolicy_for_warnings,
+        collect_policy_files, commands_for_exec_policy, default_policy_path,
+        derive_rejected_prompt_reason, derive_requested_execpolicy_amendment_from_prefix_rule,
         format_exec_policy_error_with_source, load_exec_policy, load_exec_policy_with_warning,
         parse_starlark_line_from_message, render_decision_for_unmatched_command,
     },
     shell_command::DangerousCommandMatch,
 };
+use ra_config::{
+    CONFIG_TOML_FILE, ConfigLayerEntry, ConfigLayerSource, ConfigLayerStack, ConfigRequirements,
+    ConfigRequirementsToml, ConfigToml, LoaderOverrides, NoopThreadConfigLoader, ProjectConfig,
+    TrustLevel, loader::load_config_layers_state,
+};
 use ra_execpolicy::{
     AbsolutePathBuf, AmendError, Decision, Evaluation, MatchOptions, NetworkRuleProtocol, Policy,
     PolicyParser, RequirementsExecPolicy, RuleMatch,
 };
+use ra_paths::AbsolutePathBuf as ConfigAbsolutePathBuf;
 use ra_protocol::server::protocol::{AskForApproval, ExecPolicyAmendment};
 use tempfile::tempdir;
+use toml::Value as TomlValue;
 
 const PROMPT_CONFLICT_REASON: &str =
     "approval required by policy, but AskForApproval is set to Never";
@@ -387,6 +394,374 @@ async fn ignores_policies_outside_policy_dir() {
         },
         policy.check_multiple([vec!["ls".to_string()]].iter(), &|_| Decision::Allow)
     );
+}
+
+fn config_stack_for_dot_codex_folder(dot_codex_folder: &Path) -> ConfigLayerStack {
+    let dot_codex_folder =
+        ConfigAbsolutePathBuf::from_absolute_path(dot_codex_folder).expect("absolute folder");
+    let layer = ConfigLayerEntry::new(
+        ConfigLayerSource::Project { dot_codex_folder },
+        TomlValue::Table(Default::default()),
+    );
+    ConfigLayerStack::new(
+        vec![layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("ConfigLayerStack")
+}
+
+async fn write_project_trust_config(
+    codex_home: &Path,
+    trusted_projects: &[(&Path, TrustLevel)],
+) -> std::io::Result<()> {
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        toml::to_string(&ConfigToml {
+            projects: Some(
+                trusted_projects
+                    .iter()
+                    .map(|(project, trust_level)| {
+                        (
+                            project.to_string_lossy().to_string(),
+                            ProjectConfig {
+                                trust_level: Some(*trust_level),
+                            },
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+            ),
+            ..Default::default()
+        })
+        .expect("serialize config"),
+    )
+    .await
+}
+
+/// Loads the product layer stack the way a session does, without host-managed sources.
+async fn load_config_stack(
+    codex_home: &Path,
+    cwd: &Path,
+    loader_overrides: LoaderOverrides,
+) -> std::io::Result<ConfigLayerStack> {
+    load_config_layers_state(
+        ra_executor::LOCAL_FS.as_ref(),
+        codex_home,
+        Some(ConfigAbsolutePathBuf::from_absolute_path(cwd)?),
+        &[],
+        loader_overrides,
+        &NoopThreadConfigLoader,
+    )
+    .await
+}
+
+async fn load_exec_policy_for_stack(stack: &ConfigLayerStack) -> Result<Policy, ExecPolicyError> {
+    load_exec_policy(&ExecPolicySources::from_config_layer_stack(stack)).await
+}
+
+#[tokio::test]
+async fn ignores_policy_files_when_config_stack_disables_exec_policy_rules() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let policy_dir = temp_dir.path().join("rules");
+    fs::create_dir_all(&policy_dir).expect("create policy dir");
+    fs::write(
+        policy_dir.join("allow.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="allow")"#,
+    )
+    .expect("write policy file");
+    let config_stack = config_stack_for_dot_codex_folder(temp_dir.path())
+        .with_user_and_project_exec_policy_rules_ignored(
+            /*ignore_user_and_project_exec_policy_rules*/ true,
+        );
+
+    let policy = load_exec_policy_for_stack(&config_stack)
+        .await
+        .expect("policy result");
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Forbidden)
+            .decision,
+        Decision::Forbidden,
+    );
+}
+
+#[tokio::test]
+async fn ignore_user_project_rules_keeps_system_policy_files() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_dir = temp_dir.path().join("system");
+    let policy_dir = config_dir.join("rules");
+    fs::create_dir_all(&policy_dir).expect("create policy dir");
+    fs::write(
+        policy_dir.join("allow.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="allow")"#,
+    )
+    .expect("write policy file");
+    let config_file = ConfigAbsolutePathBuf::from_absolute_path(config_dir.join(CONFIG_TOML_FILE))
+        .expect("absolute config file");
+    let layer = ConfigLayerEntry::new(
+        ConfigLayerSource::System { file: config_file },
+        TomlValue::Table(Default::default()),
+    );
+    let config_stack = ConfigLayerStack::new(
+        vec![layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("ConfigLayerStack")
+    .with_user_and_project_exec_policy_rules_ignored(
+        /*ignore_user_and_project_exec_policy_rules*/ true,
+    );
+
+    let policy = load_exec_policy_for_stack(&config_stack)
+        .await
+        .expect("policy result");
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Forbidden)
+            .decision,
+        Decision::Allow,
+    );
+}
+
+#[tokio::test]
+async fn ignores_rules_from_untrusted_project_layers() -> anyhow::Result<()> {
+    let project_dir = tempdir()?;
+    let policy_dir = project_dir.path().join("rules");
+    fs::create_dir_all(&policy_dir)?;
+    fs::write(
+        policy_dir.join("untrusted.rules"),
+        r#"prefix_rule(pattern=["ls"], decision="forbidden")"#,
+    )?;
+
+    let project_dot_codex_folder = ConfigAbsolutePathBuf::from_absolute_path(project_dir.path())?;
+    let layers = vec![ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::Project {
+            dot_codex_folder: project_dot_codex_folder,
+        },
+        TomlValue::Table(Default::default()),
+        "marked untrusted",
+    )];
+    let config_stack = ConfigLayerStack::new(
+        layers,
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )?;
+
+    let policy = load_exec_policy_for_stack(&config_stack).await?;
+
+    assert_eq!(
+        Evaluation {
+            decision: Decision::Allow,
+            matched_rules: vec![RuleMatch::HeuristicsRuleMatch {
+                command: vec!["ls".to_string()],
+                decision: Decision::Allow,
+            }],
+        },
+        policy.check_multiple([vec!["ls".to_string()]].iter(), &|_| Decision::Allow)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ignore_user_config_keeps_user_policy_files() -> std::io::Result<()> {
+    let temp = tempdir()?;
+    let codex_home = temp.path().join("home_ignore_user_config");
+    let rules_dir = codex_home.join("rules");
+    fs::create_dir_all(&rules_dir)?;
+    fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "model = \"from-user-config\"\ninvalid = [",
+    )?;
+    fs::write(
+        rules_dir.join("deny-curl.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="forbidden")"#,
+    )?;
+
+    let config_stack = load_config_stack(
+        &codex_home,
+        temp.path(),
+        LoaderOverrides {
+            ignore_user_config: true,
+            ..LoaderOverrides::without_managed_config_for_tests()
+        },
+    )
+    .await?;
+
+    let policy = load_exec_policy_for_stack(&config_stack)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Allow)
+            .decision,
+        Decision::Forbidden,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_policies_only_load_from_trusted_project_layers() -> std::io::Result<()> {
+    let temp = tempdir()?;
+    let codex_home = temp.path().join("home_execpolicy_nested");
+    let project_root = temp.path().join("project_execpolicy_nested");
+    let nested = project_root.join("nested");
+    let root_rules = project_root.join(".rusty-agent").join("rules");
+    let nested_rules = nested.join(".rusty-agent").join("rules");
+
+    fs::create_dir_all(&codex_home)?;
+    fs::create_dir_all(&nested_rules)?;
+    fs::write(project_root.join(".git"), "gitdir: here")?;
+    fs::create_dir_all(&root_rules)?;
+    fs::write(
+        root_rules.join("deny-rm.rules"),
+        r#"prefix_rule(pattern=["rm"], decision="forbidden")"#,
+    )?;
+    fs::write(
+        nested_rules.join("deny-mv.rules"),
+        r#"prefix_rule(pattern=["mv"], decision="forbidden")"#,
+    )?;
+    write_project_trust_config(&codex_home, &[(&nested, TrustLevel::Trusted)]).await?;
+
+    let config_stack = load_config_stack(
+        &codex_home,
+        &nested,
+        LoaderOverrides::without_managed_config_for_tests(),
+    )
+    .await?;
+
+    let policy = load_exec_policy_for_stack(&config_stack)
+        .await
+        .map_err(std::io::Error::other)?;
+    assert_eq!(
+        policy
+            .check_multiple([vec!["rm".to_string()]].iter(), &|_| Decision::Allow)
+            .decision,
+        Decision::Allow,
+    );
+    assert_eq!(
+        policy
+            .check_multiple([vec!["mv".to_string()]].iter(), &|_| Decision::Allow)
+            .decision,
+        Decision::Forbidden,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_policies_require_project_trust_without_config_toml() -> std::io::Result<()> {
+    let temp = tempdir()?;
+    let project_root = temp.path().join("project_execpolicy");
+    let nested = project_root.join("nested");
+    let rules_dir = project_root.join(".rusty-agent").join("rules");
+    fs::create_dir_all(&nested)?;
+    fs::write(project_root.join(".git"), "gitdir: here")?;
+    fs::create_dir_all(&rules_dir)?;
+    fs::write(
+        rules_dir.join("deny-rm.rules"),
+        r#"prefix_rule(pattern=["rm"], decision="forbidden")"#,
+    )?;
+
+    let cases = [
+        (
+            "unknown",
+            Vec::<(&Path, TrustLevel)>::new(),
+            Decision::Allow,
+        ),
+        (
+            "untrusted",
+            vec![(&project_root as &Path, TrustLevel::Untrusted)],
+            Decision::Allow,
+        ),
+        (
+            "trusted",
+            vec![(&project_root as &Path, TrustLevel::Trusted)],
+            Decision::Forbidden,
+        ),
+    ];
+
+    for (name, trust_entries, expected_decision) in cases {
+        let codex_home = temp.path().join(format!("home_execpolicy_{name}"));
+        fs::create_dir_all(&codex_home)?;
+        write_project_trust_config(&codex_home, &trust_entries).await?;
+
+        let config_stack = load_config_stack(
+            &codex_home,
+            &nested,
+            LoaderOverrides::without_managed_config_for_tests(),
+        )
+        .await?;
+
+        let policy = load_exec_policy_for_stack(&config_stack)
+            .await
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            policy
+                .check_multiple([vec!["rm".to_string()]].iter(), &|_| Decision::Allow)
+                .decision,
+            expected_decision,
+            "unexpected execpolicy decision for {name}",
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_policy_warnings_ignore_untrusted_project_rules_without_config_toml()
+-> std::io::Result<()> {
+    let temp = tempdir()?;
+    let project_root = temp.path().join("project_execpolicy_warning");
+    let nested = project_root.join("nested");
+    let rules_dir = project_root.join(".rusty-agent").join("rules");
+    fs::create_dir_all(&nested)?;
+    fs::write(project_root.join(".git"), "gitdir: here")?;
+    fs::create_dir_all(&rules_dir)?;
+    fs::write(rules_dir.join("broken.rules"), "prefix_rule(")?;
+
+    let cases = [
+        ("unknown", Vec::<(&Path, TrustLevel)>::new(), false),
+        (
+            "untrusted",
+            vec![(&project_root as &Path, TrustLevel::Untrusted)],
+            false,
+        ),
+        (
+            "trusted",
+            vec![(&project_root as &Path, TrustLevel::Trusted)],
+            true,
+        ),
+    ];
+
+    for (name, trust_entries, expect_warning) in cases {
+        let codex_home = temp.path().join(format!("home_execpolicy_warning_{name}"));
+        fs::create_dir_all(&codex_home)?;
+        write_project_trust_config(&codex_home, &trust_entries).await?;
+
+        let config_stack = load_config_stack(
+            &codex_home,
+            &nested,
+            LoaderOverrides::without_managed_config_for_tests(),
+        )
+        .await?;
+
+        let warning = check_execpolicy_for_warnings(&ExecPolicySources::from_config_layer_stack(
+            &config_stack,
+        ))
+        .await
+        .map_err(std::io::Error::other)?;
+        assert_eq!(
+            matches!(warning, Some(ExecPolicyError::ParsePolicy { .. })),
+            expect_warning,
+            "unexpected execpolicy warning state for {name}",
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::test]

@@ -90,6 +90,18 @@ impl PluginConfigManager {
         )
         .await
     }
+    /// Prepares executor environments using the source entry-point selection.
+    /// Ignoring the user configuration also skips environments.toml discovery.
+    pub async fn prepare_environment_manager(
+        &self,
+    ) -> Result<ra_executor::PreparedEnvironmentManager, ra_executor::ExecServerError> {
+        if self.options.loader_overrides.ignore_user_config {
+            ra_executor::EnvironmentManager::prepare_from_env().await
+        } else {
+            ra_executor::EnvironmentManager::prepare_from_codex_home(self.home.as_path()).await
+        }
+    }
+
     pub async fn load_for_cwd(&self, cwd: AbsolutePathBuf) -> io::Result<PluginRuntimeConfig> {
         let layers = self.load_config_layers_for_cwd(Some(cwd.clone())).await?;
         self.project(layers, cwd)

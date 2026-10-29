@@ -24,10 +24,10 @@
 //!
 //! # Differences from Codex
 //!
-//! - The host passes the configuration folders and requirements policy directly; Codex derives
-//!   them from its config layer stack, including project trust and the switch that ignores user
-//!   and project rules, and loads requirements from `requirements.toml`. Which folders to trust is
-//!   the host's decision here.
+//! - Hosts may supply rule folders directly or derive them through
+//!   [`ExecPolicySources::from_config_layer_stack`], which, like Codex, skips disabled
+//!   (untrusted) project layers, honors the user/project rule-ignore switch and keeps the
+//!   independently composed managed requirements.
 //! - Codex also overlays a policy per execution environment at decision time; a coding thread has
 //!   one environment, whose policy is the requirements policy merged at load.
 //! - [`AllowPrefixRules::Ignore`] is Codex's `IgnoreForCyberModel`, chosen there from the model
@@ -314,6 +314,31 @@ impl ExecPolicySources {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Derives trusted rule folders and managed rules from the authoritative product stack.
+    /// Disabled layers and ignored user/project rule sources remain excluded.
+    #[must_use]
+    pub fn from_config_layer_stack(stack: &ra_config::ConfigLayerStack) -> Self {
+        let mut sources = Self::new();
+        for layer in stack.layers_low_to_high() {
+            if stack.ignore_user_and_project_exec_policy_rules()
+                && matches!(
+                    layer.name,
+                    ra_config::ConfigLayerSource::User { .. }
+                        | ra_config::ConfigLayerSource::Project { .. }
+                )
+            {
+                continue;
+            }
+            if let Some(folder) = layer.config_folder() {
+                sources = sources.with_config_folder(folder.to_path_buf());
+            }
+        }
+        if let Some(policy) = &stack.requirements().exec_policy {
+            sources = sources.with_requirements(policy.value.clone());
+        }
+        sources
     }
 
     /// Adds a configuration folder whose `rules` directory is read, with higher precedence than

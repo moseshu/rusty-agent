@@ -293,3 +293,8 @@ pub use config_edit::{ConfigEdit, ConfigEditsBuilder};
 pub use config_validation::{
     deserialize_config_toml_with_base, validate_feature_requirements_for_config_toml,
 };
+
+mod permission_path;
+pub mod permission_profile_catalog;
+pub mod permission_profiles;
+pub mod permission_selection;
