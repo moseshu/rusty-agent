@@ -1,0 +1,912 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
+#![allow(
+    clippy::struct_excessive_bools,
+    reason = "Preserve the upstream configuration surface, branch order and diagnostic spelling."
+)]
+#![allow(missing_docs, reason = "Preserve upstream configuration records.")]
+//! Shared model metadata types exchanged between Codex services and clients.
+//!
+//! These types are serialized across core, TUI, app-server, and SDK boundaries, so field defaults
+//! are used to preserve compatibility when older payloads omit newly introduced attributes.
+
+use chrono::DateTime;
+use chrono::Utc;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
+use serde::de::DeserializeOwned;
+use serde::de::Error;
+use tracing::warn;
+
+use super::support::MultiAgentVersion;
+use ra_config::ReasoningSummary;
+use ra_config::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use ra_config::ServiceTier;
+use ra_config::Verbosity;
+
+#[path = "catalog/access_programs.rs"]
+mod access_programs;
+#[path = "catalog/incremental_tools.rs"]
+mod incremental_tools;
+pub use incremental_tools::IncrementalToolMessages;
+#[path = "catalog/guardian.rs"]
+mod guardian;
+pub use guardian::GuardianModelPolicy;
+pub use guardian::GuardianReviewMode;
+pub use guardian::GuardianScope;
+pub use guardian::GuardianUnscoredAction;
+
+#[path = "catalog/guardian_v2.rs"]
+mod guardian_v2;
+
+pub use access_programs::ModelAccessPrograms;
+pub use guardian_v2::AsyncClassifierMode;
+pub use guardian_v2::GuardianV2ModelConfig;
+pub use guardian_v2::GuardianV2TranscriptModelConfig;
+
+/// Backend model-catalog specialty identifying cybersecurity-focused models.
+pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
+pub const SPEED_TIER_FAST: &str = "fast";
+
+pub use ra_config::ReasoningEffort;
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum_macros::Display,
+    strum_macros::EnumIter,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum InputModality {
+    /// Plain text turns and tool payloads.
+    Text,
+    /// Image attachments included in user turns.
+    Image,
+    /// Audio attachments included in user turns.
+    Audio,
+}
+
+/// Backward-compatible default when `input_modalities` is omitted on the wire.
+///
+/// Legacy payloads predate modality metadata, so we conservatively assume both text and images are
+/// accepted unless a preset explicitly narrows support.
+#[must_use]
+pub fn default_input_modalities() -> Vec<InputModality> {
+    vec![InputModality::Text, InputModality::Image]
+}
+
+/// A reasoning effort option that can be surfaced for a model.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReasoningEffortPreset {
+    /// Effort level that the model supports.
+    pub effort: ReasoningEffort,
+    /// Short human description shown next to the effort in UIs.
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ModelUpgrade {
+    pub id: String,
+    pub migration_config_key: String,
+    pub model_link: Option<String>,
+    pub upgrade_copy: Option<String>,
+    pub migration_markdown: Option<String>,
+    /// Informational time when the model associated with this upgrade is scheduled to retire.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_rfc3339_timestamp"
+    )]
+    pub retirement_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelAvailabilityNux {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Metadata describing a Codex-supported model.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ModelPreset {
+    /// Stable identifier for the preset.
+    pub id: String,
+    /// Model slug (e.g., "gpt-5").
+    pub model: String,
+    /// Display name shown in UIs.
+    pub display_name: String,
+    /// Short human description shown in UIs.
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_specialty: Option<String>,
+    /// Reasoning effort applied when none is explicitly chosen.
+    pub default_reasoning_effort: ReasoningEffort,
+    /// Supported reasoning effort options.
+    pub supported_reasoning_efforts: Vec<ReasoningEffortPreset>,
+    /// Compatibility field retained for consumers of model presets; personality selection is no
+    /// longer supported.
+    #[serde(default)]
+    pub supports_personality: bool,
+    /// Deprecated: use `service_tiers` instead.
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    /// Service tiers this model can run with.
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
+    /// Catalog default service tier id for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
+    /// Caller-specific explicit access programs, when discovery resolved them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
+    /// Whether this is the default model for new users.
+    pub is_default: bool,
+    /// recommended upgrade model
+    pub upgrade: Option<ModelUpgrade>,
+    /// Whether this preset should appear in the picker UI.
+    pub show_in_picker: bool,
+    /// Multi-agent backend selected when this model starts a new thread.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub multi_agent_version: Option<MultiAgentVersion>,
+    /// Availability NUX shown when this preset becomes accessible to the user.
+    pub availability_nux: Option<ModelAvailabilityNux>,
+    /// whether this model is supported in the api
+    pub supported_in_api: bool,
+    /// Input modalities accepted when composing user turns for this preset.
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<InputModality>,
+}
+
+/// Visibility of a model in the picker or APIs.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum_macros::Display,
+    strum_macros::EnumIter,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum ModelVisibility {
+    List,
+    Hide,
+    None,
+}
+
+/// Shell execution capability for a model.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum_macros::Display,
+    strum_macros::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ConfigShellToolType {
+    #[serde(alias = "default", alias = "local", alias = "shell_command")]
+    UnifiedExec,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPatchToolType {
+    Freeform,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchToolType {
+    #[default]
+    Text,
+    TextAndImage,
+}
+
+/// Server-provided truncation policy metadata for a model.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationMode {
+    Bytes,
+    Tokens,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    Direct,
+    CodeMode,
+    CodeModeOnly,
+}
+
+fn deserialize_optional_model_selector<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value(serde_json::Value::String(value)).ok())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct TruncationPolicyConfig {
+    pub mode: TruncationMode,
+    pub limit: i64,
+}
+
+impl TruncationPolicyConfig {
+    #[must_use]
+    pub const fn bytes(limit: i64) -> Self {
+        Self {
+            mode: TruncationMode::Bytes,
+            limit,
+        }
+    }
+
+    #[must_use]
+    pub const fn tokens(limit: i64) -> Self {
+        Self {
+            mode: TruncationMode::Tokens,
+            limit,
+        }
+    }
+}
+
+/// Semantic version triple encoded as an array in JSON (e.g. [0, 62, 0]).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ClientVersion(pub i32, pub i32, pub i32);
+
+const fn default_effective_context_window_percent() -> i64 {
+    95
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Model metadata returned by the Codex backend `/models` endpoint.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Model-owned approval coverage. Absent preserves legacy settings; an empty map disables
+    /// ordinary Guardian review. Keys are `computer_use`, shell, `file_changes`, mcp, network,
+    /// and permissions. This does not override mandatory safety or administrator requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianModelPolicy>,
+    pub slug: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<ReasoningEffort>,
+    pub supported_reasoning_levels: Vec<ReasoningEffortPreset>,
+    pub shell_type: ConfigShellToolType,
+    pub visibility: ModelVisibility,
+    pub supported_in_api: bool,
+    pub priority: i32,
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
+    pub availability_nux: Option<ModelAvailabilityNux>,
+    pub upgrade: Option<ModelInfoUpgrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_messages: Option<ModelMessages>,
+    #[serde(default)]
+    pub include_skills_usage_instructions: bool,
+    #[serde(default)]
+    pub include_plugin_usage_instructions: bool,
+    #[serde(default = "default_true")]
+    pub include_apps_usage_instructions: bool,
+    /// Whether the model accepts the Responses API `reasoning.summary` parameter.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub supports_reasoning_summary_parameter: bool,
+    #[serde(default)]
+    pub default_reasoning_summary: ReasoningSummary,
+    pub support_verbosity: bool,
+    pub default_verbosity: Option<Verbosity>,
+    pub apply_patch_tool_type: Option<ApplyPatchToolType>,
+    #[serde(default)]
+    pub web_search_tool_type: WebSearchToolType,
+    pub truncation_policy: TruncationPolicyConfig,
+    #[serde(default)]
+    pub supports_image_detail_original: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    /// Maximum context window allowed for config overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<i64>,
+    /// Token threshold for automatic compaction. When omitted, core derives it
+    /// from `context_window` (90%). When provided, core clamps it to 90% of the
+    /// context window when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<i64>,
+    /// Opaque identifier for compaction-compatible model configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comp_hash: Option<String>,
+    /// Percentage of the context window considered usable for inputs, after
+    /// reserving headroom for system prompts, tool overhead, and model output.
+    #[serde(default = "default_effective_context_window_percent")]
+    pub effective_context_window_percent: i64,
+    pub experimental_supported_tools: Vec<String>,
+    /// Input modalities accepted by the backend for this model.
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<InputModality>,
+    /// Internal-only marker set by core when a model slug resolved to fallback metadata.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub used_fallback_model_metadata: bool,
+    #[serde(default)]
+    pub supports_search_tool: bool,
+    /// Whether experimental context management may be activated at session startup.
+    #[serde(default)]
+    pub supports_experimental_context: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    /// Whether the model accepts reasoning-effort `configuration_update` items.
+    /// Missing metadata keeps effort changes on the ordinary request parameter.
+    #[serde(default)]
+    pub supports_reasoning_effort_updates: bool,
+    #[serde(default)]
+    pub node_repl_auto_review_required: bool,
+    #[serde(default)]
+    pub node_repl_disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_specialty: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_model_selector"
+    )]
+    pub tool_mode: Option<ToolMode>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_model_selector"
+    )]
+    pub multi_agent_version: Option<MultiAgentVersion>,
+    /// Reasoning effort used for multi-agent work when the user selects Ultra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent_reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ModelInfo {
+    #[must_use]
+    pub fn resolved_context_window(&self) -> Option<i64> {
+        self.context_window.or(self.max_context_window)
+    }
+
+    /// Context available to inference after reserving this model's configured headroom.
+    #[must_use]
+    pub fn usable_context_window(&self) -> Option<i64> {
+        self.resolved_context_window().map(|context_window| {
+            context_window.saturating_mul(self.effective_context_window_percent) / 100
+        })
+    }
+
+    #[must_use]
+    pub fn auto_compact_token_limit(&self) -> Option<i64> {
+        let context_limit = self
+            .resolved_context_window()
+            .map(|context_window| (context_window * 9) / 10);
+        let config_limit = self.auto_compact_token_limit;
+        if let Some(context_limit) = context_limit {
+            return Some(
+                config_limit.map_or(context_limit, |limit| std::cmp::min(limit, context_limit)),
+            );
+        }
+        config_limit
+    }
+}
+
+/// A strongly-typed template for assembling model instructions and developer messages.
+///
+/// `instructions_template`: Formerly a personality template, now literal text. The name is
+/// retained for model catalog compatibility.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ModelMessages {
+    /// Developer guidance after a content-filter block. Missing, null, blank, or values over
+    /// 512 UTF-8 bytes use the bundled guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_filter_guidance: Option<String>,
+    /// Additional developer instructions for persistent mode. Missing or null uses the built-in
+    /// instructions; an empty string disables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolMessages>,
+    pub instructions_template: Option<String>,
+    pub approvals: Option<ApprovalMessages>,
+    pub collaboration_modes: Option<CollaborationModeMessages>,
+    pub auto_review: Option<AutoReviewMessages>,
+    pub permissions: Option<PermissionMessages>,
+    pub multi_agent: Option<MultiAgentMessages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<ModelTokenBudgetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_v2: Option<GuardianV2ModelConfig>,
+    /// Replacement confirmation-policy documents forwarded in actor MCP request metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_policies: Option<ConfirmationPolicies>,
+}
+
+/// Model-owned confirmation-policy Markdown, forwarded unchanged to actor tools.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ConfirmationPolicies {
+    /// Replacement Markdown for the Browser Use confirmation-policy document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_use: Option<String>,
+    /// Replacement Markdown for the native Computer Use confirmation policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<String>,
+}
+
+/// Model-owned tool messages and description prefixes.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ToolMessages {
+    /// Optional wording for incremental catalog notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_tools: Option<IncrementalToolMessages>,
+    /// Prefixes for individual functions in the `functions` namespace, keyed by unqualified name.
+    /// Applies to direct declarations, Code Mode, and tool search, including custom tools.
+    /// Values are trimmed; empty values and unavailable functions add nothing. The trimmed
+    /// values for available functions plus separating blank lines must fit in 256 UTF-8 bytes
+    /// in total. This bounds the added text, not the complete definition or its token count.
+    /// Other namespaces are never affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub functions_namespace_functions_description_prefixes:
+        Option<std::collections::BTreeMap<String, String>>,
+    /// Optional guidance for indirectly presented tools; missing or empty adds no prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indirect_description_prefixes: Option<IndirectDescriptionPrefixes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_user_message_async: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent: Option<MultiAgentToolMessages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<CodeModeToolMessages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_resources: Option<McpResourceToolMessages>,
+}
+
+/// Plain-text prefixes for Code Mode documentation, `ALL_TOOLS`, and loaded tool-search namespaces.
+/// Flat indirect entries carry these before any per-function prefix.
+/// Values are trimmed, and selectors for the same final namespace must agree, including empty values.
+/// Empty values add no prefix; unregistered targets are ignored.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct IndirectDescriptionPrefixes {
+    /// Exact rendered namespaces, including `functions` for plain tools.
+    /// Overlap with an MCP server prefix is allowed only when the trimmed values match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespaces: Option<std::collections::BTreeMap<String, String>>,
+    /// Configured MCP server names, before callable namespace normalization.
+    /// Each prefix applies to all namespaces exposed by that server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Model-owned messages for a built-in tool.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ToolMessage {
+    /// Missing or null uses the built-in description; an empty string suppresses its static
+    /// text without disabling the tool. Tool-owned runtime guidance is retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait,
+    /// `request_user_input_async` (the `send_user_message_async` catalog key), and MCP resource helpers.
+    /// Uses the harness's supported schema subset; unrecognized keywords are ignored.
+    /// Missing, null, invalid or unsupported structures, or a root without `type: "object"`
+    /// retains the harness parameters. Schema semantics must remain API-compatible.
+    /// Overrides must declare harness-encrypted properties so their annotations can be retained.
+    /// Argument handling is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<String>,
+}
+
+/// Model-owned descriptions and parameters for Multi-Agent V2 tools, independent of their namespace.
+/// Channel tools consume only the description; their parameter schemas are fixed.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MultiAgentToolMessages {
+    /// Replaces the static description. Missing or null uses the bundled text; an empty string
+    /// suppresses it. Generated model information and local usage hints are retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_agent: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_message: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_task: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_agent: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_agent: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_agents: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_channel: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get_channels: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_threads: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_posts: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_thread: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_post: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribe: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post: Option<ToolMessage>,
+}
+
+impl MultiAgentToolMessages {
+    /// Returns the catalog entry for a tool, independently of its runtime namespace.
+    #[must_use]
+    pub fn by_name(&self, name: &str) -> Option<&ToolMessage> {
+        match name {
+            "spawn_agent" => &self.spawn_agent,
+            "send_message" => &self.send_message,
+            "followup_task" => &self.followup_task,
+            "wait_agent" => &self.wait_agent,
+            "interrupt_agent" => &self.interrupt_agent,
+            "list_agents" => &self.list_agents,
+            "create_channel" => &self.create_channel,
+            "get_channels" => &self.get_channels,
+            "list_threads" => &self.list_threads,
+            "search_posts" => &self.search_posts,
+            "read_thread" => &self.read_thread,
+            "read_post" => &self.read_post,
+            "subscribe" => &self.subscribe,
+            "unsubscribe" => &self.unsubscribe,
+            "post" => &self.post,
+            _ => return None,
+        }
+        .as_ref()
+    }
+}
+
+/// Model-owned descriptions and parameters for the built-in MCP resource helpers.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct McpResourceToolMessages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_mcp_resources: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_mcp_resource_templates: Option<ToolMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_mcp_resource: Option<ToolMessage>,
+}
+
+/// Model-owned instructions for Code Mode's exec and wait tools.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CodeModeToolMessages {
+    /// Instructional template supporting `{{ default_exec_yield_time_ms }}` and `{{ image_helper }}`.
+    /// Runtime tool declarations are appended. Unknown placeholders remain literal.
+    /// Exec accepts raw JavaScript; `parameters` is not consumed and its grammar is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ToolMessage>,
+    /// Complete description and JSON parameter schema, selected independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<ToolMessage>,
+    /// Literal guidance appended when deferred nested tools exist.
+    /// Missing or null uses bundled text; an empty string omits the section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_nested_tools_guidance: Option<String>,
+    /// Literal shared TypeScript definitions, emitted when Code Mode Only exposes MCP results.
+    /// Missing or null uses bundled definitions; an empty string omits the section.
+    /// Custom definitions must remain compatible with the generated tool declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_typescript_preamble: Option<String>,
+}
+
+/// Model-owned defaults for the context-window token-budget feature.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ModelTokenBudgetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub use_history_notes_extension: bool,
+    pub reminder_threshold_tokens: i64,
+    pub reminder_message_template: String,
+    pub guidance_message: String,
+    pub auto_compact_fallback_prompt: String,
+    pub auto_compact_fallback_buffer_tokens: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ApprovalMessages {
+    pub on_request: Option<String>,
+    pub on_request_auto_review: Option<String>,
+    pub never: Option<String>,
+    pub unless_trusted: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CollaborationModeMessages {
+    pub default: Option<String>,
+    pub plan: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AutoReviewMessages {
+    pub policy: Option<String>,
+    pub policy_template: Option<String>,
+    /// Extra developer policy for `node_repl` and `cua_repl` reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_repl_policy: Option<String>,
+    pub rejection_instructions: Option<String>,
+    pub timeout_instructions: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PermissionMessages {
+    pub danger_full_access: Option<String>,
+    pub workspace_write: Option<String>,
+    pub read_only: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MultiAgentMessages {
+    pub role: Option<MultiAgentRoleMessages>,
+    pub mode: Option<MultiAgentModeMessages>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MultiAgentRoleMessages {
+    pub root: Option<String>,
+    pub subagent: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MultiAgentModeMessages {
+    pub explicit: Option<String>,
+    /// Ultra-only mode instructions. Missing or null uses the built-in proactive hint;
+    /// an empty string suppresses the mode message. `hint_text` takes precedence.
+    pub proactive: Option<String>,
+    pub hint_text: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ModelInfoUpgrade {
+    pub model: String,
+    pub migration_markdown: String,
+    /// Informational time when the model associated with this upgrade is scheduled to retire.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_rfc3339_timestamp"
+    )]
+    pub retirement_at: Option<DateTime<Utc>>,
+}
+
+fn deserialize_optional_rfc3339_timestamp<'de, D>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc)))
+}
+
+impl From<&ModelUpgrade> for ModelInfoUpgrade {
+    fn from(upgrade: &ModelUpgrade) -> Self {
+        ModelInfoUpgrade {
+            model: upgrade.id.clone(),
+            migration_markdown: upgrade.migration_markdown.clone().unwrap_or_default(),
+            retirement_at: upgrade.retirement_at,
+        }
+    }
+}
+
+/// Response wrapper for `/models`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct ModelsResponse {
+    #[serde(
+        serialize_with = "serialize_model_infos_with_legacy_base",
+        deserialize_with = "deserialize_model_infos_with_legacy_base"
+    )]
+    pub models: Vec<ModelInfo>,
+}
+
+#[derive(Serialize)]
+struct ModelInfoWithLegacyBaseInstructionsRef<'a> {
+    #[serde(flatten)]
+    model: &'a ModelInfo,
+    base_instructions: String,
+}
+
+#[derive(Deserialize)]
+struct ModelInfoWithLegacyBaseInstructions {
+    #[serde(default)]
+    base_instructions: Option<String>,
+    #[serde(flatten)]
+    model: ModelInfo,
+}
+
+/// Serializes catalog models with the deprecated top-level instruction field required by older
+/// clients.
+#[doc(hidden)]
+pub fn serialize_model_infos_with_legacy_base<S>(
+    models: &[ModelInfo],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    models
+        .iter()
+        .map(|model| {
+            // Mirror the literal instruction template for clients using the deprecated wire field.
+            let base_instructions = if let Some(template) = model
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_template.as_deref())
+            {
+                template.to_owned()
+            } else {
+                warn!(
+                    model = %model.slug,
+                    "Model has no instruction template; returning empty instructions."
+                );
+                String::new()
+            };
+            ModelInfoWithLegacyBaseInstructionsRef {
+                model,
+                base_instructions,
+            }
+        })
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+/// Deserializes catalog models while promoting the legacy top-level instruction field into Model
+/// Messages V2 when no canonical instruction template is present.
+#[doc(hidden)]
+pub fn deserialize_model_infos_with_legacy_base<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ModelInfo>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let models = Vec::<ModelInfoWithLegacyBaseInstructions>::deserialize(deserializer)?;
+    models
+        .into_iter()
+        .map(|legacy_model| {
+            let ModelInfoWithLegacyBaseInstructions {
+                base_instructions,
+                mut model,
+            } = legacy_model;
+            if let Some(base_instructions) = base_instructions
+                && model
+                    .model_messages
+                    .as_ref()
+                    .and_then(|messages| messages.instructions_template.as_ref())
+                    .is_none()
+            {
+                let messages = model.model_messages.get_or_insert_default();
+                messages.instructions_template = Some(base_instructions);
+            }
+            if model
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_template.as_ref())
+                .is_none()
+            {
+                let model_slug = &model.slug;
+                return Err(D::Error::custom(format!(
+                    "model `{model_slug}` is missing both `base_instructions` and \
+                     `model_messages.instructions_template`"
+                )));
+            }
+            Ok(model)
+        })
+        .collect()
+}
+
+// convert ModelInfo to ModelPreset
+impl From<ModelInfo> for ModelPreset {
+    fn from(info: ModelInfo) -> Self {
+        ModelPreset {
+            id: info.slug.clone(),
+            model: info.slug.clone(),
+            display_name: info.display_name,
+            description: info.description.unwrap_or_default(),
+            model_specialty: info.model_specialty,
+            default_reasoning_effort: info
+                .default_reasoning_level
+                .unwrap_or(ReasoningEffort::None),
+            supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
+            supports_personality: false,
+            additional_speed_tiers: info.additional_speed_tiers,
+            service_tiers: info.service_tiers,
+            default_service_tier: info.default_service_tier,
+            available_access_programs: info.available_access_programs,
+            is_default: false, // default is the highest priority available model
+            upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
+                id: upgrade.model.clone(),
+                migration_config_key: info.slug.clone(),
+                // todo(aibrahim): add the model link here.
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: Some(upgrade.migration_markdown.clone()),
+                retirement_at: upgrade.retirement_at,
+            }),
+            show_in_picker: info.visibility == ModelVisibility::List,
+            multi_agent_version: info.multi_agent_version,
+            availability_nux: info.availability_nux,
+            supported_in_api: info.supported_in_api,
+            input_modalities: info.input_modalities,
+        }
+    }
+}
+
+impl ModelPreset {
+    #[must_use]
+    pub fn supports_fast_mode(&self) -> bool {
+        self.service_tiers
+            .iter()
+            .any(|tier| tier.id == ServiceTier::Fast.request_value())
+            || self
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier == SPEED_TIER_FAST)
+    }
+}
+
+impl ModelInfo {
+    #[must_use]
+    pub fn supports_service_tier(&self, service_tier: &str) -> bool {
+        // Flex is an API request option, even when the Codex catalog does not advertise it.
+        service_tier == ServiceTier::Flex.request_value()
+            || self
+                .service_tiers
+                .iter()
+                .any(|tier| tier.id == service_tier)
+    }
+
+    #[must_use]
+    pub fn service_tier_for_request(&self, service_tier: Option<String>) -> Option<String> {
+        service_tier.filter(|service_tier| {
+            service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+                && self.supports_service_tier(service_tier)
+        })
+    }
+}

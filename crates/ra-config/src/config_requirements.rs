@@ -45,6 +45,7 @@ use crate::{Constrained, ConstrainedWithSource, RequirementSource, Sourced};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigRequirements {
+    pub chatgpt_base_url: Option<Sourced<String>>,
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
@@ -86,6 +87,7 @@ pub struct ConfigRequirements {
 impl Default for ConfigRequirements {
     fn default() -> Self {
         Self {
+            chatgpt_base_url: None,
             sqlite_home: None,
             log_dir: None,
             model_catalog_json: None,
@@ -897,6 +899,7 @@ pub(crate) fn merge_app_requirements_descending(
 /// Base config deserialized from system `requirements.toml` or MDM.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
+    pub chatgpt_base_url: Option<String>,
     pub sqlite_home: Option<AbsolutePathBuf>,
     pub log_dir: Option<AbsolutePathBuf>,
     pub model_catalog_json: Option<AbsolutePathBuf>,
@@ -982,6 +985,7 @@ pub struct RemoteSandboxConfigToml {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
+    pub chatgpt_base_url: Option<Sourced<String>>,
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
@@ -1045,6 +1049,7 @@ impl ConfigRequirementsWithSources {
         // Destructure without `..` so adding fields to `ConfigRequirementsToml`
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
+            chatgpt_base_url: _,
             sqlite_home: _,
             log_dir: _,
             model_catalog_json: _,
@@ -1106,6 +1111,7 @@ impl ConfigRequirementsWithSources {
             other,
             source,
             {
+                chatgpt_base_url,
                 sqlite_home,
                 log_dir,
                 model_catalog_json,
@@ -1189,6 +1195,7 @@ impl ConfigRequirementsWithSources {
     #[must_use]
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
+            chatgpt_base_url,
             sqlite_home,
             log_dir,
             model_catalog_json,
@@ -1229,6 +1236,7 @@ impl ConfigRequirementsWithSources {
             guardian_extra_policy,
         } = self;
         ConfigRequirementsToml {
+            chatgpt_base_url: chatgpt_base_url.map(|sourced| sourced.value),
             sqlite_home: sqlite_home.map(|sourced| sourced.value),
             log_dir: log_dir.map(|sourced| sourced.value),
             model_catalog_json: model_catalog_json.map(|sourced| sourced.value),
@@ -1332,7 +1340,8 @@ impl ConfigRequirementsToml {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sqlite_home.is_none()
+        self.chatgpt_base_url.is_none()
+            && self.sqlite_home.is_none()
             && self.log_dir.is_none()
             && self.model_catalog_json.is_none()
             && self.model_provider.is_none()
@@ -1433,6 +1442,7 @@ impl ConfigRequirementsToml {
             };
         }
 
+        apply_exact!(chatgpt_base_url);
         apply_exact!(sqlite_home);
         apply_exact!(log_dir);
         apply_exact!(model_catalog_json);
@@ -1466,11 +1476,16 @@ impl ConfigRequirementsToml {
         }) {
             return Some("model_providers");
         }
-        let managed_fields: [(bool, &[&str], &'static str); 7] = [
+        let managed_fields: [(bool, &[&str], &'static str); 8] = [
             (
                 self.model_provider.is_some(),
                 &["model_provider"],
                 "model_provider",
+            ),
+            (
+                self.chatgpt_base_url.is_some(),
+                &["chatgpt_base_url"],
+                "chatgpt_base_url",
             ),
             (self.sqlite_home.is_some(), &["sqlite_home"], "sqlite_home"),
             (self.log_dir.is_some(), &["log_dir"], "log_dir"),
@@ -1547,6 +1562,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // defaults also remain there because they are initialization values;
         // model-specific auto-review requirements are runtime constraints.
         let ConfigRequirementsWithSources {
+            chatgpt_base_url,
             sqlite_home,
             log_dir,
             model_catalog_json,
@@ -1933,6 +1949,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         let guardian_policy_config_source = guardian_policy_config.map(|sourced| sourced.source);
         let guardian_extra_policy_source = guardian_extra_policy.map(|sourced| sourced.source);
         Ok(ConfigRequirements {
+            chatgpt_base_url,
             sqlite_home,
             log_dir,
             model_catalog_json,

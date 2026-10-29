@@ -92,13 +92,18 @@ impl PluginRuntimeConfig {
             .map(str::to_owned)
             .or(cfg.model_provider)
             .unwrap_or_else(|| "openai".to_owned());
+        let chatgpt_base_url = config_layer_stack
+            .requirements()
+            .chatgpt_base_url
+            .as_ref()
+            .map(|required| required.value.clone())
+            .or(cfg.chatgpt_base_url)
+            .unwrap_or_else(|| super::remote::DEFAULT_CHATGPT_BASE_URL.to_string());
         Ok(Self {
             config_layer_stack,
             features,
             plugins: cfg.plugins,
-            chatgpt_base_url: cfg
-                .chatgpt_base_url
-                .unwrap_or_else(|| super::remote::DEFAULT_CHATGPT_BASE_URL.to_string()),
+            chatgpt_base_url,
             model_provider_id,
             mcp_servers,
             mcp_enterprise_managed_auth,
@@ -259,7 +264,7 @@ fn filter_mcp_servers_by_requirements(
     }
 }
 
-fn constrain_mcp_servers(
+pub(crate) fn constrain_mcp_servers(
     mcp_servers: HashMap<String, McpServerConfig>,
     mcp_requirements: Option<&Sourced<BTreeMap<String, McpServerRequirement>>>,
 ) -> ConstraintResult<Constrained<HashMap<String, McpServerConfig>>> {

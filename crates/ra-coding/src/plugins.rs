@@ -127,7 +127,7 @@ pub use manager::{
     PluginReadRequest, PluginUninstallError, PluginsConfigInput, PluginsManager,
 };
 
-mod runtime_config;
+pub(crate) mod runtime_config;
 pub use runtime_config::PluginRuntimeConfig;
 
 mod mentions;

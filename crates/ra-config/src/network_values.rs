@@ -62,6 +62,7 @@ pub enum NetworkMode {
 }
 
 impl NetworkMode {
+    #[must_use]
     pub fn allows_method(self, method: &str) -> bool {
         match self {
             Self::Full => true,

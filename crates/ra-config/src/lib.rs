@@ -105,9 +105,9 @@ pub use provider_gateway_oauth::{GatewayOAuthConfig, GatewayOAuthDelivery};
 pub use reasoning::ReasoningEffort;
 
 pub mod features;
-mod network_values;
+pub mod network_values;
 pub use network_values::{CredentialAuthMethod, CredentialProviderConfig};
-mod permissions_toml;
+pub mod permissions_toml;
 pub use features::{FeatureConfig, FeatureToml, FeaturesToml};
 pub use permissions_toml::{
     FilesystemPermissionToml, FilesystemPermissionsToml, NetworkToml, PermissionProfileToml,

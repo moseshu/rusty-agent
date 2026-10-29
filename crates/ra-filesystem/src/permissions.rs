@@ -59,6 +59,7 @@ pub use windows_glob::windows_deny_read_glob_scan;
 const PROTECTED_METADATA_GIT_PATH_NAME: &str = ".git";
 const PROTECTED_METADATA_AGENTS_PATH_NAME: &str = ".agents";
 const PROTECTED_METADATA_CODEX_PATH_NAME: &str = ".codex";
+const PROTECTED_METADATA_PRODUCT_PATH_NAME: &str = ".rusty-agent";
 const PROTECTED_METADATA_AWS_PATH_NAME: &str = ".aws";
 
 /// Top-level workspace metadata paths that stay protected under writable roots.
@@ -66,6 +67,7 @@ pub const PROTECTED_METADATA_PATH_NAMES: &[&str] = &[
     PROTECTED_METADATA_GIT_PATH_NAME,
     PROTECTED_METADATA_AGENTS_PATH_NAME,
     PROTECTED_METADATA_CODEX_PATH_NAME,
+    PROTECTED_METADATA_PRODUCT_PATH_NAME,
     PROTECTED_METADATA_AWS_PATH_NAME,
 ];
 
@@ -876,6 +878,10 @@ impl FileSystemSandboxPolicy {
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".git");
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".agents");
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".codex");
+        append_default_read_only_project_root_subpath_if_no_explicit_rule(
+            &mut entries,
+            ".rusty-agent",
+        );
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".aws");
         for writable_root in writable_roots {
             for protected_path in default_read_only_subpaths_for_writable_root(
@@ -2431,13 +2437,18 @@ pub(crate) fn default_read_only_subpaths_for_writable_root(
         subpaths.push(top_level_agents);
     }
 
-    // Keep top-level project metadata under .codex read-only to the agent by
+    // Keep top-level product configuration metadata read-only to the agent by
     // default. For the workspace root itself, protect it even before the
     // directory exists so first-time creation still goes through the
     // protected-path approval flow.
-    let top_level_codex = writable_root.join(PROTECTED_METADATA_CODEX_PATH_NAME);
-    if protect_missing_dot_codex || top_level_codex.as_path().is_dir() {
-        subpaths.push(top_level_codex);
+    for name in [
+        PROTECTED_METADATA_CODEX_PATH_NAME,
+        PROTECTED_METADATA_PRODUCT_PATH_NAME,
+    ] {
+        let top_level_config = writable_root.join(name);
+        if protect_missing_dot_codex || top_level_config.as_path().is_dir() {
+            subpaths.push(top_level_config);
+        }
     }
 
     // AWS profiles can select credential helpers that the application executes.

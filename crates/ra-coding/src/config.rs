@@ -1,4 +1,4 @@
-//! Compatibility exports from the shared configuration owner.
+//! Effective product configuration and compatibility exports from the shared schema owner.
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
 pub use ra_config::mcp_requirements_test_api;
@@ -24,3 +24,34 @@ pub use ra_config::{
     apply_user_plugin_config_edits, clear_user_plugin, record_user_marketplace,
     remove_user_marketplace, remove_user_marketplace_config, set_user_plugin_enabled,
 };
+
+mod agent_role_config;
+pub mod catalog;
+mod otel;
+mod product;
+mod requirements;
+mod resolved_permission_profile;
+mod roles_discovery;
+mod roles_loader;
+mod support;
+mod token_budget_startup;
+pub use agent_role_config::{
+    AgentRoleConfig, ResolvedAgentRoleFile, parse_agent_role_file_contents,
+};
+pub use catalog::{ModelInfo, ModelsResponse};
+pub use product::*;
+
+pub mod network;
+mod permission_profile_snapshot;
+pub mod providers;
+mod windows_sandbox_config;
+pub use permission_profile_snapshot::{PermissionProfileSnapshot, ProfileWorkspaceRoot};
+
+mod domain_matcher;
+
+pub use support::{
+    BaseInstructionsProvenance, CyberAccessProgram, ExtraConfig, MultiAgentVersion, SqliteConfig,
+};
+pub use token_budget_startup::TokenBudgetStartupConfig;
+
+mod mitm_validation;

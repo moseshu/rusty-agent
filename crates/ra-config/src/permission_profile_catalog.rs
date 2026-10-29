@@ -50,7 +50,7 @@ pub fn permission_profile_catalog(
     permission_profile_catalog_from_permissions(config_layer_stack, permissions.as_ref(), context)
 }
 
-pub(super) fn permission_profile_catalog_from_permissions(
+pub fn permission_profile_catalog_from_permissions(
     config_layer_stack: &ConfigLayerStack,
     permissions: Option<&PermissionsToml>,
     context: &ConfigPathContext,
@@ -95,7 +95,8 @@ pub(super) fn permission_profile_catalog_from_permissions(
     Ok(catalog)
 }
 
-pub(super) fn permission_profile_is_allowed(
+#[must_use]
+pub fn permission_profile_is_allowed(
     config_layer_stack: &ConfigLayerStack,
     profile_id: &str,
     permission_profile: &PermissionProfile,
@@ -109,7 +110,8 @@ pub(super) fn permission_profile_is_allowed(
         && permission_profile_satisfies_requirements(config_layer_stack, permission_profile)
 }
 
-pub(super) fn permission_profile_satisfies_requirements(
+#[must_use]
+pub fn permission_profile_satisfies_requirements(
     config_layer_stack: &ConfigLayerStack,
     permission_profile: &PermissionProfile,
 ) -> bool {

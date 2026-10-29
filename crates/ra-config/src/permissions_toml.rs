@@ -255,6 +255,7 @@ pub struct NetworkDomainPermissionsToml {
 }
 
 impl NetworkDomainPermissionsToml {
+    #[must_use]
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
         let allowed_domains: Vec<String> = self
             .entries
@@ -265,6 +266,7 @@ impl NetworkDomainPermissionsToml {
         (!allowed_domains.is_empty()).then_some(allowed_domains)
     }
 
+    #[must_use]
     pub fn denied_domains(&self) -> Option<Vec<String>> {
         let denied_domains: Vec<String> = self
             .entries
@@ -302,6 +304,7 @@ pub struct NetworkUnixSocketPermissionsToml {
 }
 
 impl NetworkUnixSocketPermissionsToml {
+    #[must_use]
     pub fn allow_unix_sockets(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -453,6 +456,7 @@ impl NetworkMitmToml {
         Ok(())
     }
 
+    #[must_use]
     pub fn to_runtime_hooks(
         &self,
         actions_by_name: Option<&IndexMap<String, NetworkMitmActionToml>>,
@@ -470,6 +474,7 @@ impl NetworkMitmToml {
 }
 
 impl NetworkMitmActionToml {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.strip_request_headers.is_empty() && self.inject_request_headers.is_empty()
     }

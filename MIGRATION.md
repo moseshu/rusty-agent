@@ -1178,3 +1178,32 @@ content. Queue drains transfer messages and the follow-up flag atomically, so a 
 cannot lose its wakeup between a separate flag check and message drain. Older checkpoints default
 this absent flag to false; older runtimes cannot honor the new follow-up marker. Resume schema 18
 checkpoints with this build when background follow-up matters.
+
+
+### Explicit product configuration construction
+
+`ra_coding::config::{ConfigBuilder, ConfigOverrides, Config}` constructs the effective product
+snapshot from the existing source stack and managed requirements. Harness provider selection is
+resolved after managed selection and before the effective TOML provider; `Config::plugin_runtime_config`
+retains that effective selection. The framework SDK's explicit model/provider/settings entry points
+continue to operate independently of product-file discovery.
+
+The snapshot retains 152 of the pinned Codex Config's 156 public fields. Four OpenAI account
+identity/login-routing fields are excluded. The plugin-service backend URL is retained, including
+local managed requirements and source diagnostics; cloud-managed layers retain the upstream
+restriction against setting that URL. Runtime permissions, provider adapter/registry construction,
+native MXC availability, proxy startup and SQLite quick-check lifecycle are separate consumers and
+are not made operational merely by constructing this snapshot.
+
+Product-specific environment names are `RA_SQLITE_HOME`, `RA_OSS_PORT` and `RA_OSS_BASE_URL`, alongside
+the existing `RA_HOME`. They correspond to Codex's product-specific environment variables; this does
+not add an environment configuration layer to the provider-neutral SDK.
+
+
+Default workspace filesystem policies now protect `.rusty-agent` metadata alongside `.codex`,
+`.git`, `.agents` and `.aws`. This covers both canonical profiles and legacy policy projection,
+including first-time metadata creation in the workspace. Explicit metadata grants retain the
+upstream override semantics. MCP OAuth credential storage also retains Codex's development-build
+rule: Keyring/Auto resolve to File for package version `0.0.0`, while release builds preserve the
+configured mode. The Config test inventory is recorded in
+`tests/it-coding/UPSTREAM_CONFIG_TESTS.md`.

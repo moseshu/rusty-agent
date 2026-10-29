@@ -757,3 +757,61 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-config/src/permission_profile_catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/permission_profile_catalog.rs |
 
 | `tests/it-coding/tests/config_loader_permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_loader_tests.rs (layer-stack cases loaded without ConfigBuilder) |
+
+| `crates/ra-coding/src/config/domain_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs |
+
+| `crates/ra-coding/src/config/support.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs; codex-rs/core/src/windows_sandbox.rs; codex-rs/core/src/responses_metadata.rs; codex-rs/core/src/context/world_state/managed_developer_instructions.rs; codex-rs/sandboxing/src/manager.rs; codex-rs/utils/path-utils/src/lib.rs; codex-rs/protocol/src/models.rs; codex-rs/protocol/src/protocol.rs; codex-rs/protocol/src/turn_input.rs; codex-rs/state/src/sqlite.rs; codex-rs/prompts/src/model_messages.rs |
+
+| `crates/ra-coding/src/config/agent_role_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/agent-roles/src/agent_role_config.rs |
+
+| `crates/ra-coding/src/config/roles_loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/agent-roles/src/loader.rs |
+
+| `crates/ra-coding/src/config/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models.rs |
+
+| `crates/ra-coding/src/config/otel.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/otel.rs; codex-rs/otel/src/config.rs; codex-rs/otel/src/trace_context.rs |
+
+| `crates/ra-coding/src/config/windows_sandbox_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/windows_sandbox_config.rs |
+
+| `crates/ra-coding/src/config/token_budget_startup.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/token_budget_startup.rs |
+
+| `crates/ra-coding/src/config/roles_discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/agent-roles/src/discovery.rs |
+
+| `crates/ra-coding/src/config/permission_profile_snapshot.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permission_profile_snapshot.rs |
+
+| `crates/ra-coding/src/config/requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/requirements.rs |
+
+| `crates/ra-coding/src/config/product.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs |
+
+| `crates/ra-coding/src/config/network.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/network_config.rs; codex-rs/core/src/config/network_proxy_spec.rs; codex-rs/core/src/config/permissions.rs; codex-rs/network-proxy/src/config.rs; codex-rs/network-proxy/src/state.rs; codex-rs/network-proxy/src/policy.rs; codex-rs/network-proxy/src/credential_broker/environment.rs; codex-rs/config/src/permissions_toml.rs |
+
+| `crates/ra-coding/src/config/resolved_permission_profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/resolved_permission_profile.rs |
+
+| `crates/ra-coding/src/config/providers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider-info/src/lib.rs |
+
+| `crates/ra-coding/src/config/mitm_validation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/mitm_hook.rs |
+
+| `crates/ra-coding/src/config/catalog/incremental_tools.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models/incremental_tools.rs |
+
+| `crates/ra-coding/src/config/catalog/guardian_v2.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models/guardian_v2.rs |
+
+| `crates/ra-coding/src/config/catalog/access_programs.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models/access_programs.rs |
+
+| `crates/ra-coding/src/config/catalog/guardian.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models/guardian.rs |
+
+| `tests/it-coding/tests/product_config_permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_loader_tests.rs; codex-rs/core/src/config/config_tests.rs |
+
+| `tests/it-coding/tests/product_config_defaults.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs |
+
+| `tests/it-coding/tests/product_config_builder.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs (builder precedence and real consumer adaptations) |
+
+| `tests/it-coding/tests/product_config_upstream.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs (effective Config cases; account-specific and consumer-dependent assertions are recorded separately) |
+
+| `tests/it-coding/tests/product_config_upstream_loader.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_loader_tests.rs (full ConfigBuilder source, validation and error cases) |
+
+| `tests/it-coding/tests/product_config_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs; codex-rs/core/src/config/resolved_permission_profile.rs (OAuth dev-version and state inheritance regressions) |
+
+| `tests/it-coding/tests/config_support/mod.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs; codex-rs/core/src/config/config_loader_tests.rs; codex-rs/core-test-support/src (absolute-path fixtures) |
+
+| `tests/it-coding/tests/config_support/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/models-manager/models.json (one complete pinned model record) |
+
+| `tests/it-filesystem/tests/product_metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions.rs; codex-rs/core/src/config/config_tests.rs (product metadata acceptance for canonical and legacy policies) |
