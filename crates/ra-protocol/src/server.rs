@@ -454,7 +454,7 @@ impl AppServer {
         let mcp_forwarder = processor.mcp.forward(Arc::clone(processor.outgoing()));
         let plugin_forwarder = processor.plugins.forward(Arc::clone(processor.outgoing()));
 
-        let (transport_shutdown, mut signals) = match graceful_restart {
+        let (transport_shutdown, signals) = match graceful_restart {
             Some(GracefulRestart {
                 transport_shutdown,
                 signals,
@@ -469,6 +469,10 @@ impl AppServer {
         let mut shutdown_state = ShutdownState::default();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+        // One wait outlives the loop's iterations, as Codex's `shutdown_signal_future` does: a wait
+        // made afresh in each `select!` is dropped whenever another branch wins, and a signal
+        // arriving before the next one is made is lost.
+        let mut signal_wait = Box::pin(next_signal(signals));
         let exit_reason = loop {
             // Admissions are read first: a request can start a turn before it lets its permit go,
             // and the drain must see that turn.
@@ -485,12 +489,15 @@ impl AppServer {
             }
 
             tokio::select! {
-                signal = next_signal(&mut signals), if !shutdown_state.forced() => {
+                (signals, signal) = &mut signal_wait, if !shutdown_state.forced() => {
                     let signal = match signal {
-                        Ok(signal) => signal,
+                        Ok(signal) => {
+                            signal_wait.set(next_signal(signals));
+                            signal
+                        }
                         Err(err) => {
                             tracing::warn!("failed to listen for shutdown signal during graceful restart drain: {err}");
-                            signals = None;
+                            signal_wait.set(next_signal(None));
                             continue;
                         }
                     };
@@ -645,13 +652,16 @@ async fn open_connection(
     ))
 }
 
-/// Waits for the next signal of a server set to restart gracefully; never returns for one that
-/// is not.
-async fn next_signal(signals: &mut Option<ShutdownSignals>) -> io::Result<ShutdownSignal> {
-    match signals {
-        Some(signals) => signals.next().await,
+/// Waits for the next signal of a server set to restart gracefully, handing its signal source
+/// back so the wait can be made again; never returns for one that is not.
+async fn next_signal(
+    mut signals: Option<ShutdownSignals>,
+) -> (Option<ShutdownSignals>, io::Result<ShutdownSignal>) {
+    let signal = match &mut signals {
+        Some(source) => source.next().await,
         None => std::future::pending().await,
-    }
+    };
+    (signals, signal)
 }
 
 /// How many threads are running a turn: those whose listener has heard it start and not yet sent
