@@ -2177,3 +2177,44 @@ async fn unnamed_completions_do_not_share_item_ids() {
     assert!(ids[0].as_str().starts_with("__fake_id__-"), "{}", ids[0]);
     assert_ne!(ids[0], ids[1]);
 }
+
+#[tokio::test]
+async fn developer_role_uses_endpoint_capability_and_host_selections_never_reach_wire() {
+    for supported in [false, true] {
+        let server = MockServer::start().await;
+        let model = mounted_model_with(
+            &server,
+            ResponseTemplate::new(200).set_body_json(empty_completion()),
+            ProviderQuirks::new().with_developer_role(supported),
+        )
+        .await;
+        let input = vec![
+            ModelInputItem::Message(Message::developer("hook instructions")),
+            ModelInputItem::Message(Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Mention {
+                    name: "hidden".into(),
+                    path: "plugin://hidden".into(),
+                }],
+            )),
+            ModelInputItem::Message(Message::new(
+                MessageRole::User,
+                vec![
+                    ContentBlock::text("visible prompt"),
+                    ContentBlock::Skill {
+                        name: "hidden".into(),
+                        path: "/private/SKILL.md".into(),
+                    },
+                ],
+            )),
+        ];
+        let body = sent_body(&server, &model, request(input)).await;
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["messages"][0]["role"],
+            if supported { "developer" } else { "system" }
+        );
+        assert!(!body.to_string().contains("hidden"));
+        assert!(!body.to_string().contains("/private"));
+    }
+}

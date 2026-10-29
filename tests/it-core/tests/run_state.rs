@@ -2171,7 +2171,7 @@ fn current_schema_preserves_ownerless_rules_instead_of_applying_legacy_migration
     assert_eq!(state.permission_rules().len(), 1);
     assert_eq!(
         RUN_STATE_SCHEMA_VERSION,
-        ra_core::compat::SchemaVersion::new(16)
+        ra_core::compat::SchemaVersion::new(18)
     );
     assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }

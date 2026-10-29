@@ -368,3 +368,50 @@ async fn cancellation_during_contribution_keeps_accepted_input_for_resume() {
         ["initial", "context for initial"]
     );
 }
+
+struct ContextAtStop(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl ra_core::hook::UserHook for ContextAtStop {
+    fn name(&self) -> &str {
+        "late context"
+    }
+    async fn call(
+        &self,
+        context: &ra_core::hook::UserHookContext<'_>,
+        _: &ra_core::hook::HookEvent<'_>,
+    ) -> Result<ra_core::hook::HookDecision> {
+        if self.0.swap(false, Ordering::SeqCst) {
+            context
+                .context_output()
+                .unwrap()
+                .push_background(vec![Message::developer("late $unselected context")])
+                .unwrap();
+        }
+        Ok(ra_core::hook::HookDecision::Continue)
+    }
+}
+#[tokio::test]
+async fn hook_context_is_persistent_and_never_becomes_contributor_input() {
+    let model = capture(false, None);
+    let contributor = Contributor::new(false);
+    let session = Arc::new(InMemorySession::new("hook-context"));
+    let config = RunConfig::new()
+        .with_capability(contributor.clone())
+        .with_user_hook(ra_runtime::hook::UserHookRegistration::new(
+            ra_core::hook::HookEventName::Stop,
+            Arc::new(ContextAtStop(AtomicBool::new(true))),
+        ));
+    Runner::run(
+        request(model.clone(), contributor.clone(), vec![input("initial")])
+            .with_config(config)
+            .with_session(session.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *contributor.seen.lock().unwrap(),
+        vec![vec![input("initial")], Vec::new()]
+    );
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    assert!(session.get_items(None).await.unwrap().iter().any(|item| matches!(item.kind(), RunItemKind::Message(message) if message == &Message::developer("late $unselected context"))));
+}

@@ -503,3 +503,22 @@ fn discovery_estimate_counts_schema_keys_once() {
         ModelToolDefinition::advertised_table_chars(&tools).unwrap()
     );
 }
+
+#[test]
+fn model_replacement_preserves_original_output_without_exposing_it_to_older_readers() {
+    let output = ToolOutput::text("original result").with_model_replacement("filtered result");
+    assert_eq!(output.as_text(), Some("original result"));
+    assert_eq!(
+        output.model_blocks(),
+        vec![ra_core::tool::ToolOutputBlock::text("filtered result")]
+    );
+    let mut wire = serde_json::to_value(&output).unwrap();
+    let restored = ToolOutput::from_stored(&wire).unwrap().unwrap();
+    assert_eq!(restored.as_text(), Some("original result"));
+    assert_eq!(restored.model_blocks(), output.model_blocks());
+    wire.as_object_mut().unwrap().remove("original_blocks");
+    wire["schema_version"] = serde_json::json!(3);
+    let older_view = ToolOutput::from_stored(&wire).unwrap().unwrap();
+    assert_eq!(older_view.as_text(), Some("filtered result"));
+    assert_eq!(older_view.model_blocks(), output.model_blocks());
+}

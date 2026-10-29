@@ -731,3 +731,63 @@ fn host_text_and_structured_paths_expand_home_before_absolute_matching() {
         .is_empty()
     );
 }
+
+#[tokio::test]
+async fn structured_content_selection_survives_serialization_and_blocks_plain_name_fallback() {
+    use ra_core::item::{ContentBlock, MessageRole};
+    let temp = tempfile::tempdir().unwrap();
+    let source = provider(
+        vec![
+            entry(
+                "selected",
+                SkillSourceKind::Executor,
+                "root",
+                "skill://root/right/SKILL.md",
+            ),
+            entry(
+                "selected",
+                SkillSourceKind::Executor,
+                "root",
+                "skill://root/wrong/SKILL.md",
+            ),
+        ],
+        "selected body".to_owned(),
+        false,
+    );
+    let capability = SkillsNsCapability::new(
+        SkillProviders::new().with_executor_provider(source.clone()),
+        BTreeMap::from([("root".into(), Workspace::open(temp.path()).unwrap())]),
+        4096,
+    )
+    .unwrap()
+    .bind(&run())
+    .unwrap()
+    .unwrap();
+    let input = vec![ModelInputItem::Message(Message::new(
+        MessageRole::User,
+        vec![
+            ContentBlock::text("$selected"),
+            ContentBlock::Skill {
+                name: "selected".into(),
+                path: "skill://root/right/SKILL.md".into(),
+            },
+            ContentBlock::Mention {
+                name: "unrelated".into(),
+                path: "plugin://unrelated".into(),
+            },
+        ],
+    ))];
+    let restored: Vec<ModelInputItem> =
+        serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+    let messages = capability
+        .contribute_turn_input(&run(), &restored)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]
+            .text_content()
+            .contains("skill://root/right/SKILL.md")
+    );
+    assert_eq!(source.reads.lock().unwrap().len(), 1);
+}

@@ -577,7 +577,7 @@ async fn items_read_back_carry_the_conversations_ids_and_raw_items() {
 }
 
 #[tokio::test]
-async fn instruction_messages_read_back_as_system_messages() {
+async fn instruction_messages_read_back_with_their_original_roles() {
     let fake = Fake::start().await;
     fake.seed(
         "conv_x",
@@ -588,11 +588,15 @@ async fn instruction_messages_read_back_as_system_messages() {
     );
     let session = fake.session().with_conversation_id("conv_x");
     let items = session.get_items(None).await.unwrap();
-    for (item, text) in items.iter().zip(["be brief", "be kind"]) {
+    for ((item, text), role) in items
+        .iter()
+        .zip(["be brief", "be kind"])
+        .zip([MessageRole::Developer, MessageRole::System])
+    {
         let RunItemKind::Message(message) = item.kind() else {
             panic!("expected a message");
         };
-        assert_eq!(message.role(), MessageRole::System);
+        assert_eq!(message.role(), role);
         assert_eq!(message.text_content(), text);
     }
 }

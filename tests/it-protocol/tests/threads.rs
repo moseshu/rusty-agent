@@ -3498,3 +3498,74 @@ async fn thread_start_checks_dynamic_tools() {
     assert!(started["thread"]["id"].is_string(), "{started}");
     assert_eq!(factory.origins(), vec![ThreadOrigin::Start]);
 }
+
+struct HookSessionSources(Mutex<Vec<ra_core::hook::SessionStartSource>>);
+#[async_trait]
+impl ra_core::hook::UserHook for HookSessionSources {
+    fn name(&self) -> &str {
+        "session sources"
+    }
+    async fn call(
+        &self,
+        _: &ra_core::hook::UserHookContext<'_>,
+        event: &ra_core::hook::HookEvent<'_>,
+    ) -> Result<ra_core::hook::HookDecision> {
+        if let ra_core::hook::HookEvent::SessionStart { source, .. } = event {
+            self.0.lock().unwrap().push(*source);
+        }
+        Ok(ra_core::hook::HookDecision::Continue)
+    }
+}
+#[tokio::test]
+async fn protocol_initialization_preserves_startup_clear_resume_and_fork_hook_sources() {
+    use ra_core::hook::{HookEventName, SessionStartSource};
+    let script = Arc::new(Script::default());
+    let sources = Arc::new(HookSessionSources(Mutex::new(Vec::new())));
+    let config = RunConfig::new().with_user_hook(ra_runtime::hook::UserHookRegistration::new(
+        HookEventName::SessionStart,
+        sources.clone(),
+    ));
+    let server = Server::start(Arc::new(Factory::running(&script, false, agent(), config)));
+    let mut connection = server.connect(1).await;
+    let startup = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.answer("startup");
+    server.run_turn(&mut connection, startup.id(), "new").await;
+    let clear = server
+        .start_thread(
+            &mut connection,
+            serde_json::from_value(json!({"sessionStartSource":"clear"})).unwrap(),
+        )
+        .await;
+    script.answer("cleared");
+    server
+        .run_turn(&mut connection, clear.id(), "empty conversation")
+        .await;
+    server
+        .store_thread("source-for-hooks", "stored prompt")
+        .await;
+    let resumed = server
+        .resume(&mut connection, ThreadResumeParams::new("source-for-hooks"))
+        .await;
+    script.answer("resume");
+    server
+        .run_turn(&mut connection, resumed.thread().id(), "continue")
+        .await;
+    let fork = server
+        .fork(&mut connection, ThreadForkParams::new("source-for-hooks"))
+        .await;
+    script.answer("fork");
+    server
+        .run_turn(&mut connection, fork.thread().id(), "branch")
+        .await;
+    assert_eq!(
+        *sources.0.lock().unwrap(),
+        [
+            SessionStartSource::Startup,
+            SessionStartSource::Clear,
+            SessionStartSource::Resume,
+            SessionStartSource::Fork
+        ]
+    );
+}

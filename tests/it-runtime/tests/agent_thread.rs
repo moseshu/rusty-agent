@@ -2052,3 +2052,185 @@ async fn a_runs_output_schema_replaces_the_agents_declaration() {
         declared.to_model_output_schema()
     );
 }
+
+struct PromptAcceptanceHook {
+    seen: Mutex<Vec<HookEventName>>,
+}
+#[async_trait]
+impl UserHook for PromptAcceptanceHook {
+    fn name(&self) -> &str {
+        "prompt acceptance"
+    }
+    async fn call(
+        &self,
+        context: &UserHookContext<'_>,
+        event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        self.seen.lock().unwrap().push(event.name());
+        if matches!(
+            event,
+            HookEvent::SessionStart { .. } | HookEvent::UserPromptSubmit { .. }
+        ) {
+            context
+                .context_output()
+                .unwrap()
+                .push(vec![Message::developer(event.name().as_str())])
+                .unwrap();
+        }
+        if let HookEvent::UserPromptSubmit { input } = event
+            && input
+                .iter()
+                .any(|i| matches!(i, ModelInputItem::Message(m) if m.text_content() == "reject"))
+        {
+            return Ok(HookDecision::Deny {
+                message: "rejected".to_owned(),
+            });
+        }
+        Ok(HookDecision::Continue)
+    }
+}
+#[tokio::test]
+async fn host_hooks_reject_initial_prompt_and_preserve_context_without_sampling() {
+    let script = Arc::new(Script::default());
+    let hook = Arc::new(PromptAcceptanceHook {
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut config = RunConfig::new();
+    for event in [
+        HookEventName::SessionStart,
+        HookEventName::UserPromptSubmit,
+        HookEventName::SessionEnd,
+    ] {
+        config = config.with_user_hook(UserHookRegistration::new(event, hook.clone()));
+    }
+    let thread = thread_with(&script, config);
+    let id = started(
+        &thread,
+        TurnInputRequest::new(vec![ContentBlock::text("reject")]),
+    )
+    .await;
+    assert_eq!(completes(&thread, &id).await, None);
+    assert!(script.calls().is_empty());
+    script.push(Step::Respond(final_message("accepted", "ok")));
+    let id = started(
+        &thread,
+        TurnInputRequest::new(vec![ContentBlock::text("accept")]),
+    )
+    .await;
+    let _events = events_until_turn_ends(&thread).await;
+    let calls = script.calls();
+    assert_eq!(calls.len(), 1);
+    let text: Vec<_> = calls[0]
+        .input
+        .iter()
+        .filter_map(|i| match i {
+            ModelInputItem::Message(m) => Some(m.text_content()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "session_start",
+            "user_prompt_submit",
+            "accept",
+            "user_prompt_submit"
+        ]
+    );
+    assert!(!id.is_empty());
+    thread.shutdown().await;
+    thread.shutdown().await;
+    assert_eq!(
+        *hook.seen.lock().unwrap(),
+        [
+            HookEventName::SessionStart,
+            HookEventName::UserPromptSubmit,
+            HookEventName::UserPromptSubmit,
+            HookEventName::SessionEnd
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rejected_steer_after_candidate_does_not_sample_again_or_enter_history() {
+    let script = Arc::new(Script::default());
+    let release = Arc::new(Notify::new());
+    let gate = release.clone();
+    script.push(Step::After(
+        async move { gate.notified().await }.boxed(),
+        final_message("candidate", "ok"),
+    ));
+    let hook = Arc::new(PromptAcceptanceHook {
+        seen: Mutex::new(Vec::new()),
+    });
+    let thread = thread_with(
+        &script,
+        RunConfig::new().with_user_hook(UserHookRegistration::new(
+            HookEventName::UserPromptSubmit,
+            hook,
+        )),
+    );
+    let id = started(
+        &thread,
+        TurnInputRequest::new(vec![ContentBlock::text("accept")]),
+    )
+    .await;
+    script.wait_for_calls(1).await;
+    assert!(matches!(
+        thread.steer_turn(
+            &TurnInputRequest::new(vec![ContentBlock::text("reject")]),
+            &id
+        ),
+        SteerSubmission::Steered { .. }
+    ));
+    release.notify_one();
+    events_until_turn_ends(&thread).await;
+    assert_eq!(script.calls().len(), 1);
+    script.push(Step::Respond(final_message("next", "next")));
+    started(
+        &thread,
+        TurnInputRequest::new(vec![ContentBlock::text("next")]),
+    )
+    .await;
+    events_until_turn_ends(&thread).await;
+    assert!(
+        !script.calls()[1]
+            .input
+            .iter()
+            .any(|i| matches!(i, ModelInputItem::Message(m) if m.text_content() == "reject"))
+    );
+}
+
+struct AcceptedInputCapture(Mutex<Vec<Vec<ModelInputItem>>>);
+#[async_trait]
+impl Capability for AcceptedInputCapture {
+    fn kind(&self) -> CapabilityFamily {
+        CapabilityFamily::new("accepted_input_capture").unwrap()
+    }
+    async fn contribute_turn_input(
+        &self,
+        _: &ra_core::context::RunContext,
+        input: &[ModelInputItem],
+    ) -> Result<Vec<Message>> {
+        self.0.lock().unwrap().push(input.to_vec());
+        Ok(Vec::new())
+    }
+}
+#[tokio::test]
+async fn thread_history_prefix_does_not_retrigger_input_contributors() {
+    let script = Arc::new(Script::default());
+    let capture = Arc::new(AcceptedInputCapture(Mutex::new(Vec::new())));
+    let thread = thread_with(&script, RunConfig::new().with_capability(capture.clone()));
+    for prompt in ["first $selected", "second"] {
+        script.push(Step::Respond(final_message(prompt, "ok")));
+        started(&thread, text(prompt)).await;
+        events_until_turn_ends(&thread).await;
+    }
+    assert_eq!(
+        *capture.0.lock().unwrap(),
+        vec![
+            vec![ModelInputItem::Message(Message::user("first $selected"))],
+            vec![ModelInputItem::Message(Message::user("second"))],
+        ]
+    );
+}

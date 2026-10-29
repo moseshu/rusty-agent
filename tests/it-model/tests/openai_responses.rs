@@ -1482,3 +1482,42 @@ async fn text_narration_preserves_item_identity_and_reasoning_parts() {
         frames.len()
     );
 }
+
+#[tokio::test]
+async fn developer_history_and_host_selection_omission_follow_framework_contract() {
+    let server = MockServer::start().await;
+    let model = mounted_model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_payload()),
+    )
+    .await;
+    let input = vec![
+        ModelInputItem::Message(Message::developer("hook instructions")),
+        ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Mention {
+                name: "hidden".into(),
+                path: "plugin://hidden".into(),
+            }],
+        )),
+        ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![
+                ContentBlock::text("visible"),
+                ContentBlock::Skill {
+                    name: "hidden".into(),
+                    path: "/private/SKILL.md".into(),
+                },
+            ],
+        )),
+    ];
+    model
+        .get_response(ModelRequest::new(input, resolved(ModelSettings::new())))
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    assert_eq!(body["input"][0]["role"], "developer");
+    assert!(!body.to_string().contains("hidden"));
+}

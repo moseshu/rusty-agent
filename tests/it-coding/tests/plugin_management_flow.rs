@@ -499,3 +499,71 @@ async fn config_writes_toggle_plugins_and_report_write_error_codes() {
     drop(events);
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn selected_product_installs_plugin_input_contributor_with_developer_instructions() {
+    use ra_core::{
+        context::RunContext,
+        item::{AgentId, ContentBlock, Message, MessageRole, ModelInputItem},
+        state::RunId,
+    };
+    let home = TempDir::new().unwrap();
+    let market = TempDir::new().unwrap();
+    marketplace(market.path(), "1.0.0");
+    write(
+        &home.path().join("config.toml"),
+        "[skills.bundled]\nenabled=false\n",
+    );
+    let services = services(home.path());
+    services
+        .install(PluginInstallRequest {
+            plugin_name: "sample".into(),
+            marketplace_path: absolute(&market.path().join(".agents/plugins/marketplace.json")),
+        })
+        .await
+        .unwrap();
+    let host = ra_coding::CodingHost::open(home.path())
+        .unwrap()
+        .with_plugin_skills(services);
+    let built = ra_coding::build_agent_with_control(
+        AgentId::new("coding"),
+        "Coding",
+        &ra_core::prompt::PromptRole::Main,
+        &host,
+        ra_coding::CodingProfile::Core,
+    )
+    .await
+    .unwrap();
+    let config = built.configure_run(host.build_run_config());
+    let contributor = config
+        .capabilities()
+        .iter()
+        .find(|c| c.kind().as_str() == "plugin_mentions")
+        .unwrap();
+    let run = RunContext::new(RunId::generate(), built.agent());
+    let input = [ModelInputItem::Message(Message::new(
+        MessageRole::User,
+        vec![
+            ContentBlock::text("Use [@sample](plugin://sample@company)"),
+            ContentBlock::Mention {
+                name: "sample".into(),
+                path: "plugin://sample@company".into(),
+            },
+        ],
+    ))];
+    let messages = contributor
+        .contribute_turn_input(&run, &input)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role(), MessageRole::Developer);
+    assert!(messages[0].text_content().contains("`sample:`"));
+    assert!(!messages[0].text_content().contains("Apps from"));
+    assert!(
+        contributor
+            .contribute_turn_input(&run, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

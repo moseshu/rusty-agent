@@ -505,3 +505,37 @@ fn the_positional_trimmer_reaches_a_request_as_a_named_filter() {
         "a filter carries the prefix through untouched"
     );
 }
+
+#[test]
+fn eviction_previews_replacement_instead_of_host_only_original_output() {
+    for is_error in [false, true] {
+        let original = "SECRET-ORIGINAL ".repeat(70);
+        let replacement = "FILTERED-FEEDBACK ".repeat(45);
+        assert!(replacement.chars().count() > DEFAULT_MAX_OUTPUT_CHARS);
+        let output = ToolOutput::text(original.clone()).with_model_replacement(&replacement);
+        let mut item = structured_output("old", &output);
+        if let ModelInputItem::ToolCallOutput(output) = &mut item {
+            *output = output.clone().with_error(is_error);
+        }
+        let mut input = vec![user("old request"), call("old", "read_file"), item];
+        for index in 0..=DEFAULT_RECENT_TURNS {
+            input.push(user(&format!("recent {index}")));
+        }
+        let projected = ToolOutputTrimmer::default()
+            .trim_model_input(&input)
+            .unwrap();
+        let visible = model_text(&projected[2]);
+        assert!(visible.starts_with("[Trimmed:"));
+        assert!(visible.contains("FILTERED-FEEDBACK"));
+        assert!(!visible.contains("SECRET-ORIGINAL"));
+        assert!(
+            !serde_json::to_string(&projected[2])
+                .unwrap()
+                .contains("SECRET-ORIGINAL")
+        );
+        assert_eq!(structured(&input[2]).as_text(), Some(original.as_str()));
+        assert!(
+            matches!(&projected[2], ModelInputItem::ToolCallOutput(output) if output.is_error() == is_error)
+        );
+    }
+}

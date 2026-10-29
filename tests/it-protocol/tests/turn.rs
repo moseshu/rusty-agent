@@ -864,10 +864,6 @@ async fn turn_start_refuses_what_a_run_here_does_not_carry() {
             invalid_request("audio input is not supported"),
         ),
         (
-            json!({"threadId": THREAD, "input": [{"type": "mention", "name": "a", "path": "app://a"}]}),
-            invalid_request("mention input is not supported"),
-        ),
-        (
             json!({"threadId": THREAD, "input": [
                 {"type": "image", "url": "data:image/png;base64,AA", "detail": "original"}
             ]}),
@@ -2044,4 +2040,37 @@ async fn coding_command_records_are_released_when_the_turn_ends() {
         );
         assert!(!dir.path().join("pending.txt").exists());
     }
+}
+
+#[tokio::test]
+async fn turn_start_accepts_and_projects_structured_skill_and_plugin_mentions() {
+    let server = Server::start();
+    let mut connection = server.connect(1, true).await;
+    let script = Arc::new(Script::default());
+    server.load(&script, &[&connection]).await;
+    script.push(Step::Respond(final_message("selected", "done")));
+    let params = TurnStartParams::new(
+        THREAD,
+        vec![
+            UserInput::text("prompt"),
+            UserInput::skill("selected", "/skills/selected/SKILL.md"),
+            UserInput::mention("plugin", "plugin://sample@test"),
+        ],
+    );
+    let id = server.turn_start(&mut connection, &params).await;
+    assert_eq!(
+        connection.response(id).await["turn"]["status"],
+        "inProgress"
+    );
+    let started = connection.notification("item/started").await;
+    assert_eq!(started["item"]["type"], "userMessage");
+    assert_eq!(
+        started["item"]["content"],
+        serde_json::to_value(params.input()).unwrap()
+    );
+    connection.notification("turn/completed").await;
+    assert!(
+        matches!(&script.calls()[0].input[0], ModelInputItem::Message(m)
+        if m.content().iter().any(|c| matches!(c, ra_core::item::ContentBlock::Skill { .. })))
+    );
 }

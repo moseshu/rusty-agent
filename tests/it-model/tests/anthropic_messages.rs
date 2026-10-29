@@ -617,3 +617,48 @@ async fn neutral_deltas_group_text_blocks_and_stream_thinking_without_signatures
         started
     );
 }
+
+#[tokio::test]
+async fn developer_context_follows_tool_results_and_host_selections_are_omitted() {
+    use ra_core::item::{ContentBlock, MessageRole};
+    let server = MockServer::start().await;
+    let model = model(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id":"msg-test", "type":"message", "role":"assistant",
+            "content":[{"type":"text", "text":"done"}], "stop_reason":"end_turn",
+            "usage":{"input_tokens":1,"output_tokens":1}
+        })),
+    )
+    .await;
+    let input = vec![
+        ModelInputItem::Message(Message::user("prompt")),
+        ModelInputItem::ToolCall(ToolCall::new(CallId::new("call"), "echo", json!({}))),
+        ModelInputItem::ToolCallOutput(ToolCallOutput::new(CallId::new("call"), json!("result"))),
+        ModelInputItem::Message(Message::developer("hook instructions")),
+        ModelInputItem::Message(Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Skill {
+                name: "hidden".into(),
+                path: "/private/SKILL.md".into(),
+            }],
+        )),
+    ];
+    model
+        .get_response(request_items(
+            input,
+            ModelSettings::new().with_max_tokens(1024),
+        ))
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        body["messages"][2]["content"][1]["text"],
+        "hook instructions"
+    );
+    assert!(!body.to_string().contains("hidden"));
+}
