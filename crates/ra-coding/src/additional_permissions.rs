@@ -8,9 +8,8 @@
 //!
 //! # Differences from Codex
 //!
-//! - The executor's sandboxes can neither exclude a path from a root they open nor deny a read, so
-//!   permissions that deny a path, or leave a read-only subtree inside a writable root, are refused
-//!   rather than run with more authority than they give.
+//! - macOS applies additional permissions to the canonical profile through Seatbelt. Legacy
+//!   backends still refuse grants containing denied reads or read-only subpaths they cannot express.
 //! - Codex lets inline permissions through without its `exec_permission_approvals` feature when
 //!   its `request_permissions_tool` feature is on and the grants preapprove them. Grants exist only
 //!   once that tool was installed and answered, so here preapproval alone lets them through.
@@ -410,6 +409,17 @@ pub(crate) fn granted_sandbox(
     if !sandbox.level().needs_backend() {
         return Ok(sandbox);
     }
+    if let Some((profile, cwd)) = sandbox.permission_profile() {
+        let permissions =
+            materialize_additional_permissions_with_context(permissions.clone(), context)?;
+        let permissions = canonical_additional_permissions(&permissions)?;
+        let effective = ra_exec::sandbox::policy_transforms::effective_permission_profile(
+            profile,
+            Some(&permissions),
+        );
+        let cwd = cwd.to_path_buf();
+        return Ok(sandbox.with_permission_profile(effective, cwd));
+    }
     let mut sandbox = sandbox;
     if permissions
         .network()
@@ -480,4 +490,66 @@ pub(crate) fn granted_sandbox(
         }
     }
     Ok(sandbox)
+}
+
+/// Cross the product/native boundary explicitly: product paths are native paths, while the
+/// executor-owned profile stores path URIs. No permission entry may disappear in conversion.
+fn canonical_additional_permissions(
+    permissions: &AdditionalPermissionProfile,
+) -> Result<ra_filesystem::models::AdditionalPermissionProfile, String> {
+    use ra_filesystem::{models as native, permissions as policy};
+    let file_system = permissions
+        .file_system()
+        .map(
+            |file_system| -> Result<ra_filesystem::models::FileSystemPermissions, String> {
+                let entries = file_system
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        let path = match entry.path() {
+                            FileSystemPath::Path { path } => policy::FileSystemPath::Path {
+                                path: ra_paths::PathUri::from_host_native_path(path)
+                                    .map_err(|error| error.to_string())?,
+                            },
+                            FileSystemPath::GlobPattern { pattern } => {
+                                policy::FileSystemPath::GlobPattern {
+                                    pattern: pattern.clone(),
+                                }
+                            }
+                            FileSystemPath::Special { value } => policy::FileSystemPath::Special {
+                                value: serde_json::from_value(
+                                    serde_json::to_value(value)
+                                        .map_err(|error| error.to_string())?,
+                                )
+                                .map_err(|error| error.to_string())?,
+                            },
+                        };
+                        let access = match entry.access() {
+                            FileSystemAccessMode::Read => policy::FileSystemAccessMode::Read,
+                            FileSystemAccessMode::Write => policy::FileSystemAccessMode::Write,
+                            FileSystemAccessMode::Deny => policy::FileSystemAccessMode::Deny,
+                        };
+                        let mut native = policy::FileSystemSandboxEntry::new(path, access);
+                        if entry.skips_missing_path() {
+                            native.missing_path_behavior =
+                                Some(policy::FileSystemSandboxEntryMissingPathBehavior::Skip);
+                        }
+                        Ok(native)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(native::FileSystemPermissions {
+                    entries,
+                    glob_scan_max_depth: file_system.glob_scan_max_depth(),
+                })
+            },
+        )
+        .transpose()?;
+    Ok(native::AdditionalPermissionProfile {
+        network: permissions
+            .network()
+            .map(|network| native::NetworkPermissions {
+                enabled: network.enabled(),
+            }),
+        file_system,
+    })
 }

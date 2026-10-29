@@ -410,3 +410,47 @@ fn append_control_socket_protection(
     }
     Ok(())
 }
+
+/// Narrow bridges to the shared source algorithms used by ported policy tests.
+#[cfg(all(feature = "test-api", target_os = "macos"))]
+#[doc(hidden)]
+pub mod test_api {
+    #![allow(missing_docs, reason = "Hidden bridges for source tests.")]
+    use crate::sandbox::seatbelt_profile as profile;
+    use ra_filesystem::permissions::{FileSystemSandboxPolicy, NetworkSandboxPolicy};
+    use ra_paths::AbsolutePathBuf;
+    use std::path::Path;
+
+    #[must_use]
+    pub const fn base_policy() -> &'static str {
+        include_str!("seatbelt_profile/seatbelt_base_policy.sbpl")
+    }
+    pub fn command_args(
+        command: Vec<String>,
+        permissions: &FileSystemSandboxPolicy,
+        network: NetworkSandboxPolicy,
+        cwd: &Path,
+        helper: bool,
+        home: Option<&AbsolutePathBuf>,
+    ) -> Result<Vec<String>, String> {
+        profile::create_seatbelt_command_args_with_profile(
+            command,
+            permissions,
+            cwd,
+            network,
+            if helper {
+                profile::MacosSeatbeltProfile::FileSystemHelper
+            } else {
+                profile::MacosSeatbeltProfile::Process
+            },
+            home,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(all(feature = "test-api", target_os = "macos"))]
+#[doc(hidden)]
+pub use crate::sandbox::seatbelt_profile::test_api::{
+    glob_regex, normalize_path, unreadable_glob_policy,
+};

@@ -19,7 +19,8 @@
 //! Commands are decided by Codex's command policy (see [`crate::exec_policy`]) with the rules the
 //! host selects through [`CodingThreadSettingsAdapter::with_exec_policy`]: a command that needs
 //! approval asks, a forbidden one is refused with Codex's reason when it is called, and one every
-//! rule explicitly allows runs outside the sandbox. The call's `sandbox_permissions`,
+//! rule explicitly allows runs outside the sandbox unless denied reads require retaining it.
+//! The call's `sandbox_permissions`,
 //! `justification` and `prefix_rule` are checked and applied as Codex's `exec_command` handler
 //! does: `justification` needs an explicit `sandbox_permissions`, an approval policy that rejects
 //! sandbox prompts refuses a sandbox override, and an approved `require_escalated` runs its first
@@ -59,9 +60,9 @@
 //! command that stays in the sandbox, as Codex's `apply_granted_turn_permissions` adds them: having
 //! been approved when they were given, they do not make the command ask; its sandbox gains the
 //! roots they write and read and, when they give it, the network; and its approval request and
-//! cache keys carry them. The executor's sandboxes can neither exclude a path from a root they open
-//! nor deny a read, so a command is refused when a grant denies a path or makes a subtree of a
-//! writable root read-only. Path precedence includes both baseline roots and all grants; an
+//! cache keys carry them. macOS lowers these grants onto the canonical filesystem policy, keeping
+//! read-only subpaths and denied reads. The legacy backends refuse grants they cannot express.
+//! Path precedence includes both baseline roots and all grants; an
 //! equally specific write overrides a read, as Codex's policy does.
 //!
 //! A command may also ask for permissions of its own with `sandbox_permissions:
@@ -85,7 +86,9 @@
 //! has directory capabilities, but does not run beneath the command executor's kernel sandbox. A
 //! patch the grants already let write every path it touches is preapproved and does not ask, as
 //! Codex's patch handler preapproves it.
-//! Commands do enter that sandbox. The existing executor's workspace policy grants entire writable
+//! Commands enter the platform sandbox using their canonical permission profile on macOS.
+//! Other backends still use the legacy policy until their command lowering is ported.
+//! The legacy executor workspace policy grants entire writable
 //! roots; it does not yet port Codex's nested protected-directory rules. Those remain an execution
 //! adapter parity gap rather than a new provider-neutral permission rule.
 
@@ -152,8 +155,8 @@ pub struct CodingThreadSettings {
     cwd: PathBuf,
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
-    /// The legacy projection of `profile_permissions` reported on the wire and lowered to the
-    /// executor.
+    /// The compatibility view reported on the wire and used by backends awaiting canonical
+    /// command-profile lowering.
     sandbox_policy: SandboxPolicy,
     /// The canonical permission state: Codex's session `Permissions`, with the requirement
     /// constraints of the configuration the thread was loaded with.
@@ -986,12 +989,28 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         if let ExecApprovalRequirement::Forbidden { reason } = &decision.requirement {
             return Err(ra_tools::exec_command::rejection(reason.clone()));
         }
-        let environment = environment.unwrap_or_else(|| self.environment(&decision));
-        let retry_environment = FrozenEnvironment::of(
-            &environment
+        let mut environment = environment.unwrap_or_else(|| self.environment(&decision));
+        let explicitly_approved = already_approved
+            || settings.approved_for_session(
+                &settings.command_cache_keys(context.arguments(), Some(&decision)),
+            );
+        if explicitly_approved
+            && decision
+                .sandbox_permissions
+                .requires_escalated_permissions()
+        {
+            environment = approved_command_environment(&environment)?;
+        }
+        let retry_environment = FrozenEnvironment::of(&if environment
+            .sandbox()
+            .is_some_and(sandbox_denies_reads)
+        {
+            environment.clone()
+        } else {
+            environment
                 .clone()
-                .with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined)),
-        );
+                .with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined))
+        });
         let state = AttemptState {
             decision,
             already_approved,
@@ -1009,11 +1028,20 @@ impl ExecCommandPolicy for CodingCommandPolicy {
             serde_json::from_value(attempt.state()?.clone()).ok()?;
         // Codex's launch permissions: a launch that left the sandbox its decision selected, by an
         // escalation or a rule's trust before it ran or by a retry after a denial.
-        let escalated =
-            decision.bypasses_sandbox() || environment.sandbox() != Some(&decision.sandbox);
+        let escalated = if sandbox_denies_reads(&decision.sandbox) {
+            environment
+                .sandbox()
+                .is_none_or(|policy| !policy.level().needs_backend())
+        } else {
+            decision.bypasses_sandbox() || environment.sandbox() != Some(&decision.sandbox)
+        };
         encode(&TerminalLaunch {
             sandbox: environment.sandbox().cloned(),
             escalated,
+            denied_read_context: decision
+                .sandbox
+                .permission_profile()
+                .map(|(profile, _)| profile.clone()),
             additional_permissions: decision.additional_permissions,
         })
         .ok()
@@ -1210,7 +1238,59 @@ fn sandboxed_environment(
             ExecSandboxPolicy::new(SandboxLevel::WorkspaceWrite).with_network(network(false))
         }
     };
+    #[cfg(target_os = "macos")]
+    let policy = policy.with_permission_profile(
+        settings.profile_permissions.effective_permission_profile(),
+        settings.cwd.clone(),
+    );
     environment.with_sandbox(policy)
+}
+
+fn sandbox_denies_reads(policy: &ExecSandboxPolicy) -> bool {
+    policy.permission_profile().is_some_and(|(profile, _)| {
+        profile
+            .file_system_sandbox_policy()
+            .has_denied_read_restrictions()
+    })
+}
+
+/// Approved escalation may broaden writes, but it cannot remove the sandbox enforcing denies.
+fn approved_command_environment(environment: &ExecEnvironment) -> Result<ExecEnvironment> {
+    let Some(policy) = environment
+        .sandbox()
+        .filter(|policy| sandbox_denies_reads(policy))
+    else {
+        return Ok(environment.clone());
+    };
+    let Some((profile, cwd)) = policy.permission_profile() else {
+        return Ok(environment.clone());
+    };
+    let cwd_uri = ra_paths::PathUri::from_host_native_path(cwd)
+        .map_err(|error| Error::caller(error.to_string()))?;
+    let home = AbsolutePathBufGuard::home_directory()
+        .and_then(|path| ra_paths::PathUri::from_host_native_path(path).ok());
+    let temporary = std::env::var_os("TMPDIR")
+        .and_then(|path| ra_paths::PathUri::from_host_native_path(PathBuf::from(path)).ok())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let context = ra_filesystem::permissions::FileSystemSandboxPolicyContext {
+        cwd: &cwd_uri,
+        workspace_roots: std::slice::from_ref(&cwd_uri),
+        user_home_dir: home.as_ref(),
+        temporary_directories: Some(&temporary),
+    };
+    let file_system = profile
+        .file_system_sandbox_policy()
+        .for_approved_command(&context);
+    let profile =
+        ra_filesystem::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+            profile.enforcement(),
+            &file_system,
+            profile.network_sandbox_policy(),
+        );
+    Ok(environment
+        .clone()
+        .with_sandbox(policy.clone().with_permission_profile(profile, cwd)))
 }
 
 fn network(enabled: bool) -> ExecNetworkAccess {
@@ -1343,7 +1423,41 @@ struct TerminalLaunch {
     sandbox: Option<ExecSandboxPolicy>,
     escalated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    denied_read_context: Option<ra_filesystem::models::PermissionProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     additional_permissions: Option<AdditionalPermissionProfile>,
+}
+
+impl TerminalLaunch {
+    fn cannot_enforce_denied_reads(
+        &self,
+        baseline: Option<&ExecSandboxPolicy>,
+        current: Option<&ExecSandboxPolicy>,
+    ) -> bool {
+        let Some((profile, _)) = baseline.and_then(ExecSandboxPolicy::permission_profile) else {
+            return false;
+        };
+        if !profile
+            .file_system_sandbox_policy()
+            .has_denied_read_restrictions()
+        {
+            return false;
+        }
+        let launched = self
+            .denied_read_context
+            .as_ref()
+            .map(ra_filesystem::models::PermissionProfile::file_system_sandbox_policy)
+            .or_else(|| {
+                self.sandbox
+                    .as_ref()
+                    .and_then(ExecSandboxPolicy::permission_profile)
+                    .map(|(profile, _)| profile.file_system_sandbox_policy())
+            });
+        let current = current
+            .and_then(ExecSandboxPolicy::permission_profile)
+            .map(|(profile, _)| profile.file_system_sandbox_policy());
+        self.escalated || launched != current
+    }
 }
 
 /// The coding product's [`WriteStdinPolicy`]: Codex's stdin review. Input to a running terminal
@@ -1353,7 +1467,7 @@ struct TerminalLaunch {
 /// refused where the approval policy rejects sandbox prompts. A terminal this policy did not
 /// launch is not reviewed.
 ///
-/// Codex's denied-read check has no counterpart: the executor's sandboxes deny no reads.
+/// A running terminal cannot acquire new denied-read restrictions through approval; restart it.
 pub(crate) struct CodingStdinPolicy;
 
 impl WriteStdinPolicy for CodingStdinPolicy {
@@ -1387,6 +1501,11 @@ impl WriteStdinPolicy for CodingStdinPolicy {
             }
             _ => baseline.clone(),
         };
+        if launch.cannot_enforce_denied_reads(baseline.as_ref(), current.as_ref()) {
+            return Ok(StdinReview::Refuse(
+                "this terminal cannot enforce the current denied-read restrictions; start a new terminal".to_owned(),
+            ));
+        }
         let sandbox_permissions = if launch.escalated || launch.sandbox != current {
             SandboxPermissions::RequireEscalated
         } else if launch.sandbox == baseline {
@@ -1777,10 +1896,11 @@ fn command_decision(
             ..
         }
     ) || sandbox_permissions.requires_escalated_permissions();
-    let selected = if bypass_sandbox {
+    let environment = sandboxed_environment(settings, &ExecEnvironment::new());
+    let unsandboxed_allowed = !environment.sandbox().is_some_and(sandbox_denies_reads);
+    let selected = if bypass_sandbox && unsandboxed_allowed {
         ExecEnvironment::new().with_sandbox(ExecSandboxPolicy::new(SandboxLevel::Unconfined))
     } else {
-        let environment = sandboxed_environment(settings, &ExecEnvironment::new());
         match (environment.sandbox(), &effective.additional_permissions) {
             (Some(sandbox), Some(permissions)) => {
                 let sandbox = granted_sandbox(sandbox.clone(), permissions, &policy_context)

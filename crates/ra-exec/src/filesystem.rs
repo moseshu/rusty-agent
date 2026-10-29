@@ -21,8 +21,6 @@ mod fs_helper_main;
 mod fs_sandbox;
 #[cfg(any(target_os = "linux", feature = "test-api"))]
 mod helper_linux;
-#[cfg(target_os = "macos")]
-mod helper_seatbelt;
 mod sandboxed_file_open;
 mod sandboxed_file_system;
 mod wire_error;

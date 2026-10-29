@@ -7,6 +7,26 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### macOS command sandboxing through canonical permission profiles
+
+On macOS, coding shell commands — including background terminals, their stdin, approved
+escalations and sandbox retries — now run under Seatbelt with the thread's canonical permission
+profile, through the same sandbox manager and profile builder as the filesystem helper. Behaviour
+visible to users and hosts:
+
+- Under the default `:workspace` profile, `.git`, `.agents`, `.codex`, `.rusty-agent` and `.aws` in
+  a writable root are read-only to commands, including creating them for the first time; a command
+  that must write there, such as `git commit`, needs an approved escalation.
+- Deny-read paths and globs from permission profiles and requirements are enforced for commands.
+  An approved escalation broadens writes only and keeps every denied read; a command allow rule no
+  longer runs such a command outside the sandbox.
+- A running terminal whose denied-read restrictions changed is refused further input and must be
+  restarted under the current policy.
+- `seatbelt_network_policy.sbpl` returns, in the shared Seatbelt directory, as the network section
+  of command profiles with network enabled; the filesystem helper still uses no network section.
+- Linux and Windows commands keep their previous sandbox paths until their command lowering is
+  ported; the managed network proxy is not part of this change.
+
 ### Product MCP approval requests and automatic approval
 
 Coding app-server threads now ask the client before product MCP calls execute. The effective

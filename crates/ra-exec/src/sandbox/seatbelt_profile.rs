@@ -1,5 +1,5 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Native filesystem-helper Seatbelt profile lowering.
+//! Shared process and filesystem-helper Seatbelt profile lowering.
 #![allow(
     clippy::needless_pass_by_value,
     reason = "Preserve the source ownership and public argument contract."
@@ -9,20 +9,23 @@
     reason = "Keep the source lifecycle and policy lowering order visible in one operation."
 )]
 use ra_filesystem::legacy::WritableRoot;
-use ra_filesystem::permissions::{FileSystemSandboxPolicy, PROTECTED_METADATA_PATH_NAMES};
+use ra_filesystem::permissions::{
+    FileSystemSandboxPolicy, NetworkSandboxPolicy, PROTECTED_METADATA_PATH_NAMES,
+};
 use ra_paths::AbsolutePathBuf;
 use std::{
     collections::{BTreeSet, VecDeque},
     path::{Path, PathBuf},
 };
-const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl");
-const MACOS_SEATBELT_PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl");
+const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_profile/seatbelt_base_policy.sbpl");
+const MACOS_SEATBELT_PREFERENCES_POLICY: &str =
+    include_str!("seatbelt_profile/seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
-    include_str!("seatbelt_read_only_platform_defaults.sbpl");
-#[path = "seatbelt_daemon.rs"]
+    include_str!("seatbelt_profile/seatbelt_read_only_platform_defaults.sbpl");
+#[path = "seatbelt_profile/seatbelt_daemon.rs"]
 mod daemon;
 
-#[path = "seatbelt_scratch.rs"]
+#[path = "seatbelt_profile/seatbelt_scratch.rs"]
 mod scratch;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,7 +52,7 @@ impl std::fmt::Display for SeatbeltPreparationError {
 /// to defend against an attacker trying to inject a malicious version on the
 /// PATH. If /usr/bin/sandbox-exec has been tampered with, then the attacker
 /// already has root access.
-pub(super) const MACOS_PATH_TO_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
+pub(crate) const MACOS_PATH_TO_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
 
 fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf> {
     // `AbsolutePathBuf::from_absolute_path()` normalizes relative paths against the current
@@ -519,9 +522,10 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     command: Vec<String>,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     sandbox_policy_cwd: &Path,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    profile: MacosSeatbeltProfile,
     allowed_symlinked_codex_home: Option<&AbsolutePathBuf>,
 ) -> Result<Vec<String>, SeatbeltPreparationError> {
-    let profile = MacosSeatbeltProfile::FileSystemHelper;
     let unreadable_roots =
         file_system_sandbox_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd);
     let mut writable_roots = file_system_sandbox_policy
@@ -658,7 +662,16 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
             }
         };
 
-    let network_policy = String::new();
+    // Without a managed proxy the upstream network section has only on/off behavior.
+    let network_policy = if network_sandbox_policy.is_enabled() {
+        format!(
+            "(allow network-outbound)\n(allow network-inbound)\n{}{}",
+            include_str!("seatbelt_profile/seatbelt_network_policy.sbpl"),
+            include_str!("seatbelt_profile/seatbelt_tls_trust.sbpl")
+        )
+    } else {
+        String::new()
+    };
     let deny_read_policy =
         build_seatbelt_unreadable_glob_policy(file_system_sandbox_policy, sandbox_policy_cwd);
     let mut policy_sections = vec![
@@ -722,4 +735,32 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     seatbelt_args.push("--".to_string());
     seatbelt_args.extend(command);
     Ok(seatbelt_args)
+}
+
+#[cfg(feature = "test-api")]
+pub(crate) mod test_api {
+    #![allow(missing_docs, reason = "Hidden bridges for source tests.")]
+    use super::{
+        AbsolutePathBuf, FileSystemSandboxPolicy, GlobMatch, Path,
+        build_seatbelt_unreadable_glob_policy, normalize_path_for_sandbox, seatbelt_regex_for_glob,
+    };
+    #[must_use]
+    pub fn unreadable_glob_policy(policy: &FileSystemSandboxPolicy, cwd: &Path) -> String {
+        build_seatbelt_unreadable_glob_policy(policy, cwd)
+    }
+    #[must_use]
+    pub fn glob_regex(pattern: &str, exact: bool) -> Option<String> {
+        seatbelt_regex_for_glob(
+            pattern,
+            if exact {
+                GlobMatch::Exact
+            } else {
+                GlobMatch::Subtree
+            },
+        )
+    }
+    #[must_use]
+    pub fn normalize_path(path: &Path) -> Option<AbsolutePathBuf> {
+        normalize_path_for_sandbox(path)
+    }
 }

@@ -24,10 +24,18 @@ pub mod bwrap;
 mod denial;
 #[cfg(feature = "docker")]
 pub mod docker;
+pub(crate) mod manager;
+/// Hidden bridges for the source sandbox-manager tests.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use manager::test_api as manager_test_api;
 pub mod manifest;
 pub mod network;
+pub mod policy_transforms;
 #[cfg(feature = "seatbelt")]
 pub mod seatbelt;
+#[cfg(target_os = "macos")]
+pub(crate) mod seatbelt_profile;
 pub mod unix_local;
 
 use std::{
@@ -300,8 +308,16 @@ pub struct SandboxPolicy {
     writable_roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     readable_roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<CommandPermissions>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommandPermissions {
+    profile: ra_filesystem::models::PermissionProfile,
+    cwd: PathBuf,
 }
 
 impl Default for SandboxPolicy {
@@ -331,8 +347,46 @@ impl SandboxPolicy {
             },
             writable_roots: Vec::new(),
             readable_roots: Vec::new(),
+            permissions: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Retains the canonical permission profile through command launch instead of flattening
+    /// read denies and read-only subpaths into legacy roots. The cwd anchors profile symbols.
+    /// Once supplied, the canonical profile is authoritative; legacy root fields remain its
+    /// compatibility view and must not be used to change the profile's grants.
+    #[must_use]
+    pub fn with_permission_profile(
+        mut self,
+        profile: ra_filesystem::models::PermissionProfile,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
+        let (file_system, network) = profile.to_runtime_permissions();
+        self.network = if network.is_enabled() {
+            NetworkAccess::Allowed
+        } else {
+            NetworkAccess::Denied
+        };
+        if policy_transforms::should_require_platform_sandbox(&file_system, network, false) {
+            self.level = SandboxLevel::WorkspaceWrite;
+        } else {
+            self.level = SandboxLevel::Unconfined;
+            self.network = NetworkAccess::Allowed;
+        }
+        self.permissions = Some(CommandPermissions {
+            profile,
+            cwd: cwd.into(),
+        });
+        self
+    }
+
+    /// The canonical launch permissions and their symbol-resolution directory, when supplied.
+    #[must_use]
+    pub fn permission_profile(&self) -> Option<(&ra_filesystem::models::PermissionProfile, &Path)> {
+        self.permissions
+            .as_ref()
+            .map(|permissions| (&permissions.profile, permissions.cwd.as_path()))
     }
 
     /// Names the weakest level this host will accept if the requested one cannot be delivered.
@@ -351,6 +405,21 @@ impl SandboxPolicy {
     #[must_use]
     pub const fn with_network(mut self, network: NetworkAccess) -> Self {
         self.network = network;
+        if let Some(permissions) = &mut self.permissions {
+            match &mut permissions.profile {
+                ra_filesystem::models::PermissionProfile::Managed {
+                    network: current, ..
+                }
+                | ra_filesystem::models::PermissionProfile::External { network: current } => {
+                    *current = if network.is_allowed() {
+                        ra_filesystem::permissions::NetworkSandboxPolicy::Enabled
+                    } else {
+                        ra_filesystem::permissions::NetworkSandboxPolicy::Restricted
+                    };
+                }
+                ra_filesystem::models::PermissionProfile::Disabled => {}
+            }
+        }
         self
     }
 
@@ -493,6 +562,7 @@ pub struct ConfinementRequest {
     network: NetworkAccess,
     writable_roots: Vec<PathBuf>,
     readable_roots: Vec<PathBuf>,
+    permissions: Option<CommandPermissions>,
 }
 
 impl ConfinementRequest {
@@ -663,6 +733,14 @@ pub enum SandboxError {
         /// Which pair of requests cannot hold together.
         detail: String,
     },
+    /// The backend could not prepare the native command wrapper.
+    #[error("failed to prepare {backend} sandbox: {detail}")]
+    Preparation {
+        /// The backend whose preparation failed.
+        backend: &'static str,
+        /// The original backend's explanation, retained for protocol and tool errors.
+        detail: String,
+    },
     /// A root in the policy could not be turned into a path a backend can enforce.
     #[error("sandbox root `{root}` cannot be used: {detail}")]
     UnusableRoot {
@@ -744,6 +822,46 @@ impl Confinement {
     ///
     /// Returns [`SandboxError`] when the backend cannot express the policy.
     pub fn apply(&self, command: SandboxCommand) -> Result<SandboxCommand, SandboxError> {
+        if let Some(permissions) = self
+            .request
+            .as_ref()
+            .and_then(|request| request.permissions.as_ref())
+        {
+            use manager::{SandboxManager, SandboxTransformRequest, SandboxablePreference};
+            let manager = SandboxManager::new();
+            let sandbox = manager.select_initial(
+                &permissions.profile,
+                SandboxablePreference::Auto,
+                ra_filesystem::sandbox::SandboxType::None,
+                false,
+            );
+            if sandbox == ra_filesystem::sandbox::SandboxType::MacosSeatbelt
+                && let Some(backend) = self.backend
+                && backend.name() != "seatbelt"
+            {
+                return Err(SandboxError::Preparation { backend: backend.name(),
+                    detail: "the selected backend does not support canonical command permission profiles".to_owned() });
+            }
+            if sandbox == ra_filesystem::sandbox::SandboxType::None
+                && manager.should_sandbox(&permissions.profile, SandboxablePreference::Auto, false)
+            {
+                return Err(SandboxError::Unavailable {
+                    source: SandboxUnavailable::new(
+                        "permission-profile",
+                        "no platform backend can enforce the canonical command permissions",
+                    ),
+                });
+            }
+            return manager
+                .transform(SandboxTransformRequest {
+                    command,
+                    permissions: &permissions.profile,
+                    additional_permissions: None,
+                    sandbox,
+                    sandbox_policy_cwd: &permissions.cwd,
+                })
+                .map(|request| request.command);
+        }
         let (Some(backend), Some(request)) = (self.backend, self.request.as_ref()) else {
             return Ok(command);
         };
@@ -826,6 +944,20 @@ pub fn resolve_confinement_with(
     policy: &SandboxPolicy,
     scratch_dir: Option<&Path>,
 ) -> Result<Confinement, SandboxError> {
+    // Canonical profiles, including deserialized launch snapshots, remain authoritative over
+    // their compatibility fields. Recompute that view before backend selection and reporting.
+    let canonical_policy = policy.permissions.as_ref().map(|permissions| {
+        policy
+            .clone()
+            .with_permission_profile(permissions.profile.clone(), permissions.cwd.clone())
+    });
+    let policy = canonical_policy.as_ref().unwrap_or(policy);
+    if let Some((profile, _)) = policy.permission_profile() {
+        let (file_system, network) = profile.to_runtime_permissions();
+        if !policy_transforms::should_require_platform_sandbox(&file_system, network, false) {
+            return Ok(Confinement::baseline());
+        }
+    }
     if !policy.level().needs_backend() {
         if !policy.network().is_allowed() {
             return Err(SandboxError::Contradictory {
@@ -888,6 +1020,16 @@ pub fn resolve_confinement_with(
             network: policy.network(),
             writable_roots: collect_roots(policy.writable_roots(), scratch_dir),
             readable_roots: collect_roots(policy.readable_roots(), None),
+            permissions: policy.permissions.clone().map(|mut permissions| {
+                if let Some(scratch) = scratch_dir {
+                    let (file_system, network) = permissions.profile.to_runtime_permissions();
+                    let scratch = ra_paths::AbsolutePathBuf::resolve_path_against_base(scratch, &permissions.cwd);
+                    let file_system = file_system.with_additional_writable_roots(&permissions.cwd, &[scratch]);
+                    permissions.profile = ra_filesystem::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                        permissions.profile.enforcement(), &file_system, network);
+                }
+                permissions
+            }),
         }),
     })
 }

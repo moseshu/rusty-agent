@@ -152,6 +152,47 @@ impl FileSystemSandboxRunner {
         self.sandbox_exec_request(&permission_profile, &cwd, workspace_roots, sandbox)
     }
 
+    #[cfg(target_os = "macos")]
+    fn seatbelt_command(
+        &self,
+        command: &[String],
+        permission_profile: &PermissionProfile,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<String>, JSONRPCErrorError> {
+        use crate::sandbox::SandboxCommand;
+        use crate::sandbox::manager::{
+            SandboxManager, SandboxTransformRequest, SandboxablePreference,
+        };
+        let manager = SandboxManager::for_file_system_helpers().with_allowed_symlinked_codex_home(
+            self.runtime_paths.allowed_symlinked_codex_home.clone(),
+        );
+        let sandbox = manager.select_initial(
+            permission_profile,
+            SandboxablePreference::Require,
+            ra_filesystem::sandbox::SandboxType::None,
+            false,
+        );
+        if sandbox == ra_filesystem::sandbox::SandboxType::None {
+            return Err(invalid_request(
+                "filesystem sandbox cannot be enforced on this executor".to_owned(),
+            ));
+        }
+        let transformed = manager
+            .transform(SandboxTransformRequest {
+                command: SandboxCommand::new(&command[0], command[1..].to_vec()),
+                permissions: permission_profile,
+                additional_permissions: None,
+                sandbox,
+                sandbox_policy_cwd: cwd,
+            })
+            .map_err(|error| invalid_request(format!("failed to prepare fs sandbox: {error}")))?;
+        Ok(
+            std::iter::once(transformed.command.program().to_string_lossy().into_owned())
+                .chain(transformed.command.args().iter().cloned())
+                .collect(),
+        )
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn sandbox_exec_request(
         &self,
@@ -173,7 +214,7 @@ impl FileSystemSandboxRunner {
             .ancestors()
             .last()
             .ok_or_else(|| invalid_request("filesystem sandbox cwd has no root".to_string()))?;
-        let command = vec![
+        let command = [
             helper.as_path().to_string_lossy().into_owned(),
             CODEX_FS_HELPER_ARG1.to_string(),
         ];
@@ -182,22 +223,7 @@ impl FileSystemSandboxRunner {
         #[cfg(target_os = "linux")]
         let arg0;
         #[cfg(target_os = "macos")]
-        let command = {
-            let args = super::helper_seatbelt::create_seatbelt_command_args_with_profile(
-                command,
-                &permission_profile.file_system_sandbox_policy(),
-                cwd.native.as_path(),
-                self.runtime_paths.allowed_symlinked_codex_home.as_ref(),
-            )
-            .map_err(|error| {
-                invalid_request(format!(
-                    "failed to prepare fs sandbox: failed to prepare Seatbelt sandbox: {error}"
-                ))
-            })?;
-            std::iter::once(super::helper_seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string())
-                .chain(args)
-                .collect()
-        };
+        let command = self.seatbelt_command(&command, permission_profile, cwd.native.as_path())?;
         #[cfg(target_os = "linux")]
         let command = {
             let exe = self
@@ -219,7 +245,7 @@ impl FileSystemSandboxRunner {
             .map_err(|error| invalid_request(format!("failed to prepare fs sandbox: {error}")))?;
             let mut args =
                 super::helper_linux::create_linux_sandbox_command_args_for_permission_profile(
-                    command,
+                    command.to_vec(),
                     helper_cwd.as_path(),
                     permission_profile,
                     cwd.native.as_path(),
