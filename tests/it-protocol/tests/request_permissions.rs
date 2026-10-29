@@ -1407,13 +1407,15 @@ async fn a_granted_command_that_asks_shows_its_grant() {
     assert_eq!(std::fs::read_to_string(&written).unwrap(), "asked-ok");
 }
 
-/// The executor's sandbox cannot exclude a path from a root it opens, so while a grant denies a
-/// path, commands are refused rather than run with it open.
+/// macOS enforces a grant's denied reads while allowing its writes. Legacy root-list backends
+/// still refuse the grant rather than silently open the denied path.
 #[tokio::test]
-async fn a_grant_that_denies_a_path_refuses_later_commands() {
+async fn a_grant_that_denies_a_path_is_enforced_or_refused() {
     let server = Server::start();
     let outside = tempfile::tempdir().unwrap();
     let written = outside.path().join("open.txt");
+    let secret = outside.path().join("secret");
+    std::fs::write(&secret, "denied-token").unwrap();
     let entries = json!([
         {"path": {"type": "path", "path": text(outside.path())}, "access": "write"},
         {"path": {"type": "path", "path": text(&outside.path().join("secret"))}, "access": "deny"},
@@ -1424,11 +1426,13 @@ async fn a_grant_that_denies_a_path_refuses_later_commands() {
         "permissions-call",
         json!({"permissions": {"file_system": {"entries": entries}}}),
     ));
-    script.push(call(
-        "exec_command",
-        "exec-call",
-        write_and_cat(&written, "should-not-run"),
+    let mut command = write_and_cat(&written, "granted-write");
+    command["cmd"] = json!(format!(
+        "{}; cat '{}'",
+        command["cmd"].as_str().unwrap(),
+        secret.display()
     ));
+    script.push(call("exec_command", "exec-call", command));
     script.push(final_message("done"));
     let config = server
         .load_with_tools(&script, on_request(), &connection, command_tools(&server))
@@ -1447,11 +1451,17 @@ async fn a_grant_that_denies_a_path_refuses_later_commands() {
     connection.notification("turn/completed").await;
 
     let output = script.last_output("exec-call").unwrap().to_string();
-    assert!(
-        output.contains("the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run"),
-        "{output}"
-    );
-    assert!(!written.exists());
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "granted-write");
+        assert!(output.contains("Operation not permitted"), "{output}");
+        assert!(!output.contains("denied-token"), "{output}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(output.contains("the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run"), "{output}");
+        assert!(!written.exists());
+    }
     assert_eq!(
         settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
         None
@@ -1496,16 +1506,19 @@ async fn run_with_file_system_grant(
     script
 }
 
-fn assert_read_only_refusal(script: &Script, written: &Path) {
+fn assert_read_only_enforced(script: &Script, written: &Path) {
     let output = script.last_output("exec-call").unwrap().to_string();
+    #[cfg(target_os = "macos")]
+    assert!(output.contains("Operation not permitted"), "{output}");
+    #[cfg(not(target_os = "macos"))]
     assert!(output.contains("the granted permissions require read-only paths within writable roots that the command sandbox cannot enforce, so the command was not run"), "{output}");
     assert!(!written.exists(), "the read-only path was written");
 }
 
-/// Codex preserves read-only children of writable roots. A root-list sandbox cannot do so and
-/// must refuse the command, including when the read-only child does not exist yet.
+/// Read-only children of writable roots remain protected, including before the child exists.
+/// macOS enforces the policy; legacy root-list sandboxes refuse the command.
 #[tokio::test]
-async fn read_only_children_of_granted_writable_roots_refuse_commands() {
+async fn read_only_children_of_granted_writable_roots_prevent_writes() {
     for existing in [true, false] {
         let server = Server::start();
         let outside = tempfile::tempdir().unwrap();
@@ -1519,13 +1532,13 @@ async fn read_only_children_of_granted_writable_roots_refuse_commands() {
             {"path": {"type": "path", "path": text(&child)}, "access": "read"},
         ]});
         let script = run_with_file_system_grant(&server, file_system, command(json!({"cmd": format!("mkdir -p '{}' && printf unauthorized > '{}'", child.display(), written.display())}))).await;
-        assert_read_only_refusal(&script, &written);
+        assert_read_only_enforced(&script, &written);
     }
 }
 
 /// A read grant can constrain the thread's baseline writable root, even with no write grant.
 #[tokio::test]
-async fn read_only_children_of_baseline_writable_roots_refuse_commands() {
+async fn read_only_children_of_baseline_writable_roots_prevent_writes() {
     let server = Server::start();
     let child = server.root().join("readonly");
     std::fs::create_dir(&child).unwrap();
@@ -1536,7 +1549,7 @@ async fn read_only_children_of_baseline_writable_roots_refuse_commands() {
         write_and_cat(&written, "unauthorized"),
     )
     .await;
-    assert_read_only_refusal(&script, &written);
+    assert_read_only_enforced(&script, &written);
 }
 
 /// A more specific read survives session/turn merging whichever scope supplied it.
@@ -1600,7 +1613,7 @@ async fn read_only_carveouts_survive_session_and_turn_merging() {
             )
             .await;
         connection.notification("turn/completed").await;
-        assert_read_only_refusal(&script, &written);
+        assert_read_only_enforced(&script, &written);
         assert!(settings(&config).granted_session_permissions().is_some());
         assert_eq!(
             settings(&config).granted_turn_permissions(&RunId::new(&turn_id)),
@@ -1667,7 +1680,7 @@ async fn read_only_carveouts_match_system_aliases() {
             write_and_cat(&written, "unauthorized"),
         )
         .await;
-        assert_read_only_refusal(&script, &written);
+        assert_read_only_enforced(&script, &written);
     }
 }
 

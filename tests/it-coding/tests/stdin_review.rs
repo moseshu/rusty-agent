@@ -505,3 +505,274 @@ async fn resumed_input_rejects_other_invocations_and_invalid_state() {
         .unwrap();
     assert!(output.contains("approved"), "{output}");
 }
+
+#[cfg(target_os = "macos")]
+async fn install_native_profile(
+    fixture: &mut Fixture,
+    profile: ra_filesystem::models::PermissionProfile,
+) {
+    use ra_coding::{
+        config::{ConfigBuilder, ConfigOverrides},
+        thread_settings::ProductPermissionSource,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let cwd = fixture._dir.path().canonicalize().unwrap();
+    let builder = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(cwd),
+            permission_profile: Some(profile),
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..ConfigOverrides::default()
+        });
+    let config = builder.clone().build().await.unwrap();
+    fixture.adapter = fixture
+        .adapter
+        .clone()
+        .with_product_config(&config, ProductPermissionSource::new(builder));
+    fixture.config = fixture.adapter.initialize(fixture.config.clone());
+}
+
+/// Approval cannot add new denied reads to a terminal whose process has already started.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn denied_read_drift_refuses_stdin_even_when_sandbox_prompts_are_allowed() {
+    use ra_filesystem::{
+        models::PermissionProfile,
+        permissions::{
+            FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+            NetworkSandboxPolicy,
+        },
+    };
+    let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+    let session = fixture.open(json!({})).await;
+    let root = fixture._dir.path().canonicalize().unwrap();
+    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &ra_filesystem::legacy::SandboxPolicy::new_workspace_write_policy(),
+        &root,
+    );
+    policy.entries.push(FileSystemSandboxEntry::new(
+        ra_paths::AbsolutePathBuf::from_absolute_path(root.join("private"))
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    ));
+    install_native_profile(
+        &mut fixture,
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+    )
+    .await;
+    let text = fixture.refusal(&session, "hello\n").await;
+    assert!(text.contains("this terminal cannot enforce the current denied-read restrictions; start a new terminal"), "{text}");
+}
+
+/// The coding adapter must carry its canonical profile into exec_command, beyond its wire view.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn coding_shell_enforces_canonical_deny_read_and_metadata_protection() {
+    use ra_filesystem::{
+        models::PermissionProfile,
+        permissions::{
+            FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+            NetworkSandboxPolicy,
+        },
+    };
+    let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+    let root = fixture._dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".rusty-agent/rules")).unwrap();
+    std::fs::write(root.join(".rusty-agent/rules/default.rules"), "original").unwrap();
+    std::fs::write(root.join("secret"), "private-token").unwrap();
+    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &ra_filesystem::legacy::SandboxPolicy::new_workspace_write_policy(),
+        &root,
+    );
+    policy.entries.push(FileSystemSandboxEntry::new(
+        ra_paths::AbsolutePathBuf::from_absolute_path(root.join("secret"))
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    ));
+    install_native_profile(
+        &mut fixture,
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+    )
+    .await;
+    let output = fixture.call(&fixture.exec, "denied-command", &json!({"cmd": "cat secret; printf changed > .rusty-agent/rules/default.rules", "yield_time_ms":1000}), None).await.unwrap();
+    let text = output.as_text().unwrap();
+    assert!(!text.contains("private-token"), "{text}");
+    assert!(text.contains("Operation not permitted"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".rusty-agent/rules/default.rules")).unwrap(),
+        "original"
+    );
+}
+
+/// Explicit approval may grant broad writes, but denied reads still require Seatbelt.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn approved_escalation_keeps_denied_reads_enforced() {
+    use ra_filesystem::{
+        models::PermissionProfile,
+        permissions::{
+            FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+            NetworkSandboxPolicy,
+        },
+    };
+    let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+    let root = fixture._dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("secret"), "private-token").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().canonicalize().unwrap().join("written");
+    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &ra_filesystem::legacy::SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        },
+        &root,
+    );
+    policy.entries.push(FileSystemSandboxEntry::new(
+        ra_paths::AbsolutePathBuf::from_absolute_path(root.join("secret"))
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    ));
+    policy.entries.push(FileSystemSandboxEntry::new(
+        ra_filesystem::permissions::FileSystemPath::GlobPattern {
+            pattern: "~/.rusty-agent-denied-test/**".to_owned(),
+        },
+        FileSystemAccessMode::Deny,
+    ));
+    install_native_profile(
+        &mut fixture,
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+    )
+    .await;
+    fixture
+        .call(
+            &fixture.exec,
+            "before-escalation",
+            &json!({
+                "cmd": format!("printf unapproved > '{}'", target.display()), "yield_time_ms":1000,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !target.exists(),
+        "the baseline must not already allow the approved target"
+    );
+    let arguments = json!({"cmd":format!("printf approved > '{}'; cat secret",target.display()), "sandbox_permissions":"require_escalated", "justification":"write outside the workspace", "yield_time_ms":1000});
+    let approval = fixture
+        .asks_as(&fixture.exec, "approved-deny-read", &arguments)
+        .await
+        .expect("explicit escalation asks");
+    let output = fixture
+        .call(
+            &fixture.exec,
+            "approved-deny-read",
+            &arguments,
+            Some(&approval),
+        )
+        .await
+        .unwrap();
+    let text = output.as_text().unwrap();
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "approved");
+    assert!(!text.contains("private-token"), "{text}");
+    assert!(text.contains("Operation not permitted"), "{text}");
+}
+
+/// Explicit additional entries cross the product/native type boundary without flattening them.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn additional_permissions_preserve_denies_and_nested_read_only_paths() {
+    let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+    let root = fixture._dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("secret"), "private-token").unwrap();
+    std::fs::write(root.join("read-only.txt"), "original").unwrap();
+    let host = CodingHost::open(&root)
+        .unwrap()
+        .with_exec_permission_approvals();
+    fixture.exec = host.shell_capability().unwrap().exec_command();
+    let arguments = json!({"cmd":"cat secret; printf changed > read-only.txt", "yield_time_ms":1000,
+        "sandbox_permissions":"with_additional_permissions",
+        "additional_permissions":{"file_system":{"entries":[
+            {"path":{"type":"path","path":root.join("secret")},"access":"deny"},
+            {"path":{"type":"path","path":root.join("read-only.txt")},"access":"read"}
+        ]}}
+    });
+    let approval = fixture
+        .asks_as(&fixture.exec, "additional-denies", &arguments)
+        .await;
+    let output = fixture
+        .call(
+            &fixture.exec,
+            "additional-denies",
+            &arguments,
+            approval.as_ref(),
+        )
+        .await
+        .unwrap();
+    let text = output.as_text().unwrap();
+    assert!(!text.contains("private-token"), "{text}");
+    assert!(text.contains("Operation not permitted"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("read-only.txt")).unwrap(),
+        "original"
+    );
+}
+
+/// A retry after sandbox denial cannot remove the only enforcement of denied reads.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn approved_retry_after_denied_read_keeps_the_sandbox() {
+    use ra_filesystem::{
+        models::PermissionProfile,
+        permissions::{
+            FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+            NetworkSandboxPolicy,
+        },
+    };
+    let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+    let root = fixture._dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("secret"), "private-token").unwrap();
+    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &ra_filesystem::legacy::SandboxPolicy::new_workspace_write_policy(),
+        &root,
+    );
+    policy.entries.push(FileSystemSandboxEntry::new(
+        ra_paths::AbsolutePathBuf::from_absolute_path(root.join("secret"))
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    ));
+    install_native_profile(
+        &mut fixture,
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+    )
+    .await;
+    fixture
+        .update(&ThreadPolicyOverrides::new().with_approval_policy(AskForApproval::UnlessTrusted));
+    let arguments = json!({"cmd":"printf attempt >> attempts; cat secret", "yield_time_ms":1000});
+    let approval = fixture
+        .asks_as(&fixture.exec, "retry-denied-read", &arguments)
+        .await
+        .expect("initial command asks");
+    let output = fixture
+        .call(
+            &fixture.exec,
+            "retry-denied-read",
+            &arguments,
+            Some(&approval),
+        )
+        .await
+        .unwrap();
+    let text = output.as_text().unwrap();
+    assert!(!text.contains("private-token"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("attempts")).unwrap(),
+        "attemptattempt"
+    );
+}

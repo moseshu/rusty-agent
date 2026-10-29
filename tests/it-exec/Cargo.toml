@@ -10,6 +10,9 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 ra-core = { path = "../../crates/ra-core" }
+ra-filesystem = { path = "../../crates/ra-filesystem" }
+ra-paths = { path = "../../crates/ra-paths" }
+regex-lite = "0.1"
 ra-exec = { path = "../../crates/ra-exec", features = ["test-api"] }
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
@@ -22,5 +25,6 @@ tempfile = "3"
 ra-uds = { path = "../../crates/ra-uds" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
 core-foundation = "0.9"
 base64 = "0.22"
