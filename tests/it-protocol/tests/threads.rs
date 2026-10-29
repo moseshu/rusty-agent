@@ -23,6 +23,8 @@ mod prompt_cache_key;
 #[path = "threads/coding_tools.rs"]
 mod coding_tools;
 
+#[path = "threads/product_permissions.rs"]
+mod product_permissions;
 #[path = "threads/skill_context.rs"]
 mod skill_context;
 

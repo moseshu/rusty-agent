@@ -11,6 +11,8 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-paths = { path = "../../crates/ra-paths" }
 ra-coding = { path = "../../crates/ra-coding" }
+ra-config = { path = "../../crates/ra-config" }
+ra-filesystem = { path = "../../crates/ra-filesystem" }
 ra-exec = { path = "../../crates/ra-exec" }
 ra-core = { path = "../../crates/ra-core" }
 ra-protocol = { path = "../../crates/ra-protocol", features = ["test-api"] }
