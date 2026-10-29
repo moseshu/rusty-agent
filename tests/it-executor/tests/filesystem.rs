@@ -1,8 +1,8 @@
 //! Native filesystem contract and sandbox-helper integration.
 use futures::StreamExt;
 use ra_executor::{
-    CopyOptions, ExecServerRuntimeOptions, ExecutorFileSystem, FileSystemSandboxContext,
-    GetMetadataOptions, LocalFileSystem, ReadFileOptions, WalkOptions, WriteFileOptions,
+    CopyOptions, ExecutorFileSystem, FileSystemSandboxContext, GetMetadataOptions, LocalFileSystem,
+    ReadFileOptions, WalkOptions, WriteFileOptions,
 };
 use ra_filesystem::{
     models::PermissionProfile,
@@ -145,8 +145,9 @@ async fn seatbelt_helper_enforces_roots_and_transfers_stream_descriptors() {
         .join("../../target/debug/ra-fs-helper")
         .canonicalize()
         .expect("build ra-fs-helper before running this target");
-    let fs =
-        LocalFileSystem::with_runtime_paths(ExecServerRuntimeOptions::new(helper, None).unwrap());
+    let fs = LocalFileSystem::with_runtime_paths(
+        ra_executor::ExecServerRuntimeOptions::new(helper, None).unwrap(),
+    );
     let file = root.join("data.txt").unwrap();
     fs.write_file(
         &file,
