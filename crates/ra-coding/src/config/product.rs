@@ -1274,6 +1274,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// The harness overrides this builder applies, for a caller that adjusts some of them.
+    pub(crate) fn harness_overrides_mut(&mut self) -> &mut ConfigOverrides {
+        self.harness_overrides
+            .get_or_insert_with(ConfigOverrides::default)
+    }
+
     #[must_use]
     pub fn loader_overrides(mut self, loader_overrides: LoaderOverrides) -> Self {
         self.loader_overrides = Some(loader_overrides);

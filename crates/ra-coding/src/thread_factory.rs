@@ -16,10 +16,11 @@ use ra_runtime::{agent::AgentBinding, thread::AgentThread};
 
 use crate::{
     agent::{HOST_BACKED_PROFILE, assemble_agent},
+    config::ConfigBuilder,
     host::CodingHost,
     profile::CodingProfile,
     spawned,
-    thread_settings::CodingThreadSettingsAdapter,
+    thread_settings::{CodingThreadSettingsAdapter, ProductPermissionSource},
 };
 
 /// Builds the coding agent's threads for the app server (see the module's documentation).
@@ -28,6 +29,7 @@ pub struct CodingThreadFactory {
     host: CodingHost,
     models: Arc<dyn ModelResolver>,
     settings: CodingThreadSettingsAdapter,
+    product_config: Option<ConfigBuilder>,
     role: PromptRole,
     profile: CodingProfile,
     agent_id: AgentId,
@@ -59,11 +61,23 @@ impl CodingThreadFactory {
             host,
             models,
             settings,
+            product_config: None,
             role: PromptRole::Main,
             profile: HOST_BACKED_PROFILE,
             agent_id: AgentId::new("coding"),
             agent_name: "Coding agent".to_owned(),
         }
+    }
+
+    /// Loads each thread's product configuration with `builder`, as Codex builds a configuration
+    /// for every `thread/start`, `thread/resume` and `thread/fork`: the thread's approval policy,
+    /// reviewer and permissions — the canonical profile and its requirement constraints — come
+    /// from it, with the host workspace as its working directory, and named permission profiles
+    /// are later resolved through it. Without it the settings adapter's own policy applies.
+    #[must_use]
+    pub fn with_product_config(mut self, builder: ConfigBuilder) -> Self {
+        self.product_config = Some(builder);
+        self
     }
 
     /// Assembles the agent for `role`.
@@ -107,6 +121,26 @@ impl ThreadFactory for CodingThreadFactory {
 
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         let host = self.host.with_new_process_manager();
+        let settings = match &self.product_config {
+            Some(builder) => {
+                let mut builder = builder.clone();
+                builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
+                ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())
+                    .map_err(ra_core::error::Error::config)?;
+                let config = builder.clone().build().await.map_err(|error| {
+                    ra_core::error::Error::config(format!(
+                        "failed to load the product configuration: {error}"
+                    ))
+                })?;
+                // As in Codex's thread start, resume and fork, a named profile requirements
+                // disallow falls back to the required value with a startup warning; only a
+                // settings or turn update refuses it.
+                self.settings
+                    .clone()
+                    .with_product_config(&config, ProductPermissionSource::new(builder))
+            }
+            None => self.settings.clone(),
+        };
         let assembled = assemble_agent(
             self.agent_id.clone(),
             self.agent_name.clone(),
@@ -121,7 +155,7 @@ impl ThreadFactory for CodingThreadFactory {
             Arc::clone(&self.models),
         )
         .with_config(
-            self.settings.initialize(
+            settings.initialize(
                 host.build_run_config()
                     .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
                     .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
@@ -140,8 +174,13 @@ impl ThreadFactory for CodingThreadFactory {
                 Some(crate::prompt_cache_key::session_id(request).clone()),
             )?);
         }
-        Ok(PreparedThread::new(builder)
-            .with_settings_adapter(Arc::new(self.settings.clone()))
-            .with_background_terminals(Arc::new(host.background_terminals())))
+        let prepared = PreparedThread::new(builder)
+            .with_settings_adapter(Arc::new(settings))
+            .with_background_terminals(Arc::new(host.background_terminals()));
+        Ok(if self.product_config.is_some() {
+            prepared.with_applied_policy()
+        } else {
+            prepared
+        })
     }
 }

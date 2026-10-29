@@ -531,24 +531,36 @@ impl MessageProcessor {
                 unreachable!("initialize is handled before initialized request dispatch")
             }
             ClientRequest::ThreadStart { params, .. } => {
-                let result = self
-                    .thread_processor
-                    .thread_start(request_id.clone(), params, &self.thread_method_context())
-                    .await;
+                // Thread loading awaits product settings preparation; keep its future off the
+                // request handler's stack.
+                let result = Box::pin(self.thread_processor.thread_start(
+                    request_id.clone(),
+                    params,
+                    &self.thread_method_context(),
+                ))
+                .await;
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadResume { params, .. } => {
-                let result = self
-                    .thread_processor
-                    .thread_resume(request_id.clone(), params, &self.thread_method_context())
-                    .await;
+                // Thread loading awaits product settings preparation; keep its future off the
+                // request handler's stack.
+                let result = Box::pin(self.thread_processor.thread_resume(
+                    request_id.clone(),
+                    params,
+                    &self.thread_method_context(),
+                ))
+                .await;
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadFork { params, .. } => {
-                let result = self
-                    .thread_processor
-                    .thread_fork(request_id.clone(), params, &self.thread_method_context())
-                    .await;
+                // Thread loading awaits product settings preparation; keep its future off the
+                // request handler's stack.
+                let result = Box::pin(self.thread_processor.thread_fork(
+                    request_id.clone(),
+                    params,
+                    &self.thread_method_context(),
+                ))
+                .await;
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadRead { params, .. } => {

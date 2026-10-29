@@ -55,17 +55,19 @@ pub struct ThreadFactoryRequest {
     session_source: SessionSource,
     thread_spawn: Option<RolloutThreadSpawn>,
     ephemeral: bool,
+    policy: super::protocol::ThreadPolicyOverrides,
     fork_session_id: Option<SessionId>,
 }
 
 impl ThreadFactoryRequest {
-    pub(crate) const fn new(thread_id: SessionId, origin: ThreadOrigin) -> Self {
+    pub(crate) fn new(thread_id: SessionId, origin: ThreadOrigin) -> Self {
         Self {
             thread_id,
             origin,
             session_source: SessionSource::Unknown,
             thread_spawn: None,
             ephemeral: false,
+            policy: super::protocol::ThreadPolicyOverrides::new(),
             fork_session_id: None,
         }
     }
@@ -82,6 +84,18 @@ impl ThreadFactoryRequest {
         self.ephemeral = ephemeral;
         self.fork_session_id = fork_session_id;
         self
+    }
+
+    pub(crate) fn with_policy(mut self, policy: super::protocol::ThreadPolicyOverrides) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Request overrides and persisted fallback permissions, available before configuration
+    /// loading so the factory validates the effective policy rather than an unused default.
+    #[must_use]
+    pub const fn policy(&self) -> &super::protocol::ThreadPolicyOverrides {
+        &self.policy
     }
 
     /// The server-selected source, restored from metadata when resuming a stored thread.
@@ -130,6 +144,7 @@ pub struct PreparedThread {
     builder: AgentThreadBuilder,
     adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
     terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+    policy_applied: bool,
 }
 
 impl std::fmt::Debug for PreparedThread {
@@ -138,6 +153,7 @@ impl std::fmt::Debug for PreparedThread {
             .field("thread_id", self.builder.thread_id())
             .field("has_adapter", &self.adapter.is_some())
             .field("has_terminals", &self.terminals.is_some())
+            .field("policy_applied", &self.policy_applied)
             .finish()
     }
 }
@@ -149,6 +165,7 @@ impl PreparedThread {
             builder,
             adapter: None,
             terminals: None,
+            policy_applied: false,
         }
     }
 
@@ -157,6 +174,14 @@ impl PreparedThread {
     /// refused.
     pub fn with_settings_adapter(mut self, adapter: Arc<dyn ThreadSettingsAdapter>) -> Self {
         self.adapter = Some(adapter);
+        self
+    }
+
+    /// Records that the factory already resolved and applied the request's complete policy
+    /// through its configuration loader, including requirements and persisted fallback state.
+    /// The server still applies model settings and checks final tool approval requirements.
+    pub const fn with_applied_policy(mut self) -> Self {
+        self.policy_applied = true;
         self
     }
 
@@ -171,7 +196,12 @@ impl PreparedThread {
     }
 
     pub(crate) fn into_parts(self) -> PreparedParts {
-        (self.builder, self.adapter, self.terminals)
+        (
+            self.builder,
+            self.adapter,
+            self.terminals,
+            self.policy_applied,
+        )
     }
 }
 
@@ -236,11 +266,12 @@ fn declared_tools(builder: &AgentThreadBuilder) -> Vec<(Arc<dyn Tool>, ra_core::
     tools
 }
 
-/// A prepared thread taken apart: its builder, settings adapter and background terminals.
+/// A prepared thread taken apart: builder, adapter, terminals and whether policy was applied.
 pub(crate) type PreparedParts = (
     AgentThreadBuilder,
     Option<Arc<dyn ThreadSettingsAdapter>>,
     Option<Arc<dyn ThreadBackgroundTerminals>>,
+    bool,
 );
 
 /// Prepares the threads the server loads (see the module's documentation).

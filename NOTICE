@@ -815,3 +815,9 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-coding/tests/config_support/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/models-manager/models.json (one complete pinned model record) |
 
 | `tests/it-filesystem/tests/product_metadata.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/permissions.rs; codex-rs/core/src/config/config_tests.rs (product metadata acceptance for canonical and legacy policies) |
+
+| `tests/it-protocol/tests/threads/product_permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/tests/suite/v2/{thread_resume,thread_fork,thread_settings_update,turn_start}.rs; codex-rs/core/src/session/tests.rs (permission profile persistence, selection, and deny preservation; config request map and runtime workspace roots not ported) |
+
+| `crates/ra-coding/src/thread_settings/product.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/config_manager.rs (load_permission_config_for_thread); codex-rs/app-server/src/request_processors/turn_processor.rs (named permission selection); codex-rs/app-server/src/request_processors/persisted_resume_settings.rs; codex-rs/app-server/src/request_processors/thread_processor.rs (initial config overrides) |
+
+| `crates/ra-coding/src/thread_settings/profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/session/session.rs (set_permission_profile_projection and legacy sandbox updates preserving session denies) |

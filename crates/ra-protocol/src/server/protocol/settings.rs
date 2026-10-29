@@ -23,6 +23,16 @@ pub struct ThreadPolicyOverrides {
     pub(crate) sandbox_policy: Option<SandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) permissions: Option<String>,
+    /// A named profile recovered from the thread's persisted settings. Unlike `permissions`, a
+    /// profile that no longer resolves falls back to the configured default, as Codex's
+    /// `persisted_permission_profile_id` does. It is server state, never read from the wire.
+    #[serde(skip)]
+    pub(crate) persisted_permissions: Option<String>,
+    /// The unnamed permission profile recovered from persisted thread settings, in the form the
+    /// product described it: Codex's `persisted_permission_profile`, fallback state that explicit
+    /// overrides and current requirements take priority over. Never read from the wire.
+    #[serde(skip)]
+    pub(crate) persisted_permission_profile: Option<Value>,
 }
 
 impl ThreadPolicyOverrides {
@@ -60,6 +70,22 @@ impl ThreadPolicyOverrides {
         self
     }
 
+    /// Restores a named profile from persisted thread settings: a profile that no longer resolves
+    /// falls back to the configured default instead of failing.
+    #[must_use]
+    pub fn with_persisted_permissions(mut self, profile: impl Into<String>) -> Self {
+        self.persisted_permissions = Some(profile.into());
+        self
+    }
+
+    /// Restores the unnamed permission profile persisted thread settings recorded, as the product
+    /// described it; current requirements and explicit overrides still take priority.
+    #[must_use]
+    pub fn with_persisted_permission_profile(mut self, profile: Value) -> Self {
+        self.persisted_permission_profile = Some(profile);
+        self
+    }
+
     /// Approval prompt policy; `None` leaves it unchanged.
     #[must_use]
     pub const fn approval_policy(&self) -> Option<AskForApproval> {
@@ -84,6 +110,19 @@ impl ThreadPolicyOverrides {
         self.permissions.as_deref()
     }
 
+    /// Named profile restored from persisted thread settings, applied only when it still
+    /// resolves.
+    #[must_use]
+    pub fn persisted_permissions(&self) -> Option<&str> {
+        self.persisted_permissions.as_deref()
+    }
+
+    /// Unnamed permission profile restored from persisted thread settings.
+    #[must_use]
+    pub const fn persisted_permission_profile(&self) -> Option<&Value> {
+        self.persisted_permission_profile.as_ref()
+    }
+
     /// Whether no policy fields were supplied.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -91,6 +130,8 @@ impl ThreadPolicyOverrides {
             && self.approvals_reviewer.is_none()
             && self.sandbox_policy.is_none()
             && self.permissions.is_none()
+            && self.persisted_permissions.is_none()
+            && self.persisted_permission_profile.is_none()
     }
     /// Validates policy conflicts and absolute writable roots.
     pub fn validate(&self) -> Result<(), String> {

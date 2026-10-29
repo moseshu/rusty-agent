@@ -92,7 +92,7 @@ impl TurnRequestProcessor {
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
         let (input, model, effort, output_schema) = params.into_parts();
         let content = input_content(input)?;
-        let overrides = prepare_overrides(
+        let overrides = Box::pin(prepare_overrides(
             "turn/start",
             &SettingsTarget::of(&thread),
             thread.run_config(),
@@ -101,7 +101,8 @@ impl TurnRequestProcessor {
             &policy,
             summary,
             tier,
-        )?;
+        ))
+        .await?;
         let mut start = TurnStartOptions::new();
         if let Some(schema) = output_schema {
             start = start.with_final_output_json_schema(schema);
@@ -233,7 +234,7 @@ impl TurnRequestProcessor {
         let summary = params.summary();
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
         let (_, model, effort) = params.into_parts();
-        let overrides = prepare_overrides(
+        let overrides = Box::pin(prepare_overrides(
             "thread/settings/update",
             &SettingsTarget::of(&thread),
             thread.run_config(),
@@ -242,7 +243,8 @@ impl TurnRequestProcessor {
             &policy,
             summary,
             tier,
-        )?;
+        ))
+        .await?;
         if !overrides.is_empty() {
             thread.update_settings(&overrides);
         }
@@ -284,7 +286,7 @@ impl TurnRequestProcessor {
             approvals_reviewer: params.approvals_reviewer,
             ..ThreadPolicyOverrides::default()
         };
-        let overrides = prepare_overrides(
+        let overrides = Box::pin(prepare_overrides(
             "turn/settings/update",
             &SettingsTarget::of(&thread),
             config,
@@ -293,7 +295,8 @@ impl TurnRequestProcessor {
             &policy,
             params.summary,
             params.service_tier,
-        )?;
+        ))
+        .await?;
         turn_settings_response(thread.update_turn_settings(&params.turn_id, &overrides))
     }
 
@@ -336,7 +339,7 @@ fn turn_settings_response(outcome: TurnSettingsUpdateOutcome) -> TurnMethodResul
     clippy::option_option,
     reason = "Codex distinguishes omitted, null and supplied service tiers"
 )]
-pub(crate) fn prepare_overrides(
+pub(crate) async fn prepare_overrides(
     method: &str,
     target: &SettingsTarget<'_>,
     mut config: ra_runtime::runner::RunConfig,
@@ -372,11 +375,14 @@ pub(crate) fn prepare_overrides(
                 "the thread's host has not configured a permission settings adapter",
             )
         })?;
-        config = adapter.prepare(&config, policy).map_err(|reason| {
-            JsonRpcErrorObject::invalid_request(format!(
-                "invalid thread settings override: {reason}"
-            ))
-        })?;
+        config = adapter
+            .prepare_async(&config, policy)
+            .await
+            .map_err(|reason| {
+                JsonRpcErrorObject::invalid_request(format!(
+                    "invalid thread settings override: {reason}"
+                ))
+            })?;
     }
     if summary.is_some() || service_tier.is_some() {
         let resolved_model = target_model
@@ -426,7 +432,7 @@ pub(crate) fn prepare_overrides(
 /// What settings are prepared against: how the thread resolves models, and the host adapter its
 /// product settings go through, for a loaded thread or for one about to be built.
 pub(crate) struct SettingsTarget<'a> {
-    pub(crate) models: &'a dyn ResolveModel,
+    pub(crate) models: &'a (dyn ResolveModel + Sync),
     pub(crate) adapter: Option<&'a dyn ThreadSettingsAdapter>,
 }
 

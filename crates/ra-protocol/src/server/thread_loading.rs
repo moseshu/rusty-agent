@@ -167,22 +167,29 @@ impl ThreadRequestProcessor {
         let prepared = factory
             .prepare_thread(
                 &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Start)
-                    .with_session_context(context.session_source.clone(), None, ephemeral, None),
+                    .with_session_context(context.session_source.clone(), None, ephemeral, None)
+                    .with_policy(to_policy_overrides(&params.policy)),
             )
             .await
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
             })?;
-        let (builder, adapter, terminals) = prepared.into_parts();
-        let builder = apply_settings(
+        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
+        let policy = if policy_applied {
+            ThreadPolicyOverrides::new()
+        } else {
+            to_policy_overrides(&params.policy)
+        };
+        let builder = Box::pin(apply_settings(
             METHOD,
             builder,
             adapter.as_deref(),
             params.model,
             None,
-            &to_policy_overrides(&params.policy),
+            &policy,
             params.service_tier,
-        )?;
+        ))
+        .await?;
         let (builder, dynamic_tool_calls) = register_dynamic_tools(builder, &dynamic_tools)
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
@@ -303,7 +310,12 @@ impl ThreadRequestProcessor {
                         stored.thread_spawn().cloned(),
                         false,
                         None,
-                    ),
+                    )
+                    .with_policy(restore_persisted_policy(
+                        to_policy_overrides(&params.policy),
+                        &records,
+                        true,
+                    )),
             )
             .await
         {
@@ -315,18 +327,22 @@ impl ThreadRequestProcessor {
                 )));
             }
         };
-        let (builder, adapter, terminals) = prepared.into_parts();
+        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
         let (model, effort) = if params.model.is_some() {
             (params.model.clone(), None)
         } else {
             persisted_model_and_effort(&builder, &stored)
         };
-        let policy = restore_persisted_policy(
-            to_policy_overrides(&params.policy),
-            &records,
-            adapter.is_some(),
-        );
-        let builder = match apply_settings(
+        let policy = if policy_applied {
+            ThreadPolicyOverrides::new()
+        } else {
+            restore_persisted_policy(
+                to_policy_overrides(&params.policy),
+                &records,
+                adapter.is_some(),
+            )
+        };
+        let builder = match Box::pin(apply_settings(
             METHOD,
             builder,
             adapter.as_deref(),
@@ -334,7 +350,9 @@ impl ThreadRequestProcessor {
             effort,
             &policy,
             params.service_tier.clone(),
-        ) {
+        ))
+        .await
+        {
             Ok(builder) => builder,
             Err(error) => {
                 discard(&recorder).await;
@@ -468,19 +486,28 @@ impl ThreadRequestProcessor {
                         || source_id.clone(),
                         |spawn| spawn.root_session_id().clone(),
                     )),
-                ),
+                )
+                .with_policy(restore_policy_from_snapshot(
+                    to_policy_overrides(&params.policy),
+                    persisted_policy.as_ref(),
+                    true,
+                )),
             )
             .await
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
             })?;
-        let (builder, adapter, terminals) = prepared.into_parts();
-        let policy = restore_policy_from_snapshot(
-            to_policy_overrides(&params.policy),
-            persisted_policy.as_ref(),
-            adapter.is_some(),
-        );
-        let builder = apply_settings(
+        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
+        let policy = if policy_applied {
+            ThreadPolicyOverrides::new()
+        } else {
+            restore_policy_from_snapshot(
+                to_policy_overrides(&params.policy),
+                persisted_policy.as_ref(),
+                adapter.is_some(),
+            )
+        };
+        let builder = Box::pin(apply_settings(
             METHOD,
             builder,
             adapter.as_deref(),
@@ -488,7 +515,8 @@ impl ThreadRequestProcessor {
             None,
             &policy,
             params.service_tier.clone(),
-        )?;
+        ))
+        .await?;
         let (builder, dynamic_tool_calls) = register_dynamic_tools(builder, &dynamic_tools)
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
@@ -962,6 +990,8 @@ fn to_policy_overrides(policy: &ThreadPolicyFields) -> ThreadPolicyOverrides {
         approvals_reviewer: policy.approvals_reviewer,
         sandbox_policy: policy.sandbox.map(super::protocol::SandboxMode::to_policy),
         permissions: policy.permissions.clone(),
+        persisted_permissions: None,
+        persisted_permission_profile: None,
     }
 }
 
@@ -971,7 +1001,7 @@ fn to_policy_overrides(policy: &ThreadPolicyFields) -> ThreadPolicyOverrides {
     clippy::option_option,
     reason = "Codex distinguishes omitted, null and supplied service tiers"
 )]
-fn apply_settings(
+async fn apply_settings(
     method: &str,
     builder: AgentThreadBuilder,
     adapter: Option<&dyn ThreadSettingsAdapter>,
@@ -980,7 +1010,7 @@ fn apply_settings(
     policy: &ThreadPolicyOverrides,
     service_tier: Option<Option<String>>,
 ) -> Result<AgentThreadBuilder, JsonRpcErrorObject> {
-    let overrides = prepare_overrides(
+    let overrides = Box::pin(prepare_overrides(
         method,
         &SettingsTarget {
             models: &builder,
@@ -992,7 +1022,8 @@ fn apply_settings(
         policy,
         None,
         service_tier,
-    )?;
+    ))
+    .await?;
     let builder = builder.with_settings(&overrides);
     check_approval_requests(&builder, adapter).map_err(|error| {
         let operation = match method {
@@ -1066,12 +1097,21 @@ fn restore_policy_from_snapshot(
             .and_then(|value| serde_json::from_value::<ApprovalsReviewer>(value.clone()).ok())
             .filter(|reviewer| *reviewer != ApprovalsReviewer::AutoReview);
     }
+    // Codex restores the recorded profile as `persisted_permission_profile_id`: one the current
+    // configuration no longer defines falls back to its default rather than failing the load.
     if policy.sandbox_policy.is_none() && policy.permissions.is_none() {
-        policy.permissions = snapshot
+        policy.persisted_permissions = snapshot
             .get("activePermissionProfile")
             .and_then(|profile| profile.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        // A thread that ran with no named profile restores the unnamed profile it recorded.
+        if policy.persisted_permissions.is_none() {
+            policy.persisted_permission_profile = snapshot
+                .get("permissionProfile")
+                .filter(|profile| !profile.is_null())
+                .cloned();
+        }
     }
     policy
 }

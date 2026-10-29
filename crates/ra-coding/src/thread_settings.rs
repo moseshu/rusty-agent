@@ -140,6 +140,11 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
+mod product;
+mod profile;
+
+pub use product::ProductPermissionSource;
+
 /// A policy captured by one model step and its tools.
 #[derive(Clone, Debug)]
 pub struct CodingThreadSettings {
@@ -147,8 +152,13 @@ pub struct CodingThreadSettings {
     cwd: PathBuf,
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
+    /// The legacy projection of `profile_permissions` reported on the wire and lowered to the
+    /// executor.
     sandbox_policy: SandboxPolicy,
-    active_permission_profile: Option<String>,
+    /// The canonical permission state: Codex's session `Permissions`, with the requirement
+    /// constraints of the configuration the thread was loaded with.
+    profile_permissions: crate::config::Permissions,
+    active_permission_profile: Option<ra_filesystem::models::ActivePermissionProfile>,
     file_system_read_policy: Option<crate::permissions::FileSystemPermissions>,
     base_permission: PermissionEngine,
     exec_policy: Arc<ExecPolicyManager>,
@@ -450,6 +460,21 @@ impl CodingThreadSettings {
         &self.sandbox_policy
     }
 
+    /// The canonical permission state: the profile, its constraints and the active named
+    /// profile, from which [`Self::sandbox_policy`] is projected.
+    #[must_use]
+    pub const fn permissions_state(&self) -> &crate::config::Permissions {
+        &self.profile_permissions
+    }
+
+    /// The named profile the thread runs with, if one is selected.
+    #[must_use]
+    pub const fn active_permission_profile(
+        &self,
+    ) -> Option<&ra_filesystem::models::ActivePermissionProfile> {
+        self.active_permission_profile.as_ref()
+    }
+
     /// The thread's working directory.
     #[must_use]
     pub fn cwd(&self) -> &Path {
@@ -486,6 +511,9 @@ pub struct CodingThreadSettingsAdapter {
     initial: CodingThreadSettings,
     profiles: BTreeMap<String, SandboxPolicy>,
     file_system_read_profiles: BTreeMap<String, crate::permissions::FileSystemPermissions>,
+    /// The product configuration named profiles are resolved through, as Codex resolves them by
+    /// reloading its configuration; `None` for a host that supplies its catalog directly.
+    product: Option<Arc<ProductPermissionSource>>,
 }
 
 impl CodingThreadSettingsAdapter {
@@ -499,6 +527,9 @@ impl CodingThreadSettingsAdapter {
             .with_sandbox_policy(sandbox_policy.clone())
             .validate()
             .map_err(Error::config)?;
+        let profile_permissions =
+            profile::unconstrained_permissions(AskForApproval::default(), &sandbox_policy, &cwd)
+                .map_err(Error::config)?;
         let mut profiles = BTreeMap::new();
         profiles.insert(
             ":danger-full-access".into(),
@@ -523,6 +554,7 @@ impl CodingThreadSettingsAdapter {
             initial: CodingThreadSettings {
                 cwd,
                 sandbox_policy,
+                profile_permissions,
                 approval_policy: AskForApproval::default(),
                 approvals_reviewer: ApprovalsReviewer::default(),
                 active_permission_profile: None,
@@ -538,6 +570,7 @@ impl CodingThreadSettingsAdapter {
             },
             profiles,
             file_system_read_profiles: BTreeMap::new(),
+            product: None,
         })
     }
 
@@ -636,6 +669,72 @@ impl CodingThreadSettingsAdapter {
         install(config, settings)
     }
 
+    /// Applies the policy fields every adapter resolves the same way: the approval policy and
+    /// reviewer, a legacy sandbox policy, and — for a host-supplied catalog — a named profile.
+    /// Each change is checked against the thread's requirement constraints first, as Codex's
+    /// session previews its settings, so a refused update leaves the thread as it was.
+    fn prepare_settings(
+        &self,
+        mut settings: CodingThreadSettings,
+        update: &ThreadPolicyOverrides,
+    ) -> std::result::Result<CodingThreadSettings, String> {
+        if let Some(policy) = update.approval_policy() {
+            settings
+                .profile_permissions
+                .approval_policy
+                .set(policy)
+                .map_err(|error| error.to_string())?;
+            settings.approval_policy = policy;
+        }
+        if let Some(reviewer) = update.approvals_reviewer() {
+            settings.approvals_reviewer = reviewer;
+        }
+        if let Some(policy) = update.sandbox_policy() {
+            profile::set_session_legacy_policy(
+                &mut settings.profile_permissions,
+                policy,
+                &settings.cwd,
+            )?;
+            settings.sandbox_policy = policy.clone();
+            settings.active_permission_profile = None;
+            settings.file_system_read_policy = None;
+        }
+        if self.product.is_none() {
+            if let Some(profile) = update.permissions() {
+                self.select_catalog_profile(&mut settings, profile)?;
+            } else if let Some(profile) = update.persisted_permissions() {
+                // A recorded profile the catalog no longer defines, or that the thread's
+                // constraints now refuse, leaves the configured default in place, as Codex's
+                // stale `persisted_permission_profile_id` does.
+                let _ = self.select_catalog_profile(&mut settings, profile);
+            }
+        }
+        Ok(settings)
+    }
+
+    /// Selects `profile` from the host-supplied catalog; the settings change only on success.
+    fn select_catalog_profile(
+        &self,
+        settings: &mut CodingThreadSettings,
+        profile: &str,
+    ) -> std::result::Result<(), String> {
+        let policy = self
+            .profiles
+            .get(profile)
+            .ok_or_else(|| format!("unknown permissions profile: {profile}"))?;
+        profile::select_named_legacy_profile(
+            &mut settings.profile_permissions,
+            profile,
+            policy,
+            &settings.cwd,
+        )?;
+        settings.sandbox_policy = policy.clone();
+        settings.active_permission_profile =
+            Some(ra_filesystem::models::ActivePermissionProfile::new(profile));
+        settings.file_system_read_policy = self.file_system_read_profiles.get(profile).cloned();
+        Ok(())
+    }
+
     fn snapshot(&self, config: &RunConfig) -> CodingThreadSettings {
         config
             .app_context()
@@ -659,27 +758,30 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         update: &ThreadPolicyOverrides,
     ) -> std::result::Result<RunConfig, String> {
         update.validate()?;
+        if self.product.is_some()
+            && (update.permissions().is_some() || update.persisted_permissions().is_some())
+        {
+            return Err(
+                "named permissions are resolved from the product configuration; prepare them asynchronously"
+                    .to_owned(),
+            );
+        }
+        let settings = self.prepare_settings(self.snapshot(current), update)?;
+        Ok(install(current.clone(), settings))
+    }
+
+    async fn prepare_async(
+        &self,
+        current: &RunConfig,
+        update: &ThreadPolicyOverrides,
+    ) -> std::result::Result<RunConfig, String> {
+        update.validate()?;
         let mut settings = self.snapshot(current);
-        if let Some(policy) = update.approval_policy() {
-            settings.approval_policy = policy;
-        }
-        if let Some(reviewer) = update.approvals_reviewer() {
-            settings.approvals_reviewer = reviewer;
-        }
-        if let Some(policy) = update.sandbox_policy() {
-            settings.sandbox_policy = policy.clone();
-            settings.active_permission_profile = None;
-            settings.file_system_read_policy = None;
-        }
-        if let Some(profile) = update.permissions() {
-            settings.sandbox_policy = self
-                .profiles
-                .get(profile)
-                .cloned()
-                .ok_or_else(|| format!("unknown permissions profile: {profile}"))?;
-            settings.active_permission_profile = Some(profile.to_owned());
-            settings.file_system_read_policy = self.file_system_read_profiles.get(profile).cloned();
-        }
+        let Some(product) = &self.product else {
+            return self.prepare(current, update);
+        };
+        product.select_named_profile(&mut settings, update).await?;
+        let settings = self.prepare_settings(settings, update)?;
         Ok(install(current.clone(), settings))
     }
 
@@ -687,7 +789,8 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         let settings = self.snapshot(config);
         json!({"cwd": settings.cwd, "approvalPolicy": settings.approval_policy,
             "approvalsReviewer": settings.approvals_reviewer, "sandboxPolicy": settings.sandbox_policy,
-            "activePermissionProfile": settings.active_permission_profile.map(|id| json!({"id": id, "extends": null})),
+            "activePermissionProfile": settings.active_permission_profile.map(|profile| json!({"id": profile.id, "extends": profile.extends})),
+            "permissionProfile": serde_json::to_value(settings.profile_permissions.permission_profile()).unwrap_or(Value::Null),
             "disabledPluginIds": [], "collaborationMode": null,
             "multiAgentMode": "explicitRequestOnly", "personality": null})
     }

@@ -85,6 +85,17 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
         update: &ThreadPolicyOverrides,
     ) -> Result<RunConfig, String>;
 
+    /// The server's entry to [`Self::prepare`]. A product whose settings are resolved from its
+    /// configuration on disk, as Codex reloads its configuration to select a named permission
+    /// profile, overrides this to do that work; the default prepares synchronously.
+    async fn prepare_async(
+        &self,
+        current: &RunConfig,
+        update: &ThreadPolicyOverrides,
+    ) -> Result<RunConfig, String> {
+        self.prepare(current, update)
+    }
+
     /// Returns the product-owned fields of the effective thread settings.
     fn describe(&self, config: &RunConfig) -> Value;
 
