@@ -703,10 +703,20 @@ async fn interrupting_a_nested_permission_request_withdraws_it() {
     );
 }
 
-/// Codex rejects clearly foreign absolute paths instead of reinterpreting them as POSIX names.
+/// Codex resolves permission paths as path URIs in the cwd's convention: on a POSIX cwd it rejects
+/// clearly foreign absolute paths, including `//` UNC spellings, instead of reinterpreting them as
+/// POSIX names, and refuses a drive path spelled as a POSIX path, which no path URI represents
+/// losslessly.
+#[cfg(unix)]
 #[tokio::test]
 async fn foreign_absolute_permission_paths_are_refused() {
-    for raw in [r"C:\outside", "C:/outside", r"\\server\share\outside"] {
+    for raw in [
+        r"C:\outside",
+        "C:/outside",
+        r"\\server\share\outside",
+        "//server/share",
+        "/C:/outside",
+    ] {
         for file_system in [
             json!({"write": [raw]}),
             json!({"entries": [{"path": {"type": "path", "path": raw}, "access": "read"}]}),
@@ -730,29 +740,28 @@ async fn foreign_absolute_permission_paths_are_refused() {
                 })
                 .await;
             assert_eq!(completed["method"], "turn/completed", "{completed}");
-            assert_eq!(
-                script.last_output("call1"),
-                Some(Value::String(format!(
+            let refusal = if raw.starts_with("/C:") {
+                "permission path cannot be represented losslessly".to_owned()
+            } else {
+                format!(
                     "path {raw} uses Windows paths, but executor cwd {} uses POSIX paths",
-                    server.root().display()
-                )))
-            );
+                    ra_paths::PathUri::from_host_native_path(server.root()).unwrap()
+                )
+            };
+            assert_eq!(script.last_output("call1"), Some(Value::String(refusal)));
             assert_eq!(settings(&config).granted_session_permissions(), None);
         }
     }
 }
 
-/// A drive-like relative name and a POSIX absolute name remain native POSIX paths.
+/// A drive-like name without a separator is relative and resolves against a POSIX cwd.
+#[cfg(unix)]
 #[tokio::test]
-async fn ambiguous_permission_paths_keep_posix_semantics() {
-    let asked = ask(json!({"permissions": {"file_system": {"write": ["C:relative", "/C:/outside", "//server/share"]}}})).await;
+async fn drive_like_relative_permission_paths_resolve_against_the_cwd() {
+    let asked = ask(json!({"permissions": {"file_system": {"write": ["C:relative"]}}})).await;
     assert_eq!(
         asked.request["params"]["permissions"]["fileSystem"]["write"],
-        json!([
-            text(&asked.server.root().join("C:relative")),
-            "/C:/outside",
-            "/server/share"
-        ])
+        json!([text(&asked.server.root().join("C:relative"))])
     );
 }
 
