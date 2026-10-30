@@ -86,8 +86,25 @@ jobs:
       # 只有 FAIL 让这一步变红；被测对象尚未存在的几条报 SKIP 并在汇总里计数，
       # 每次 CI 输出都会提醒还欠几条。sandbox-parity 在这里两个后端都必须真跑：
       # 缺 daemon 或镜像即 FAIL，不能退成本地那样的 SKIP。
+      # 日志要登录才能看：失败时把门禁汇总、panic 与失败用例另以 annotation 输出，
+      # 公开的 check-runs annotations API 不登录即可读取。
       - name: 九条门禁
-        run: cargo xtask all
+        run: |
+          set +e +o pipefail
+          cargo xtask all 2>&1 | tee xtask.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            body=$(
+              grep -E '^FAIL ' xtask.log
+              grep -E -A12 '^---- .* stdout ----$' xtask.log | head -n 300
+              grep -E '\.\.\. FAILED$|^error: test failed|^error: [0-9]+ targets? failed' xtask.log | head -n 60
+            )
+            body=${body//'%'/'%25'}
+            body=${body//$'\r'/}
+            body=${body//$'\n'/'%0A'}
+            echo "::error title=xtask all failed (exit $status)::$body"
+          fi
+          exit "$status"
         env:
           RA_SANDBOX_PARITY_REQUIRE: unix_local,docker
 
