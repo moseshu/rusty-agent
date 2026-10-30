@@ -1,0 +1,92 @@
+# Windows 上的命令沙箱验证。
+#
+# Windows 目前没有可执行规范权限 profile 的命令沙箱后端，执行层必须在启动前拒绝，而不是
+# 压平成旧的 roots。这里只跑覆盖这条拒绝路径的用例：tests/ 里的大多数命令用例假设
+# Unix shell，整文件跑会混进与沙箱无关的失败。
+#
+# 日志要登录才能看，因此每个包的编译错误、失败用例与汇总行另以 annotation 输出，
+# 公开的 check-runs annotations API 不登录即可读取。
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  sandbox-refusal:
+    name: Windows 命令沙箱拒绝
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链由 rust-toolchain.toml 固定，rustup 在首次调用 cargo 时自动安装。
+      - name: 工具链版本
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests
+
+      # 逐包运行：多个 -p 合在一条命令里会合并 feature。某个包失败不阻止后面的包，
+      # 最后一步统一判定。
+      - name: 拒绝路径用例
+        run: |
+          failed=0
+          run_pkg() {
+            local name=$1 expected=$2
+            shift 2
+            local status=0
+            cargo test --manifest-path tests/Cargo.toml --no-fail-fast "$@" > "$name.log" 2>&1 || status=$?
+            # A name filter that matches nothing still exits 0, so the passing count is checked too.
+            local passed
+            passed=$(grep -cE '\.\.\. ok$' "$name.log" || true)
+            if [ "$status" -eq 0 ] && [ "$passed" -ne "$expected" ]; then
+              echo "expected $expected passing tests, saw $passed" >> "$name.log"
+              status=98
+            fi
+            {
+              grep -E -A8 '^error(\[E[0-9]+\])?:' "$name.log" | head -n 160
+              grep -E -A14 '^---- .* stdout ----$' "$name.log" | head -n 160
+              grep -E '\.\.\. (ok|FAILED|ignored)$|^test result:|^error: test failed|^expected [0-9]+ passing' "$name.log"
+            } > "$name.summary"
+            local body
+            body=$(cat "$name.summary")
+            body=${body//'%'/'%25'}
+            body=${body//$'\r'/}
+            body=${body//$'\n'/'%0A'}
+            if [ "$status" -eq 0 ]; then
+              echo "::notice title=$name passed::$body"
+            else
+              echo "::error title=$name failed (exit $status)::$body"
+              failed=1
+            fi
+            {
+              echo "### $name (exit $status)"
+              echo '```'
+              cat "$name.summary"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          run_pkg it-exec 8 -p it-exec --test sandbox_legacy_profiles
+          run_pkg it-tools 1 -p it-tools --test exec_command -- \
+            test_exec_command_reports_sandbox_preparation_as_process_creation
+          run_pkg it-coding 1 -p it-coding --test stdin_review -- \
+            legacy_platform_commands_refuse_unenforceable_profiles_before_launch
+          run_pkg it-protocol 4 -p it-protocol --test request_permissions -- \
+            a_grant_that_denies_a_path_is_enforced_or_refused \
+            read_only_children_of_granted_writable_roots_prevent_writes \
+            read_only_children_of_baseline_writable_roots_prevent_writes \
+            read_only_carveouts_survive_session_and_turn_merging
+          exit "$failed"
