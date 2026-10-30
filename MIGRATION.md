@@ -24,8 +24,18 @@ visible to users and hosts:
   restarted under the current policy.
 - `seatbelt_network_policy.sbpl` returns, in the shared Seatbelt directory, as the network section
   of command profiles with network enabled; the filesystem helper still uses no network section.
-- Linux and Windows commands keep their previous sandbox paths until their command lowering is
-  ported; the managed network proxy is not part of this change.
+- Linux and Windows now retain canonical command profiles too. Before invoking a legacy backend,
+  execution rejects denied reads, read-only carveouts, protected metadata (including paths not yet
+  created), and any profile that cannot be represented by the backend's root lists. There is no
+  automatic fallback to flattened roots or unsandboxed execution. In particular, the default
+  `:workspace` profile is refused on these platforms until an enforcing backend is ported. A
+  representable read-only profile still requires an available platform backend; Windows currently
+  has none. Explicit disabled/external enforcement retains its existing host-owned contract.
+- Approved escalation keeps denied reads and is refused on legacy platforms if they cannot be
+  enforced. A sandbox that cannot be prepared is reported to the model as Codex reports it,
+  `Failed to create unified exec process: <reason>`, classified as an execution failure rather
+  than a policy rejection or a lost session.
+- The Linux helper and managed network proxy are separate follow-up work.
 
 ### Product MCP approval requests and automatic approval
 

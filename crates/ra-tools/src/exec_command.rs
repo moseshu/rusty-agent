@@ -1249,6 +1249,8 @@ enum ExecCommandFailure {
     PtyUnavailable,
     /// The process could not be started.
     Spawn(String),
+    /// The sandbox could not be prepared for the process, as Codex's `CreateProcess`.
+    CreateProcess(String),
     /// Every execution slot is held by something that will not stop.
     Busy(String),
     /// An execution session could not be addressed.
@@ -1267,7 +1269,9 @@ impl ExecCommandFailure {
             | Self::AmbiguousParent(_)
             | Self::MissingDirectory(_)
             | Self::PtyUnavailable => ToolErrorKind::InvalidInput,
-            Self::Spawn(_) | Self::Busy(_) | Self::Session(_) => ToolErrorKind::ExecutionFailed,
+            Self::Spawn(_) | Self::CreateProcess(_) | Self::Busy(_) | Self::Session(_) => {
+                ToolErrorKind::ExecutionFailed
+            }
             Self::Rejected(_) => ToolErrorKind::PermissionDenied,
         }
     }
@@ -1300,8 +1304,9 @@ impl ExecCommandFailure {
                 "Wait for them to be reclaimed and try again; tell the user if it persists."
             }
             Self::Session(_) => "Start the command again rather than addressing that session.",
-            // The reason is the whole answer, as Codex returns a rejected command's reason alone.
-            Self::Rejected(_) => return None,
+            // The reason is the whole answer, as Codex returns a rejected command's reason or a
+            // process it could not create alone; retrying cannot change either.
+            Self::Rejected(_) | Self::CreateProcess(_) => return None,
         })
     }
 }
@@ -1309,6 +1314,7 @@ impl ExecCommandFailure {
 impl From<&ExecError> for ExecCommandFailure {
     fn from(error: &ExecError) -> Self {
         match error {
+            ExecError::Sandbox { source } => Self::CreateProcess(source.to_string()),
             ExecError::Spawn { command, source } => {
                 Self::Spawn(format!("`{command}` could not be started: {source}"))
             }
@@ -1343,6 +1349,9 @@ impl fmt::Display for ExecCommandFailure {
                 )
             }
             Self::Spawn(reason) => write!(f, "The command did not start: {reason}."),
+            Self::CreateProcess(reason) => {
+                write!(f, "Failed to create unified exec process: {reason}")
+            }
             Self::Busy(reason) => write!(f, "No room to run another command: {reason}."),
             Self::Session(reason) => write!(f, "The execution session is unavailable: {reason}."),
             Self::Rejected(reason) => f.write_str(reason),

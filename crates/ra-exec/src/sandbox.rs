@@ -24,6 +24,7 @@ pub mod bwrap;
 mod denial;
 #[cfg(feature = "docker")]
 pub mod docker;
+mod legacy_profile;
 pub(crate) mod manager;
 /// Hidden bridges for the source sandbox-manager tests.
 #[cfg(feature = "test-api")]
@@ -822,12 +823,13 @@ impl Confinement {
     ///
     /// Returns [`SandboxError`] when the backend cannot express the policy.
     pub fn apply(&self, command: SandboxCommand) -> Result<SandboxCommand, SandboxError> {
-        if let Some(permissions) = self
-            .request
-            .as_ref()
-            .and_then(|request| request.permissions.as_ref())
+        if let Some(request) = self.request.as_ref()
+            && let Some(permissions) = request.permissions.as_ref()
         {
             use manager::{SandboxManager, SandboxTransformRequest, SandboxablePreference};
+            if let Some(backend) = self.backend.filter(|backend| backend.name() == "bwrap") {
+                return backend.confine(request, command);
+            }
             let manager = SandboxManager::new();
             let sandbox = manager.select_initial(
                 &permissions.profile,
@@ -946,11 +948,34 @@ pub fn resolve_confinement_with(
 ) -> Result<Confinement, SandboxError> {
     // Canonical profiles, including deserialized launch snapshots, remain authoritative over
     // their compatibility fields. Recompute that view before backend selection and reporting.
-    let canonical_policy = policy.permissions.as_ref().map(|permissions| {
-        policy
+    let canonical_policy = if let Some(permissions) = policy.permissions.as_ref() {
+        let mut permissions = permissions.clone();
+        if let Some(scratch) = scratch_dir {
+            let (file_system, network) = permissions.profile.to_runtime_permissions();
+            let scratch =
+                ra_paths::AbsolutePathBuf::resolve_path_against_base(scratch, &permissions.cwd);
+            let file_system =
+                file_system.with_additional_writable_roots(&permissions.cwd, &[scratch]);
+            permissions.profile =
+                ra_filesystem::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                    permissions.profile.enforcement(),
+                    &file_system,
+                    network,
+                );
+        }
+        let mut canonical = policy
             .clone()
-            .with_permission_profile(permissions.profile.clone(), permissions.cwd.clone())
-    });
+            .with_permission_profile(permissions.profile.clone(), permissions.cwd.clone());
+        if cfg!(not(target_os = "macos"))
+            || backend.is_some_and(|backend| backend.name() == "bwrap")
+        {
+            canonical.writable_roots =
+                legacy_profile::writable_roots(&permissions.profile, &permissions.cwd)?;
+        }
+        Some(canonical)
+    } else {
+        None
+    };
     let policy = canonical_policy.as_ref().unwrap_or(policy);
     if let Some((profile, _)) = policy.permission_profile() {
         let (file_system, network) = profile.to_runtime_permissions();
@@ -1020,16 +1045,7 @@ pub fn resolve_confinement_with(
             network: policy.network(),
             writable_roots: collect_roots(policy.writable_roots(), scratch_dir),
             readable_roots: collect_roots(policy.readable_roots(), None),
-            permissions: policy.permissions.clone().map(|mut permissions| {
-                if let Some(scratch) = scratch_dir {
-                    let (file_system, network) = permissions.profile.to_runtime_permissions();
-                    let scratch = ra_paths::AbsolutePathBuf::resolve_path_against_base(scratch, &permissions.cwd);
-                    let file_system = file_system.with_additional_writable_roots(&permissions.cwd, &[scratch]);
-                    permissions.profile = ra_filesystem::models::PermissionProfile::from_runtime_permissions_with_enforcement(
-                        permissions.profile.enforcement(), &file_system, network);
-                }
-                permissions
-            }),
+            permissions: policy.permissions.clone(),
         }),
     })
 }

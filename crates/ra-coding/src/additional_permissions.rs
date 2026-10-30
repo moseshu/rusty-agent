@@ -8,8 +8,9 @@
 //!
 //! # Differences from Codex
 //!
-//! - macOS applies additional permissions to the canonical profile through Seatbelt. Legacy
-//!   backends still refuse grants containing denied reads or read-only subpaths they cannot express.
+//! - Additional permissions are merged into the canonical profile on every platform. macOS enforces
+//!   it through Seatbelt; Linux and Windows have no ported backend for it yet, so the executor
+//!   refuses a merged profile with denied reads, read-only subpaths or protected metadata.
 //! - Codex lets inline permissions through without its `exec_permission_approvals` feature when
 //!   its `request_permissions_tool` feature is on and the grants preapprove them. Grants exist only
 //!   once that tool was installed and answered, so here preapproval alone lets them through.
@@ -23,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use ra_core::{state::RunId, tool::ToolContext};
-use ra_exec::sandbox::{NetworkAccess as ExecNetworkAccess, SandboxPolicy as ExecSandboxPolicy};
+use ra_exec::sandbox::SandboxPolicy as ExecSandboxPolicy;
 use ra_protocol::server::protocol::AskForApproval;
 
 use crate::{
@@ -31,9 +32,8 @@ use crate::{
     permissions::{
         AdditionalPermissionProfile, FileSystemAccessMode, FileSystemPath, FileSystemPermissions,
         FileSystemSandboxEntry, FileSystemSandboxPolicyContext, FileSystemSpecialPath,
-        NetworkPermissions, materialize_additional_permissions_with_context,
-        merge_permission_profiles, normalize_additional_permissions_with_context, resolve_access,
-        resolved_entries,
+        materialize_additional_permissions_with_context, merge_permission_profiles,
+        normalize_additional_permissions_with_context, resolve_access, resolved_entries,
     },
     thread_settings::CodingThreadSettings,
 };
@@ -386,21 +386,14 @@ fn sandbox_namespace_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Why a command whose grants deny a path is refused.
-const UNENFORCEABLE_DENY: &str = "the permissions granted to this turn or session deny paths the command sandbox cannot exclude, so the command was not run";
-
-/// Why a command whose effective permissions carve a read-only path out of a writable root is refused.
-const UNENFORCEABLE_READ_ONLY: &str = "the granted permissions require read-only paths within writable roots that the command sandbox cannot enforce, so the command was not run";
-
-/// `sandbox` with `permissions` added: Codex's `effective_permission_profile` for the executor's
-/// sandbox. Each path an entry writes becomes a writable root and each it reads a readable root,
-/// resolved in `context`, and a network grant opens the network. An unconfined sandbox is left
-/// alone, as Codex leaves an unrestricted or external one.
+/// `sandbox` with `permissions` added: Codex's `effective_permission_profile` applied to the
+/// command's canonical permission profile. An unconfined sandbox is left alone, as Codex leaves an
+/// unrestricted or external one.
 ///
-/// The executor's sandboxes can neither exclude a path from a root they open nor deny a read, so
-/// permissions that deny any path or require a read-only carveout are refused. As Codex's
-/// `get_writable_roots_with_cwd_impl` does, the carveout check resolves precedence across the
-/// baseline and the complete grant before deciding whether a read entry restricts a write.
+/// Every confined coding command carries its canonical profile, so the grant is merged there and
+/// the executor decides whether its backend can enforce the result; a backend that cannot refuses
+/// the command rather than flattening the profile into roots. A confined sandbox without a profile
+/// has nothing the grant could be merged into faithfully and is refused.
 pub(crate) fn granted_sandbox(
     sandbox: ExecSandboxPolicy,
     permissions: &AdditionalPermissionProfile,
@@ -409,87 +402,21 @@ pub(crate) fn granted_sandbox(
     if !sandbox.level().needs_backend() {
         return Ok(sandbox);
     }
-    if let Some((profile, cwd)) = sandbox.permission_profile() {
-        let permissions =
-            materialize_additional_permissions_with_context(permissions.clone(), context)?;
-        let permissions = canonical_additional_permissions(&permissions)?;
-        let effective = ra_exec::sandbox::policy_transforms::effective_permission_profile(
-            profile,
-            Some(&permissions),
+    let Some((profile, cwd)) = sandbox.permission_profile() else {
+        return Err(
+            "the command sandbox has no permission profile to add the granted permissions to, so the command was not run"
+                .to_owned(),
         );
-        let cwd = cwd.to_path_buf();
-        return Ok(sandbox.with_permission_profile(effective, cwd));
-    }
-    let mut sandbox = sandbox;
-    if permissions
-        .network()
-        .is_some_and(NetworkPermissions::grants)
-    {
-        sandbox = sandbox.with_network(ExecNetworkAccess::Allowed);
-    }
-    let Some(file_system) = permissions.file_system() else {
-        return Ok(sandbox);
     };
-    if file_system
-        .entries()
-        .iter()
-        .any(|entry| entry.access() == FileSystemAccessMode::Deny)
-    {
-        return Err(UNENFORCEABLE_DENY.to_owned());
-    }
-    let resolved: Vec<_> = file_system
-        .entries()
-        .iter()
-        .flat_map(|entry| {
-            resolved_entries(std::slice::from_ref(entry), context)
-                .into_iter()
-                .filter(|(path, _)| !entry.skips_missing_path() || path.exists())
-        })
-        .collect();
-    if resolved
-        .iter()
-        .any(|(_, access)| *access == FileSystemAccessMode::Read)
-    {
-        // Seatbelt resolves trusted top-level aliases before matching. Compare paths in the
-        // same namespace, preserving mutable components rather than following deeper symlinks.
-        let effective_entries = sandbox
-            .writable_roots()
-            .iter()
-            .map(|path| (path, FileSystemAccessMode::Write))
-            .chain(resolved.iter().map(|(path, access)| (path, *access)))
-            .map(|(path, access)| {
-                Ok(FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: sandbox_namespace_path(path)?,
-                    },
-                    access,
-                ))
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()?;
-        let effective_paths = resolved_entries(&effective_entries, context);
-        for (path, access) in &effective_paths {
-            if *access == FileSystemAccessMode::Read
-                && effective_paths.iter().any(|(root, access)| {
-                    *access == FileSystemAccessMode::Write && path.starts_with(root)
-                })
-                && resolve_access(&effective_entries, path, context) != FileSystemAccessMode::Write
-            {
-                return Err(UNENFORCEABLE_READ_ONLY.to_owned());
-            }
-        }
-    }
-    for (path, access) in resolved {
-        match access {
-            FileSystemAccessMode::Write if !sandbox.writable_roots().contains(&path) => {
-                sandbox = sandbox.with_writable_root(path);
-            }
-            FileSystemAccessMode::Read if !sandbox.readable_roots().contains(&path) => {
-                sandbox = sandbox.with_readable_root(path);
-            }
-            _ => {}
-        }
-    }
-    Ok(sandbox)
+    let permissions =
+        materialize_additional_permissions_with_context(permissions.clone(), context)?;
+    let permissions = canonical_additional_permissions(&permissions)?;
+    let effective = ra_exec::sandbox::policy_transforms::effective_permission_profile(
+        profile,
+        Some(&permissions),
+    );
+    let cwd = cwd.to_path_buf();
+    Ok(sandbox.with_permission_profile(effective, cwd))
 }
 
 /// Cross the product/native boundary explicitly: product paths are native paths, while the

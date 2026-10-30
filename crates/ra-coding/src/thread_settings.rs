@@ -9,9 +9,9 @@
 //! configuration, and loads that thread with the same adapter. Generic framework hosts need no
 //! coding policy. The immutable snapshot occupies the application's context slot; a coding host
 //! using another application context must compose those payloads in its own selected adapter.
-//! The named catalog supports the legacy filesystem policies the executor can enforce. Profile
-//! inheritance, glob grants and externally managed mounts require a richer host adapter; an
-//! unknown profile never falls back to ambient authority. External sandbox enforcement is an
+//! Product configuration resolves named profiles, inheritance and glob restrictions into the
+//! canonical permission state. Execution refuses profiles the selected backend cannot enforce;
+//! an unknown profile never falls back to ambient authority. External sandbox enforcement is an
 //! explicit embedding-host responsibility. The client is the only approval reviewer: the server
 //! refuses Codex's automatic reviewer, which is not ported, and a snapshot that names it anyway
 //! asks the client nothing, so its calls are refused.
@@ -87,10 +87,8 @@
 //! patch the grants already let write every path it touches is preapproved and does not ask, as
 //! Codex's patch handler preapproves it.
 //! Commands enter the platform sandbox using their canonical permission profile on macOS.
-//! Other backends still use the legacy policy until their command lowering is ported.
-//! The legacy executor workspace policy grants entire writable
-//! roots; it does not yet port Codex's nested protected-directory rules. Those remain an execution
-//! adapter parity gap rather than a new provider-neutral permission rule.
+//! Linux and Windows retain the canonical profile and refuse execution when their legacy
+//! backend cannot enforce its denied reads, read-only carveouts or protected metadata.
 
 use crate::additional_permissions::{
     EffectiveAdditionalPermissions, apply_granted_turn_permissions, granted_sandbox,
@@ -1238,7 +1236,6 @@ fn sandboxed_environment(
             ExecSandboxPolicy::new(SandboxLevel::WorkspaceWrite).with_network(network(false))
         }
     };
-    #[cfg(target_os = "macos")]
     let policy = policy.with_permission_profile(
         settings.profile_permissions.effective_permission_profile(),
         settings.cwd.clone(),
