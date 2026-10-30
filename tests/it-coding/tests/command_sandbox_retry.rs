@@ -226,6 +226,10 @@ fn retry_state(outcome: Result<ToolOutput>) -> Value {
 /// A call no one approved, whose first attempt the sandbox refused, asks to run again outside the
 /// sandbox with Codex's retry reason; approved, it runs only the retry.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_refused_attempt_asks_before_running_outside_the_sandbox() {
     let fixture = fixture(granular(true)).await;
     let arguments = fixture.arguments("");
@@ -248,6 +252,10 @@ async fn a_refused_attempt_asks_before_running_outside_the_sandbox() {
 /// A call the host approved before it ran is not asked about again: its refused first attempt is
 /// retried outside the sandbox at once, as Codex's `should_bypass_approval` decides.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn an_approved_call_retries_without_asking_again() {
     let fixture = fixture(AskForApproval::UnlessTrusted).await;
     let arguments = fixture.arguments("");
@@ -263,6 +271,10 @@ async fn an_approved_call_retries_without_asking_again() {
 /// Under `OnRequest` and `Never`, and under `Granular` without sandbox approval, the refused
 /// attempt's output is the result: nothing runs outside the sandbox and nothing is asked.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn policies_that_do_not_ask_return_the_refused_attempt() {
     for approval in [
         AskForApproval::OnRequest,
@@ -286,6 +298,10 @@ async fn policies_that_do_not_ask_return_the_refused_attempt() {
 
 /// Ordinary failures and commands still running when they yield do not request a retry.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn ordinary_failure_and_yield_are_not_retried() {
     let fixture = fixture(granular(true)).await;
 
@@ -304,6 +320,10 @@ async fn ordinary_failure_and_yield_are_not_retried() {
 /// The retry resumes in another process from the approval's state alone: the first attempt is
 /// not run again.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_retry_resumes_in_another_process() {
     let mut fixture = fixture(granular(true)).await;
     let arguments = fixture.arguments("");
@@ -320,6 +340,10 @@ async fn a_retry_resumes_in_another_process() {
 /// straight outside the sandbox; the approved call keeps the path it was decided
 /// on, in the sandbox first, even resumed in another process.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn an_amendment_does_not_change_the_approved_calls_path() {
     let mut fixture = fixture(AskForApproval::UnlessTrusted).await;
     let arguments = fixture.arguments("");
@@ -361,6 +385,10 @@ async fn an_amendment_does_not_change_the_approved_calls_path() {
 /// The retry an approval admits belongs to the call that asked: the same call ID with other
 /// arguments cannot use it.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_retry_approval_cannot_run_other_arguments() {
     let fixture = fixture(granular(true)).await;
     let arguments = fixture.arguments("");
@@ -433,6 +461,10 @@ fn run_request(fixture: &Fixture, responses: Vec<ModelResponse>) -> RunRequest {
 /// Through the runner: the refused call pauses the run with an approval the host answers from a
 /// serialized checkpoint in another process, and the resumed run runs only the retry.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_checkpointed_retry_approval_runs_only_the_retry() {
     let mut fixture = fixture(granular(true)).await;
     let mut arguments = fixture.arguments("");
@@ -492,6 +524,10 @@ async fn a_checkpointed_retry_approval_runs_only_the_retry() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn retry_approval_is_consumed_once() {
     let fixture = fixture(granular(true)).await;
     let arguments = fixture.arguments("");
@@ -506,6 +542,10 @@ async fn retry_approval_is_consumed_once() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_late_sandbox_refusal_is_output_even_when_retry_approval_is_allowed() {
     for approval in [granular(true), AskForApproval::UnlessTrusted] {
         let fixture = fixture(approval).await;
@@ -564,6 +604,10 @@ async fn approval_retains_the_selected_sandbox() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn resumed_checkpoint_cannot_execute_again() {
     let mut fixture = fixture(granular(true)).await;
     let mut arguments = fixture.arguments("");
@@ -633,6 +677,10 @@ async fn resumed_checkpoint_cannot_execute_again() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn retry_does_not_bypass_configured_deny() {
     let mut fixture = fixture(granular(true)).await;
     let mut arguments = fixture.arguments("");
@@ -704,6 +752,10 @@ async fn retry_does_not_bypass_configured_deny() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_retry_approval_is_consumed_atomically() {
     let fixture = fixture(granular(true)).await;
     let arguments = fixture.arguments("");
@@ -717,6 +769,10 @@ async fn a_retry_approval_is_consumed_atomically() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_cancelled_retry_cannot_execute_again() {
     let fixture = fixture(granular(true)).await;
     let target = fixture.outside.path().join("written.txt");
@@ -740,6 +796,10 @@ async fn a_cancelled_retry_cannot_execute_again() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_retry_that_fails_to_spawn_cannot_execute_again() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = fixture(granular(true)).await;
@@ -770,6 +830,10 @@ async fn a_retry_that_fails_to_spawn_cannot_execute_again() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn an_approved_request_keeps_its_prepared_working_directory() {
     let mut fixture = fixture(AskForApproval::UnlessTrusted).await;
     let arguments = json!({"cmd": "printf retained > prepared.txt", "yield_time_ms": 5000});
@@ -788,6 +852,10 @@ async fn an_approved_request_keeps_its_prepared_working_directory() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_timed_out_command_that_printed_a_refusal_is_not_retried() {
     let fixture = fixture(granular(true)).await;
     let arguments = json!({"cmd": "echo attempt >> attempts.log; printf 'permission denied' >&2; sleep 2", "yield_time_ms": 5000, "timeout_ms": 100});

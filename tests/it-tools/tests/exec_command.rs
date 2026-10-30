@@ -588,3 +588,43 @@ async fn test_exec_command_policy_resolvers_add_the_approval_arguments() {
     let output = observe(&tool, &args).await;
     assert_eq!(output.as_text(), Some("ok"));
 }
+
+/// A sandbox that cannot be prepared is a process-creation failure, as Codex's unified exec
+/// reports it: not a policy rejection, and with no instruction to start the command again.
+#[tokio::test]
+async fn test_exec_command_reports_sandbox_preparation_as_process_creation() {
+    use ra_exec::sandbox::{ExecEnvironment, NetworkAccess, SandboxLevel, SandboxPolicy};
+
+    let dir = workspace();
+    let marker = dir.path().join("must-not-exist");
+    let tool = rooted(&dir).with_policy_resolvers(
+        std::sync::Arc::new(|_context: &ToolContext<'_>| {
+            // Every platform refuses this contradiction before choosing a backend.
+            Ok(ExecEnvironment::default().with_sandbox(
+                SandboxPolicy::new(SandboxLevel::Unconfined).with_network(NetworkAccess::Denied),
+            ))
+        }),
+        std::sync::Arc::new(|_context: &ToolContext<'_>| Ok(false)),
+    );
+    let arguments = arguments(json!({ "cmd": format!("touch '{}'", marker.display()) }));
+
+    let error = execute(&tool, &arguments)
+        .await
+        .expect_err("an unpreparable sandbox must not run the command");
+    assert!(matches!(
+        error,
+        ra_core::error::Error::Tool {
+            kind: ra_core::error::ToolErrorKind::ExecutionFailed,
+            ..
+        }
+    ));
+    let output = observe(&tool, &arguments).await;
+    let text = output.as_text().expect("text output");
+    assert!(
+        text.starts_with("Failed to create unified exec process: "),
+        "{text}"
+    );
+    assert!(text.contains("cannot deny the network"), "{text}");
+    assert!(output.metadata().guidance().is_empty(), "{text}");
+    assert!(!marker.exists());
+}

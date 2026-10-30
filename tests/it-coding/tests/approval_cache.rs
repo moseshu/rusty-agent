@@ -200,6 +200,10 @@ fn patch(body: &str) -> Value {
 /// Approved for the session, a command runs again without asking, also spelled with other
 /// whitespace, which Codex's canonical form ignores.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_command_approved_for_the_session_does_not_ask_again() {
     let fixture = fixture(AskForApproval::UnlessTrusted).await;
     let first = command("touch made.txt");
@@ -340,6 +344,10 @@ async fn a_patch_approved_for_the_session_covers_each_of_its_paths() {
 /// A command approved for the session whose first attempt the sandbox refuses runs again outside
 /// the sandbox without asking, whether or not its policy asked before it ran.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_refused_command_approved_for_the_session_retries_without_asking() {
     for approval in [granular_sandbox_approval(), AskForApproval::UnlessTrusted] {
         let fixture = fixture(approval).await;
@@ -367,6 +375,10 @@ async fn a_refused_command_approved_for_the_session_retries_without_asking() {
 /// The retry approval Codex asks after a sandbox refusal is cached too: approved for the session,
 /// the same command later retries without asking.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_retry_approved_for_the_session_is_not_asked_again() {
     let fixture = fixture(granular_sandbox_approval()).await;
     let arguments = fixture.refused_command();
@@ -472,6 +484,10 @@ fn done() -> ModelResponse {
 /// approval item the host receives, and a later turn's call of the same command runs without
 /// stopping. The host still approves the paused call itself, once.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_session_approval_answered_through_the_runner_spans_turns() {
     let fixture = fixture(AskForApproval::UnlessTrusted).await;
     // The runner checks arguments against the strict schema, which lists every field.

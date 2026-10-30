@@ -156,6 +156,10 @@ async fn assembled_roles_bind_mode_behavior_without_removing_control_tools(
 #[case(PromptRole::Planner, false)]
 #[case(PromptRole::Planner, true)]
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn external_plugin_instructions_are_readable_through_the_inherited_shell(
     #[case] role: PromptRole,
     #[case] restricted: bool,

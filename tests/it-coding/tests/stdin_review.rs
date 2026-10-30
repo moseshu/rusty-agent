@@ -181,6 +181,10 @@ impl Fixture {
 
 /// Input to a terminal running under the thread's current sandbox is written without asking.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn input_under_the_launch_sandbox_does_not_ask() {
     let fixture = fixture(AskForApproval::OnRequest, workspace());
     let session = fixture.open(json!({})).await;
@@ -198,6 +202,10 @@ async fn input_under_the_launch_sandbox_does_not_ask() {
 /// Codex's reason: one launched without a sandbox says so, one launched in a different sandbox
 /// says its settings differ.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_changed_sandbox_asks_with_codexs_reason() {
     for (launched, reason) in [
         (workspace(), DRIFTED),
@@ -234,6 +242,10 @@ async fn an_escalated_terminal_asks_for_every_input() {
 
 /// An approved input is written as it was approved.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn an_approved_input_is_written() {
     let mut fixture = fixture(AskForApproval::OnRequest, workspace());
     let session = fixture.open(json!({})).await;
@@ -252,6 +264,10 @@ async fn an_approved_input_is_written() {
 /// Where the approval policy rejects sandbox prompts, input that would ask is refused with
 /// Codex's reason instead; so is input carrying a NUL byte, which cannot be shown for review.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn input_that_cannot_be_asked_about_is_refused() {
     let mut never = fixture(AskForApproval::Never, workspace());
     let session = never.open(json!({})).await;
@@ -278,6 +294,10 @@ async fn input_that_cannot_be_asked_about_is_refused() {
 
 /// A wait and a signal are not reviewed, however the sandbox changed.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn waits_and_signals_are_not_reviewed() {
     let mut fixture = fixture(AskForApproval::OnRequest, workspace());
     let session = fixture.open(json!({})).await;
@@ -296,6 +316,10 @@ async fn waits_and_signals_are_not_reviewed() {
 /// A terminal a sandbox retry launched outside its sandbox asks for every input, as Codex reviews
 /// a terminal whose retry left the sandbox.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_terminal_a_sandbox_retry_launched_asks_for_every_input() {
     let outside = tempfile::tempdir().unwrap();
     let fixture = fixture(
@@ -344,6 +368,10 @@ async fn a_terminal_a_sandbox_retry_launched_asks_for_every_input() {
 
 /// A signal sent with input is a call `write_stdin` refuses on its own; it is not asked about.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn a_signal_with_input_is_not_asked_about() {
     let mut fixture = fixture(AskForApproval::OnRequest, workspace());
     let session = fixture.open(json!({})).await;
@@ -506,7 +534,6 @@ async fn resumed_input_rejects_other_invocations_and_invalid_state() {
     assert!(output.contains("approved"), "{output}");
 }
 
-#[cfg(target_os = "macos")]
 async fn install_native_profile(
     fixture: &mut Fixture,
     profile: ra_filesystem::models::PermissionProfile,
@@ -775,4 +802,74 @@ async fn approved_retry_after_denied_read_keeps_the_sandbox() {
         std::fs::read_to_string(root.join("attempts")).unwrap(),
         "attemptattempt"
     );
+}
+
+/// Profile restrictions survive the product-to-native boundary on legacy platforms.
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test]
+async fn legacy_platform_commands_refuse_unenforceable_profiles_before_launch() {
+    use ra_filesystem::{
+        models::PermissionProfile,
+        permissions::{
+            FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+            NetworkSandboxPolicy,
+        },
+    };
+    for case in ["metadata", "deny", "readonly", "approved-deny"] {
+        let mut fixture = fixture(AskForApproval::OnRequest, workspace());
+        let root = fixture._dir.path().canonicalize().unwrap();
+        let mut fs = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+            &ra_filesystem::legacy::SandboxPolicy::new_workspace_write_policy(),
+            &root,
+        );
+        if case != "metadata" {
+            fs.entries.push(FileSystemSandboxEntry::new(
+                ra_paths::AbsolutePathBuf::from_absolute_path(root.join("restricted"))
+                    .unwrap()
+                    .into(),
+                if case.contains("deny") {
+                    FileSystemAccessMode::Deny
+                } else {
+                    FileSystemAccessMode::Read
+                },
+            ));
+        }
+        install_native_profile(
+            &mut fixture,
+            PermissionProfile::from_runtime_permissions(&fs, NetworkSandboxPolicy::Restricted),
+        )
+        .await;
+        let mut arguments = json!({"cmd": "echo launched > must-not-exist", "yield_time_ms":1000});
+        let approval = if case == "approved-deny" {
+            arguments["sandbox_permissions"] = json!("require_escalated");
+            arguments["justification"] = json!("approved test command");
+            Some(
+                fixture
+                    .asks_as(&fixture.exec, "legacy-rejected", &arguments)
+                    .await
+                    .expect("explicit escalation asks"),
+            )
+        } else {
+            None
+        };
+        let error = fixture
+            .call(
+                &fixture.exec,
+                "legacy-rejected",
+                &arguments,
+                approval.as_ref(),
+            )
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("Failed to create unified exec process: "),
+            "{case}: {text}"
+        );
+        assert!(
+            text.contains("legacy command sandbox cannot enforce this profile"),
+            "{case}: {text}"
+        );
+        assert!(!root.join("must-not-exist").exists());
+    }
 }

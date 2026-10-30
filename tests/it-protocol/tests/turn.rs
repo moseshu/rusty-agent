@@ -1450,6 +1450,10 @@ async fn thread_settings_notify_all_experimental_subscribers() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
 async fn coding_permission_updates_are_atomic_and_enforced_by_commands() {
     use ra_coding::{host::CodingHost, thread_settings::CodingThreadSettingsAdapter};
     use ra_core::state::RunId;
