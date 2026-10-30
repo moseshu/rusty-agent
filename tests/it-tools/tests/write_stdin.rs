@@ -202,12 +202,14 @@ async fn test_an_empty_poll_outlives_the_session_it_polls() {
     let started = call(
         &exec_command,
         json!({
-            "cmd": "printf 'before\\n'; sleep 1; printf 'after\\n'",
+            "cmd": "printf 'before\\n'; sleep 2; printf 'after\\n'",
             "workdir": null,
             "shell": null,
             "tty": null,
             "login": null,
-            "yield_time_ms": 100,
+            // Long enough for a loaded machine to start the shell and print the first line, short
+            // of the sleep so the command is still running when the call yields.
+            "yield_time_ms": 1_000,
             "timeout_ms": null
         }),
     )
@@ -225,7 +227,21 @@ async fn test_an_empty_poll_outlives_the_session_it_polls() {
         .expect("the background command has a session");
     // Polled after the command is gone, not while it is still running: a poll that arrives during
     // the wait would be answered by a live session and would prove nothing about a finished one.
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    // Waiting for the session to leave the active set, rather than for a fixed time, keeps a slow
+    // machine from polling a command that has not finished yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while exec_command
+        .process_manager()
+        .active_sessions()
+        .await
+        .contains(&session_id)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command did not finish"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     let output = call(
         &write_stdin,
@@ -409,6 +425,21 @@ async fn test_a_match_sees_output_printed_before_the_call() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (exec_command, write_stdin) = tools(&workspace);
     let session_id = background(&exec_command, "printf 'server READY on 8080\\n'; sleep 30").await;
+    // The line may arrive after the start call yields on a slow machine. A first match delivers it
+    // either way, so the match asserted below runs on output that was certainly delivered before.
+    call(
+        &write_stdin,
+        json!({
+            "session_id": session_id,
+            "chars": "",
+            "until": "match",
+            "match_text": "READY",
+            "control": null,
+            "yield_time_ms": 10_000
+        }),
+    )
+    .await
+    .expect("the line is printed");
 
     let output = call(
         &write_stdin,
