@@ -43,6 +43,8 @@ jobs:
       # 最后一步统一判定。
       - name: 拒绝路径用例
         run: |
+          # Each status is handled explicitly; a grep with no match must not end the step.
+          set +e +o pipefail
           failed=0
           run_pkg() {
             local name=$1 expected=$2
