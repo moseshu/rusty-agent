@@ -5,9 +5,10 @@ members = ["crates/*", "examples/*", "xtask"]
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-# 跟着锁文件里真实需要的最低版本走：`time` 0.3.47（RUSTSEC-2026-0009 的修复版）
-# 要求 1.88。工具链固定在 1.97.1，这个下限只对下游消费者有意义。
-rust-version = "1.88"
+# 跟着锁文件里真实需要的最低版本走：ra-network-proxy 精确锁定的 rama 0.3.0-alpha.4（与 Codex
+# 同版本）声明 rust-version 1.91.0，经 ra-coding 传到 ra-cli。工具链固定在 1.97.1，这个下限只对
+# 下游消费者有意义。
+rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/moseshu/rusty-agent"
 authors = ["moses"]
@@ -148,7 +149,7 @@ globset = "0.4"
 starlark = { version = "0.14.2", default-features = false }
 multimap = "0.10.0"
 shlex = "1.3.0"
-# ra-execpolicy 追加规则时锁住规则文件。codex 用 `File::lock`（Rust 1.89 起稳定），本工作区 MSRV 是 1.88；
+# ra-execpolicy 追加规则时锁住规则文件。codex 用 `File::lock`（Rust 1.89 起稳定），引入时本工作区 MSRV 是 1.88；
 # fd-lock 在 Unix 上用 flock、Windows 上用 LockFileEx，与 `File::lock` 的整文件独占锁一致，且经 starlark
 # 的 rustyline 已在锁文件里。
 fd-lock = "4.0.4"

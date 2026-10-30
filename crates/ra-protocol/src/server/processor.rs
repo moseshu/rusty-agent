@@ -71,7 +71,7 @@ const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a thread with no subscribers and no active turn stays loaded by default: Codex's
 /// `thread_unload_delay_secs` default.
-pub(crate) const DEFAULT_THREAD_UNLOAD_DELAY: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_THREAD_UNLOAD_DELAY: Duration = Duration::from_mins(1);
 
 /// What the server knows of one connection: Codex's `ConnectionSessionState`.
 #[derive(Debug)]

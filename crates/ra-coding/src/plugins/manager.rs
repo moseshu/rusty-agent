@@ -69,7 +69,7 @@ mod marketplace_context;
 pub use marketplace_context::{PluginMarketplaceContext, PluginMarketplaceScope};
 static CURATED_REPO_SYNC_STARTED: AtomicBool = AtomicBool::new(false);
 const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
-const FEATURED_PLUGIN_IDS_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 3);
+const FEATURED_PLUGIN_IDS_CACHE_TTL: Duration = Duration::from_hours(3);
 pub type EffectivePluginsChangedCallback =
     Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
 #[derive(Debug, Clone)]

@@ -31,7 +31,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use thiserror::Error;
 
-const SYSTEM_PROXY_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(60);
+const SYSTEM_PROXY_SUCCESS_CACHE_TTL: Duration = Duration::from_mins(1);
 const SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL: Duration = Duration::from_secs(5);
 const SYSTEM_PROXY_CACHE_MAX_ENTRIES: usize = 256;
 #[cfg(any(target_os = "windows", target_os = "macos"))]

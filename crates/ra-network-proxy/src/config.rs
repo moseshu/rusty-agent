@@ -1,13 +1,12 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 use crate::Platform;
-use crate::credential_broker::{
-    CredentialBrokerContext, environment::is_credential_broker_provider_env_key,
-};
+use crate::credential_broker::{CredentialBrokerContext, is_credential_broker_provider_env_key};
 use crate::domain_matcher::normalize_host;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-pub use ra_config::network_values::{CredentialProviderConfig, MitmHookConfig, NetworkMode};
+pub use ra_config::network_values::NetworkMode;
+pub(crate) use ra_config::network_values::{CredentialProviderConfig, MitmHookConfig};
 use ra_paths::AbsolutePathBuf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -164,8 +163,8 @@ pub struct NetworkProxyConfig {
     /// Trusted `OpenAI` endpoint derived from local configuration, never sent to remote executors.
     #[serde(skip)]
     pub credential_broker_openai_host: Option<String>,
-    #[serde(skip)]
     /// Trusted local destination context, never sent to remote executors or child environments.
+    #[serde(skip)]
     pub credential_broker_context: CredentialBrokerContext,
     #[serde(default)]
     pub dangerously_allow_plaintext_credential_injection: bool,
@@ -465,16 +464,8 @@ pub(crate) struct RuntimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Socket normalization is consumed by the upcoming proxy runtime."
-)]
 pub(crate) struct UnixStyleAbsolutePath(String);
 
-#[expect(
-    dead_code,
-    reason = "Socket normalization is consumed by the upcoming proxy runtime."
-)]
 impl UnixStyleAbsolutePath {
     fn parse(value: &str) -> Option<Self> {
         value.starts_with('/').then(|| Self(value.to_string()))
@@ -482,19 +473,11 @@ impl UnixStyleAbsolutePath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Socket normalization is consumed by the upcoming proxy runtime."
-)]
 pub(crate) enum ValidatedUnixSocketPath {
     Native(AbsolutePathBuf),
     UnixStyleAbsolute(UnixStyleAbsolutePath),
 }
 
-#[expect(
-    dead_code,
-    reason = "Socket normalization is consumed by the upcoming proxy runtime."
-)]
 impl ValidatedUnixSocketPath {
     pub(crate) fn parse(socket_path: &str) -> Result<Self> {
         let path = Path::new(socket_path);

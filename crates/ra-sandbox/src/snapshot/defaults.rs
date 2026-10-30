@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use ra_core::sandbox::{ErrorCode, OpName, SandboxError, SandboxResult, SnapshotSpec};
 
 /// How long a snapshot in the managed directory is kept before it counts as stale.
-pub const DEFAULT_LOCAL_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+pub const DEFAULT_LOCAL_SNAPSHOT_TTL: Duration = Duration::from_hours(24 * 30);
 
 /// The path the managed directory has below the platform's state directory.
 ///

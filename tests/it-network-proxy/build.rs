@@ -3,20 +3,42 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn copy_sources(source: &Path, target: &Path, tests: &Path) {
+fn copy_sources(source: &Path, target: &Path, tests: &Path, fragments: &Path) {
     fs::create_dir_all(target).unwrap();
     for entry in fs::read_dir(source).unwrap() {
         let path = entry.unwrap().path();
         println!("cargo:rerun-if-changed={}", path.display());
         let destination = target.join(path.file_name().unwrap());
         if path.is_dir() {
-            copy_sources(&path, &destination, &tests.join(path.file_name().unwrap()));
+            copy_sources(
+                &path,
+                &destination,
+                &tests.join(path.file_name().unwrap()),
+                &fragments.join(path.file_name().unwrap()),
+            );
         } else {
             let mut text = fs::read_to_string(&path).unwrap();
             // Product-only unused-code expectations do not apply when private tests use helpers.
             while let Some(start) = text.find("#[expect(") {
                 let end = start + text[start..].find(")]").unwrap() + 2;
                 text.replace_range(start..end, "");
+            }
+            // Test-only fixtures replace one import each; an unmatched import must fail the build
+            // rather than silently fall back to the real resolver or the developer's home.
+            match path.file_name().unwrap().to_str().unwrap() {
+                "runtime.rs" => replace_exactly_once(
+                    &mut text,
+                    &path,
+                    "use tokio::net::lookup_host;",
+                    "use crate::dns_fixture::lookup_host;",
+                ),
+                "certs.rs" => replace_exactly_once(
+                    &mut text,
+                    &path,
+                    "use ra_config::find_ra_home;",
+                    "use crate::home_fixture::find_ra_home;",
+                ),
+                _ => {}
             }
             let test = tests.join(path.file_name().unwrap());
             if test.is_file() {
@@ -27,6 +49,15 @@ fn copy_sources(source: &Path, target: &Path, tests: &Path) {
 mod tests;
 ",
                     test.to_str().unwrap()
+                ));
+            }
+            let fragment = fragments.join(path.file_name().unwrap());
+            if fragment.is_file() {
+                text.push_str(&format!(
+                    "
+#[cfg(test)] include!({:?});
+",
+                    fragment.to_str().unwrap()
                 ));
             }
             fs::write(destination, text).unwrap();
@@ -43,10 +74,27 @@ fn main() {
     let tests = manifest.join("tests/modules").canonicalize().unwrap();
     println!("cargo:rerun-if-changed={}", tests.display());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("proxy");
-    copy_sources(&source, &output, &tests);
+    let fragments = manifest.join("tests/root_modules").canonicalize().unwrap();
+    println!("cargo:rerun-if-changed={}", fragments.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("tests/upstream").display()
+    );
+    copy_sources(&source, &output, &tests, &fragments);
     assert_no_orphan_tests(&tests, &output);
+    assert_no_orphan_tests(&fragments, &output);
     let root = fs::read_to_string(output.join("lib.rs")).unwrap();
     fs::write(output.join("test_root.rs"), item_declarations(&root)).unwrap();
+}
+
+fn replace_exactly_once(text: &mut String, path: &Path, from: &str, to: &str) {
+    assert_eq!(
+        text.matches(from).count(),
+        1,
+        "expected exactly one `{from}` in {}",
+        path.display()
+    );
+    *text = text.replacen(from, to, 1);
 }
 
 // Every test file, at any depth, must have a product module; an orphan must fail the build visibly.

@@ -36,7 +36,7 @@ pub const JITTER_RANGE: f64 = 0.25;
 /// this request any more; honoring it would park the run in a sleep no budget accounts for and no
 /// user can see, whereas falling back to bounded backoff fails the attempt quickly and lets the
 /// retry budget end the run in the open.
-pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(60);
+pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_mins(1);
 
 /// A uniform random sample in `[0, 1]`, used to jitter one delay.
 ///

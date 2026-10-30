@@ -219,3 +219,21 @@ fn normalize_host_preserves_ipv6_scope_ids() {
     assert_eq!(normalize_host("[fe80::1%lo0]"), "fe80::1%lo0");
     assert_eq!(normalize_host("[fe80::1%25lo0]"), "fe80::1%lo0");
 }
+
+#[test]
+fn policy_loading_rejects_an_invalid_entry_in_either_list() {
+    for denied in [false, true] {
+        let mut config = crate::config::NetworkProxyConfig::default();
+        config.set_allowed_domains(vec!["example.com".to_string()]);
+        let invalid = vec!["valid.com".to_string(), "api[12].com".to_string()];
+        if denied {
+            config.set_denied_domains(invalid);
+        } else {
+            config.set_allowed_domains(invalid);
+        }
+        assert!(
+            crate::state::build_config_state(config, Default::default(), crate::Platform::native())
+                .is_err()
+        );
+    }
+}

@@ -19,7 +19,7 @@ pub(crate) enum GlobalWildcard {
 }
 
 #[derive(Clone)]
-pub(crate) struct DomainPatternSet {
+pub struct DomainPatternSet {
     patterns: Arc<[Vec<u8>]>,
 }
 
@@ -82,7 +82,7 @@ impl DomainPatternSet {
         })
     }
 
-    pub(crate) fn is_match(&self, host: impl AsRef<str>) -> bool {
+    pub fn is_match(&self, host: impl AsRef<str>) -> bool {
         let host = host.as_ref().as_bytes();
         self.patterns.iter().any(|pattern| matches(pattern, host))
     }

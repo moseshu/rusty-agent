@@ -1,9 +1,25 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
+use crate::config::NetworkDomainPermissions;
+use crate::config::NetworkMode;
+use crate::config::NetworkProxyConfig;
+use crate::config::NetworkUnixSocketPermissions;
 use crate::domain_matcher::is_global_wildcard_domain_pattern;
-use crate::mitm_validation::validate_mitm_hook_config;
+use crate::mitm::MitmState;
+use crate::mitm::MitmUpstreamConfig;
+use crate::mitm_hook::MitmHookConfig;
+use crate::mitm_hook::compile_mitm_hooks;
+use crate::mitm_hook::validate_mitm_hook_config;
 use crate::policy::DomainPattern;
-use crate::{NetworkMode, NetworkProxyConfig};
+use crate::policy::compile_allowlist;
+use crate::policy::compile_denylist;
+use crate::runtime::ConfigState;
+use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::Arc;
+
+pub(crate) use crate::runtime::BlockedRequest;
+pub(crate) use crate::runtime::BlockedRequestArgs;
+pub(crate) use crate::runtime::NetworkProxyState;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NetworkProxyConstraints {
@@ -18,6 +34,83 @@ pub struct NetworkProxyConstraints {
     pub denylist_expansion_enabled: Option<bool>,
     pub allow_unix_sockets: Option<Vec<String>>,
     pub allow_local_binding: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartialNetworkProxyConfig {
+    pub enabled: Option<bool>,
+    pub mode: Option<NetworkMode>,
+    pub allow_upstream_proxy: Option<bool>,
+    pub dangerously_allow_non_loopback_proxy: Option<bool>,
+    pub dangerously_allow_all_unix_sockets: Option<bool>,
+    #[serde(default)]
+    pub domains: Option<NetworkDomainPermissions>,
+    #[serde(default)]
+    pub unix_sockets: Option<NetworkUnixSocketPermissions>,
+    pub allow_local_binding: Option<bool>,
+    pub mitm: Option<bool>,
+    pub credential_broker: Option<bool>,
+    pub dangerously_allow_plaintext_credential_injection: Option<bool>,
+    #[serde(default)]
+    pub mitm_hooks: Option<Vec<MitmHookConfig>>,
+}
+
+/// Compiles policy using the supplied executor OS, which may differ from this host.
+/// Socket paths are validated without native normalization or filesystem access.
+pub fn build_config_state(
+    mut config: NetworkProxyConfig,
+    constraints: NetworkProxyConstraints,
+    executor_os: crate::Platform,
+) -> anyhow::Result<ConfigState> {
+    if constraints.enabled == Some(false) {
+        config.credential_broker = false;
+    }
+    let brokerage_created_proxy = config.credential_broker && !config.enabled;
+    let brokerage_created_default_allowlist = brokerage_created_proxy
+        && config.allowed_domains().is_none()
+        && constraints.allowed_domains.is_none();
+    if brokerage_created_proxy {
+        config.enabled = true;
+    }
+    if brokerage_created_default_allowlist {
+        config.set_allowed_domains(vec!["*".to_string()]);
+    }
+    crate::config::validate_unix_socket_allowlist_paths(&config, executor_os)?;
+    anyhow::ensure!(
+        !config.credential_broker || config.mitm,
+        "network.credential_broker requires network.mitm = true"
+    );
+    anyhow::ensure!(
+        config.mitm_ca.is_none() || config.mitm,
+        "network.mitm_ca requires network.mitm = true"
+    );
+    let allowed_domains = config.allowed_domains().unwrap_or_default();
+    let denied_domains = config.denied_domains().unwrap_or_default();
+    validate_non_global_wildcard_domain_patterns("network.denied_domains", &denied_domains)
+        .map_err(NetworkProxyConstraintError::into_anyhow)?;
+    let deny_set = compile_denylist(&denied_domains)?;
+    let allow_set = compile_allowlist(&allowed_domains)?;
+    let mitm_hooks = compile_mitm_hooks(&config)?;
+    let mitm = if config.mitm {
+        Some(Arc::new(MitmState::new(MitmUpstreamConfig {
+            allow_upstream_proxy: config.allow_upstream_proxy,
+            external_ca: config.mitm_ca.clone(),
+        })?))
+    } else {
+        None
+    };
+    Ok(ConfigState {
+        executor_os,
+        config,
+        brokerage_created_default_allowlist,
+        allow_set,
+        deny_set,
+        mitm,
+        mitm_hooks,
+        constraints,
+        blocked: std::collections::VecDeque::new(),
+        blocked_total: 0,
+    })
 }
 
 pub fn validate_policy_against_constraints(
@@ -349,7 +442,6 @@ pub enum NetworkProxyConstraintError {
 }
 
 impl NetworkProxyConstraintError {
-    #[must_use]
     pub fn into_anyhow(self) -> anyhow::Error {
         anyhow::anyhow!(self)
     }

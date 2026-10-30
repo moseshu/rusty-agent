@@ -37,7 +37,7 @@ use super::McpServerConfig;
 /// Source default for a server's startup handshake.
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Source default for one tool call.
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Certificate-bundle variables the source forwards to local stdio servers as absolute paths.
 const CUSTOM_CA_ENV_KEYS: [&str; 11] = [

@@ -1,7 +1,28 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 use crate::reasons::REASON_POLICY_DENIED;
-use crate::{NetworkRequestCancellation, NetworkRequestDisconnect};
-use std::{future::Future, pin::Pin, sync::Arc};
+use crate::request_cancellation::NetworkRequestCancellation;
+use crate::request_disconnect::NetworkRequestDisconnect;
+use crate::runtime::HostAuthorization;
+use crate::runtime::HostBlockDecision;
+use crate::runtime::HostBlockReason;
+use crate::state::NetworkProxyState;
+use anyhow::Result;
+use chrono::SecondsFormat;
+use chrono::Utc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+const AUDIT_TARGET: &str = "codex_otel.network_proxy";
+const POLICY_DECISION_EVENT_NAME: &str = "codex.network_proxy.policy_decision";
+const POLICY_SCOPE_DOMAIN: &str = "domain";
+const POLICY_SCOPE_NON_DOMAIN: &str = "non_domain";
+const POLICY_DECISION_ALLOW: &str = "allow";
+const POLICY_DECISION_DENY: &str = "deny";
+const POLICY_REASON_ALLOW: &str = "allow";
+const DEFAULT_METHOD: &str = "none";
+const DEFAULT_CLIENT_ADDRESS: &str = "unknown";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkProtocol {
     Http,
@@ -182,6 +203,137 @@ impl NetworkDecision {
     }
 }
 
+pub(crate) struct BlockDecisionAuditEventArgs<'a> {
+    pub source: NetworkDecisionSource,
+    pub reason: &'a str,
+    pub protocol: NetworkProtocol,
+    pub server_address: &'a str,
+    pub server_port: u16,
+    pub method: Option<&'a str>,
+    pub client_addr: Option<&'a str>,
+}
+
+pub(crate) fn emit_block_decision_audit_event(
+    state: &NetworkProxyState,
+    args: BlockDecisionAuditEventArgs<'_>,
+) {
+    emit_non_domain_policy_decision_audit_event(state, args, POLICY_DECISION_DENY);
+}
+
+pub(crate) fn emit_allow_decision_audit_event(
+    state: &NetworkProxyState,
+    args: BlockDecisionAuditEventArgs<'_>,
+) {
+    emit_non_domain_policy_decision_audit_event(state, args, POLICY_DECISION_ALLOW);
+}
+
+fn emit_non_domain_policy_decision_audit_event(
+    state: &NetworkProxyState,
+    args: BlockDecisionAuditEventArgs<'_>,
+    decision: &'static str,
+) {
+    let execution_id = state.execution_id();
+    emit_policy_audit_event(
+        state,
+        PolicyAuditEventArgs {
+            scope: POLICY_SCOPE_NON_DOMAIN,
+            decision,
+            source: args.source.as_str(),
+            reason: args.reason,
+            protocol: args.protocol,
+            server_address: args.server_address,
+            server_port: args.server_port,
+            method: args.method,
+            client_addr: args.client_addr,
+            execution_id: execution_id.as_deref(),
+            policy_override: false,
+        },
+    );
+}
+
+struct PolicyAuditEventArgs<'a> {
+    scope: &'static str,
+    decision: &'a str,
+    source: &'a str,
+    reason: &'a str,
+    protocol: NetworkProtocol,
+    server_address: &'a str,
+    server_port: u16,
+    method: Option<&'a str>,
+    client_addr: Option<&'a str>,
+    execution_id: Option<&'a str>,
+    policy_override: bool,
+}
+
+fn emit_policy_audit_event(state: &NetworkProxyState, args: PolicyAuditEventArgs<'_>) {
+    let audit_metadata = state.audit_metadata();
+    let process_log_metadata = &state.process_log_metadata;
+    let conversation_id = process_log_metadata
+        .thread_id
+        .as_deref()
+        .or(audit_metadata.conversation_id.as_deref());
+    let timestamp = audit_timestamp();
+    let launch_trace_id = state
+        .launch_span_context
+        .as_ref()
+        .map(|context| context.trace_id().to_string());
+    let launch_span_id = state
+        .launch_span_context
+        .as_ref()
+        .map(|context| context.span_id().to_string());
+    let executor_identity = process_log_metadata.executor_identity.as_ref();
+    tracing::event!(
+        target: AUDIT_TARGET,
+        tracing::Level::INFO,
+        event.name = POLICY_DECISION_EVENT_NAME,
+        event.timestamp = %timestamp,
+        launch.trace_id = launch_trace_id.as_deref(),
+        launch.span_id = launch_span_id.as_deref(),
+        conversation.id = conversation_id,
+        tool.call_id = process_log_metadata.tool_call_id.as_deref(),
+        executor.environment_id = executor_identity.map(|identity| identity.environment_id.as_str()),
+        executor.registration_id = executor_identity.map(|identity| identity.registration_id.as_str()),
+        app.version = audit_metadata.app_version.as_deref(),
+        auth_mode = audit_metadata.auth_mode.as_deref(),
+        originator = audit_metadata.originator.as_deref(),
+        user.account_id = audit_metadata.user_account_id.as_deref(),
+        user.email = audit_metadata.user_email.as_deref(),
+        terminal.type = audit_metadata.terminal_type.as_deref(),
+        model = audit_metadata.model.as_deref(),
+        slug = audit_metadata.slug.as_deref(),
+        network.policy.scope = args.scope,
+        network.policy.decision = args.decision,
+        network.policy.source = args.source,
+        network.policy.reason = args.reason,
+        network.transport.protocol = args.protocol.as_policy_protocol(),
+        server.address = args.server_address,
+        server.port = args.server_port,
+        http.request.method = args.method.unwrap_or(DEFAULT_METHOD),
+        client.address = args.client_addr.unwrap_or(DEFAULT_CLIENT_ADDRESS),
+        execution.id = args.execution_id,
+        network.policy.override = args.policy_override,
+    );
+    if let Some(observer) = &state.policy_audit_observer {
+        observer(NetworkPolicyAuditEvent {
+            timestamp,
+            scope: args.scope.to_string(),
+            decision: args.decision.to_string(),
+            source: args.source.to_string(),
+            reason: args.reason.to_string(),
+            protocol: args.protocol,
+            host: args.server_address.to_string(),
+            port: args.server_port,
+            method: args.method.map(str::to_string),
+            client: args.client_addr.map(str::to_string),
+            policy_override: args.policy_override,
+        });
+    }
+}
+
+fn audit_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Decide whether a network request should be allowed.
 ///
 /// If `command` or `exec_policy_hint` is provided, callers can map exec-policy
@@ -207,5 +359,116 @@ where
 {
     fn decide(&self, req: NetworkPolicyRequest) -> NetworkPolicyDeciderFuture<'_> {
         Box::pin((self)(req))
+    }
+}
+
+pub(crate) async fn evaluate_host_policy(
+    state: &NetworkProxyState,
+    decider: Option<&Arc<dyn NetworkPolicyDecider>>,
+    request: &NetworkPolicyRequest,
+) -> Result<NetworkDecision> {
+    let execution_id = state.execution_id();
+    let host_decision = state.host_blocked(&request.host, request.port).await?;
+    let (decision, policy_override) = match host_decision {
+        HostBlockDecision::Allowed => (NetworkDecision::Allow, false),
+        HostBlockDecision::Blocked(HostBlockReason::NotAllowed) => {
+            if let Some(decider) = decider {
+                let mut attributed_request = request.clone();
+                if attributed_request.environment_id.is_none()
+                    && let Some(environment_id) = state.environment_id()
+                {
+                    attributed_request.environment_id = Some(environment_id.to_string());
+                }
+                attributed_request.execution_id = execution_id.clone();
+                let mut decider_decision =
+                    map_decider_decision(decider.decide(attributed_request).await);
+                // Approval permits DNS, but cannot bypass private-address or explicit deny policy.
+                if matches!(decider_decision, NetworkDecision::Allow)
+                    && let HostBlockDecision::Blocked(reason) = state
+                        .host_blocked_with_local_binding(
+                            &request.host,
+                            request.port,
+                            /*allow_local_binding*/ None,
+                            HostAuthorization::Approved,
+                        )
+                        .await?
+                {
+                    decider_decision = NetworkDecision::deny_with_source(
+                        reason.as_str(),
+                        NetworkDecisionSource::BaselinePolicy,
+                    );
+                }
+                let policy_override = matches!(decider_decision, NetworkDecision::Allow);
+                (decider_decision, policy_override)
+            } else {
+                (
+                    NetworkDecision::deny_with_source(
+                        HostBlockReason::NotAllowed.as_str(),
+                        NetworkDecisionSource::BaselinePolicy,
+                    ),
+                    false,
+                )
+            }
+        }
+        HostBlockDecision::Blocked(reason) => (
+            NetworkDecision::deny_with_source(
+                reason.as_str(),
+                NetworkDecisionSource::BaselinePolicy,
+            ),
+            false,
+        ),
+    };
+
+    let (policy_decision, source, reason) = match &decision {
+        NetworkDecision::Allow => (
+            POLICY_DECISION_ALLOW,
+            if policy_override {
+                NetworkDecisionSource::Decider
+            } else {
+                NetworkDecisionSource::BaselinePolicy
+            },
+            if policy_override {
+                HostBlockReason::NotAllowed.as_str()
+            } else {
+                POLICY_REASON_ALLOW
+            },
+        ),
+        NetworkDecision::Deny {
+            reason,
+            source,
+            decision,
+        } => (decision.as_str(), *source, reason.as_str()),
+    };
+
+    emit_policy_audit_event(
+        state,
+        PolicyAuditEventArgs {
+            scope: POLICY_SCOPE_DOMAIN,
+            decision: policy_decision,
+            source: source.as_str(),
+            reason,
+            protocol: request.protocol,
+            server_address: request.host.as_str(),
+            server_port: request.port,
+            method: request.method.as_deref(),
+            client_addr: request.client_addr.as_deref(),
+            execution_id: execution_id.as_deref(),
+            policy_override,
+        },
+    );
+
+    Ok(decision)
+}
+
+fn map_decider_decision(decision: NetworkDecision) -> NetworkDecision {
+    match decision {
+        NetworkDecision::Allow => NetworkDecision::Allow,
+        NetworkDecision::Deny {
+            reason, decision, ..
+        } => NetworkDecision::Deny {
+            reason,
+            source: NetworkDecisionSource::Decider,
+            decision,
+        },
     }
 }

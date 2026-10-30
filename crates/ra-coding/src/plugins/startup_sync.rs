@@ -35,7 +35,7 @@ const CURATED_PLUGINS_SYNC_LOCK_FILE: &str = ".tmp/plugins.sync.lock";
 const CURATED_PLUGINS_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 // Keep this comfortably above a normal sync attempt so we do not race another Codex process.
-const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_mins(10);
 #[derive(Debug, Deserialize)]
 struct GitHubRepositorySummary {
     default_branch: String,

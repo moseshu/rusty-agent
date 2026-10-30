@@ -52,7 +52,7 @@ impl McpHttpParams {
             headers: BTreeMap::new(),
             bearer_token_env_var: None,
             timeout: Duration::from_secs(5),
-            sse_read_timeout: Duration::from_secs(300),
+            sse_read_timeout: Duration::from_mins(5),
             terminate_on_close: true,
             ignore_initialized_notification_failure: false,
             auth: None,

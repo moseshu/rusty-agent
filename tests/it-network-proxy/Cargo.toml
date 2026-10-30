@@ -16,4 +16,41 @@ globset = "0.4"
 http = "1"
 tracing = "0.1"
 pretty_assertions = "1"
-tokio = { version = "1", features = ["macros","rt","time"] }
+
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+time = "0.3"
+base64 = "0.22"
+rand = "0.9"
+regex = "1"
+sha2 = "0.10"
+ra-tls = { path = "../../crates/ra-tls" }
+rustls-native-certs = "0.8"
+rustix = "1"
+chrono = "0.4"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+regex-automata = "0.4"
+regex-syntax = "0.8"
+rand_regex = "0.18"
+rama-core = "=0.3.0-alpha.4"
+rama-http = "=0.3.0-alpha.4"
+rama-http-backend = { version = "=0.3.0-alpha.4", features = ["tls"] }
+rama-net = { version = "=0.3.0-alpha.4", features = ["http","tls"] }
+rama-tcp = { version = "=0.3.0-alpha.4", features = ["http"] }
+rama-tls-rustls = { version = "=0.3.0-alpha.4", features = ["http"] }
+
+rama-error = "=0.3.0-alpha.4"
+rama-macros = "=0.3.0-alpha.4"
+rama-utils = "=0.3.0-alpha.4"
+
+
+[target.'cfg(target_family = "unix")'.dependencies]
+rama-unix = "=0.3.0-alpha.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rama-dns = "=0.3.0-alpha.4"
+security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
+schannel = "0.1"

@@ -113,7 +113,7 @@ as you need them:
 | `ra-sandbox` | Sandbox backends: unix-local and Docker | `docker` connects to a real Docker daemon; `http-sink` posts session events over HTTP |
 
 Take every crate from the same tag. Crates from two tags are two copies of `ra-core`, and
-their types do not interoperate. The crates declare Rust 1.88 as their minimum supported
+their types do not interoperate. The crates declare Rust 1.91 as their minimum supported
 version.
 
 On the current checkout, `rusty-agent` provides a unified import surface and a configured
