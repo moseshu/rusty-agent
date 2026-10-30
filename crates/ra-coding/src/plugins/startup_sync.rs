@@ -98,10 +98,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
     api_base_url: &str,
     http_client_factory: &HttpClientFactory,
 ) -> Result<String, String> {
-    let mut sync_lock = lock_curated_plugins_startup_sync(codex_home)?;
-    let _file_guard = sync_lock
-        .write()
-        .map_err(|err| format!("failed to lock curated plugins sync: {err}"))?;
+    let _file_guard = lock_curated_plugins_startup_sync(codex_home)?;
 
     let git_sync_result = match git_binary {
         Some(git_binary) => sync_openai_plugins_repo_via_git(codex_home, git_binary),
@@ -122,7 +119,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
     }
 }
 
-fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<fd_lock::RwLock<File>, String> {
+fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> {
     let lock_path = codex_home.join(CURATED_PLUGINS_SYNC_LOCK_FILE);
     std::fs::create_dir_all(codex_home.join(".tmp"))
         .map_err(|err| format!("failed to create curated plugins sync directory: {err}"))?;
@@ -132,7 +129,10 @@ fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<fd_lock::RwLoc
         .truncate(false)
         .open(&lock_path)
         .map_err(|err| format!("failed to open curated plugins sync lock: {err}"))?;
-    Ok(fd_lock::RwLock::new(lock_file))
+    lock_file
+        .lock()
+        .map_err(|err| format!("failed to lock curated plugins sync: {err}"))?;
+    Ok(lock_file)
 }
 
 fn sync_openai_plugins_repo_via_git(

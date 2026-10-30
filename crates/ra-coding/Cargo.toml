@@ -28,7 +28,6 @@ include_dir = "0.7"
 ra-http = { workspace = true }
 http = { workspace = true }
 zip = { workspace = true }
-fd-lock = { workspace = true }
 ra-executor = { workspace = true }
 ra-config = { workspace = true }
 regex = { workspace = true }

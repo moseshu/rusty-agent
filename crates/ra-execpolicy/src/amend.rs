@@ -187,7 +187,7 @@ fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError> {
 }
 
 fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
@@ -196,11 +196,7 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
             path: policy_path.to_path_buf(),
             source,
         })?;
-    // Codex takes `File::lock`, stable only since Rust 1.89; this workspace supports 1.88. The
-    // same exclusive lock on the whole file is taken through `fd-lock`, which uses `flock` on Unix
-    // and `LockFileEx` on Windows, as `File::lock` does, and releases it when the guard drops.
-    let mut lock = fd_lock::RwLock::new(file);
-    let mut file = lock.write().map_err(|source| AmendError::LockPolicyFile {
+    file.lock().map_err(|source| AmendError::LockPolicyFile {
         path: policy_path.to_path_buf(),
         source,
     })?;

@@ -295,8 +295,6 @@ fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf>
 }
 
 /// An exclusive startup lock held until dropped. The lock file remains for later waiters.
-///
-/// Uses `rustix::fs::flock`, matching Codex's `File::lock` on Unix while supporting Rust 1.88.
 pub struct AppServerStartupLock {
     _file: std::fs::File,
 }
@@ -319,13 +317,7 @@ pub async fn acquire_app_server_startup_lock(
             .read(true)
             .write(true)
             .open(startup_lock_path.as_path())?;
-        loop {
-            match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
-                Ok(()) => break,
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
+        file.lock()?;
         Ok(AppServerStartupLock { _file: file })
     })
     .await
