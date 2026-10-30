@@ -60,7 +60,7 @@ jobs:
             fi
             {
               grep -E -A8 '^error(\[E[0-9]+\])?:' "$name.log" | head -n 160
-              grep -E -A14 '^---- .* stdout ----$' "$name.log" | head -n 160
+              grep -E -A20 '^---- .* stdout ----$' "$name.log" | head -n 400
               grep -E '\.\.\. (ok|FAILED|ignored)$|^test result:|^error: test failed|^expected [0-9]+ passing' "$name.log"
             } > "$name.summary"
             local body

@@ -427,10 +427,13 @@ impl Connection {
             return self.passed.remove(index).unwrap();
         }
         loop {
-            let queued = timeout(PATIENCE, self.written.recv())
-                .await
-                .expect("the server writes the message waited for")
-                .expect("the server keeps the write queue");
+            let Ok(queued) = timeout(PATIENCE, self.written.recv()).await else {
+                panic!(
+                    "the server did not write the message waited for within {PATIENCE:?}; its last messages:\n{}",
+                    self.recent()
+                );
+            };
+            let queued = queued.expect("the server keeps the write queue");
             let message = serde_json::to_value(queued.message()).unwrap();
             if matches(&message) {
                 return message;
@@ -465,6 +468,18 @@ impl Connection {
             message["method"] == "thread/status/changed" && message["params"]["status"] == *status
         })
         .await;
+    }
+
+    /// The last messages read past without matching, one per line and truncated, so a timeout
+    /// says what the server did instead.
+    fn recent(&self) -> String {
+        let skip = self.passed.len().saturating_sub(12);
+        self.passed
+            .iter()
+            .skip(skip)
+            .map(|message| message.to_string().chars().take(700).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Everything written to it so far that a case has not read, once the server has had a moment
