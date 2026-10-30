@@ -166,8 +166,7 @@ fn git_command(mode: PluginGitMode) -> Command {
 #[cfg(windows)]
 fn git_path_arg(path: &Path) -> PathBuf {
     strip_windows_verbatim_path_prefix(&path.to_string_lossy())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| path.to_path_buf())
+        .map_or_else(|| path.to_path_buf(), PathBuf::from)
 }
 
 #[cfg(not(windows))]
@@ -180,8 +179,7 @@ fn strip_windows_verbatim_path_prefix(path: &str) -> Option<String> {
     let stripped = path.strip_prefix(r"\\?\")?;
     let stripped = stripped
         .strip_prefix(r"UNC\")
-        .map(|unc_path| format!(r"\\{unc_path}"))
-        .unwrap_or_else(|| stripped.to_string());
+        .map_or_else(|| stripped.to_string(), |unc_path| format!(r"\\{unc_path}"));
     Some(stripped)
 }
 

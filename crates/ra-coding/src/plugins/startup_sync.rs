@@ -863,6 +863,10 @@ fn apply_zip_permissions(
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Keeps the Unix signature; only Unix applies archive file modes."
+)]
 fn apply_zip_permissions(
     _entry: &zip::read::ZipFile<'_, impl std::io::Read>,
     _output_path: &Path,

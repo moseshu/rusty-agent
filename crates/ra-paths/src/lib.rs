@@ -1025,6 +1025,7 @@ pub enum PathConvention {
 impl PathConvention {
     /// Returns the path convention used by the current process.
     #[cfg(windows)]
+    #[must_use]
     pub const fn native() -> Self {
         Self::Windows
     }

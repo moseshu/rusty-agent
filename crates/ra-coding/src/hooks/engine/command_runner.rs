@@ -39,7 +39,7 @@ use tokio::time::timeout;
 use tracing::Span;
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use super::CommandShell;
 use super::ConfiguredHandler;

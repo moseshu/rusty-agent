@@ -49,6 +49,7 @@ use ra_core::sandbox::{
 pub const UNIX_LOCAL_BACKEND_ID: &str = "unix_local";
 
 /// The prefix of a workspace directory this backend created for itself.
+#[cfg(unix)]
 pub(crate) const DEFAULT_WORKSPACE_PREFIX: &str = "sandbox-local-";
 
 /// The state field recording whether this backend created the workspace root.

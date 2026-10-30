@@ -48,6 +48,7 @@ impl Child {
         reason = "Retain this source process API for the unported execution backend."
     )]
     /// Returns the operating-system process identifier while retained.
+    #[must_use]
     pub fn id(&self) -> Option<u32> {
         match &self.inner {
             ChildKind::Tokio(child) => child.id(),

@@ -1243,6 +1243,7 @@ async fn a_second_forceable_signal_stops_at_once() {
 }
 
 /// Codex's `websocket_transport_repeated_sighup_keeps_waiting_for_running_turn`.
+#[cfg(unix)]
 #[tokio::test]
 async fn repeated_graceful_only_signals_keep_waiting_for_the_running_turn() {
     let server = Server::restartable();

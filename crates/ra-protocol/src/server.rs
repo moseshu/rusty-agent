@@ -160,7 +160,8 @@ enum OutboundControlEvent {
 enum ShutdownSignal {
     /// `SIGINT` or `SIGTERM`: drain, or stop at once if already draining.
     Forceable,
-    /// `SIGHUP`: drain, however often it comes.
+    /// `SIGHUP`: drain, however often it comes. Windows has no `SIGHUP`.
+    #[cfg(unix)]
     GracefulOnly,
 }
 
@@ -1101,6 +1102,7 @@ pub mod test_api {
         }
 
         /// Sends `SIGHUP`. Returns whether the server was still listening.
+        #[cfg(unix)]
         pub async fn graceful_only(&self) -> bool {
             self.signals
                 .send(ShutdownSignal::GracefulOnly)

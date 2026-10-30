@@ -1046,6 +1046,10 @@ const fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` passes a reference; `SystemTime` is 8 bytes on Windows"
+)]
 fn serialize_timestamp<S: Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format_event_timestamp(*time))
 }

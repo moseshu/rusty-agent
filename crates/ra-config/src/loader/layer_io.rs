@@ -82,7 +82,7 @@ pub(super) async fn load_config_layers_internal(
         match fs
             .get_metadata(
                 &path_uri,
-                ra_filesystem::GetMetadataOptions::default(),
+                GetMetadataOptions::default(),
                 /*sandbox*/ None,
             )
             .await

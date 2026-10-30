@@ -497,8 +497,7 @@ fn host_path_string(path: &Path) -> String {
     if let Some(path) = rendered.strip_prefix(r"\\?\") {
         return path
             .strip_prefix(r"UNC\")
-            .map(|path| format!(r"\\{path}"))
-            .unwrap_or_else(|| path.to_string());
+            .map_or_else(|| path.to_string(), |path| format!(r"\\{path}"));
     }
     rendered.into_owned()
 }

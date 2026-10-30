@@ -3,7 +3,7 @@
     unsafe_code,
     reason = "Preserve the upstream WinHTTP proxy discovery boundary."
 )]
-//! Windows system proxy resolution through WinHTTP.
+//! Windows system proxy resolution through `WinHTTP`.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -147,8 +147,8 @@ fn resolve_with_winhttp_options(
         WinHttpGetProxyForUrl(
             session.0,
             request_url.as_ptr(),
-            &mut options,
-            &mut proxy_info,
+            &raw mut options,
+            &raw mut proxy_info,
         )
     };
     if ok == FALSE {
@@ -194,7 +194,7 @@ fn current_user_ie_proxy_config() -> Result<IeProxyConfig, RouteFailureClass> {
         lpszProxy: ptr::null_mut(),
         lpszProxyBypass: ptr::null_mut(),
     };
-    let ok = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut raw) };
+    let ok = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&raw mut raw) };
     if ok == FALSE {
         let error = last_error();
         if error == ERROR_FILE_NOT_FOUND {
@@ -336,6 +336,10 @@ fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "Kept as upstream names the resolver errors; unknown errors fall into the same class."
+)]
 fn classify_winhttp_error(code: u32) -> RouteFailureClass {
     match code {
         ERROR_WINHTTP_TIMEOUT => RouteFailureClass::ConnectTimeout,
