@@ -758,8 +758,6 @@ An optional final license column overrides the default Apache-2.0 source license
 
 | `tests/it-coding/tests/config_loader_permissions.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_loader_tests.rs (layer-stack cases loaded without ConfigBuilder) |
 
-| `crates/ra-coding/src/config/domain_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs |
-
 | `crates/ra-coding/src/config/support.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/mod.rs; codex-rs/core/src/windows_sandbox.rs; codex-rs/core/src/responses_metadata.rs; codex-rs/core/src/context/world_state/managed_developer_instructions.rs; codex-rs/sandboxing/src/manager.rs; codex-rs/utils/path-utils/src/lib.rs; codex-rs/protocol/src/models.rs; codex-rs/protocol/src/protocol.rs; codex-rs/protocol/src/turn_input.rs; codex-rs/state/src/sqlite.rs; codex-rs/prompts/src/model_messages.rs |
 
 | `crates/ra-coding/src/config/agent_role_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/agent-roles/src/agent_role_config.rs |
@@ -787,8 +785,6 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/config/resolved_permission_profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/resolved_permission_profile.rs |
 
 | `crates/ra-coding/src/config/providers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider-info/src/lib.rs |
-
-| `crates/ra-coding/src/config/mitm_validation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/mitm_hook.rs |
 
 | `crates/ra-coding/src/config/catalog/incremental_tools.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/openai_models/incremental_tools.rs |
 
@@ -837,3 +833,43 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-exec/tests/seatbelt_permissions/tls.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_tls_tests.rs (cases without a managed network) |
 
 | `tests/it-exec/tests/seatbelt_permissions/daemon_socket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_daemon_socket_tests.rs (without the managed Unix-socket allowance) |
+
+| `crates/ra-network-proxy/src/authorization_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/authorization_path.rs |
+
+| `crates/ra-network-proxy/src/config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/config.rs |
+
+| `crates/ra-network-proxy/src/credential_broker/environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/credential_broker/environment.rs |
+
+| `crates/ra-network-proxy/src/credential_broker.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/credential_broker.rs |
+
+| `crates/ra-network-proxy/src/domain_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher.rs |
+
+| `crates/ra-network-proxy/src/environment_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/environment_policy.rs |
+
+| `crates/ra-network-proxy/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/lib.rs |
+
+| `crates/ra-network-proxy/src/mitm_validation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/mitm_hook.rs |
+
+| `crates/ra-network-proxy/src/network_policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/network_policy.rs |
+
+| `crates/ra-network-proxy/src/policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/policy.rs |
+
+| `crates/ra-network-proxy/src/reasons.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/reasons.rs |
+
+| `crates/ra-network-proxy/src/request_cancellation.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/request_cancellation.rs |
+
+| `crates/ra-network-proxy/src/request_disconnect.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/request_disconnect.rs |
+
+| `crates/ra-network-proxy/src/socket_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/socket_path.rs |
+
+| `crates/ra-network-proxy/src/state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/state.rs |
+
+| `tests/it-network-proxy/tests/modules/authorization_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/authorization_path_tests.rs |
+
+| `tests/it-network-proxy/tests/modules/config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/config.rs |
+
+| `tests/it-network-proxy/tests/modules/domain_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/domain_matcher_tests.rs |
+
+| `tests/it-network-proxy/tests/modules/policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/policy.rs |
+
+| `tests/it-network-proxy/tests/modules/request_disconnect.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/request_disconnect_tests.rs |

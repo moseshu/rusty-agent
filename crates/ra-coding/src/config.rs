@@ -47,11 +47,7 @@ pub mod providers;
 mod windows_sandbox_config;
 pub use permission_profile_snapshot::{PermissionProfileSnapshot, ProfileWorkspaceRoot};
 
-mod domain_matcher;
-
 pub use support::{
     BaseInstructionsProvenance, CyberAccessProgram, ExtraConfig, MultiAgentVersion, SqliteConfig,
 };
 pub use token_budget_startup::TokenBudgetStartupConfig;
-
-mod mitm_validation;

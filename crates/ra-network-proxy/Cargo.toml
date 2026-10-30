@@ -1,0 +1,26 @@
+[package]
+name = "ra-network-proxy"
+description = "Managed network proxy policy contracts and configuration"
+rust-version.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ra-config.workspace = true
+ra-paths.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+url.workspace = true
+globset.workspace = true
+http.workspace = true
+tracing.workspace = true

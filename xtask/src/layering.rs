@@ -73,6 +73,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-execpolicy", Layer::Service),
     ("ra-paths", Layer::Service),
     ("ra-config", Layer::Service),
+    ("ra-network-proxy", Layer::Service),
     ("ra-filesystem", Layer::Service),
     ("ra-executor-protocol", Layer::Service),
     ("ra-executor", Layer::Service),
@@ -126,6 +127,7 @@ const LAYERS: &[(&str, Layer)] = &[
 /// first. That is precisely the intent — wherever this proves unavoidable, the contract belonged
 /// in the kernel all along, rather than the kernel learning about one concrete implementation.
 const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
+    ("ra-network-proxy", &["ra-config", "ra-paths"]),
     ("ra-core", &[]),
     ("ra-macros", &[]),
     // See above: this is dependency inversion, not something nobody got around to adding.
@@ -248,6 +250,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     (
         "ra-coding",
         &[
+            "ra-network-proxy",
             "ra-config",
             "ra-http",
             "ra-filesystem",

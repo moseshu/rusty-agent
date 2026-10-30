@@ -14,6 +14,7 @@ workspace = true
 test-api = ["ra-config/test-api"]
 
 [dependencies]
+ra-network-proxy.workspace = true
 strum = "0.28"
 strum_macros = "0.28"
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }

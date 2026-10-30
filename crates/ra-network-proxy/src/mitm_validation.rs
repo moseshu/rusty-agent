@@ -5,7 +5,7 @@
 )]
 //! Validates declarative proxy hooks without resolving secrets or starting the proxy.
 use super::domain_matcher::normalize_host;
-use super::network::NetworkProxyConfig;
+use crate::config::NetworkProxyConfig;
 use anyhow::{Context as _, Result, anyhow};
 use globset::GlobBuilder;
 use http::header::HeaderName;

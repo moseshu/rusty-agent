@@ -55,6 +55,7 @@ ra-patch = { path = "crates/ra-patch", version = "0.3.0" }
 ra-tools = { path = "crates/ra-tools", version = "0.3.0" }
 ra-coding = { path = "crates/ra-coding", version = "0.3.0" }
 ra-execpolicy = { path = "crates/ra-execpolicy", version = "0.3.0" }
+ra-network-proxy = { path = "crates/ra-network-proxy", version = "0.3.0" }
 
 # --- 运行时 ---
 tokio = { version = "1.53", features = [

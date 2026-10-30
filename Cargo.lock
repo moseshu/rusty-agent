@@ -3230,6 +3230,7 @@ dependencies = [
  "ra-http",
  "ra-mcp",
  "ra-model",
+ "ra-network-proxy",
  "ra-patch",
  "ra-paths",
  "ra-prompt",
@@ -3549,6 +3550,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ra-network-proxy"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "globset",
+ "http",
+ "ra-config",
+ "ra-paths",
+ "serde",
+ "thiserror 2.0.19",
+ "tracing",
+ "url",
 ]
 
 [[package]]
