@@ -27,6 +27,7 @@ use std::{
 
 use async_trait::async_trait;
 use ra_core::{state::RunId, tool::ToolContext};
+use ra_paths::{LegacyAppPathString, PathUri};
 use ra_protocol::server::{
     ThreadServerRequests,
     protocol::{
@@ -416,7 +417,8 @@ fn resolve_permission_path_strings(
     Ok(())
 }
 
-/// Codex's `resolve_permission_path_string`.
+/// Codex's `resolve_permission_path_string`: the path is resolved in the executor cwd's own path
+/// convention, so a native Windows path is accepted on a Windows cwd and refused on a POSIX one.
 pub(crate) fn resolve_permission_path_string(
     value: &mut Value,
     context: &FileSystemSandboxPolicyContext<'_>,
@@ -424,30 +426,24 @@ pub(crate) fn resolve_permission_path_string(
     let Some(raw) = value.as_str() else {
         return Ok(());
     };
-    let home_relative = raw
-        .strip_prefix("~/")
-        .or_else(|| (raw == "~").then_some(""));
-    let resolved = if let Some(rest) = home_relative {
-        let home = context.user_home_dir().ok_or_else(|| {
-            format!("cannot resolve home-relative path `{raw}` without an executor home")
-        })?;
-        path::join(home, rest.trim_start_matches('/'))
-    } else {
-        if matches!(raw.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
-            || raw.starts_with(r"\\")
-        {
-            return Err(format!(
-                "path {raw} uses Windows paths, but executor cwd {} uses POSIX paths",
-                context.cwd().display()
-            ));
-        }
-        path::join(context.cwd(), raw)
-    }
-    .ok_or_else(|| "permission path cannot be represented losslessly".to_owned())?;
-    let Some(resolved) = resolved.to_str() else {
+    let cwd = PathUri::from_host_native_path(context.cwd()).map_err(|error| error.to_string())?;
+    let convention = cwd
+        .infer_path_convention()
+        .ok_or_else(|| format!("request_permissions cwd `{cwd}` has no path convention"))?;
+    let home = context
+        .user_home_dir()
+        .map(PathUri::from_host_native_path)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let path = LegacyAppPathString::from_string(raw)
+        .resolve_against(&cwd, home.as_ref())
+        .map_err(|error| error.to_string())?;
+    if path.is_opaque() || std::str::from_utf8(&path.decoded_path_bytes()).is_err() {
         return Err("permission path cannot be represented losslessly".to_owned());
-    };
-    *value = Value::String(resolved.to_owned());
+    }
+    let path =
+        LegacyAppPathString::from_path_uri(&path, convention).map_err(|error| error.to_string())?;
+    *value = Value::String(path.into_string());
     Ok(())
 }
 
