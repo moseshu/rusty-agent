@@ -48,7 +48,7 @@ mod procthreadattr;
 mod psuedocon;
 
 pub(crate) use conpty::ConPtySystem;
-pub(crate) use job::JobObject;
+pub use job::JobObject;
 pub(crate) use psuedocon::conpty_supported;
 
 #[derive(Debug)]
