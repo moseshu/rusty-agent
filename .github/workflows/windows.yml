@@ -4,6 +4,9 @@
 # 压平成旧的 roots。这里只跑覆盖这条拒绝路径的用例：tests/ 里的大多数命令用例假设
 # Unix shell，整文件跑会混进与沙箱无关的失败。
 #
+# 另跑一遍产品 workspace 的严格 Clippy：Windows 专属代码只在这里编译，macOS 与 Linux 的
+# 门禁看不到它们。
+#
 # 日志要登录才能看，因此每个包的编译错误、失败用例与汇总行另以 annotation 输出，
 # 公开的 check-runs annotations API 不登录即可读取。
 name: Windows
@@ -37,11 +40,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: tests
+          workspaces: |
+            . -> target
+            tests -> target
+
+      - name: Clippy（Windows，全部 features）
+        run: |
+          set +e +o pipefail
+          cargo clippy --workspace --all-targets --all-features --message-format short -- -D warnings > clippy.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            body=$(grep -E ': (warning|error)|^error' clippy.log | sort -u | head -n 120)
+            body=${body//'%'/'%25'}
+            body=${body//$'\r'/}
+            body=${body//$'\n'/'%0A'}
+            echo "::error title=clippy failed (exit $status)::$body"
+          fi
+          exit "$status"
 
       # 逐包运行：多个 -p 合在一条命令里会合并 feature。某个包失败不阻止后面的包，
       # 最后一步统一判定。
       - name: 拒绝路径用例
+        if: success() || failure()
         run: |
           # Each status is handled explicitly; a grep with no match must not end the step.
           set +e +o pipefail
