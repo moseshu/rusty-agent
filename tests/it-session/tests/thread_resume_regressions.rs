@@ -70,7 +70,10 @@ async fn an_idle_thread_is_owned_before_its_rollout_is_materialized() {
     else {
         panic!("the idle owner must prevent resume");
     };
-    assert!(error.to_string().contains("another writer"), "{error}");
+    assert!(
+        error.to_string().contains("already has an active writer"),
+        "{error}"
+    );
     owner.discard().await.unwrap();
     secondary
         .create_thread(&session_id, &spawn())

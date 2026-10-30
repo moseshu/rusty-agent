@@ -269,12 +269,18 @@ async fn a_thread_has_one_live_writer_until_it_is_shut_down_or_discarded() {
     // A second directory over the same files stands in for another process.
     let secondary = RolloutThreadDirectory::new(directory.path());
     let error = failure(secondary.resume_thread(&params).await);
-    assert!(error.to_string().contains("another writer"), "{error}");
+    assert!(
+        error.to_string().contains("already has an active writer"),
+        "{error}"
+    );
 
     primary.shutdown().await.unwrap();
     let resumed = secondary.resume_thread(&params).await.unwrap();
     let error = failure(directory.resume_thread(&params).await);
-    assert!(error.to_string().contains("another writer"), "{error}");
+    assert!(
+        error.to_string().contains("already has an active writer"),
+        "{error}"
+    );
 
     resumed.discard().await.unwrap();
     directory.resume_thread(&params).await.unwrap();

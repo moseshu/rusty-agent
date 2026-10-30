@@ -113,7 +113,10 @@ async fn check_recovery(discard: bool) {
     let Err(error) = secondary.resume_thread(&params).await else {
         panic!("I/O recovery must not relinquish ownership");
     };
-    assert!(error.to_string().contains("another writer"), "{error}");
+    assert!(
+        error.to_string().contains("already has an active writer"),
+        "{error}"
+    );
     if discard {
         owner.discard().await.unwrap();
     } else {
