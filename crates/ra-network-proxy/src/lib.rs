@@ -85,6 +85,12 @@ mod certs;
 mod connect_policy;
 #[expect(
     dead_code,
+    unused_imports,
+    reason = "Listener runtime awaits the proxy facade that owns it."
+)]
+mod connection_lifecycle;
+#[expect(
+    dead_code,
     reason = "Implementation helpers await proxy listener and product consumers."
 )]
 mod http_proxy;
@@ -109,6 +115,11 @@ mod responses;
 mod runtime;
 #[expect(
     dead_code,
+    reason = "Listener runtime awaits the proxy facade that owns it."
+)]
+mod socks5;
+#[expect(
+    dead_code,
     reason = "Implementation helpers await proxy listener and product consumers."
 )]
 mod upstream;
@@ -119,7 +130,7 @@ mod upstream;
     reason = "Implementation helpers await proxy listener and product consumers."
 )]
 mod system_dns;
-pub use attribution::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
+pub use attribution::{PROXY_ATTRIBUTION_TOKEN_ENV_KEY, write_attribution_frame};
 pub use certs::{CUSTOM_CA_ENV_KEYS, is_managed_mitm_ca_trust_bundle_path};
 pub use credential_broker::{
     CREDENTIAL_BROKER_ACTIVE_ENV_KEY, brokered_credential_binding_env_keys,

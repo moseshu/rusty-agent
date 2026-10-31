@@ -3956,6 +3956,7 @@ dependencies = [
  "rama-http-backend",
  "rama-macros",
  "rama-net",
+ "rama-socks5",
  "rama-tcp",
  "rama-tls-rustls",
  "rama-unix",
@@ -4390,6 +4391,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rama-socks5"
+version = "0.3.0-alpha.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5468b263516daaf258de32542c1974b7cbe962363ad913dcb669f5d46db0ef3e"
+dependencies = [
+ "byteorder",
+ "rama-core",
+ "rama-net",
+ "rama-tcp",
+ "rama-udp",
+ "rama-utils",
+ "tokio",
+]
+
+[[package]]
 name = "rama-tcp"
 version = "0.3.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4424,6 +4440,18 @@ dependencies = [
  "tokio-rustls",
  "webpki-roots",
  "x509-parser",
+]
+
+[[package]]
+name = "rama-udp"
+version = "0.3.0-alpha.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36ed05e0ecac73e084e92a3a8b1fbf16fdae8958c506f0f0eada180a2d99eef4"
+dependencies = [
+ "rama-core",
+ "rama-net",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

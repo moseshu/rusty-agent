@@ -74,6 +74,10 @@ fn main() {
     let tests = manifest.join("tests/modules").canonicalize().unwrap();
     println!("cargo:rerun-if-changed={}", tests.display());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("proxy");
+    // Start from an empty copy so a renamed or deleted product module cannot linger.
+    if output.exists() {
+        fs::remove_dir_all(&output).unwrap();
+    }
     let fragments = manifest.join("tests/root_modules").canonicalize().unwrap();
     println!("cargo:rerun-if-changed={}", fragments.display());
     println!(
