@@ -52,19 +52,20 @@ async fn unapproved_hosts_do_not_trigger_dns() {
 }
 
 #[tokio::test]
-async fn local_approvals_recheck_dns_after_the_decider() -> Result<()> {
+async fn local_and_remote_approvals_recheck_dns_after_the_decider() -> Result<()> {
     use crate::NetworkDecision;
     use crate::NetworkDecisionSource;
     use crate::NetworkPolicyDecider;
     use crate::NetworkPolicyRequest;
     use crate::NetworkPolicyRequestArgs;
     use crate::NetworkProtocol;
+    use crate::NetworkProxy;
     use crate::network_policy::evaluate_host_policy;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
-    {
+    for remote in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
         let decider_calls = Arc::clone(&calls);
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new(move |_request| {
@@ -77,6 +78,22 @@ async fn local_approvals_recheck_dns_after_the_decider() -> Result<()> {
             ..NetworkProxyConfig::default()
         };
         let state = Arc::new(network_proxy_state_for_policy(config));
+        let proxy = NetworkProxy::builder()
+            .state(Arc::clone(&state))
+            .managed_by_codex(/*managed_by_codex*/ false)
+            .policy_decider_arc(Arc::clone(&decider))
+            .build()
+            .await?;
+        let scoped = proxy.for_execution(
+            "remote",
+            "execution",
+            "token".to_string(),
+            /*environment_policy*/ None,
+            /*fallback_policy_decider*/ None,
+        )?;
+        let remote_decider = scoped
+            .remote_policy_decider(/*allow_local_binding*/ true)
+            .unwrap();
         for host in ["does-not-resolve.invalid", "8.8.8.8"] {
             let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
                 protocol: NetworkProtocol::HttpsConnect,
@@ -88,7 +105,11 @@ async fn local_approvals_recheck_dns_after_the_decider() -> Result<()> {
                 command: None,
                 exec_policy_hint: None,
             });
-            let decision = evaluate_host_policy(&state, Some(&decider), &request).await?;
+            let decision = if remote {
+                remote_decider.decide(request).await
+            } else {
+                evaluate_host_policy(&state, Some(&decider), &request).await?
+            };
             let expected = if host.ends_with(".invalid") {
                 NetworkDecision::deny_with_source(
                     HostBlockReason::NotAllowedLocal.as_str(),

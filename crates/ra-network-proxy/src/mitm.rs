@@ -326,7 +326,7 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[expect(dead_code, reason = "Only the upstream MITM tests call it.")]
 async fn mitm_blocking_response(
     req: &Request,
     policy: &MitmPolicyContext,

@@ -1,5 +1,9 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 #[cfg(test)]
+#[path = "../upstream/http_proxy/host_header_tests.rs"]
+mod host_header_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

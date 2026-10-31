@@ -11,8 +11,23 @@ license.workspace = true
 test = false
 doctest = false
 
-[lints]
-workspace = true
+# Same as the workspace lints except `unsafe_code`: the Windows TCP attribution module needs
+# reviewed local unsafe for the IP Helper and token FFI ported from Codex.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [dependencies]
 ra-config.workspace = true
@@ -61,3 +76,11 @@ security-framework = "3"
 
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

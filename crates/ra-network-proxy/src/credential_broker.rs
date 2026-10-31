@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 mod configured;
 mod destination;
-pub(crate) mod environment;
+mod environment;
 mod matching;
 mod provider_config;
 mod providers;
@@ -37,6 +37,7 @@ pub use environment::brokered_credential_value_env_keys;
 pub use environment::credential_broker_provider_context_env_keys;
 pub use environment::credential_broker_provider_sources_allowed;
 pub use environment::is_credential_broker_provider_env_key;
+pub(crate) use environment::marked_credential_dummy_env_keys;
 pub use provider_config::CredentialAuthMethod;
 pub use provider_config::CredentialProviderConfig;
 pub use provider_config::CredentialProviderConfigExt;

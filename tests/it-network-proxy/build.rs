@@ -38,6 +38,7 @@ fn copy_sources(source: &Path, target: &Path, tests: &Path, fragments: &Path) {
                     "use ra_config::find_ra_home;",
                     "use crate::home_fixture::find_ra_home;",
                 ),
+                "windows_proxy_ingress.rs" => weak_shared_ingress(&mut text, &path),
                 _ => {}
             }
             let test = tests.join(path.file_name().unwrap());
@@ -99,6 +100,56 @@ fn replace_exactly_once(text: &mut String, path: &Path, from: &str, to: &str) {
         path.display()
     );
     *text = text.replacen(from, to, 1);
+}
+
+// Restores the upstream `cfg(test)` ownership of the shared Windows ingress in the test copy only:
+// tests use independent Tokio runtimes and requested ports, so they keep a weak reference and tear
+// each ingress down between tests. The product keeps a strong reference for the process lifetime,
+// and no Cargo feature of the product crate can switch it.
+fn weak_shared_ingress(text: &mut String, path: &Path) {
+    replace_exactly_once(
+        text,
+        path,
+        "use std::sync::Mutex;\n",
+        "use std::sync::Mutex;\nuse std::sync::Weak;\n",
+    );
+    replace_exactly_once(
+        text,
+        path,
+        "static SHARED_INGRESS: LazyLock<Mutex<Option<Arc<WindowsProxyIngress>>>> =
+    LazyLock::new(|| Mutex::new(None));",
+        "static SHARED_INGRESS: LazyLock<Mutex<Weak<WindowsProxyIngress>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));",
+    );
+    replace_exactly_once(
+        text,
+        path,
+        "        if let Some(ingress) = shared.as_ref()
+            && ingress.is_running()
+        {
+            if reserve_socks_listener {
+                ingress.ensure_socks_listener(requested_socks_addr)?;
+            }
+            return Ok(Arc::clone(ingress));
+        }
+        shared.take();
+",
+        "        if let Some(ingress) = shared.upgrade()
+            && ingress.is_running()
+        {
+            if reserve_socks_listener {
+                ingress.ensure_socks_listener(requested_socks_addr)?;
+            }
+            return Ok(ingress);
+        }
+",
+    );
+    replace_exactly_once(
+        text,
+        path,
+        "*shared = Some(Arc::clone(&ingress));",
+        "*shared = Arc::downgrade(&ingress);",
+    );
 }
 
 // Every test file, at any depth, must have a product module; an orphan must fail the build visibly.

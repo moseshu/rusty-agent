@@ -11,38 +11,14 @@
 )]
 mod authorization_path;
 mod config;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod credential_broker;
 mod domain_matcher;
 mod environment_policy;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod mitm_hook;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod network_policy;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod policy;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod reasons;
 mod request_cancellation;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod request_disconnect;
 mod socket_path;
 mod state;
@@ -68,68 +44,31 @@ pub use state::{
 pub use ra_paths::Platform;
 
 mod attribution;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod brokered_tunnel;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod certs;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod connect_policy;
-#[expect(
-    dead_code,
-    unused_imports,
-    reason = "Listener runtime awaits the proxy facade that owns it."
-)]
 mod connection_lifecycle;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod http_proxy;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod mitm;
 mod native_certs;
 mod process_log_metadata;
 mod proxy;
 mod remote_config;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod responses;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod runtime;
-#[expect(
-    dead_code,
-    reason = "Listener runtime awaits the proxy facade that owns it."
-)]
 mod socks5;
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod upstream;
 
 #[cfg(target_os = "macos")]
-#[expect(
-    dead_code,
-    reason = "Implementation helpers await proxy listener and product consumers."
-)]
 mod system_dns;
+#[cfg(target_os = "windows")]
+mod windows_proxy_ingress;
+#[cfg(target_os = "windows")]
+#[allow(
+    unsafe_code,
+    reason = "Windows IP Helper and token FFI ported from Codex."
+)]
+mod windows_tcp_attribution;
 pub use attribution::{PROXY_ATTRIBUTION_TOKEN_ENV_KEY, write_attribution_frame};
 pub use certs::{CUSTOM_CA_ENV_KEYS, is_managed_mitm_ca_trust_bundle_path};
 pub use credential_broker::{
@@ -147,9 +86,16 @@ pub use mitm_hook::{
     MitmHookMatchConfig,
 };
 pub use process_log_metadata::{ExecutorLogIdentity, NetworkProxyProcessLogMetadata};
+#[cfg(target_os = "macos")]
+pub use proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER;
+#[cfg(target_os = "macos")]
+pub use proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
 pub use proxy::{
-    ALL_PROXY_ENV_KEYS, ALLOW_LOCAL_BINDING_ENV_KEY, PROXY_ACTIVE_ENV_KEY, PROXY_ENV_KEYS,
-    PROXY_URL_ENV_KEYS, is_managed_proxy_env_var, strip_managed_proxy_env,
+    ALL_PROXY_ENV_KEYS, ALLOW_LOCAL_BINDING_ENV_KEY, DEFAULT_NO_PROXY_VALUE,
+    ManagedNetworkSandboxContext, ManagedProxyRouting, NO_PROXY_ENV_KEYS, NetworkProxy,
+    NetworkProxyBuilder, NetworkProxyHandle, PROXY_ACTIVE_ENV_KEY, PROXY_ENV_KEYS,
+    PROXY_URL_ENV_KEYS, PreparedManagedNetwork, has_proxy_url_env_vars, is_managed_proxy_env_var,
+    proxy_url_env_value, strip_managed_proxy_env,
 };
 pub use remote_config::{RemoteNetworkProxyConfig, RemoteNetworkProxyLaunchConfig};
 pub use runtime::{

@@ -17,7 +17,9 @@ use super::providers;
 use super::registry::BrokeredCredentialProvider;
 use super::remove_env_value;
 use super::set_env_value;
+use crate::NetworkProxy;
 use crate::NetworkProxyConfig;
+use crate::PreparedManagedNetwork;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -38,6 +40,34 @@ impl std::fmt::Debug for CredentialBrokerContext {
 }
 
 impl CredentialBrokerContext {
+    /// Uses private destination hints during brokerage and returns an environment ready to spawn.
+    /// Context values override routing inputs, but never change the child's visible values.
+    pub fn prepare_child_environment(
+        self,
+        proxy: &NetworkProxy,
+        mut env: HashMap<String, String>,
+        environment_id: Option<&str>,
+    ) -> anyhow::Result<PreparedManagedNetwork> {
+        let previous = self
+            .0
+            .into_iter()
+            .map(|(key, value)| {
+                let previous =
+                    env_entry(&env, &key).map(|(key, value)| (key.to_string(), value.to_string()));
+                set_env_value(&mut env, &key, value);
+                (key, previous)
+            })
+            .collect::<Vec<_>>();
+        let mut prepared = proxy.prepare_for_optional_environment(env, environment_id)?;
+        for (key, previous) in previous {
+            remove_env_value(&mut prepared.env, &key);
+            if let Some((key, value)) = previous {
+                prepared.env.insert(key, value);
+            }
+        }
+        Ok(prepared)
+    }
+
     pub(crate) fn capture(
         config: &NetworkProxyConfig,
         overrides: &HashMap<String, String>,
