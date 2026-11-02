@@ -874,11 +874,11 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         Ok(install(current.clone(), settings))
     }
 
-    /// Codex refreshes its managed network proxy once a settings commit changed the permission
+    /// Codex refreshes its managed network proxy when a settings update changes the permission
     /// profile.
-    async fn settings_committed(&self, previous: &RunConfig, committed: &RunConfig) {
+    async fn align_runtime_state(&self, previous: &RunConfig, settings: &RunConfig) {
         let previous = self.snapshot(previous);
-        let committed = self.snapshot(committed);
+        let committed = self.snapshot(settings);
         if previous.profile_permissions.permission_profile()
             == committed.profile_permissions.permission_profile()
         {

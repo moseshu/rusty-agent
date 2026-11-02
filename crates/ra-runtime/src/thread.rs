@@ -135,6 +135,11 @@ pub enum TurnAbortReason {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
+    /// A host warning, delivered in order with turn events: Codex's `Warning` event.
+    Warning {
+        /// What the client is told.
+        message: String,
+    },
     /// Persistent thread settings were applied. Consumers read the current thread snapshot.
     ThreadSettingsApplied,
     /// A turn started: Codex's `TurnStarted`.
@@ -401,6 +406,14 @@ impl ThreadSettingsOverrides {
             && self.config.is_none()
     }
 
+    /// The configuration `config` becomes once these overrides apply, without applying them: what
+    /// a caller brings its own state in line with before the thread takes the overrides.
+    pub fn applied_to(&self, config: &RunConfig) -> RunConfig {
+        let mut config = config.clone();
+        self.apply(&mut config);
+        config
+    }
+
     fn apply(&self, config: &mut RunConfig) {
         if self.is_empty() {
             return;
@@ -496,6 +509,8 @@ impl TurnInputRequest {
 /// Builds an [`AgentThread`].
 #[must_use]
 pub struct AgentThreadBuilder {
+    events: mpsc::UnboundedSender<ThreadEvent>,
+    receiver: mpsc::UnboundedReceiver<ThreadEvent>,
     step_model_switching: bool,
     thread_id: SessionId,
     agent: AgentBinding,
@@ -509,6 +524,13 @@ pub struct AgentThreadBuilder {
 }
 
 impl AgentThreadBuilder {
+    /// A sender for host events ordered with the thread's turn events, as Codex's session sends
+    /// `Warning` through its event stream. Keeping the sender does not keep the thread alive.
+    #[must_use]
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<ThreadEvent> {
+        self.events.clone()
+    }
+
     /// Opts into Codex's experimental step-model-switching capability, disabled by default.
     pub const fn with_step_model_switching(mut self, enabled: bool) -> Self {
         self.step_model_switching = enabled;
@@ -619,7 +641,6 @@ impl AgentThreadBuilder {
             .clone()
             .with_session_id(self.thread_id.clone());
         let config = self.config.with_user_hooks(hooks);
-        let (events, receiver) = mpsc::unbounded_channel();
         AgentThread {
             inner: Arc::new(ThreadInner {
                 step_model_switching: self.step_model_switching,
@@ -638,8 +659,8 @@ impl AgentThreadBuilder {
                     session_ended: false,
                 }),
                 turn_ended: Notify::new(),
-                events,
-                receiver: tokio::sync::Mutex::new(receiver),
+                events: self.events,
+                receiver: tokio::sync::Mutex::new(self.receiver),
             }),
         }
     }
@@ -727,7 +748,10 @@ impl AgentThread {
         agent: AgentBinding,
         model_resolver: Arc<dyn ModelResolver>,
     ) -> AgentThreadBuilder {
+        let (events, receiver) = mpsc::unbounded_channel();
         AgentThreadBuilder {
+            events,
+            receiver,
             step_model_switching: false,
             thread_id,
             agent,
@@ -1237,6 +1261,13 @@ impl AgentThread {
     #[must_use]
     pub fn is_shut_down(&self) -> bool {
         self.inner.lock().shut_down
+    }
+
+    /// A sender for host events in the same order as the runtime's turn events. Keeping the sender
+    /// does not keep the thread alive; sending fails once the thread is dropped.
+    #[must_use]
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<ThreadEvent> {
+        self.inner.events.clone()
     }
 
     /// The next thing that happened to the thread's turns: Codex's `next_event`. Waits for it.

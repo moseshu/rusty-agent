@@ -24,8 +24,8 @@
 use std::{fmt, sync::Arc};
 
 use ra_core::session::SessionId;
-use ra_runtime::thread::AgentThreadBuilder;
-use tokio::sync::{Mutex, oneshot};
+use ra_runtime::thread::{AgentThreadBuilder, ThreadEvent};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::{
     answers::{command_execution_approval_decision, request_permissions_response},
@@ -46,6 +46,7 @@ use super::{
 /// A loaded thread's way of asking its client: what Codex's session reaches its app server through.
 #[derive(Clone)]
 pub struct ThreadServerRequests {
+    events: mpsc::UnboundedSender<ThreadEvent>,
     outgoing: Arc<OutgoingMessageSender>,
     thread_id: SessionId,
 }
@@ -60,8 +61,13 @@ impl fmt::Debug for ThreadServerRequests {
 }
 
 impl ThreadServerRequests {
-    pub(crate) fn new(outgoing: &Arc<OutgoingMessageSender>, thread_id: &SessionId) -> Self {
+    pub(crate) fn new(
+        outgoing: &Arc<OutgoingMessageSender>,
+        thread_id: &SessionId,
+        events: mpsc::UnboundedSender<ThreadEvent>,
+    ) -> Self {
         Self {
+            events,
             outgoing: Arc::clone(outgoing),
             thread_id: thread_id.clone(),
         }
@@ -119,28 +125,32 @@ impl ThreadServerRequests {
     }
 
     /// Tells the thread's connections `message` as Codex's `warning` notification: the delivery of
-    /// a session's `Warning` event.
+    /// a session's `Warning` event. It shares the turn event stream, so earlier events precede it
+    /// and later events cannot overtake it; a thread without a listener has no connection to tell.
     pub async fn send_warning(&self, message: String) {
-        let outgoing = ThreadScopedOutgoingMessageSender::new(
-            Arc::clone(&self.outgoing),
-            self.outgoing
-                .thread_state()
-                .subscribed_connection_ids(&self.thread_id),
-            self.thread_id.clone(),
-        );
-        let warning = WarningNotification::new(Some(self.thread_id.as_str().to_owned()), message);
-        match serde_json::to_value(warning) {
-            Ok(params) => {
-                outgoing
-                    .send_server_notification_to_current_connections(ServerNotification::new(
-                        WARNING_METHOD,
-                        params,
-                    ))
-                    .await;
-            }
-            // The notification is a plain record, so this does not happen.
-            Err(error) => tracing::error!("failed to serialize {WARNING_METHOD}: {error}"),
+        let state = self.outgoing.thread_state().thread_state(&self.thread_id);
+        if !state.lock().await.has_listener() {
+            return;
         }
+        let _ = self.events.send(ThreadEvent::Warning { message });
+    }
+}
+
+/// Sends `message` to the thread's connections as Codex's `warning` notification.
+pub(crate) async fn send_warning(
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    thread_id: &str,
+    message: String,
+) {
+    let warning = WarningNotification::new(Some(thread_id.to_owned()), message);
+    match serde_json::to_value(warning) {
+        Ok(params) => {
+            outgoing
+                .send_server_notification(ServerNotification::new(WARNING_METHOD, params))
+                .await;
+        }
+        // The notification is a plain record, so this does not happen.
+        Err(error) => tracing::error!("failed to serialize {WARNING_METHOD}: {error}"),
     }
 }
 
@@ -264,7 +274,7 @@ pub(crate) fn attach_server_requests(
     if let Some(adapter) = adapter {
         adapter.attach_server_requests(
             builder.config(),
-            ThreadServerRequests::new(outgoing, builder.thread_id()),
+            ThreadServerRequests::new(outgoing, builder.thread_id(), builder.event_sender()),
         );
     }
 }

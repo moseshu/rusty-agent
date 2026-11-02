@@ -108,11 +108,29 @@ impl TurnRequestProcessor {
         if let Some(schema) = output_schema {
             start = start.with_final_output_json_schema(schema);
         }
-        let commits_policy = !policy.is_empty();
+        // Codex refreshes thread-owned runtime state inside the settings update, before the turn
+        // runs: aligned after submission, the turn's first command could still run under the
+        // previous permission profile's network policy. The settings lock keeps the prospective
+        // configuration the one the submission installs.
+        let aligned = (!policy.is_empty())
+            .then_some(thread.adapter.as_deref())
+            .flatten()
+            .map(|adapter| (adapter, Box::new(overrides.applied_to(&previous))));
+        if let Some((adapter, settings)) = &aligned {
+            adapter.align_runtime_state(&previous, settings).await;
+        }
         let request = TurnInputRequest::new(content)
             .with_thread_settings(overrides)
             .on_start(start);
-        let turn_id = match thread.start_or_steer_turn(request).await {
+        let submission = thread.start_or_steer_turn(request).await;
+        if !matches!(
+            submission,
+            TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }
+        ) && let Some((adapter, settings)) = &aligned
+        {
+            adapter.align_runtime_state(settings, &previous).await;
+        }
+        let turn_id = match submission {
             TurnInputSubmission::Started { turn_id } | TurnInputSubmission::Steered { turn_id } => {
                 turn_id
             }
@@ -134,12 +152,6 @@ impl TurnRequestProcessor {
                 )));
             }
         };
-        // A started or steered turn has applied its settings to the thread.
-        if commits_policy && let Some(adapter) = thread.adapter.as_deref() {
-            adapter
-                .settings_committed(&previous, &thread.run_config())
-                .await;
-        }
         response(TurnStartResponse::new(Turn::new(
             turn_id,
             TurnStatus::InProgress,
@@ -260,7 +272,7 @@ impl TurnRequestProcessor {
                 && let Some(adapter) = thread.adapter.as_deref()
             {
                 adapter
-                    .settings_committed(&previous, &thread.run_config())
+                    .align_runtime_state(&previous, &thread.run_config())
                     .await;
             }
         }

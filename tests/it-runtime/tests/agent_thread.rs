@@ -2234,3 +2234,39 @@ async fn thread_history_prefix_does_not_retrigger_input_contributors() {
         ]
     );
 }
+
+/// A host can bind its sender before the thread is built, and keeping that sender after teardown
+/// must not keep the thread alive or accept undeliverable events.
+#[tokio::test]
+async fn host_event_senders_follow_the_thread_lifetime() {
+    let script = Arc::new(Script::default());
+    let builder = AgentThread::builder(
+        SessionId::new("thread-warning"),
+        AgentBinding::direct(agent()),
+        Arc::new(Resolver(script)),
+    );
+    let sender = builder.event_sender();
+    let before_build = ThreadEvent::Warning {
+        message: "before build".to_owned(),
+    };
+    sender.send(before_build.clone()).unwrap();
+    let thread = builder.build();
+    assert_eq!(next_event(&thread).await, before_build);
+
+    let live_sender = thread.event_sender();
+    let after_build = ThreadEvent::Warning {
+        message: "after build".to_owned(),
+    };
+    live_sender.send(after_build.clone()).unwrap();
+    assert_eq!(next_event(&thread).await, after_build);
+
+    drop(thread);
+    assert!(sender.is_closed());
+    assert!(
+        live_sender
+            .send(ThreadEvent::Warning {
+                message: "after teardown".to_owned(),
+            })
+            .is_err()
+    );
+}

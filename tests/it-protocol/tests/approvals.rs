@@ -36,14 +36,15 @@ use ra_core::{
 use ra_protocol::{
     frame::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId},
     server::{
-        AppServer, PendingApproval, ReviewDecision, ThreadSettingsAdapter, ThreadToolItemEvent,
-        ThreadToolItems,
+        AppServer, PendingApproval, ReviewDecision, ThreadServerRequests, ThreadSettingsAdapter,
+        ThreadToolItemEvent, ThreadToolItems,
         protocol::{
             ClientInfo, CommandExecutionItem, CommandExecutionRequestApprovalParams,
             CommandExecutionStatus, FileChangeRequestApprovalParams, InitializeCapabilities,
-            InitializeParams, ServerRequestPayload, ThreadItem, ThreadPolicyOverrides,
-            ThreadTurnsListParams, ThreadTurnsListResponse, TurnInterruptParams, TurnItemsView,
-            TurnStartParams, UserInput,
+            InitializeParams, NetworkApprovalContext, NetworkApprovalProtocol,
+            ServerRequestPayload, ThreadItem, ThreadPolicyOverrides, ThreadTurnsListParams,
+            ThreadTurnsListResponse, TurnInterruptParams, TurnItemsView, TurnStartParams,
+            UserInput,
         },
         test_api::ThreadLoader,
     },
@@ -252,6 +253,13 @@ impl Tool for GuardedTool {
 /// other tools. Keeps the decisions it is told of.
 #[derive(Default)]
 struct Product {
+    listener_gate: Mutex<Option<ListenerGate>>,
+    /// The thread, so an alignment can tell which turn was running when it happened.
+    thread: Mutex<Option<AgentThread>>,
+    /// Each runtime alignment: the models of the configurations it went from and to, and the
+    /// turn running at the time.
+    alignments: Mutex<Vec<Alignment>>,
+    server_requests: Mutex<Option<ThreadServerRequests>>,
     decisions: Mutex<Vec<(String, ReviewDecision)>>,
     request_models: Mutex<Vec<Option<String>>>,
     decision_models: Mutex<Vec<Option<String>>>,
@@ -293,14 +301,77 @@ impl Product {
     }
 }
 
+/// Stops the listener at the turn's first event while producers enqueue later events.
+struct ListenerGate {
+    entered: Arc<Notify>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// What a policy change does to the configuration here: it switches the model, so an alignment
+/// shows which configuration it was given.
+const ALIGNED_MODEL: &str = "aligned";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Alignment {
+    from: Option<String>,
+    to: Option<String>,
+    running_turn: Option<String>,
+}
+
+impl Product {
+    fn alignments(&self) -> Vec<Alignment> {
+        self.alignments.lock().unwrap().clone()
+    }
+
+    fn server_requests(&self) -> ThreadServerRequests {
+        self.server_requests
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the server attached its requests")
+    }
+}
+
 #[async_trait]
 impl ThreadSettingsAdapter for Product {
     fn prepare(
         &self,
         current: &RunConfig,
-        _update: &ThreadPolicyOverrides,
+        update: &ThreadPolicyOverrides,
     ) -> std::result::Result<RunConfig, String> {
-        Ok(current.clone())
+        Ok(if *update == ThreadPolicyOverrides::new() {
+            current.clone()
+        } else {
+            current.clone().with_model(ALIGNED_MODEL)
+        })
+    }
+
+    async fn align_runtime_state(&self, previous: &RunConfig, settings: &RunConfig) {
+        let running_turn = self
+            .thread
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(AgentThread::active_turn_id);
+        self.alignments.lock().unwrap().push(Alignment {
+            from: previous.model().map(str::to_owned),
+            to: settings.model().map(str::to_owned),
+            running_turn,
+        });
+    }
+
+    fn attach_server_requests(&self, _config: &RunConfig, requests: ThreadServerRequests) {
+        *self.server_requests.lock().unwrap() = Some(requests);
+    }
+
+    fn on_thread_event(&self, _config: &RunConfig, event: &ra_runtime::thread::ThreadEvent) {
+        if matches!(event, ra_runtime::thread::ThreadEvent::TurnStarted { .. }) {
+            let gate = self.listener_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.resume.recv_timeout(PATIENCE).unwrap();
+            }
+        }
     }
 
     fn describe(&self, _config: &RunConfig) -> Value {
@@ -569,6 +640,9 @@ impl Server {
         .with_step_model_switching(true)
         .with_rollout_recorder(recorder)
         .build();
+        if let Some(product) = &product {
+            *product.thread.lock().unwrap() = Some(thread.clone());
+        }
         self.loader
             .load_with_adapter(
                 thread,
@@ -1406,4 +1480,330 @@ async fn an_ended_batch_leaves_the_next_turns_requests_alone() {
     let turn = connection.notification("turn/completed").await;
     assert_eq!(turn["turn"]["status"], "completed");
     assert_eq!(thread.runs(), ["call-4"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime alignment, network approvals and warnings
+// ---------------------------------------------------------------------------------------------
+
+fn turn_start_params(text: &str, extra: Value) -> Value {
+    let mut params =
+        serde_json::to_value(TurnStartParams::new(THREAD, vec![UserInput::text(text)])).unwrap();
+    params
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    params
+}
+
+fn network_request(turn_id: &str) -> CommandExecutionRequestApprovalParams {
+    CommandExecutionRequestApprovalParams::new(THREAD, turn_id, "network-1", 0)
+        .with_network_approval_context(NetworkApprovalContext::new(
+            "example.com",
+            NetworkApprovalProtocol::Https,
+        ))
+}
+
+/// Codex refreshes thread-owned runtime state inside the settings update, before the turn runs:
+/// the product aligns while no turn is running, with the configuration the turn then runs on.
+#[tokio::test]
+async fn a_turn_start_aligns_runtime_state_before_its_turn_runs() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    script.push(final_message("answer", "done"));
+
+    let id = server
+        .request(
+            &mut connection,
+            "turn/start",
+            turn_start_params("go", json!({"approvalPolicy": "never"})),
+        )
+        .await;
+    connection.response(id).await;
+    connection.notification("turn/completed").await;
+
+    assert_eq!(
+        product.alignments(),
+        [Alignment {
+            from: None,
+            to: Some(ALIGNED_MODEL.to_owned()),
+            running_turn: None,
+        }]
+    );
+}
+
+/// A turn/start without a policy change leaves runtime state alone.
+#[tokio::test]
+async fn a_turn_start_without_a_policy_change_aligns_nothing() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    script.push(final_message("answer", "done"));
+
+    server.turn_start(&mut connection, "go").await;
+    connection.notification("turn/completed").await;
+
+    assert!(product.alignments().is_empty());
+}
+
+/// A turn/start the thread refuses after the product aligned takes the alignment back.
+#[tokio::test]
+async fn a_turn_start_that_is_not_submitted_aligns_back() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    let gate = script.gate_next_response();
+    script.push(final_message("answer", "done"));
+    let running = server.turn_start(&mut connection, "first").await;
+    script.wait_for_calls(1).await;
+
+    // Steering the running turn with an output schema it does not have is refused.
+    let id = server
+        .request(
+            &mut connection,
+            "turn/start",
+            turn_start_params(
+                "second",
+                json!({"approvalPolicy": "never", "outputSchema": {"type": "object"}}),
+            ),
+        )
+        .await;
+    let refused = connection
+        .until(|message| message["id"] == id && message.get("method").is_none())
+        .await;
+    assert!(refused.get("error").is_some(), "{refused}");
+    gate.notify_one();
+    connection.notification("turn/completed").await;
+
+    let running = Some(running);
+    assert_eq!(
+        product.alignments(),
+        [
+            Alignment {
+                from: None,
+                to: Some(ALIGNED_MODEL.to_owned()),
+                running_turn: running.clone(),
+            },
+            Alignment {
+                from: Some(ALIGNED_MODEL.to_owned()),
+                to: None,
+                running_turn: running,
+            },
+        ]
+    );
+}
+
+/// `thread/settings/update` aligns once the settings are in place, as Codex refreshes after its
+/// settings update.
+#[tokio::test]
+async fn a_settings_update_aligns_runtime_state_once_applied() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+
+    let id = server
+        .request(
+            &mut connection,
+            "thread/settings/update",
+            json!({"threadId": THREAD, "approvalPolicy": "never"}),
+        )
+        .await;
+    connection.response(id).await;
+
+    assert_eq!(
+        product.alignments(),
+        [Alignment {
+            from: None,
+            to: Some(ALIGNED_MODEL.to_owned()),
+            running_turn: None,
+        }]
+    );
+}
+
+/// A network approval for a turn that has ended is not asked: no decision comes, and the next
+/// request the client sees is the next turn's own.
+#[tokio::test]
+async fn a_network_approval_for_an_ended_turn_is_not_asked() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    script.push(final_message("answer", "done"));
+    let ended = server.turn_start(&mut connection, "first").await;
+    connection.notification("turn/completed").await;
+
+    let decision = timeout(
+        PATIENCE,
+        product
+            .server_requests()
+            .request_network_approval(network_request(&ended)),
+    )
+    .await
+    .expect("the listener settles the request");
+    assert_eq!(decision, None);
+
+    script.push(calls("run", &["call-1"]));
+    script.push(final_message("answer", "done"));
+    server.turn_start(&mut connection, "second").await;
+    let request = connection.server_request().await;
+    assert_eq!(request["params"]["itemId"], "call-1", "{request}");
+}
+
+/// A network approval asked of the client is answered with the client's decision, and one whose
+/// turn is interrupted while it waits gets none: Codex's session reads that as an abort.
+#[tokio::test]
+async fn a_network_approval_follows_its_turn() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    let gate = script.gate_next_response();
+    script.push(final_message("answer", "done"));
+    let turn_id = server.turn_start(&mut connection, "go").await;
+    script.wait_for_calls(1).await;
+
+    let requests = product.server_requests();
+    let asked = {
+        let requests = requests.clone();
+        let turn_id = turn_id.clone();
+        tokio::spawn(async move {
+            requests
+                .request_network_approval(network_request(&turn_id))
+                .await
+        })
+    };
+    let request = connection.server_request().await;
+    assert_eq!(request["method"], "item/commandExecution/requestApproval");
+    assert_eq!(
+        request["params"]["networkApprovalContext"]["host"],
+        "example.com"
+    );
+    server
+        .answer(&connection, &request, json!({"decision": "accept"}))
+        .await;
+    assert_eq!(asked.await.unwrap(), Some(ReviewDecision::Approved));
+
+    let pending = {
+        let turn_id = turn_id.clone();
+        tokio::spawn(async move {
+            requests
+                .request_network_approval(network_request(&turn_id))
+                .await
+        })
+    };
+    connection.server_request().await;
+    let id = server
+        .request(
+            &mut connection,
+            "turn/interrupt",
+            serde_json::to_value(TurnInterruptParams::new(THREAD, turn_id)).unwrap(),
+        )
+        .await;
+    connection.response(id).await;
+    gate.notify_one();
+    connection.notification("turn/completed").await;
+    let decision = timeout(PATIENCE, pending)
+        .await
+        .expect("the interrupted turn settles the request")
+        .unwrap();
+    assert_eq!(decision, None);
+}
+
+/// A warning reaches the thread's connections after the turn events the listener received
+/// before it.
+#[tokio::test]
+async fn a_warning_follows_the_turn_events_before_it() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    script.push(final_message("answer", "done"));
+    server.turn_start(&mut connection, "go").await;
+    connection.notification("turn/completed").await;
+
+    product
+        .server_requests()
+        .send_warning("rule not saved".to_owned())
+        .await;
+    let warning = connection.notification("warning").await;
+    assert_eq!(warning["threadId"], THREAD);
+    assert_eq!(warning["message"], "rule not saved");
+}
+
+/// A warning shares the turn event stream: earlier events precede it and later events cannot
+/// overtake it, even when the listener has not consumed any of them yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_turn_completion_cannot_overtake_a_queued_warning() {
+    let server = Server::start();
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    let product = Arc::new(Product::default());
+    server
+        .load(&script, Some(Arc::clone(&product)), &connection)
+        .await;
+    let entered = Arc::new(Notify::new());
+    let (resume, receiver) = std::sync::mpsc::channel();
+    *product.listener_gate.lock().unwrap() = Some(ListenerGate {
+        entered: Arc::clone(&entered),
+        resume: receiver,
+    });
+    let gate = script.gate_next_response();
+    script.push(final_message("answer", "done"));
+    server.turn_start(&mut connection, "go").await;
+    timeout(PATIENCE, entered.notified()).await.unwrap();
+    product
+        .server_requests()
+        .send_warning("before completion".to_owned())
+        .await;
+    gate.notify_one();
+    let thread = product.thread.lock().unwrap().clone().unwrap();
+    timeout(PATIENCE, async {
+        while thread.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    resume.send(()).unwrap();
+
+    for expected in ["turn/started", "warning", "turn/completed"] {
+        let notification = connection
+            .until(|message| {
+                matches!(
+                    message["method"].as_str(),
+                    Some("turn/started" | "warning" | "turn/completed")
+                )
+            })
+            .await;
+        assert_eq!(notification["method"], expected, "{notification}");
+        if expected == "warning" {
+            assert_eq!(notification["params"]["message"], "before completion");
+        }
+    }
 }

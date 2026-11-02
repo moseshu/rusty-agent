@@ -59,7 +59,7 @@ use super::{
         OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
         now_unix_timestamp_ms,
     },
-    permission_requests::{request_network_approval, request_permissions},
+    permission_requests::{request_network_approval, request_permissions, send_warning},
     protocol::{
         AGENT_MESSAGE_DELTA_METHOD, AgentMessageDeltaNotification,
         COMMAND_EXECUTION_OUTPUT_DELTA_METHOD, CommandExecutionOutputDeltaNotification,
@@ -772,6 +772,9 @@ async fn apply_turn_event_handling(
     thread_state: &Mutex<ThreadState>,
 ) {
     match event {
+        ThreadEvent::Warning { message } => {
+            send_warning(outgoing, thread_id.as_str(), message).await;
+        }
         ThreadEvent::TurnStarted {
             turn_id,
             started_at,

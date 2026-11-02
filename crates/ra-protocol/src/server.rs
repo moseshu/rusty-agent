@@ -1023,7 +1023,11 @@ pub mod test_api {
             if let Some(adapter) = &loaded.adapter {
                 adapter.attach_server_requests(
                     &loaded.run_config(),
-                    super::ThreadServerRequests::new(outgoing, loaded.thread_id()),
+                    super::ThreadServerRequests::new(
+                        outgoing,
+                        loaded.thread_id(),
+                        loaded.thread.event_sender(),
+                    ),
                 );
             }
             if let Err(error) =
