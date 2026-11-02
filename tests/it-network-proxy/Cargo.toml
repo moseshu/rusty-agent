@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+# The integration tests use the product crate itself; the unit tests in `src/` run against a copy
+# of its sources that `build.rs` prepares.
+ra-network-proxy = { path = "../../crates/ra-network-proxy" }
 ra-config = { path = "../../crates/ra-config" }
 ra-paths = { path = "../../crates/ra-paths" }
 anyhow = "1"
