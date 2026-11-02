@@ -23,8 +23,11 @@
 
 use std::{fmt, sync::Arc};
 
-use ra_core::session::SessionId;
-use ra_runtime::thread::{AgentThreadBuilder, ThreadEvent};
+use ra_core::{item::Message, session::SessionId};
+use ra_runtime::{
+    runner::RunConfig,
+    thread::{AgentThreadBuilder, ThreadEvent, WeakAgentThread},
+};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::{
@@ -46,6 +49,7 @@ use super::{
 /// A loaded thread's way of asking its client: what Codex's session reaches its app server through.
 #[derive(Clone)]
 pub struct ThreadServerRequests {
+    thread: WeakAgentThread,
     events: mpsc::UnboundedSender<ThreadEvent>,
     outgoing: Arc<OutgoingMessageSender>,
     thread_id: SessionId,
@@ -65,8 +69,10 @@ impl ThreadServerRequests {
         outgoing: &Arc<OutgoingMessageSender>,
         thread_id: &SessionId,
         events: mpsc::UnboundedSender<ThreadEvent>,
+        thread: WeakAgentThread,
     ) -> Self {
         Self {
+            thread,
             events,
             outgoing: Arc::clone(outgoing),
             thread_id: thread_id.clone(),
@@ -77,6 +83,25 @@ impl ThreadServerRequests {
     #[must_use]
     pub fn thread_id(&self) -> &str {
         self.thread_id.as_str()
+    }
+
+    /// The running turn and the settings its next step runs with: what Codex's
+    /// `active_turn_context_and_strict_auto_review` reads, so a decision made while the turn runs
+    /// follows a mid-turn settings change. `None` while no turn runs.
+    #[must_use]
+    pub fn running_turn(&self) -> Option<(String, RunConfig)> {
+        let thread = self.thread.upgrade()?;
+        let turn_id = thread.active_turn_id()?;
+        let config = thread.turn_config(&turn_id)?;
+        Some((turn_id, config))
+    }
+
+    /// Adds `messages` to the running turn's context, or records them in the thread's history
+    /// without starting a turn: Codex's `inject_no_new_turn`.
+    pub async fn inject_context(&self, messages: Vec<Message>) {
+        if let Some(thread) = self.thread.upgrade() {
+            thread.inject_context(messages).await;
+        }
     }
 
     /// Asks the client for the permissions `params` request and waits for the grant: Codex's
@@ -274,7 +299,12 @@ pub(crate) fn attach_server_requests(
     if let Some(adapter) = adapter {
         adapter.attach_server_requests(
             builder.config(),
-            ThreadServerRequests::new(outgoing, builder.thread_id(), builder.event_sender()),
+            ThreadServerRequests::new(
+                outgoing,
+                builder.thread_id(),
+                builder.event_sender(),
+                builder.thread_handle(),
+            ),
         );
     }
 }

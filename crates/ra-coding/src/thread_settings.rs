@@ -192,10 +192,23 @@ impl CodingThreadSettings {
         context: &ToolContext<'_>,
         decision: &CommandDecision,
     ) -> Result<ExecCommandAttempt> {
-        if decision
+        // Codex's `sandbox_permissions_preserving_denied_reads`: an escalation cannot drop a
+        // sandbox that enforces denied reads, so the command still runs sandboxed, and under the
+        // managed proxy and its review like any other.
+        let preserves_sandbox = attempt
+            .environment()
+            .sandbox()
+            .is_some_and(sandbox_denies_reads);
+        let sandbox_permissions = if decision
             .sandbox_permissions
             .requires_escalated_permissions()
+            && preserves_sandbox
         {
+            SandboxPermissions::UseDefault
+        } else {
+            decision.sandbox_permissions
+        };
+        if sandbox_permissions.requires_escalated_permissions() {
             return Ok(attempt);
         }
         let arguments = context.arguments();
@@ -214,7 +227,7 @@ impl CodingThreadSettings {
                 tool_name: EXEC_COMMAND_TOOL.to_owned(),
                 command: vec![command.clone()],
                 cwd,
-                sandbox_permissions: decision.sandbox_permissions,
+                sandbox_permissions,
                 additional_permissions: decision.additional_permissions.clone(),
                 justification: arguments
                     .get("justification")
@@ -228,11 +241,7 @@ impl CodingThreadSettings {
             environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
             permission_profile: permission_profile.clone(),
         };
-        let Some(network) = self.network_proxy.begin_command(
-            permission_profile,
-            spec,
-            context.services().hook_context().cloned(),
-        ) else {
+        let Some(network) = self.network_proxy.begin_command(permission_profile, spec) else {
             return Ok(attempt);
         };
         let network = network.map_err(|error| Error::caller(error.to_string()))?;
@@ -919,29 +928,10 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
                         .settle(&RunId::new(turn_id), output.call_id());
                 }
             }
-            ThreadEvent::TurnStarted { turn_id, .. } => {
-                // Codex's network approval reviews under the active turn's settings.
-                if let Ok(cwd) = ra_paths::AbsolutePathBuf::from_absolute_path(&settings.cwd) {
-                    settings.network_proxy.set_active_turn(
-                        crate::network_approval::NetworkApprovalTurn {
-                            turn_id: turn_id.clone(),
-                            environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
-                            approval_policy: settings.approval_policy,
-                            permission_profile: settings
-                                .profile_permissions
-                                .permission_profile()
-                                .clone(),
-                            cwd: ra_paths::PathUri::from_abs_path(&cwd),
-                        },
-                        settings.approvals_reviewer == ApprovalsReviewer::AutoReview,
-                    );
-                }
-            }
             ThreadEvent::TurnComplete { turn_id, .. }
             | ThreadEvent::TurnAborted { turn_id, .. } => {
                 settings.command_decisions.finish_run(&RunId::new(turn_id));
                 settings.permissions.finish_turn(&RunId::new(turn_id));
-                settings.network_proxy.clear_active_turn(turn_id);
             }
             _ => {}
         }
@@ -1395,6 +1385,26 @@ fn sandboxed_environment(
         settings.cwd.clone(),
     );
     environment.with_sandbox(policy)
+}
+
+/// The running turn `turn_id` as a network review sees it under `settings`, the settings of its
+/// next step, and whether they name the automatic reviewer: Codex's
+/// `active_turn_context_and_strict_auto_review` for the thread's one environment.
+fn network_approval_turn(
+    turn_id: String,
+    settings: &CodingThreadSettings,
+) -> Option<(crate::network_approval::NetworkApprovalTurn, bool)> {
+    let cwd = ra_paths::AbsolutePathBuf::from_absolute_path(&settings.cwd).ok()?;
+    Some((
+        crate::network_approval::NetworkApprovalTurn {
+            turn_id,
+            environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
+            approval_policy: settings.approval_policy,
+            permission_profile: settings.profile_permissions.permission_profile().clone(),
+            cwd: ra_paths::PathUri::from_abs_path(&cwd),
+        },
+        settings.approvals_reviewer == ApprovalsReviewer::AutoReview,
+    ))
 }
 
 fn sandbox_denies_reads(policy: &ExecSandboxPolicy) -> bool {

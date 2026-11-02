@@ -875,38 +875,3 @@ command = """printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionRequ
         )
     );
 }
-
-#[tokio::test]
-async fn a_saved_network_rule_reaches_the_running_turn_as_a_developer_message() {
-    use ra_coding::thread_settings::network_proxy_test_api::ThreadNetworkProxyProbe;
-    use ra_protocol::server::protocol::{NetworkPolicyAmendment, NetworkPolicyRuleAction};
-
-    let home = TempDir::new().unwrap();
-    let config = hooks_config(home.path(), "").await;
-    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
-    let queue = ra_core::hook::HookContextQueue::default();
-    let _bound = bound_with_queue(&runtime, &queue);
-    let proxy = ThreadNetworkProxyProbe::default();
-    proxy.attach_hooks(Arc::clone(&runtime));
-
-    proxy
-        .record_network_policy_amendment_message(
-            "turn-1",
-            &NetworkPolicyAmendment::new("example.com".to_owned(), NetworkPolicyRuleAction::Allow),
-        )
-        .await;
-    proxy
-        .record_network_policy_amendment_message(
-            "turn-1",
-            &NetworkPolicyAmendment::new("evil.test".to_owned(), NetworkPolicyRuleAction::Deny),
-        )
-        .await;
-
-    assert_eq!(
-        queue.take(),
-        vec![
-            Message::developer("Allowed network rule saved in execpolicy (allowlist): example.com"),
-            Message::developer("Denied network rule saved in execpolicy (denylist): evil.test"),
-        ]
-    );
-}

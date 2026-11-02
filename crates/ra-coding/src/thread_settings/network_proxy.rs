@@ -4,9 +4,12 @@
 //!
 //! # Differences from Codex
 //!
-//! - The thread's proxy is also Codex's network approval session: it keeps the active turn, the
-//!   way to ask the client and the exec policy amendments are saved to, and builds the policy
-//!   decider and blocked-request observer the proxy starts with.
+//! - The thread's proxy is also Codex's network approval session: it reads the running turn and
+//!   the settings of its next step through the way to ask the client, keeps the exec policy
+//!   amendments are saved to, and builds the policy decider and blocked-request observer the
+//!   proxy starts with.
+//! - A thread without a rules home still applies an approved rule to the running proxy and
+//!   reports only its saving as failed; Codex's session always has a home to save to.
 //! - An automatic reviewer is refused rather than routed, as for command approvals: Codex's
 //!   reviewer, Guardian, is not ported.
 //! - Routing and local binding are always `SharedIngress` and `DefaultFalse`: Codex only changes
@@ -23,7 +26,6 @@ use crate::network_approval::{
     begin_network_approval, build_blocked_request_observer, build_network_policy_decider,
 };
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
-use ra_core::hook::HookContextQueue;
 use ra_core::item::Message;
 use ra_execpolicy::Policy;
 use ra_filesystem::models::PermissionProfile;
@@ -52,16 +54,10 @@ pub(crate) struct ThreadNetworkProxy {
     approval: Arc<NetworkApprovalService>,
     /// How the thread asks its client, once the app server has handed it over.
     requests: OnceLock<ThreadServerRequests>,
-    /// The turn running now, and whether it names the automatic reviewer.
-    active_turn: Mutex<Option<(NetworkApprovalTurn, bool)>>,
     /// The exec policy and rules home amendments are saved to.
     policy: Mutex<Option<(Arc<ExecPolicyManager>, Option<PathBuf>)>>,
-    /// The thread's product hooks, which decide a network access before its client is asked and
-    /// carry the notice that a rule was saved to the model.
+    /// The thread's product hooks, which decide a network access before its client is asked.
     hooks: OnceLock<Arc<ProductHookRuntime>>,
-    /// The context queue of each turn that ran a routed command, by turn id: where a notice for
-    /// the turn goes without starting one, as Codex's `inject_no_new_turn` adds to a running turn.
-    turn_context: Mutex<std::collections::HashMap<String, HookContextQueue>>,
 }
 
 /// What a command's attempt runs under when the thread's managed proxy routes it: the
@@ -210,8 +206,6 @@ impl ThreadNetworkProxy {
     ) -> anyhow::Result<()> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let host = validated_network_policy_amendment_host(amendment, network_approval_context)?;
-        let codex_home = rules_home
-            .ok_or_else(|| anyhow::anyhow!("no rules home is configured for this thread"))?;
         let execpolicy_amendment =
             execpolicy_network_rule_amendment(amendment, network_approval_context, &host);
         let mut on_policy_applied = Some(on_policy_applied);
@@ -236,6 +230,10 @@ impl ThreadNetworkProxy {
             }
         }
 
+        // Codex's session always has a home to save to. Without one, the rule above still applies
+        // to the running proxy and only saving it fails.
+        let codex_home = rules_home
+            .ok_or_else(|| anyhow::anyhow!("no rules home is configured for this thread"))?;
         exec_policy
             .append_network_rule_and_update(
                 codex_home,
@@ -277,30 +275,15 @@ impl ThreadNetworkProxy {
             Some((exec_policy, rules_home));
     }
 
-    /// Records the turn that started, and whether its settings name the automatic reviewer.
-    pub(crate) fn set_active_turn(&self, turn: NetworkApprovalTurn, auto_review: bool) {
-        *self
-            .active_turn
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((turn, auto_review));
-    }
-
-    /// Forgets the turn `turn_id` once it ended.
-    pub(crate) fn clear_active_turn(&self, turn_id: &str) {
-        self.turn_context
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(turn_id);
-        let mut active = self
-            .active_turn
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if active
-            .as_ref()
-            .is_some_and(|(turn, _)| turn.turn_id == turn_id)
-        {
-            *active = None;
-        }
+    /// The running turn as a network review sees it, and whether its next step names the
+    /// automatic reviewer: Codex's `active_turn_context_and_strict_auto_review`, read when the
+    /// review happens so a mid-turn settings change applies.
+    fn running_turn(&self) -> Option<(NetworkApprovalTurn, bool)> {
+        let (turn_id, config) = self.requests.get()?.running_turn()?;
+        let settings = config
+            .app_context()?
+            .downcast_ref::<super::CodingThreadSettings>()?;
+        super::network_approval_turn(turn_id, settings)
     }
 
     /// Codex's `begin_network_approval` for one command under `permission_profile`: `None` when
@@ -309,15 +292,8 @@ impl ThreadNetworkProxy {
         &self,
         permission_profile: &PermissionProfile,
         spec: NetworkApprovalCallSpec,
-        turn_context: Option<HookContextQueue>,
     ) -> Option<anyhow::Result<CommandNetwork>> {
         let network = self.for_permission_profile(permission_profile)?;
-        if let Some(queue) = turn_context {
-            self.turn_context
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(spec.turn_id.clone(), queue);
-        }
         Some(
             begin_network_approval(&self.approval, &network, spec).and_then(
                 |active: ActiveNetworkApproval| {
@@ -353,11 +329,7 @@ impl ThreadNetworkProxy {
 #[async_trait::async_trait]
 impl NetworkApprovalSession for ThreadNetworkProxy {
     fn active_turn(&self) -> Option<NetworkApprovalTurn> {
-        self.active_turn
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|(turn, _)| turn.clone())
+        self.running_turn().map(|(turn, _)| turn)
     }
 
     /// Codex's `request_approval` for a network access, routed to the client as its
@@ -386,11 +358,8 @@ impl NetworkApprovalSession for ThreadNetworkProxy {
             }
         }
         let auto_review = self
-            .active_turn
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|(_, auto_review)| *auto_review);
+            .running_turn()
+            .is_some_and(|(_, auto_review)| auto_review);
         if auto_review {
             return Err(NetworkApprovalError::Rejected(
                 "automatic approval review is not available".to_string(),
@@ -478,26 +447,17 @@ impl NetworkApprovalSession for ThreadNetworkProxy {
         .await
     }
 
+    /// Codex's `record_network_policy_amendment_message`: the notice goes to the running turn,
+    /// or into the thread's history when none can take it, as `inject_no_new_turn` does.
     async fn record_network_policy_amendment_message(
         &self,
-        turn_id: &str,
+        _turn_id: &str,
         amendment: &NetworkPolicyAmendment,
     ) {
-        let message = network_rule_saved_message(amendment);
-        let queue = self
-            .turn_context
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(turn_id)
-            .cloned();
-        // The turn's own queue first; a turn that has closed it, or never ran a routed command,
-        // falls back to the hooks' delivery when the host attached them.
-        let undelivered = match queue {
-            Some(queue) => queue.push(vec![message]).err(),
-            None => Some(vec![message]),
-        };
-        if let (Some(messages), Some(hooks)) = (undelivered, self.hooks.get()) {
-            hooks.inject_without_turn(turn_id, messages);
+        if let Some(requests) = self.requests.get() {
+            requests
+                .inject_context(vec![network_rule_saved_message(amendment)])
+                .await;
         }
     }
 

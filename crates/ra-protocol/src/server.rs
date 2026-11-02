@@ -1027,6 +1027,7 @@ pub mod test_api {
                         outgoing,
                         loaded.thread_id(),
                         loaded.thread.event_sender(),
+                        loaded.thread.downgrade(),
                     ),
                 );
             }

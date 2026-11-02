@@ -2270,3 +2270,268 @@ async fn host_event_senders_follow_the_thread_lifetime() {
             .is_err()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Context injected without a turn
+// ---------------------------------------------------------------------------------------------
+
+/// Codex's `inject_no_new_turn` into running work: the run reads the context at its next model
+/// call.
+#[tokio::test]
+async fn context_injected_into_a_running_turn_is_read_at_its_next_model_call() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let (release, wait) = gate();
+    script.push(Step::After(wait, tool_call("m-1", "c-1", "quick_look")));
+    script.push(Step::Respond(final_message("m-2", "done")));
+
+    let turn_id = started(&thread, text("work")).await;
+    script.wait_for_calls(1).await;
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    release.notify_one();
+    completes(&thread, &turn_id).await;
+
+    let calls = script.calls();
+    assert!(!texts(&calls[0].input).contains(&"rule saved".to_owned()));
+    assert!(
+        texts(&calls[1].input).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&calls[1].input)
+    );
+}
+
+/// With no running work, Codex records the context without starting a turn: the next turn
+/// starts with it.
+#[tokio::test]
+async fn context_injected_while_idle_starts_the_next_turn() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    script.push(Step::Respond(final_message("m-1", "done")));
+
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    assert!(!thread.is_running(), "injecting starts no turn");
+    let turn_id = started(&thread, text("work")).await;
+    completes(&thread, &turn_id).await;
+
+    let calls = script.calls();
+    assert!(
+        texts(&calls[0].input).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&calls[0].input)
+    );
+    assert!(texts(&thread.history()).contains(&"rule saved".to_owned()));
+}
+
+/// Context injected after the run's last model call is kept with the turn, so the next turn
+/// still sees it.
+#[tokio::test]
+async fn context_injected_after_the_last_model_call_stays_in_the_history() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let (release, wait) = gate();
+    script.push(Step::After(wait, final_message("m-1", "done")));
+    script.push(Step::Respond(final_message("m-2", "again")));
+
+    let first = started(&thread, text("work")).await;
+    script.wait_for_calls(1).await;
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    release.notify_one();
+    completes(&thread, &first).await;
+    assert!(
+        texts(&thread.history()).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&thread.history())
+    );
+
+    let second = started(&thread, text("more")).await;
+    completes(&thread, &second).await;
+    let calls = script.calls();
+    assert_eq!(calls.len(), 2, "the context asks for no follow-up call");
+    assert!(texts(&calls[1].input).contains(&"rule saved".to_owned()));
+}
+
+/// Context injected once the run has concluded, while its turn is still ending, is kept with the
+/// turn rather than left in a queue nobody reads.
+#[tokio::test]
+async fn context_injected_while_a_turn_ends_is_kept() {
+    let script = Arc::new(Script::default());
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let config = RunConfig::new().with_lifecycle_hook(Arc::new(HoldAtEnd {
+        reached: Arc::clone(&reached),
+        release: Arc::clone(&release),
+    }));
+    let thread = thread_with(&script, config);
+    script.push(Step::Respond(final_message("m-1", "done")));
+    script.push(Step::Respond(final_message("m-2", "again")));
+
+    let first = started(&thread, text("work")).await;
+    timeout(PATIENCE, reached.notified()).await.unwrap();
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    release.notify_one();
+    completes(&thread, &first).await;
+
+    let second = started(&thread, text("more")).await;
+    timeout(PATIENCE, reached.notified()).await.unwrap();
+    release.notify_one();
+    completes(&thread, &second).await;
+    let calls = script.calls();
+    assert!(
+        texts(&calls[1].input).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&calls[1].input)
+    );
+}
+
+/// Waits for the turn to pause on approval and approves every call it waits on.
+async fn approve_paused(thread: &AgentThread, turn_id: &str) -> RunState {
+    awaits_approval(thread, turn_id).await;
+    let mut state = timeout(PATIENCE, async {
+        loop {
+            if let Some(state) = thread.paused_run() {
+                return state;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the run pauses for approval");
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    for item in &pending {
+        state.approve(item, false).unwrap();
+    }
+    state
+}
+
+/// Context injected while the turn waits for approval reaches the run once it continues.
+#[tokio::test]
+async fn context_injected_while_awaiting_approval_reaches_the_continued_run() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    script.push(Step::Respond(tool_call("m-1", "c-1", "guarded_look")));
+    script.push(Step::Respond(final_message("m-2", "looked")));
+
+    let turn_id = started(&thread, text("look")).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnStarted { .. } => {}
+        other => panic!("expected the turn to start, got {other:?}"),
+    }
+    let state = approve_paused(&thread, &turn_id).await;
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    thread.resume_turn(state).unwrap();
+    match next_event(&thread).await {
+        ThreadEvent::TurnComplete { .. } => {}
+        other => panic!("expected the turn to complete, got {other:?}"),
+    }
+
+    let calls = script.calls();
+    assert!(
+        texts(&calls[1].input).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&calls[1].input)
+    );
+}
+
+/// Context injected during a model call of the continued run reaches its next model call.
+#[tokio::test]
+async fn context_injected_after_an_approval_reaches_the_next_model_call() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    let (release, wait) = gate();
+    script.push(Step::Respond(tool_call("m-1", "c-1", "guarded_look")));
+    script.push(Step::After(wait, tool_call("m-2", "c-2", "quick_look")));
+    script.push(Step::Respond(final_message("m-3", "done")));
+
+    let turn_id = started(&thread, text("look")).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnStarted { .. } => {}
+        other => panic!("expected the turn to start, got {other:?}"),
+    }
+    let state = approve_paused(&thread, &turn_id).await;
+    thread.resume_turn(state).unwrap();
+    script.wait_for_calls(2).await;
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    release.notify_one();
+    match next_event(&thread).await {
+        ThreadEvent::TurnComplete { .. } => {}
+        other => panic!("expected the turn to complete, got {other:?}"),
+    }
+
+    let calls = script.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(
+        texts(&calls[2].input).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&calls[2].input)
+    );
+}
+
+/// Codex's `inject_no_new_turn` with no running work records the context at once: it is in the
+/// history and the rollout before any turn starts, so a thread reloaded from its rollout keeps it.
+#[tokio::test]
+async fn context_injected_while_idle_is_recorded_at_once() {
+    use ra_core::session::rollout::RolloutItem;
+    let script = Arc::new(Script::default());
+    let recorder = Arc::new(PendingRecorder::default());
+    let thread = AgentThread::builder(
+        SessionId::new("thread-1"),
+        AgentBinding::direct(agent()),
+        Arc::new(Resolver(Arc::clone(&script))),
+    )
+    .with_rollout_recorder(recorder.clone())
+    .build();
+
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+
+    assert!(!thread.is_running(), "injecting starts no turn");
+    assert_eq!(texts(&thread.history()), vec!["rule saved"]);
+    assert!(recorder.0.lock().unwrap().iter().any(|item| matches!(
+        item,
+        RolloutItem::Item(item) if matches!(item.kind(),
+            RunItemKind::Message(message) if message.text_content() == "rule saved")
+    )));
+}
+
+/// Context injected while the turn waits for approval stays in the history when the turn is
+/// interrupted instead of continued.
+#[tokio::test]
+async fn context_injected_while_awaiting_approval_survives_an_interrupt() {
+    let script = Arc::new(Script::default());
+    let thread = thread(&script);
+    script.push(Step::Respond(tool_call("m-1", "c-1", "guarded_look")));
+
+    let turn_id = started(&thread, text("look")).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnStarted { .. } => {}
+        other => panic!("expected the turn to start, got {other:?}"),
+    }
+    approve_paused(&thread, &turn_id).await;
+    thread
+        .inject_context(vec![Message::developer("rule saved")])
+        .await;
+    assert!(thread.interrupt());
+    match next_event(&thread).await {
+        ThreadEvent::TurnAborted { .. } => {}
+        other => panic!("expected the turn to abort, got {other:?}"),
+    }
+
+    assert!(
+        texts(&thread.history()).contains(&"rule saved".to_owned()),
+        "{:?}",
+        texts(&thread.history())
+    );
+}

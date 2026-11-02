@@ -962,9 +962,51 @@ async fn network_access_review(
     decision: Value,
     expect_warning: bool,
 ) -> (Value, String, Option<Value>) {
+    let (params, output, warning) = network_review(NetworkReview {
+        decision: Some(decision),
+        expect_warning,
+        ..NetworkReview::default()
+    })
+    .await;
+    (params.expect("the client is asked"), output, warning)
+}
+
+/// How [`network_review`] runs the probe.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct NetworkReview {
+    /// Top-level configuration added to the thread's.
+    root_config: &'static str,
+    /// Requirements added to the managed network's.
+    requirements: &'static str,
+    /// The command asks to run escalated, and its approval is accepted.
+    escalated: bool,
+    /// The turn is moved to the user reviewer after it starts and before its command runs.
+    switch_reviewer_to_user: bool,
+    /// The answer to the network request, which must come when given and must not otherwise.
+    decision: Option<Value>,
+    /// A `warning` notification follows the answer.
+    expect_warning: bool,
+}
+
+/// The network review of [`network_access_review`], run as `review` says.
+#[cfg(target_os = "macos")]
+async fn network_review(review: NetworkReview) -> (Option<Value>, String, Option<Value>) {
+    let NetworkReview {
+        root_config,
+        requirements,
+        escalated,
+        switch_reviewer_to_user,
+        decision,
+        expect_warning,
+    } = review;
     let home = ProductHome::new();
-    home.write_mock_config("on-request", "", "[features]\nnetwork_proxy = true\n");
-    home.write_requirements(
+    home.write_mock_config(
+        "on-request",
+        root_config,
+        "[features]\nnetwork_proxy = true\n",
+    );
+    home.write_requirements(&format!(
         r#"
 [experimental_network]
 enabled = true
@@ -972,8 +1014,10 @@ allow_local_binding = true
 
 [experimental_network.domains]
 "example.org" = "allow"
-"#,
-    );
+
+{requirements}
+"#
+    ));
     let server = home.server();
     let mut connection = server.connect(1).await;
     let started = server
@@ -989,20 +1033,27 @@ allow_local_binding = true
          {test_module}::managed_network_approval_probe --ignored --nocapture --test-threads=1"
     );
     let call_id = "managed-network-approval-probe";
-    home.script
-        .push(Step::Respond(ModelResponse::new(vec![RunItem::new(
-            ItemId::new(call_id),
-            RunItemKind::ToolCall(ToolCall::new(
-                CallId::new(call_id),
-                "exec_command",
-                json!({"cmd": command, "justification": null, "prefix_rule": null,
-                       "sandbox_permissions": null, "workdir": null, "shell": "/bin/sh",
-                       "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
-            )),
-        )])));
+    let probe = ModelResponse::new(vec![RunItem::new(
+        ItemId::new(call_id),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new(call_id),
+            "exec_command",
+            json!({"cmd": command, "justification": escalated.then_some("reach the host"),
+                   "prefix_rule": null,
+                   "sandbox_permissions": escalated.then_some("require_escalated"),
+                   "workdir": null, "shell": "/bin/sh",
+                   "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+        )),
+    )]);
+    let gate = Arc::new(Notify::new());
+    home.script.push(if switch_reviewer_to_user {
+        Step::After(Arc::clone(&gate), probe)
+    } else {
+        Step::Respond(probe)
+    });
     home.script.answer("Network probe complete");
 
-    server
+    let started = server
         .call(
             &mut connection,
             "turn/start",
@@ -1010,27 +1061,113 @@ allow_local_binding = true
                    "input": [{"type": "text", "text": "Reach a host outside the allowlist"}]}),
         )
         .await;
-    let request = connection
-        .until(|message| message["method"] == "item/commandExecution/requestApproval")
-        .await;
-    server
-        .send(
-            &connection,
-            ra_protocol::frame::JsonRpcResponse::new(
-                serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
-                    .unwrap(),
-                json!({"decision": decision}),
-            ),
-        )
-        .await;
+    if switch_reviewer_to_user {
+        server
+            .call(
+                &mut connection,
+                "turn/settings/update",
+                json!({"threadId": thread_id, "turnId": started["turn"]["id"],
+                       "approvalsReviewer": "user"}),
+            )
+            .await;
+        gate.notify_one();
+    }
+    if escalated {
+        let request = connection
+            .until(|message| {
+                message["method"] == "item/commandExecution/requestApproval"
+                    && message["params"].get("networkApprovalContext").is_none()
+            })
+            .await;
+        server
+            .send(
+                &connection,
+                ra_protocol::frame::JsonRpcResponse::new(
+                    serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
+                        .unwrap(),
+                    json!({"decision": "accept"}),
+                ),
+            )
+            .await;
+    }
+    let request = if let Some(decision) = decision {
+        let request = connection
+            .until(|message| {
+                message["method"] == "item/commandExecution/requestApproval"
+                    && message["params"].get("networkApprovalContext").is_some()
+            })
+            .await;
+        server
+            .send(
+                &connection,
+                ra_protocol::frame::JsonRpcResponse::new(
+                    serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
+                        .unwrap(),
+                    json!({"decision": decision}),
+                ),
+            )
+            .await;
+        Some(request["params"].clone())
+    } else {
+        None
+    };
     let warning = if expect_warning {
         Some(connection.notification("warning").await)
     } else {
         None
     };
     connection.notification("turn/completed").await;
+    assert!(
+        request.is_some()
+            || !connection.passed.iter().any(|message| {
+                message["method"] == "item/commandExecution/requestApproval"
+                    && message["params"].get("networkApprovalContext").is_some()
+            }),
+        "the client is not asked"
+    );
     let output = serde_json::to_string(home.script.last_request().input()).unwrap();
-    (request["params"].clone(), output, warning)
+    (request, output, warning)
+}
+
+/// Codex routes a network review under an automatic reviewer to Guardian, which is not ported:
+/// the access is refused without asking the client.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_automatic_reviewer_refuses_network_access() {
+    let (_, output, _) = network_review(NetworkReview {
+        root_config: "approvals_reviewer = \"auto_review\"",
+        ..NetworkReview::default()
+    })
+    .await;
+
+    assert!(
+        output.contains("automatic approval review is not available"),
+        "unexpected tool output: {output}"
+    );
+    assert!(!output.contains("proxied status 200"), "{output}");
+}
+
+/// Codex reviews a network access under the settings the running turn's next step has, so a
+/// mid-turn switch to the user reviewer asks the client.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_mid_turn_reviewer_switch_applies_to_network_review() {
+    let (params, output, _) = network_review(NetworkReview {
+        root_config: "approvals_reviewer = \"auto_review\"",
+        switch_reviewer_to_user: true,
+        decision: Some(json!("accept")),
+        ..NetworkReview::default()
+    })
+    .await;
+
+    assert_eq!(
+        params.unwrap()["networkApprovalContext"]["host"],
+        "127.0.0.1"
+    );
+    assert!(
+        output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1142,4 +1279,27 @@ fn managed_network_approval_probe() {
     let _ = connection.take(4096).read_to_string(&mut response);
     let status = response.split_whitespace().nth(1).unwrap_or("none");
     println!("proxied status {status}");
+}
+
+/// Codex's `sandbox_permissions_preserving_denied_reads`: an escalated command cannot drop the
+/// sandbox that enforces denied reads, so it still runs under the managed proxy and its review.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_escalation_kept_sandboxed_by_denied_reads_stays_under_network_review() {
+    let (params, output, _) = network_review(NetworkReview {
+        requirements: "[permissions.filesystem]\ndeny_read = ['/rusty-agent-denied-read-probe']",
+        escalated: true,
+        decision: Some(json!("accept")),
+        ..NetworkReview::default()
+    })
+    .await;
+
+    assert_eq!(
+        params.unwrap()["networkApprovalContext"]["host"],
+        "127.0.0.1"
+    );
+    assert!(
+        output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
 }

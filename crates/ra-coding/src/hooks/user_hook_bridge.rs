@@ -239,16 +239,6 @@ impl ProductHookRuntime {
         outcome.decision
     }
 
-    /// Adds `messages` to the run `turn_id` without starting a turn, as Codex's
-    /// `inject_no_new_turn` does: the run reads them at its next model call, and a thread with no
-    /// run yet reads them with the next one.
-    pub fn inject_without_turn(&self, turn_id: &str, messages: Vec<Message>) {
-        self.context_delivery
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .deliver_to(Some(turn_id), messages, false);
-    }
-
     fn publish(&self, events: Vec<HookCompletedEvent>) {
         for event in events {
             let _ = self.completed.send(event);

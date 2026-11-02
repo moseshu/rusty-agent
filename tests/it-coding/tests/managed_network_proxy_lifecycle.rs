@@ -350,3 +350,54 @@ async fn persisted_network_policy_amendment_updates_proxy_and_rules() -> anyhow:
     );
     Ok(())
 }
+
+/// Not a Codex case: Codex's session always has a home to save to. A thread without one still
+/// applies an approved rule to the running proxy, and only saving it fails.
+#[tokio::test]
+async fn a_rule_without_a_rules_home_still_reaches_the_running_proxy() -> anyhow::Result<()> {
+    let permission_profile = PermissionProfile::workspace_write();
+    let spec = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            enabled: true,
+            ..NetworkProxyConfig::default()
+        },
+        /*requirements*/ None,
+        &permission_profile,
+    )?;
+    let proxy = ThreadNetworkProxyProbe::default();
+    proxy
+        .start(Some(&spec), &Policy::empty(), &permission_profile, false)
+        .await?;
+    let exec_policy = ExecPolicyManager::default();
+    let applied = std::sync::atomic::AtomicUsize::new(0);
+
+    let error = proxy
+        .persist_network_policy_amendment(
+            &NetworkPolicyAmendment::new("example.com", NetworkPolicyRuleAction::Allow),
+            &NetworkApprovalContext::new("example.com", NetworkApprovalProtocol::Https),
+            &exec_policy,
+            /*rules_home*/ None,
+            || {
+                applied.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("there is nowhere to save the rule");
+
+    assert!(error.to_string().contains("no rules home"), "{error}");
+    assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        proxy
+            .started_proxy()
+            .unwrap()
+            .current_cfg()
+            .await?
+            .allowed_domains(),
+        Some(vec!["example.com".to_string()])
+    );
+    assert_eq!(
+        exec_policy.current().compiled_network_domains(),
+        (Vec::new(), Vec::new())
+    );
+    Ok(())
+}

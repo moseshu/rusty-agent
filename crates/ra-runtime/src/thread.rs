@@ -509,6 +509,8 @@ impl TurnInputRequest {
 /// Builds an [`AgentThread`].
 #[must_use]
 pub struct AgentThreadBuilder {
+    /// Where the built thread is found by the handles given out before it exists.
+    handle: Arc<std::sync::OnceLock<std::sync::Weak<ThreadInner>>>,
     events: mpsc::UnboundedSender<ThreadEvent>,
     receiver: mpsc::UnboundedReceiver<ThreadEvent>,
     step_model_switching: bool,
@@ -529,6 +531,13 @@ impl AgentThreadBuilder {
     #[must_use]
     pub fn event_sender(&self) -> mpsc::UnboundedSender<ThreadEvent> {
         self.events.clone()
+    }
+
+    /// A handle to the thread this builder will build, which reaches it once it is built and does
+    /// not keep it alive: for a host to hand state the thread will own before building it.
+    #[must_use]
+    pub fn thread_handle(&self) -> WeakAgentThread {
+        WeakAgentThread(Arc::clone(&self.handle))
     }
 
     /// Opts into Codex's experimental step-model-switching capability, disabled by default.
@@ -641,7 +650,8 @@ impl AgentThreadBuilder {
             .clone()
             .with_session_id(self.thread_id.clone());
         let config = self.config.with_user_hooks(hooks);
-        AgentThread {
+        let handle = self.handle;
+        let thread = AgentThread {
             inner: Arc::new(ThreadInner {
                 step_model_switching: self.step_model_switching,
                 thread_id: self.thread_id,
@@ -657,12 +667,34 @@ impl AgentThreadBuilder {
                     shut_down: false,
                     pending_session_start: Some(self.session_start_source),
                     session_ended: false,
+                    pending_context: Vec::new(),
                 }),
                 turn_ended: Notify::new(),
                 events: self.events,
                 receiver: tokio::sync::Mutex::new(self.receiver),
             }),
-        }
+        };
+        let _ = handle.set(Arc::downgrade(&thread.inner));
+        thread
+    }
+}
+
+/// A handle to an [`AgentThread`] that does not keep it alive: for state the thread owns that
+/// needs to reach back to it.
+#[derive(Clone)]
+pub struct WeakAgentThread(Arc<std::sync::OnceLock<std::sync::Weak<ThreadInner>>>);
+
+impl WeakAgentThread {
+    /// The thread, once it has been built and while it is still alive.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<AgentThread> {
+        self.0.get()?.upgrade().map(|inner| AgentThread { inner })
+    }
+}
+
+impl std::fmt::Debug for WeakAgentThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakAgentThread").finish_non_exhaustive()
     }
 }
 
@@ -706,12 +738,16 @@ struct ThreadState {
     shut_down: bool,
     pending_session_start: Option<ra_core::hook::SessionStartSource>,
     session_ended: bool,
+    /// Context injected while the running turn ends, which joins the history once it has ended.
+    pending_context: Vec<Message>,
 }
 
 /// The running turn: Codex's `ActiveTurn`.
 struct ActiveTurn {
     turn_id: String,
     pending: PendingInput,
+    /// Where context injected into the running turn goes: its run reads it at the next model call.
+    context: ra_core::hook::HookContextQueue,
     settings: LiveRunSettings,
     cancel: CancelScope,
     /// The schema the turn's final answer is constrained to, which input steering it must match.
@@ -750,6 +786,7 @@ impl AgentThread {
     ) -> AgentThreadBuilder {
         let (events, receiver) = mpsc::unbounded_channel();
         AgentThreadBuilder {
+            handle: Arc::default(),
             events,
             receiver,
             step_model_switching: false,
@@ -785,6 +822,38 @@ impl AgentThread {
             .active_turn
             .as_ref()
             .map(|turn| turn.turn_id.clone())
+    }
+
+    /// Adds `messages` to the running turn's context, which its run reads at its next model call,
+    /// or records them in the thread's history without starting a turn: Codex's
+    /// `inject_no_new_turn`. Messages that arrive while the running turn ends join the history
+    /// once it has ended, as Codex waits for a finishing turn before it records them.
+    pub async fn inject_context(&self, messages: Vec<Message>) {
+        if messages.is_empty() {
+            return;
+        }
+        let messages = {
+            let mut state = self.inner.lock();
+            if let Some(turn) = &state.active_turn {
+                if let Err(unread) = turn.context.push(messages) {
+                    state.pending_context.extend(unread);
+                }
+                return;
+            }
+            state
+                .history
+                .extend(messages.iter().cloned().map(ModelInputItem::Message));
+            messages
+        };
+        record_injected_context(&self.inner, messages).await;
+    }
+
+    /// A handle to this thread that does not keep it alive.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakAgentThread {
+        WeakAgentThread(Arc::new(std::sync::OnceLock::from(Arc::downgrade(
+            &self.inner,
+        ))))
     }
 
     /// The settings the next turn starts with.
@@ -1287,6 +1356,7 @@ impl AgentThread {
         let turn_id = uuid::Uuid::now_v7().to_string();
         let cancel = CancelScope::root().child(ScopeKind::Run);
         let pending = PendingInput::new();
+        let context = ra_core::hook::HookContextQueue::default();
         let settings = LiveRunSettings::new(state.config.clone());
         let final_output_json_schema = request.start.final_output_json_schema.clone();
         let output_schema = final_output_json_schema.clone().map(|schema| {
@@ -1295,6 +1365,7 @@ impl AgentThread {
         state.active_turn = Some(ActiveTurn {
             turn_id: turn_id.clone(),
             pending: pending.clone(),
+            context: context.clone(),
             settings: settings.clone(),
             cancel: cancel.clone(),
             final_output_json_schema,
@@ -1324,6 +1395,7 @@ impl AgentThread {
             config: state.config.clone(),
             output_schema,
             pending,
+            context,
             settings,
             cancel,
         };
@@ -1355,6 +1427,8 @@ struct StartedTurn {
     /// The turn's output schema, which every segment of its run is given.
     output_schema: Option<OutputSchema>,
     pending: PendingInput,
+    /// The turn's context queue, holding what was injected before it started.
+    context: ra_core::hook::HookContextQueue,
     settings: LiveRunSettings,
     cancel: CancelScope,
 }
@@ -1499,6 +1573,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         config,
         output_schema,
         pending,
+        context,
         settings,
         cancel,
     } = turn;
@@ -1511,8 +1586,10 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         store: inner.rollout.clone(),
         ending: Mutex::new(None),
     });
-    let (run_input, stopped, hook_context) =
-        prepare_host_input(&inner, &recorder, &config, &cancel, run_input, submitted).await;
+    let (run_input, stopped, hook_context) = prepare_host_input(
+        &inner, &recorder, &config, &cancel, context, run_input, submitted,
+    )
+    .await;
     let (end, history) = if stopped {
         recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
             RunId::new(&turn_id),
@@ -1593,39 +1670,68 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     recorder.finish().await;
     let completed_at = unix_seconds();
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let mut state = inner.lock();
-    state.history = history;
-    state.active_turn = None;
-    if interrupted {
-        inner.emit(ThreadEvent::TurnAborted {
-            turn_id,
-            reason: TurnAbortReason::Interrupted,
-            completed_at,
-            duration_ms,
-        });
-    } else {
-        let last_agent_message = match end {
-            TurnEnd::Completed(message) => message,
-            TurnEnd::Failed(message) => {
-                inner.emit(ThreadEvent::Error {
-                    turn_id: turn_id.clone(),
-                    message,
-                });
-                None
-            }
-            // Cancelled from outside the thread: it ends as a turn that stopped, not one the host
-            // asked to abort.
-            TurnEnd::Cancelled => None,
-        };
-        inner.emit(ThreadEvent::TurnComplete {
-            turn_id,
-            last_agent_message,
-            completed_at,
-            duration_ms,
-        });
-    }
-    drop(state);
+    let ended_context = {
+        let mut state = inner.lock();
+        state.history = history;
+        // Context injected while the turn ended joins the history now that it has; it is recorded
+        // below, outside the lock.
+        let ended_context = std::mem::take(&mut state.pending_context);
+        state
+            .history
+            .extend(ended_context.iter().cloned().map(ModelInputItem::Message));
+        state.active_turn = None;
+        if interrupted {
+            inner.emit(ThreadEvent::TurnAborted {
+                turn_id,
+                reason: TurnAbortReason::Interrupted,
+                completed_at,
+                duration_ms,
+            });
+        } else {
+            let last_agent_message = match end {
+                TurnEnd::Completed(message) => message,
+                TurnEnd::Failed(message) => {
+                    inner.emit(ThreadEvent::Error {
+                        turn_id: turn_id.clone(),
+                        message,
+                    });
+                    None
+                }
+                // Cancelled from outside the thread: it ends as a turn that stopped, not one the host
+                // asked to abort.
+                TurnEnd::Cancelled => None,
+            };
+            inner.emit(ThreadEvent::TurnComplete {
+                turn_id,
+                last_agent_message,
+                completed_at,
+                duration_ms,
+            });
+        }
+        ended_context
+    };
+    record_injected_context(&inner, ended_context).await;
     inner.turn_ended.notify_waiters();
+}
+
+/// Records context injected outside a turn in the thread's rollout and persists it: Codex's
+/// `record_conversation_items` for `inject_no_new_turn` with no running work.
+async fn record_injected_context(inner: &ThreadInner, messages: Vec<Message>) {
+    let Some(rollout) = &inner.rollout else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    for message in messages {
+        rollout.record(RolloutItem::Item(RunItem::new(
+            ItemId::new(uuid::Uuid::now_v7().to_string()),
+            RunItemKind::Message(message),
+        )));
+    }
+    if let Err(error) = rollout.persist(PersistContext::Standard).await {
+        tracing::warn!(%error, "context injected without a turn could not be persisted");
+    }
 }
 
 /// Runs a turn's run to its end — across any number of pauses for approval — and returns how it
@@ -1654,6 +1760,8 @@ async fn run_to_end(
     )
     .with_recorded_input(history_len);
     let event_seqs = request.event_seq_allocator().clone();
+    // The lane the run reads injected context from; see `park_paused_turn`.
+    let mut hook_context = hook_context.clone();
     loop {
         request = request
             .with_config(config.clone())
@@ -1708,20 +1816,17 @@ async fn run_to_end(
         let run_id = state.run_id().clone();
         let context_on_cancel = state.clone().take_hook_context();
         let (resume, answered) = oneshot::channel();
-        let paused = inner.lock().active_turn.as_mut().map(|active| {
-            active.paused = Some(PausedTurn {
+        park_paused_turn(
+            inner,
+            &mut hook_context,
+            PausedTurn {
                 state,
                 resume,
                 config: config.clone(),
                 event_seqs: event_seqs.clone(),
                 recorder: Arc::clone(recorder),
-            });
-        });
-        if paused.is_some() {
-            inner.emit(ThreadEvent::TurnAwaitingApproval {
-                turn_id: recorder.turn_id.clone(),
-            });
-        }
+            },
+        );
         let answered = tokio::select! {
             answered = answered => answered.ok(),
             () = cancel.cancelled() => None,
@@ -1731,6 +1836,8 @@ async fn run_to_end(
         }
         let Some((agent, state)) = answered else {
             let mut history = history;
+            let mut context_on_cancel = context_on_cancel;
+            context_on_cancel.extend(hook_context.close());
             record_context_history(recorder, &mut history, context_on_cancel);
             let history = cancel_paused(recorder.as_ref(), &config, cancel, run_id, history);
             return (TurnEnd::Cancelled, history);
@@ -1744,6 +1851,29 @@ async fn run_to_end(
             Vec::new(),
         )
         .with_state_and_shared_event_seqs(state, &event_seqs);
+    }
+}
+
+/// Keeps `paused` with the turn until the host answers it, and reports that the turn waits.
+///
+/// The runner closes the context lane when the run stops for approval and opens another for the
+/// continuation, so the turn moves to a fresh lane here: context injected while it waits, or once
+/// it continues, is read by the continued run.
+fn park_paused_turn(
+    inner: &ThreadInner,
+    hook_context: &mut ra_core::hook::HookContextQueue,
+    paused: PausedTurn,
+) {
+    if hook_context.is_closed() {
+        *hook_context = ra_core::hook::HookContextQueue::default();
+    }
+    let turn_id = paused.recorder.turn_id.clone();
+    let parked = inner.lock().active_turn.as_mut().map(|active| {
+        active.context = hook_context.clone();
+        active.paused = Some(paused);
+    });
+    if parked.is_some() {
+        inner.emit(ThreadEvent::TurnAwaitingApproval { turn_id });
     }
 }
 
@@ -1801,11 +1931,11 @@ async fn prepare_host_input(
     recorder: &ThreadRecorder,
     config: &RunConfig,
     cancel: &CancelScope,
+    queue: ra_core::hook::HookContextQueue,
     mut history: Vec<ModelInputItem>,
     submitted: Vec<ModelInputItem>,
 ) -> (Vec<ModelInputItem>, bool, ra_core::hook::HookContextQueue) {
-    use ra_core::hook::{HookContextQueue, HookDecision, HookEvent};
-    let queue = HookContextQueue::default();
+    use ra_core::hook::{HookDecision, HookEvent};
     let run = Arc::new(ra_core::context::RunContext::new(
         RunId::new(&recorder.turn_id),
         inner.agent.public(),
