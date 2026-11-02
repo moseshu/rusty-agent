@@ -1896,7 +1896,12 @@ async fn watch_process(
                 // stopped from outside, not by a deadline or by itself.
                 cancellation = None;
                 context.session.lock().await.finish(ExecSessionState::Cancelled);
-                hard_kill_at = Some(begin_termination(child, context.pid, &mut outcome));
+                // Codex's unified exec terminates a process its network denial cancelled at once
+                // (`fail_and_terminate`), with no grace for `SIGTERM`: the command must not keep
+                // acting once its access was refused. Other termination paths keep the drain.
+                outcome.termination_requested = true;
+                signal_group(Some(child), context.pid, TerminationSignal::Kill);
+                hard_kill_at = None;
             }
             () = sleep_until(total_at) => {
                 outcome.expiry = Some(ExecEvictionReason::TotalTimeout);
@@ -2257,8 +2262,10 @@ fn spawn_child(
             .proxy()
             .apply_to_env_for_optional_environment(&mut env, network.environment_id())
             .map_err(|error| {
+                // Codex's `network_proxy_environment_error`.
                 std::io::Error::other(format!(
-                    "failed to prepare the managed network proxy environment: {error}"
+                    "failed to prepare network proxy for environment `{}`: {error}",
+                    network.environment_id().unwrap_or("default")
                 ))
             })?;
     }

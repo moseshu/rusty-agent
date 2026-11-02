@@ -1126,3 +1126,253 @@ async fn environment_cancellation_stops_a_backgrounded_command() {
         Some(ExecSessionState::Cancelled)
     );
 }
+
+/// Not a Codex case: a cancelled command is killed at once with everything it started, as
+/// Codex's unified exec terminates a process its network denial cancelled. The command and its
+/// child ignore `SIGTERM`, and the child would act 300ms later; neither may survive the
+/// cancellation, so the session state alone (recorded before any signal) is not the evidence.
+#[cfg(unix)]
+#[tokio::test]
+async fn environment_cancellation_kills_the_command_and_its_children_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let leader_pid = dir.path().join("leader");
+    let child_pid = dir.path().join("child");
+    let child_ready = dir.path().join("child-ready");
+    let release_child = dir.path().join("release-child");
+    let side_effect = dir.path().join("side-effect");
+    let command = format!(
+        "trap '' TERM; echo $$ > '{leader}'; \
+         (trap '' TERM; touch '{ready}'; \
+         while [ ! -e '{release}' ]; do sleep 0.01; done; \
+         sleep 0.3; touch '{side}') & echo $! > '{child}'; wait",
+        leader = leader_pid.display(),
+        child = child_pid.display(),
+        ready = child_ready.display(),
+        release = release_child.display(),
+        side = side_effect.display(),
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let environment =
+        ra_exec::sandbox::ExecEnvironment::new().with_cancellation(cancellation.clone());
+    let manager = ProcessManager::default();
+    // Clean up even if startup, the deadline, or a later assertion fails.
+    struct CommandCleanup {
+        cancellation: tokio_util::sync::CancellationToken,
+        leader_pid: std::path::PathBuf,
+        armed: bool,
+    }
+    impl Drop for CommandCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cancellation.cancel();
+                if let Some(pid) = std::fs::read_to_string(&self.leader_pid)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    let _ = ra_exec::process_group::kill_process_group(pid);
+                }
+            }
+        }
+    }
+    let mut cleanup = CommandCleanup {
+        cancellation: cancellation.clone(),
+        leader_pid: leader_pid.clone(),
+        armed: true,
+    };
+    let request = ExecRequest::new(command)
+        .with_limits(ExecLimits::new().with_initial_yield_timeout(Duration::from_millis(50)));
+    let result = manager
+        .execute_with_environment(request, None, &environment)
+        .await
+        .expect("execute");
+    let ExecExecutionResult::Yielded { .. } = result else {
+        panic!("the command was left running: {result:?}");
+    };
+    let read_pid = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    let pids = tokio::time::timeout(RESPONSIVE, async {
+        loop {
+            if let (Some(leader), Some(child), true) = (
+                read_pid(&leader_pid),
+                read_pid(&child_pid),
+                child_ready.exists(),
+            ) {
+                break (leader, child);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the command started its child");
+
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe whether the process exists")
+            .success()
+    };
+    assert!(alive(pids.0) && alive(pids.1), "both processes are ready");
+    assert!(!side_effect.exists(), "the child is waiting for release");
+
+    let cancelled_at = tokio::time::Instant::now();
+    cancellation.cancel();
+    // The delayed action cannot start counting down before cancellation, even under load.
+    std::fs::write(&release_child, b"release").unwrap();
+    let exited = tokio::time::timeout_at(cancelled_at + Duration::from_millis(250), async {
+        loop {
+            let leader_alive = alive(pids.0);
+            let child_alive = alive(pids.1);
+            if !leader_alive && !child_alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let ended_after = cancelled_at.elapsed();
+    if exited.is_ok() {
+        cleanup.armed = false;
+    }
+
+    // Observe the forbidden action even when a regressed termination misses its deadline.
+    tokio::time::sleep_until(cancelled_at + Duration::from_millis(600)).await;
+    assert!(
+        exited.is_ok() && ended_after < Duration::from_millis(250),
+        "a cancelled command is killed without a SIGTERM grace: ended after {ended_after:?}"
+    );
+    assert!(!alive(pids.0), "the command is gone");
+    assert!(!alive(pids.1), "its child is gone");
+    assert!(
+        !side_effect.exists(),
+        "the child did not act after the cancellation"
+    );
+}
+
+/// Not a Codex case: Codex's `cancel_when_either` as `with_cancellation` uses it. A second token
+/// does not replace the first: either one cancels the environment, a token cancelled before it is
+/// attached cancels it at once, and cancelling the environment's token cancels neither original.
+#[tokio::test]
+async fn environment_cancellations_combine_rather_than_replace() {
+    use tokio_util::sync::CancellationToken;
+    let settled = |token: &CancellationToken| {
+        let token = token.clone();
+        async move {
+            tokio::time::timeout(RESPONSIVE, token.cancelled())
+                .await
+                .is_ok()
+        }
+    };
+
+    let (first, second) = (CancellationToken::new(), CancellationToken::new());
+    let environment = ra_exec::sandbox::ExecEnvironment::new()
+        .with_cancellation(first.clone())
+        .with_cancellation(second.clone());
+    first.cancel();
+    assert!(
+        settled(environment.cancellation().unwrap()).await,
+        "the first token still cancels"
+    );
+
+    let (first, second) = (CancellationToken::new(), CancellationToken::new());
+    let environment = ra_exec::sandbox::ExecEnvironment::new()
+        .with_cancellation(first.clone())
+        .with_cancellation(second.clone());
+    second.cancel();
+    assert!(
+        settled(environment.cancellation().unwrap()).await,
+        "the second token cancels"
+    );
+
+    let (first, second) = (CancellationToken::new(), CancellationToken::new());
+    second.cancel();
+    let environment = ra_exec::sandbox::ExecEnvironment::new()
+        .with_cancellation(first.clone())
+        .with_cancellation(second);
+    assert!(
+        environment.cancellation().unwrap().is_cancelled(),
+        "a token cancelled beforehand cancels at once"
+    );
+
+    let (first, second) = (CancellationToken::new(), CancellationToken::new());
+    let environment = ra_exec::sandbox::ExecEnvironment::new()
+        .with_cancellation(first.clone())
+        .with_cancellation(second.clone());
+    environment.cancellation().unwrap().cancel();
+    tokio::task::yield_now().await;
+    assert!(
+        !first.is_cancelled() && !second.is_cancelled(),
+        "neither original is cancelled"
+    );
+}
+
+/// Not a Codex case: a proxy that cannot serve the command's environment refuses the command with
+/// Codex's `network_proxy_environment_error` text, naming the environment.
+#[tokio::test]
+async fn a_proxy_environment_it_cannot_serve_names_the_environment() {
+    use ra_network_proxy::{
+        ConfigReloader, ConfigReloaderFuture, ConfigState, NetworkMode, NetworkProxy,
+        NetworkProxyConfig, NetworkProxyConstraints, NetworkProxyState, build_config_state,
+    };
+
+    struct FixedConfig;
+    impl ConfigReloader for FixedConfig {
+        fn source_label(&self) -> String {
+            "process execution test config".to_owned()
+        }
+        fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+            Box::pin(async { Err(anyhow::anyhow!("fixed test config cannot reload")) })
+        }
+    }
+
+    let state = build_config_state(
+        NetworkProxyConfig {
+            enabled: true,
+            mode: NetworkMode::Full,
+            ..Default::default()
+        },
+        NetworkProxyConstraints::default(),
+        ra_paths::Platform::native(),
+    )
+    .unwrap();
+    let proxy = NetworkProxy::builder()
+        .state(Arc::new(NetworkProxyState::with_reloader(
+            state,
+            Arc::new(FixedConfig),
+        )))
+        .managed_by_codex(false)
+        .build()
+        .await
+        .unwrap();
+    // Scoped to one environment, the proxy refuses to prepare another.
+    let scoped = proxy
+        .for_execution("env-a", "execution-1", "token-1".to_owned(), None, None)
+        .unwrap();
+    let environment = ra_exec::sandbox::ExecEnvironment::new().with_managed_network(
+        ra_exec::sandbox::ManagedNetwork::new(scoped, Some("env-b".to_owned())),
+    );
+
+    let error = ProcessManager::default()
+        .execute_with_environment(ExecRequest::new("true"), None, &environment)
+        .await
+        .expect_err("the command is refused");
+
+    let mut chain = vec![error.to_string()];
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        chain.push(cause.to_string());
+        source = cause.source();
+    }
+    assert!(
+        chain.iter().any(|message| message
+            .starts_with("failed to prepare network proxy for environment `env-b`: ")),
+        "{chain:?}"
+    );
+}

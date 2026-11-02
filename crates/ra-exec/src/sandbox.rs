@@ -86,6 +86,28 @@ pub struct ExecEnvironment {
     cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// Codex's `cancel_when_either`: a token cancelled when `first` or `second` is. Cancelling it
+/// cancels neither of them.
+fn cancel_when_either(
+    first: &tokio_util::sync::CancellationToken,
+    second: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    let combined = first.child_token();
+    if combined.is_cancelled() || second.is_cancelled() {
+        combined.cancel();
+        return combined;
+    }
+    let cancel = combined.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = second.cancelled() => {}
+            () = cancel.cancelled() => {}
+        }
+        cancel.cancel();
+    });
+    combined
+}
+
 /// The managed network proxy a command's traffic is routed through: Codex's `network` and
 /// `network_environment_id` on its exec request.
 ///
@@ -176,10 +198,17 @@ impl ExecEnvironment {
 
     /// Stops every child started under this environment once `token` is cancelled, as Codex's
     /// exec expiration does with its network-denial cancellation: the command is cancelled and
-    /// its process group terminated, whether its caller is still waiting or it was left running.
+    /// its process group killed, whether its caller is still waiting or it was left running.
+    ///
+    /// A cancellation already attached is kept: the environment is cancelled when either token
+    /// is, as Codex's `ExecExpiration::with_cancellation` combines them. Combining spawns a task
+    /// that watches the new token, so it must run inside a Tokio runtime, as Codex's does.
     #[must_use]
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
-        self.cancellation = Some(token);
+        self.cancellation = Some(match self.cancellation.take() {
+            Some(existing) => cancel_when_either(&existing, token),
+            None => token,
+        });
         self
     }
 

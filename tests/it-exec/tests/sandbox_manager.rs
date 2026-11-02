@@ -35,6 +35,22 @@ fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
 }
 
 #[test]
+fn explicit_mxc_only_overrides_the_windows_sandbox() {
+    let sandbox = manager::select_initial(
+        &PermissionProfile::read_only(),
+        SandboxablePreference::Auto,
+        SandboxType::WindowsMxc,
+        /*has_managed_network_requirements*/ false,
+    );
+    let expected = if cfg!(windows) {
+        SandboxType::WindowsMxc
+    } else {
+        manager::platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None)
+    };
+    assert_eq!(sandbox, expected);
+}
+
+#[test]
 fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
     let expected =
         manager::platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
