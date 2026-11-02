@@ -189,6 +189,16 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "SandboxExecRequest",
     ),
     ("crates/ra-exec/src/filesystem/fs_sandbox.rs", "SandboxCwd"),
+    // Codex protocol/src/network_policy.rs and core/src/network_policy_decision.rs records, built
+    // by literal in the original decision tests.
+    (
+        "crates/ra-coding/src/network_policy_decision.rs",
+        "NetworkPolicyDecisionPayload",
+    ),
+    (
+        "crates/ra-coding/src/network_policy_decision.rs",
+        "ExecPolicyNetworkRuleAmendment",
+    ),
     // Codex sandboxing/src/seatbelt.rs managed-network inputs: the Seatbelt argument bundle and
     // the derived proxy policy inputs the original seatbelt tests build by literal.
     (

@@ -33,6 +33,12 @@ pub mod hook_mcp_executor;
 pub mod hooks;
 pub mod host;
 pub mod mcp;
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod network_approval;
+#[cfg(not(feature = "test-api"))]
+pub(crate) mod network_approval;
+pub(crate) mod network_policy_decision;
 pub mod permission_mode;
 pub mod permissions;
 pub mod plugins;
@@ -58,6 +64,11 @@ pub use permission_mode::CodingPermissionMode;
 pub use profile::CodingProfile;
 
 pub mod thread_settings;
+
+/// Codex's network policy decisions for the external integration-test workspace.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use network_policy_decision::test_api as network_policy_decision_test_api;
 
 /// Controlled executor-path context for the external integration-test workspace.
 #[cfg(feature = "test-api")]

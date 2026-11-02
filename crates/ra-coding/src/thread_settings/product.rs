@@ -201,4 +201,27 @@ impl CodingThreadSettingsAdapter {
         self.product = Some(std::sync::Arc::new(source));
         self
     }
+
+    /// Codex's session initialization starts the managed network proxy for the loaded
+    /// configuration before the thread runs anything.
+    pub(crate) async fn start_network_proxy(&self, config: &Config) -> std::io::Result<()> {
+        let permissions = &self.initial.profile_permissions;
+        self.initial.network_proxy.bind_exec_policy(
+            std::sync::Arc::clone(&self.initial.exec_policy),
+            self.initial.rules_home.clone(),
+        );
+        self.initial
+            .network_proxy
+            .start(
+                permissions.network.as_ref(),
+                self.initial.exec_policy.current().as_ref(),
+                permissions.permission_profile(),
+                config
+                    .config_layer_stack
+                    .requirements_toml()
+                    .network
+                    .is_some(),
+            )
+            .await
+    }
 }

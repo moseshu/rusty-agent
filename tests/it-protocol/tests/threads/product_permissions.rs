@@ -72,7 +72,8 @@ impl ProductHome {
                 network_access: false,
             },
         )
-        .unwrap();
+        .unwrap()
+        .with_rules_home(self.home.path());
         let builder = self.config_builder();
         let factory =
             CodingThreadFactory::new(host, Arc::new(Resolver(Arc::clone(&self.script))), settings)
@@ -747,4 +748,398 @@ async fn thread_start_falls_back_from_disallowed_named_profile() {
         .call(&mut connection, "thread/loaded/list", json!({}))
         .await;
     assert_eq!(loaded["data"], json!([thread_id]));
+}
+
+/// Codex's `turn_start_enforces_managed_network_sandbox`, under Seatbelt: Codex runs the case on
+/// Linux through its bubblewrap helper, which is not ported, so this exercises the same managed
+/// profile through the macOS sandbox. Codex binds the origin to `127.0.0.2` to keep it apart
+/// from a sandbox network namespace; macOS has no such namespace and does not configure that
+/// loopback alias, so the origin is on `127.0.0.1` and the allowlist names it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn turn_start_enforces_managed_network_sandbox() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = ProductHome::new();
+    home.write_mock_config("never", "", "[features]\nnetwork_proxy = true\n");
+    home.write_requirements(
+        r#"
+default_permissions = "managed-network"
+
+[allowed_permission_profiles]
+managed-network = true
+":read-only" = true
+
+[permissions.managed-network]
+extends = ":read-only"
+
+[permissions.managed-network.network]
+enabled = true
+allow_local_binding = false
+allow_upstream_proxy = false
+
+[permissions.managed-network.network.domains]
+"127.0.0.1" = "allow"
+"#,
+    );
+    let server = home.server();
+    let mut connection = server.connect(1).await;
+    let started = server
+        .call(&mut connection, "thread/start", json!({}))
+        .await;
+    let thread_id = started["thread"]["id"].as_str().unwrap().to_owned();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    // Keep the real origin listening throughout both the proxied and direct requests.
+    let _origin = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let body = "sandbox proxy response";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }));
+    let test_executable = std::env::current_exe().unwrap();
+    let test_executable = test_executable.to_str().unwrap();
+    // Libtest selectors omit the integration crate name.
+    let (_, test_module) = module_path!().split_once("::").unwrap();
+    let command = format!(
+        "env 'CODEX_TEST_MANAGED_NETWORK_TARGET={target}' '{test_executable}' --exact \
+         {test_module}::managed_network_sandbox_probe --ignored --nocapture --test-threads=1"
+    );
+    let call_id = "managed-network-probe";
+    home.script
+        .push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+            ItemId::new(call_id),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(call_id),
+                "exec_command",
+                json!({"cmd": command, "justification": null, "prefix_rule": null,
+                   "sandbox_permissions": null, "workdir": null, "shell": "/bin/sh",
+                   "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+            )),
+        )])));
+    home.script.answer("Network probe complete");
+
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({"threadId": thread_id,
+                   "input": [{"type": "text", "text": "Verify managed sandbox networking"}],
+                   "permissions": "managed-network"}),
+        )
+        .await;
+    connection.notification("turn/completed").await;
+
+    // The marker also proves the child ran: libtest succeeds if no selector matches.
+    let output = serde_json::to_string(home.script.last_request().input()).unwrap();
+    assert!(
+        output.contains("proxied request succeeded; direct access blocked"),
+        "unexpected tool output: {output}"
+    );
+}
+
+/// Runs as the model-controlled command inside the managed network sandbox.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "invoked through the managed network sandbox"]
+fn managed_network_sandbox_probe() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let target: SocketAddr = std::env::var("CODEX_TEST_MANAGED_NETWORK_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let proxy = std::env::var("HTTP_PROXY").expect("the managed proxy is advertised");
+    let proxy = proxy
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .expect("the managed proxy listens on a loopback socket address");
+    let proxy_timeout = Duration::from_secs(5);
+    let mut connection = TcpStream::connect_timeout(&proxy, proxy_timeout).unwrap();
+    connection.set_read_timeout(Some(proxy_timeout)).unwrap();
+    connection.set_write_timeout(Some(proxy_timeout)).unwrap();
+    // HTTP/1.0 keeps this small fixture response close-delimited, without chunked encoding.
+    write!(
+        connection,
+        "GET http://{target}/sandbox HTTP/1.0\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    connection.take(4096).read_to_string(&mut response).unwrap();
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .expect("complete proxy HTTP response");
+    let status = headers.split_whitespace().nth(1).expect("HTTP status");
+    assert_eq!((status, body), ("200", "sandbox proxy response"));
+
+    let direct_error = TcpStream::connect_timeout(&target, Duration::from_secs(2))
+        .expect_err("sandbox allowed direct host access");
+    assert!(
+        matches!(
+            direct_error.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::PermissionDenied
+        ),
+        "unexpected direct access error: {direct_error:?}"
+    );
+    println!("proxied request succeeded; direct access blocked");
+}
+
+/// A loopback origin answering every request with `sandbox proxy response`, kept alive for as long
+/// as the returned handle lives.
+#[cfg(target_os = "macos")]
+async fn loopback_origin() -> (
+    std::net::SocketAddr,
+    tokio_util::task::AbortOnDropHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let origin = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let body = "sandbox proxy response";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }));
+    (target, origin)
+}
+
+/// Codex's network approval in flight, under Seatbelt: a command reaches a host the managed
+/// allowlist does not name, the proxy asks the client through `item/commandExecution/requestApproval`
+/// with the network context, and the client's answer decides the request. Not a Codex test file
+/// case: Codex covers the same flow in `core/tests/suite/network_approval.rs` through its own
+/// harness. Local binding is allowed so the loopback origin is an allowlist miss rather than a
+/// private-address denial.
+#[cfg(target_os = "macos")]
+async fn network_access_is_reviewed_in_flight(decision: &str) -> (Value, String) {
+    let (params, output, _) = network_access_review(json!(decision), false).await;
+    (params, output)
+}
+
+/// [`network_access_is_reviewed_in_flight`] with the client's whole answer, and the `warning`
+/// notification that follows it when `expect_warning` says one does.
+#[cfg(target_os = "macos")]
+async fn network_access_review(
+    decision: Value,
+    expect_warning: bool,
+) -> (Value, String, Option<Value>) {
+    let home = ProductHome::new();
+    home.write_mock_config("on-request", "", "[features]\nnetwork_proxy = true\n");
+    home.write_requirements(
+        r#"
+[experimental_network]
+enabled = true
+allow_local_binding = true
+
+[experimental_network.domains]
+"example.org" = "allow"
+"#,
+    );
+    let server = home.server();
+    let mut connection = server.connect(1).await;
+    let started = server
+        .call(&mut connection, "thread/start", json!({}))
+        .await;
+    let thread_id = started["thread"]["id"].as_str().unwrap().to_owned();
+    let (target, _origin) = loopback_origin().await;
+    let test_executable = std::env::current_exe().unwrap();
+    let test_executable = test_executable.to_str().unwrap();
+    let (_, test_module) = module_path!().split_once("::").unwrap();
+    let command = format!(
+        "env 'CODEX_TEST_MANAGED_NETWORK_TARGET={target}' '{test_executable}' --exact \
+         {test_module}::managed_network_approval_probe --ignored --nocapture --test-threads=1"
+    );
+    let call_id = "managed-network-approval-probe";
+    home.script
+        .push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+            ItemId::new(call_id),
+            RunItemKind::ToolCall(ToolCall::new(
+                CallId::new(call_id),
+                "exec_command",
+                json!({"cmd": command, "justification": null, "prefix_rule": null,
+                       "sandbox_permissions": null, "workdir": null, "shell": "/bin/sh",
+                       "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+            )),
+        )])));
+    home.script.answer("Network probe complete");
+
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({"threadId": thread_id,
+                   "input": [{"type": "text", "text": "Reach a host outside the allowlist"}]}),
+        )
+        .await;
+    let request = connection
+        .until(|message| message["method"] == "item/commandExecution/requestApproval")
+        .await;
+    server
+        .send(
+            &connection,
+            ra_protocol::frame::JsonRpcResponse::new(
+                serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
+                    .unwrap(),
+                json!({"decision": decision}),
+            ),
+        )
+        .await;
+    let warning = if expect_warning {
+        Some(connection.notification("warning").await)
+    } else {
+        None
+    };
+    connection.notification("turn/completed").await;
+    let output = serde_json::to_string(home.script.last_request().input()).unwrap();
+    (request["params"].clone(), output, warning)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn approved_network_access_reaches_the_host() {
+    let (params, output) = network_access_is_reviewed_in_flight("accept").await;
+
+    assert_eq!(params["networkApprovalContext"]["host"], "127.0.0.1");
+    assert_eq!(params["networkApprovalContext"]["protocol"], "http");
+    assert_eq!(params["reason"], "127.0.0.1 is not in the allowed_domains");
+    assert!(params.get("command").is_none(), "{params}");
+    assert_eq!(
+        params["proposedNetworkPolicyAmendments"],
+        json!([{"host": "127.0.0.1", "action": "allow"},
+               {"host": "127.0.0.1", "action": "deny"}])
+    );
+    assert!(
+        output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn declined_network_access_rejects_the_command() {
+    let (_, output) = network_access_is_reviewed_in_flight("decline").await;
+
+    assert!(
+        output.contains("rejected by user"),
+        "unexpected tool output: {output}"
+    );
+    assert!(
+        !output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_network_rule_that_cannot_be_applied_warns_the_client() {
+    // The amendment names a host other than the one approved, so it is refused when applied.
+    let (_, output, warning) = network_access_review(
+        json!({"applyNetworkPolicyAmendment": {"network_policy_amendment": {
+            "host": "other.test", "action": "allow"}}}),
+        true,
+    )
+    .await;
+
+    let warning = warning.expect("the client is warned");
+    let message = warning["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Failed to apply network policy amendment: ")
+            && message.contains("does not match approved host"),
+        "{warning}"
+    );
+    assert!(
+        !output.contains("proxied status 200"),
+        "the access stays blocked: {output}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_saved_network_rule_is_told_to_the_model_without_hooks() {
+    let (_, output, _) = network_access_review(
+        json!({"applyNetworkPolicyAmendment": {"network_policy_amendment": {
+            "host": "127.0.0.1", "action": "allow"}}}),
+        false,
+    )
+    .await;
+
+    assert!(
+        output.contains("Allowed network rule saved in execpolicy (allowlist): 127.0.0.1"),
+        "unexpected model input: {output}"
+    );
+    assert!(
+        output.contains("proxied status 200"),
+        "the saved rule lets the access through: {output}"
+    );
+}
+
+/// Runs as the model-controlled command; prints the status the proxy answered with.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "invoked through the managed network sandbox"]
+fn managed_network_approval_probe() {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let target: SocketAddr = std::env::var("CODEX_TEST_MANAGED_NETWORK_TARGET")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let proxy = std::env::var("HTTP_PROXY").expect("the managed proxy is advertised");
+    let proxy = proxy
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .expect("the managed proxy listens on a loopback socket address");
+    let timeout = Duration::from_secs(20);
+    let mut connection = TcpStream::connect_timeout(&proxy, timeout).unwrap();
+    connection.set_read_timeout(Some(timeout)).unwrap();
+    write!(
+        connection,
+        "GET http://{target}/sandbox HTTP/1.0\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    let _ = connection.take(4096).read_to_string(&mut response);
+    let status = response.split_whitespace().nth(1).unwrap_or("none");
+    println!("proxied status {status}");
 }

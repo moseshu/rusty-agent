@@ -114,7 +114,7 @@ use ra_core::{
 };
 use ra_exec::output::ExecOutputSummary;
 use ra_exec::sandbox::{
-    ExecEnvironment, NetworkAccess as ExecNetworkAccess, SandboxLevel,
+    ExecEnvironment, ManagedNetwork, NetworkAccess as ExecNetworkAccess, SandboxLevel,
     SandboxPolicy as ExecSandboxPolicy,
     unix_local::{EnvPolicy, ResourceLimits},
 };
@@ -141,8 +141,17 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
+mod network_proxy;
 mod product;
+
+/// The environment id a local thread's commands and network reviews carry: Codex's
+/// `LOCAL_ENVIRONMENT_ID`.
+const LOCAL_NETWORK_ENVIRONMENT_ID: &str = "local";
 mod profile;
+/// Codex's session network-proxy entry points for the external integration-test workspace.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use network_proxy::test_api as network_proxy_test_api;
 
 pub use product::ProductPermissionSource;
 
@@ -168,9 +177,78 @@ pub struct CodingThreadSettings {
     command_decisions: Arc<CommandDecisions>,
     approvals: Arc<Mutex<ApprovalStore>>,
     permissions: Arc<ThreadPermissions>,
+    /// The thread's managed network proxy: Codex's session `network_proxy` service.
+    network_proxy: Arc<network_proxy::ThreadNetworkProxy>,
 }
 
 impl CodingThreadSettings {
+    /// Codex's per-attempt network: the turn's proxy unless the command runs with escalated
+    /// permissions, which skip the execution proxy. A routed command runs as its own call, as
+    /// Codex's orchestrator begins its network approval: the proxy is scoped to the call, a
+    /// reviewed denial cancels the command, and the approval is finished once it has ended.
+    fn with_thread_network(
+        &self,
+        attempt: ExecCommandAttempt,
+        context: &ToolContext<'_>,
+        decision: &CommandDecision,
+    ) -> Result<ExecCommandAttempt> {
+        if decision
+            .sandbox_permissions
+            .requires_escalated_permissions()
+        {
+            return Ok(attempt);
+        }
+        let arguments = context.arguments();
+        let command = arguments
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let cwd = ra_paths::AbsolutePathBuf::from_absolute_path(&self.cwd)
+            .map(|cwd| ra_paths::PathUri::from_abs_path(&cwd))
+            .map_err(|error| Error::caller(error.to_string()))?;
+        let permission_profile = self.profile_permissions.permission_profile();
+        let spec = crate::network_approval::NetworkApprovalCallSpec {
+            trigger: crate::network_approval::NetworkAccessTrigger {
+                call_id: context.call_id().as_str().to_owned(),
+                tool_name: EXEC_COMMAND_TOOL.to_owned(),
+                command: vec![command.clone()],
+                cwd,
+                sandbox_permissions: decision.sandbox_permissions,
+                additional_permissions: decision.additional_permissions.clone(),
+                justification: arguments
+                    .get("justification")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                tty: None,
+            },
+            tool_name: ToolLookupKey::bare(EXEC_COMMAND_TOOL)?,
+            command,
+            turn_id: context.run().run_id().as_str().to_owned(),
+            environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
+            permission_profile: permission_profile.clone(),
+        };
+        let Some(network) = self.network_proxy.begin_command(
+            permission_profile,
+            spec,
+            context.services().hook_context().cloned(),
+        ) else {
+            return Ok(attempt);
+        };
+        let network = network.map_err(|error| Error::caller(error.to_string()))?;
+        let environment = attempt
+            .environment()
+            .clone()
+            .with_managed_network(ManagedNetwork::new(network.proxy, None))
+            .with_cancellation(network.cancellation);
+        let mut routed =
+            ExecCommandAttempt::new(environment).with_network_approval(network.approval);
+        if let Some(state) = attempt.state() {
+            routed = routed.with_state(state.clone());
+        }
+        Ok(routed)
+    }
+
     /// What the command policy decided for a call that asked for approval and has not run yet: the
     /// reason and proposed amendment its approval request carries.
     #[must_use]
@@ -488,6 +566,14 @@ impl CodingThreadSettings {
         self.permissions.session()
     }
 
+    /// Lets `hooks`, the thread's product hooks, decide a network access before its client is
+    /// asked, as Codex's permission-request hooks decide any approval, and tell the model when an
+    /// approved rule was saved. Product hooks belong to a thread, so the host that builds them
+    /// attaches them to the settings of the thread's configuration. Without them neither happens.
+    pub fn attach_hook_runtime(&self, hooks: Arc<crate::hooks::ProductHookRuntime>) {
+        self.network_proxy.attach_hooks(hooks);
+    }
+
     /// What `request_permissions` granted the turn `run_id` while it runs: Codex's
     /// `granted_turn_permissions`.
     #[must_use]
@@ -567,6 +653,7 @@ impl CodingThreadSettingsAdapter {
                 command_decisions: Arc::new(CommandDecisions::default()),
                 approvals: Arc::default(),
                 permissions: Arc::default(),
+                network_proxy: Arc::default(),
                 mcp_approvals: Arc::default(),
             },
             profiles,
@@ -746,6 +833,7 @@ impl CodingThreadSettingsAdapter {
                 initial.base_permission = config.permission().clone();
                 initial.approvals = Arc::default();
                 initial.permissions = Arc::default();
+                initial.network_proxy = Arc::default();
                 initial
             })
     }
@@ -786,6 +874,26 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
         Ok(install(current.clone(), settings))
     }
 
+    /// Codex refreshes its managed network proxy once a settings commit changed the permission
+    /// profile.
+    async fn settings_committed(&self, previous: &RunConfig, committed: &RunConfig) {
+        let previous = self.snapshot(previous);
+        let committed = self.snapshot(committed);
+        if previous.profile_permissions.permission_profile()
+            == committed.profile_permissions.permission_profile()
+        {
+            return;
+        }
+        committed
+            .network_proxy
+            .refresh(
+                committed.profile_permissions.network.as_ref(),
+                committed.exec_policy.current().as_ref(),
+                committed.profile_permissions.permission_profile(),
+            )
+            .await;
+    }
+
     fn describe(&self, config: &RunConfig) -> Value {
         let settings = self.snapshot(config);
         json!({"cwd": settings.cwd, "approvalPolicy": settings.approval_policy,
@@ -811,10 +919,29 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
                         .settle(&RunId::new(turn_id), output.call_id());
                 }
             }
+            ThreadEvent::TurnStarted { turn_id, .. } => {
+                // Codex's network approval reviews under the active turn's settings.
+                if let Ok(cwd) = ra_paths::AbsolutePathBuf::from_absolute_path(&settings.cwd) {
+                    settings.network_proxy.set_active_turn(
+                        crate::network_approval::NetworkApprovalTurn {
+                            turn_id: turn_id.clone(),
+                            environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
+                            approval_policy: settings.approval_policy,
+                            permission_profile: settings
+                                .profile_permissions
+                                .permission_profile()
+                                .clone(),
+                            cwd: ra_paths::PathUri::from_abs_path(&cwd),
+                        },
+                        settings.approvals_reviewer == ApprovalsReviewer::AutoReview,
+                    );
+                }
+            }
             ThreadEvent::TurnComplete { turn_id, .. }
             | ThreadEvent::TurnAborted { turn_id, .. } => {
                 settings.command_decisions.finish_run(&RunId::new(turn_id));
                 settings.permissions.finish_turn(&RunId::new(turn_id));
+                settings.network_proxy.clear_active_turn(turn_id);
             }
             _ => {}
         }
@@ -825,6 +952,7 @@ impl ThreadSettingsAdapter for CodingThreadSettingsAdapter {
             .app_context()
             .and_then(|value| value.downcast_ref::<CodingThreadSettings>())
         {
+            settings.network_proxy.attach_requests(requests.clone());
             settings.permissions.attach(requests);
         }
     }
@@ -963,8 +1091,9 @@ impl ExecCommandPolicy for CodingCommandPolicy {
                     already_approved: true,
                     retry_environment: environment.clone(),
                 };
-                return Ok(ExecCommandAttempt::new(environment.restore(&self.base))
-                    .with_state(encode(&state)?));
+                let attempt = ExecCommandAttempt::new(environment.restore(&self.base))
+                    .with_state(encode(&state)?);
+                return settings.with_thread_network(attempt, context, &state.decision);
             }
             Some(CommandResume::Approval {
                 decision,
@@ -1014,7 +1143,8 @@ impl ExecCommandPolicy for CodingCommandPolicy {
             already_approved,
             retry_environment,
         };
-        Ok(ExecCommandAttempt::new(environment).with_state(encode(&state)?))
+        let attempt = ExecCommandAttempt::new(environment).with_state(encode(&state)?);
+        settings.with_thread_network(attempt, context, &state.decision)
     }
 
     fn launch_state(

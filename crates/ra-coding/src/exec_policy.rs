@@ -44,8 +44,9 @@ use std::{
 };
 
 use ra_execpolicy::{
-    AmendError, Decision, Error as ExecPolicyRuleError, Evaluation, MatchOptions, Policy,
-    PolicyParser, PrefixRule, RequirementsExecPolicy, RuleMatch, blocking_append_allow_prefix_rule,
+    AmendError, Decision, Error as ExecPolicyRuleError, Evaluation, MatchOptions,
+    NetworkRuleProtocol, Policy, PolicyParser, PrefixRule, RequirementsExecPolicy, RuleMatch,
+    blocking_append_allow_prefix_rule, blocking_append_network_rule,
 };
 use ra_protocol::server::protocol::{AskForApproval, ExecPolicyAmendment, SandboxPolicy};
 use serde::{Deserialize, Serialize};
@@ -566,6 +567,60 @@ impl ExecPolicyManager {
 
         let mut updated_policy = current_policy.as_ref().clone();
         updated_policy.add_prefix_rule(amendment.command(), Decision::Allow)?;
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(updated_policy);
+        Ok(())
+    }
+
+    /// Saves a network rule for `host`: appends it to [`default_policy_path`]`(codex_home)` and
+    /// adds it to the policy in force, as Codex's `append_network_rule_and_update` does. Updates
+    /// run one at a time.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the rules file cannot be written or the rule is invalid, leaving the policy in
+    /// force unchanged.
+    pub async fn append_network_rule_and_update(
+        &self,
+        codex_home: &Path,
+        host: &str,
+        protocol: NetworkRuleProtocol,
+        decision: Decision,
+        justification: Option<String>,
+    ) -> Result<(), ExecPolicyUpdateError> {
+        let _update_guard =
+            self.update_lock
+                .acquire()
+                .await
+                .map_err(|_| ExecPolicyUpdateError::AddRule {
+                    source: ExecPolicyRuleError::InvalidRule(
+                        "exec policy update semaphore closed".to_string(),
+                    ),
+                })?;
+        let policy_path = default_policy_path(codex_home);
+        let host = host.to_string();
+        tokio::task::spawn_blocking({
+            let policy_path = policy_path.clone();
+            let host = host.clone();
+            let justification = justification.clone();
+            move || {
+                blocking_append_network_rule(
+                    &policy_path,
+                    &host,
+                    protocol,
+                    decision,
+                    justification.as_deref(),
+                )
+            }
+        })
+        .await
+        .map_err(|source| ExecPolicyUpdateError::JoinBlockingTask { source })?
+        .map_err(|source| ExecPolicyUpdateError::AppendRule {
+            path: policy_path,
+            source,
+        })?;
+
+        let mut updated_policy = self.current().as_ref().clone();
+        updated_policy.add_network_rule(&host, protocol, decision, justification)?;
         *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(updated_policy);
         Ok(())
     }

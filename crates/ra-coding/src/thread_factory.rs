@@ -135,9 +135,15 @@ impl ThreadFactory for CodingThreadFactory {
                 // As in Codex's thread start, resume and fork, a named profile requirements
                 // disallow falls back to the required value with a startup warning; only a
                 // settings or turn update refuses it.
-                self.settings
+                let settings = self
+                    .settings
                     .clone()
-                    .with_product_config(&config, ProductPermissionSource::new(builder))
+                    .with_product_config(&config, ProductPermissionSource::new(builder));
+                settings
+                    .start_network_proxy(&config)
+                    .await
+                    .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
+                settings
             }
             None => self.settings.clone(),
         };

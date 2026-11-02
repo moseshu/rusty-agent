@@ -771,3 +771,142 @@ async fn session_start_command_matchers_receive_all_lifecycle_sources() {
         assert_eq!(queue.take(), [Message::developer(source.as_str())]);
     }
 }
+
+fn network_request(turn_id: &str) -> ra_coding::network_approval::NetworkApprovalRequest {
+    ra_coding::network_approval::NetworkApprovalRequest {
+        item_id: "approval-1".to_owned(),
+        turn_id: turn_id.to_owned(),
+        environment_id: "local".to_owned(),
+        reason: "example.com is not in the allowed_domains".to_owned(),
+        network_approval_context: ra_protocol::server::protocol::NetworkApprovalContext::new(
+            "example.com".to_owned(),
+            ra_protocol::server::protocol::NetworkApprovalProtocol::Https,
+        ),
+        target: "https://example.com:443".to_owned(),
+        hook_command: "curl https://example.com".to_owned(),
+        hook_run_id: "approval-1#registration-1".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn permission_request_hooks_decide_a_network_access_as_the_asking_command() {
+    let home = TempDir::new().unwrap();
+    let capture = home.path().join("hook-input.json");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PermissionRequest]]
+matcher = "Bash"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = """cat > {capture}; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"allow"}}}}}}'"""
+"#,
+            capture = capture.display()
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let mut completed = runtime.subscribe_completed();
+
+    let decision = runtime
+        .run_permission_request_hooks(
+            "turn-1",
+            "approval-1#registration-1",
+            "curl https://example.com",
+            "network-access https://example.com:443",
+        )
+        .await;
+
+    assert_eq!(
+        decision,
+        Some(ra_coding::hooks::PermissionRequestDecision::Allow)
+    );
+    let input: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+    assert_eq!(input["hook_event_name"], "PermissionRequest");
+    assert_eq!(input["tool_name"], "Bash");
+    assert_eq!(input["tool_input"]["command"], "curl https://example.com");
+    assert_eq!(
+        input["tool_input"]["description"],
+        "network-access https://example.com:443"
+    );
+    let event = tokio::time::timeout(Duration::from_secs(5), completed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.run.event_name, HookEventName::PermissionRequest);
+}
+
+#[tokio::test]
+async fn a_thread_proxy_lets_permission_request_hooks_answer_before_its_client() {
+    use ra_coding::thread_settings::network_proxy_test_api::ThreadNetworkProxyProbe;
+
+    let home = TempDir::new().unwrap();
+    let config = hooks_config(
+        home.path(),
+        r#"
+[[hooks.PermissionRequest]]
+matcher = "Bash"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = """printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"blocked by policy hook"}}}'"""
+"#,
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let proxy = ThreadNetworkProxyProbe::default();
+
+    // No client is attached, so only a hook can answer: the request would abort otherwise.
+    assert!(matches!(
+        proxy
+            .request_network_approval(network_request("turn-1"))
+            .await,
+        Err(ra_coding::network_approval::NetworkApprovalError::TurnAborted)
+    ));
+    proxy.attach_hooks(Arc::clone(&runtime));
+    assert_eq!(
+        proxy
+            .request_network_approval(network_request("turn-1"))
+            .await
+            .unwrap_err(),
+        ra_coding::network_approval::NetworkApprovalError::Rejected(
+            "blocked by policy hook".to_owned()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_saved_network_rule_reaches_the_running_turn_as_a_developer_message() {
+    use ra_coding::thread_settings::network_proxy_test_api::ThreadNetworkProxyProbe;
+    use ra_protocol::server::protocol::{NetworkPolicyAmendment, NetworkPolicyRuleAction};
+
+    let home = TempDir::new().unwrap();
+    let config = hooks_config(home.path(), "").await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let _bound = bound_with_queue(&runtime, &queue);
+    let proxy = ThreadNetworkProxyProbe::default();
+    proxy.attach_hooks(Arc::clone(&runtime));
+
+    proxy
+        .record_network_policy_amendment_message(
+            "turn-1",
+            &NetworkPolicyAmendment::new("example.com".to_owned(), NetworkPolicyRuleAction::Allow),
+        )
+        .await;
+    proxy
+        .record_network_policy_amendment_message(
+            "turn-1",
+            &NetworkPolicyAmendment::new("evil.test".to_owned(), NetworkPolicyRuleAction::Deny),
+        )
+        .await;
+
+    assert_eq!(
+        queue.take(),
+        vec![
+            Message::developer("Allowed network rule saved in execpolicy (allowlist): example.com"),
+            Message::developer("Denied network rule saved in execpolicy (denylist): evil.test"),
+        ]
+    );
+}

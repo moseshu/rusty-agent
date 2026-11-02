@@ -208,6 +208,47 @@ impl ProductHookRuntime {
         )
     }
 
+    /// Codex's `run_permission_request_hooks` for an approval that is not a tool call, which the
+    /// runtime's hook dispatcher is never asked about: the access is described to the hooks as
+    /// the shell command asking, with `description`, under the run `run_id_suffix` of `turn_id`.
+    pub async fn run_permission_request_hooks(
+        &self,
+        turn_id: &str,
+        run_id_suffix: &str,
+        command: &str,
+        description: &str,
+    ) -> Option<PermissionRequestDecision> {
+        let session = &self.session;
+        let outcome = self
+            .current()
+            .run_permission_request(PermissionRequestRequest {
+                session_id: session.session_id.clone(),
+                turn_id: turn_id.to_owned(),
+                subagent: None,
+                cwd: session.cwd.to_path_buf(),
+                transcript_path: session.transcript_path.clone(),
+                model: session.model.clone(),
+                permission_mode: self.permission_mode(),
+                tool_name: "Bash".to_owned(),
+                matcher_aliases: Vec::new(),
+                run_id_suffix: run_id_suffix.to_owned(),
+                tool_input: serde_json::json!({"command": command, "description": description}),
+            })
+            .await;
+        self.publish(outcome.hook_events);
+        outcome.decision
+    }
+
+    /// Adds `messages` to the run `turn_id` without starting a turn, as Codex's
+    /// `inject_no_new_turn` does: the run reads them at its next model call, and a thread with no
+    /// run yet reads them with the next one.
+    pub fn inject_without_turn(&self, turn_id: &str, messages: Vec<Message>) {
+        self.context_delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .deliver_to(Some(turn_id), messages, false);
+    }
+
     fn publish(&self, events: Vec<HookCompletedEvent>) {
         for event in events {
             let _ = self.completed.send(event);
