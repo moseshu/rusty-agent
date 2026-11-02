@@ -1175,13 +1175,12 @@ pub fn begin_network_approval(
     })
 }
 
-const NETWORK_ACCESS_DENIED_MESSAGE: &str =
-    "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A command's deferred network approval, finished once the command has ended: Codex's unified
-/// exec `finish_deferred_network_approval_after_process_exit`, and its denial message when the
-/// review had already cancelled the command.
+/// exec `finish_deferred_network_approval_after_process_exit`. Finishing again reports the
+/// outcome the first finish took, as [`DeferredNetworkApproval::finish`] caches it; the exec tools
+/// supply Codex's default denial message.
 pub struct CommandNetworkApproval {
     service: Arc<NetworkApprovalService>,
     deferred: DeferredNetworkApproval,
@@ -1207,14 +1206,14 @@ impl CommandNetworkApproval {
     }
 
     /// Codex's `wait_for_late_network_denial`: a denial racing the command's exit still counts.
-    async fn wait_for_late_network_denial(&self) -> bool {
+    async fn wait_for_late_network_denial(&self) {
         let network_cancelled = self.deferred.cancellation_token();
         if network_cancelled.is_cancelled() {
-            return true;
+            return;
         }
         tokio::select! {
-            () = network_cancelled.cancelled() => true,
-            () = tokio::time::sleep(LATE_NETWORK_DENIAL_GRACE_PERIOD) => false,
+            () = network_cancelled.cancelled() => {}
+            () = tokio::time::sleep(LATE_NETWORK_DENIAL_GRACE_PERIOD) => {}
         }
     }
 }
@@ -1222,13 +1221,10 @@ impl CommandNetworkApproval {
 #[async_trait]
 impl ra_tools::exec_command::ExecNetworkApproval for CommandNetworkApproval {
     async fn finish_after_exit(&self) -> Result<(), String> {
-        let denied = self.wait_for_late_network_denial().await;
+        self.wait_for_late_network_denial().await;
         self.finished
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        match self.deferred.finish(&self.service).await {
-            Ok(()) if denied => Err(NETWORK_ACCESS_DENIED_MESSAGE.to_string()),
-            result => result,
-        }
+        self.deferred.finish(&self.service).await
     }
 
     fn is_denied(&self) -> bool {

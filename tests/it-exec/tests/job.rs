@@ -581,3 +581,45 @@ async fn test_terminate_background_terminals_stops_every_command() {
         assert!(snapshot.is_closed());
     }
 }
+
+/// Codex's `release_process`: a released session stops answering. A finished one leaves at once;
+/// a running one is cancelled and leaves once its process is reaped.
+#[tokio::test]
+async fn test_a_released_session_stops_answering() {
+    let manager = Arc::new(ProcessManager::default());
+
+    let finished = start_job(Arc::clone(&manager), "sleep 0.2").await;
+    finished
+        .wait(JobWaitUntil::Done)
+        .await
+        .expect("job is retained");
+    manager.release(finished.session_id()).await;
+    assert!(
+        manager
+            .get_session_state(finished.session_id())
+            .await
+            .is_none()
+    );
+
+    let running = start_job(Arc::clone(&manager), "sleep 30").await;
+    manager.release(running.session_id()).await;
+    // Already gone is as good as closed here; the loop below is what checks it.
+    let _ = manager.wait_for_close(running.session_id()).await;
+    for _ in 0..100 {
+        if manager
+            .get_session_state(running.session_id())
+            .await
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        manager
+            .get_session_state(running.session_id())
+            .await
+            .is_none()
+    );
+    assert!(manager.active_sessions().await.is_empty());
+}

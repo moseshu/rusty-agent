@@ -365,19 +365,20 @@ impl Tool for WriteStdinTool {
             .min(self.process_manager.limits().initial_yield_timeout());
         let deadline = tokio::time::Instant::now() + waited;
         let emitter = context.event_emitter();
-        match input.control {
-            Some(SessionControl::Cancel) => {
-                job.cancel()
-                    .await
-                    .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
-            }
-            Some(SessionControl::Interrupt) => {
-                self.process_manager
-                    .write_stdin(&session_id, None, true, emitter.as_ref())
-                    .await
-                    .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
-            }
-            None => {}
+        let control_result = match input.control {
+            Some(SessionControl::Cancel) => job
+                .cancel()
+                .await
+                .map_err(|error| WriteStdinFailure::from_job(&error).into_error()),
+            Some(SessionControl::Interrupt) => self
+                .process_manager
+                .write_stdin(&session_id, None, true, emitter.as_ref())
+                .await
+                .map_err(|error| WriteStdinFailure::from_exec(&error).into_error()),
+            None => Ok(()),
+        };
+        if let Err(error) = control_result {
+            return Err(self.failed_write(&session_id, error).await);
         }
 
         let _interaction = if let Ok(result) =
@@ -386,39 +387,27 @@ impl Tool for WriteStdinTool {
         {
             result.map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?
         } else {
-            // Said in the same vocabulary as every other result: this one returned without looking,
-            // which is a different fact from a wait that looked and saw nothing, and the snapshot
-            // still has to answer where the session stands.
-            let snapshot = job
-                .snapshot()
-                .await
-                .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
-            return Ok(SessionReturn {
-                session_id: &session_id,
-                watched: plan.watched(),
-                waited,
-                reason: ReturnReason::Contended {
-                    control_sent: input.control.is_some(),
-                },
-                state: snapshot.state().clone(),
-                closed: snapshot.is_closed(),
-                exit_code: snapshot.output().exit_code(),
-                stdout: String::new(),
-                stderr: String::new(),
-                matched: None,
-                delivered_bytes: 0,
-                omitted_bytes: 0,
-            }
-            .render());
+            return self
+                .contended(
+                    &job,
+                    &session_id,
+                    plan.watched(),
+                    waited,
+                    input.control.is_some(),
+                )
+                .await;
         };
         let (stdout_cursor, stderr_cursor) = self
             .process_manager
             .interactive_output_cursors(&session_id)
             .await
             .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
-        if input.control.is_none() {
-            self.send_input(&session_id, &input.chars, deadline, emitter.as_ref())
-                .await?;
+        if input.control.is_none()
+            && let Err(error) = self
+                .send_input(&session_id, &input.chars, deadline, emitter.as_ref())
+                .await
+        {
+            return Err(self.failed_write(&session_id, error).await);
         }
 
         let outcome = job
@@ -474,7 +463,69 @@ impl Tool for WriteStdinTool {
 }
 
 impl WriteStdinTool {
-    /// Fails the call with the rejection a network approval left for `session_id`, if any.
+    /// The result of a call that could not take the session's delivery lock in time.
+    ///
+    /// Said in the same vocabulary as every other result: this one returned without looking,
+    /// which is a different fact from a wait that looked and saw nothing, and the snapshot still
+    /// has to answer where the session stands.
+    async fn contended(
+        &self,
+        job: &BackgroundJob,
+        session_id: &ExecSessionId,
+        watched: Watched<'_>,
+        waited: Duration,
+        control_sent: bool,
+    ) -> Result<ToolOutput> {
+        let snapshot = job
+            .snapshot()
+            .await
+            .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
+        // The denial check needs no delivery lock: a denied command is reported now. The entry and
+        // the session are left to the call holding the lock, which reports and releases them once
+        // its wait returns.
+        if let Some(approvals) = &self.network_approvals
+            && let Some(rejection) = approvals
+                .pending_rejection(session_id, snapshot.is_closed())
+                .await
+        {
+            return Err(WriteStdinFailure::Rejected(rejection).into_error());
+        }
+        Ok(SessionReturn {
+            session_id,
+            watched,
+            waited,
+            reason: ReturnReason::Contended { control_sent },
+            state: snapshot.state().clone(),
+            closed: snapshot.is_closed(),
+            exit_code: snapshot.output().exit_code(),
+            stdout: String::new(),
+            stderr: String::new(),
+            matched: None,
+            delivered_bytes: 0,
+            omitted_bytes: 0,
+        }
+        .render())
+    }
+
+    /// The failure of a write to `session_id` that failed with `error`. Codex's write to a process
+    /// that has exited is not the call's failure: the call goes on to report the denial that
+    /// stopped it. Here only that denial replaces the error; a write that failed for any other
+    /// reason is still reported as it was.
+    async fn failed_write(&self, session_id: &ExecSessionId, error: Error) -> Error {
+        let ended = self
+            .process_manager
+            .get_session_state(session_id)
+            .await
+            .is_some_and(|state| state.is_terminal());
+        match self.fail_on_network_rejection(session_id, ended).await {
+            Err(rejection) => rejection,
+            Ok(()) => error,
+        }
+    }
+
+    /// Fails the call with the rejection a network approval left for `session_id`, if any, and
+    /// releases the session: Codex releases the process whose result a rejection replaced, so its
+    /// identifier stops answering.
     async fn fail_on_network_rejection(
         &self,
         session_id: &ExecSessionId,
@@ -484,7 +535,10 @@ impl WriteStdinTool {
             return Ok(());
         };
         match approvals.rejection(session_id, ended).await {
-            Some(rejection) => Err(WriteStdinFailure::Rejected(rejection).into_error()),
+            Some(rejection) => {
+                self.process_manager.release(session_id).await;
+                Err(WriteStdinFailure::Rejected(rejection).into_error())
+            }
             None => Ok(()),
         }
     }

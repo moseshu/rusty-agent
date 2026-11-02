@@ -34,7 +34,7 @@
 //! manager (`core/src/unified_exec/process_manager.rs`) lists and terminates its processes.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -649,6 +649,8 @@ struct RegistryState {
     active: VecDeque<ExecSessionId>,
     /// Finished sessions still answerable by a poll, oldest first.
     retired: VecDeque<ExecSessionId>,
+    /// Running sessions released by their owner, dropped instead of retained once reaped.
+    released: HashSet<ExecSessionId>,
 }
 
 struct SessionRegistry {
@@ -675,6 +677,7 @@ impl SessionRegistry {
                 sessions: HashMap::new(),
                 active: VecDeque::new(),
                 retired: VecDeque::new(),
+                released: HashSet::new(),
             }),
             watched: std::sync::Mutex::new(HashMap::new()),
             retention,
@@ -750,7 +753,11 @@ impl SessionRegistry {
             if was_active.is_none() {
                 return;
             }
-            state.retired.push_back(session_id.clone());
+            if state.released.remove(session_id) {
+                state.sessions.remove(session_id);
+            } else {
+                state.retired.push_back(session_id.clone());
+            }
             while state.retired.len() > self.retention {
                 // A session someone is waiting on keeps its place, and the next oldest unwatched
                 // one goes instead. The wait is about to return that session's final output, and
@@ -766,6 +773,19 @@ impl SessionRegistry {
             }
         }
         self.retired_notify.notify_waiters();
+    }
+
+    /// Stops answering for a session: a finished one leaves at once, and a running one leaves when
+    /// it is reaped rather than joining the retention window, so its slot is still counted until
+    /// its process is gone.
+    async fn release(&self, session_id: &ExecSessionId) {
+        let mut state = self.state.lock().await;
+        if let Some(index) = state.retired.iter().position(|id| id == session_id) {
+            state.retired.remove(index);
+            state.sessions.remove(session_id);
+        } else if state.active.contains(session_id) {
+            state.released.insert(session_id.clone());
+        }
     }
 
     async fn active_ids(&self) -> Vec<ExecSessionId> {
@@ -1657,6 +1677,26 @@ impl ProcessManager {
     /// what has already happened is that its recorded death is a cancellation and nothing else.
     pub async fn cancel(&self, session_id: &ExecSessionId) {
         let _ = self.stop(session_id, TerminalOutcome::Cancelled).await;
+    }
+
+    /// Stops the command of `session_id` if it still runs and forgets the session: Codex's
+    /// `release_process`, which unified exec calls once a command's result has been refused, so the
+    /// process identifier stops answering. A later lookup reports an unknown session.
+    ///
+    /// A command still running is cancelled and leaves the manager once its process is reaped;
+    /// until then it keeps holding the slot it was admitted against, as [`Self::cancel`] keeps it.
+    pub async fn release(&self, session_id: &ExecSessionId) {
+        self.registry.release(session_id).await;
+        self.cancel(session_id).await;
+    }
+
+    /// Waits for the session's process and output closeout without declaring a watch on it, so
+    /// the idle sweep and the retention window still apply. Returns `false` when the manager no
+    /// longer retains the session.
+    pub async fn wait_for_close(&self, session_id: &ExecSessionId) -> bool {
+        self.wait_for_session_close(session_id, None)
+            .await
+            .is_some()
     }
 
     /// Requests cancellation and reports an identifier the manager no longer retains.

@@ -440,27 +440,41 @@ pub fn rejection(reason: impl Into<String>) -> Error {
     ExecCommandFailure::Rejected(reason.into()).into_error()
 }
 
-/// How often a command left running is checked for its end, to finish its network approval.
-const SESSION_END_POLL: Duration = Duration::from_millis(200);
+/// Codex's message for a command a network review denied, when finishing its approval left no
+/// rejection of its own: unified exec's `NETWORK_ACCESS_DENIED_MESSAGE`.
+const NETWORK_ACCESS_DENIED_MESSAGE: &str =
+    "Network access was denied by the Codex sandbox network proxy.";
 
-/// Finishes `approval` once the session it ran in has ended or is gone. A denial is kept in
-/// `approvals` for the `write_stdin` call that observes the end to report, as Codex reports it
-/// from the process entry; an approval that ended cleanly leaves nothing to report.
-fn finish_network_approval_after_session(
+/// Finishes `approval`: the rejection it left, or Codex's denial message when a review denied the
+/// command and finishing left none, as unified exec's `network_denial_message_for_session` reports
+/// a cancelled approval.
+async fn finish_approval(approval: &dyn ExecNetworkApproval) -> std::result::Result<(), String> {
+    match approval.finish_after_exit().await {
+        Ok(()) if approval.is_denied() => Err(NETWORK_ACCESS_DENIED_MESSAGE.to_owned()),
+        result => result,
+    }
+}
+
+/// Finishes the approval of a command left running once its session has closed.
+///
+/// Codex keeps the approval on the process entry, finishes it when a `write_stdin` call observes
+/// the exit, and unregisters it when the process is released or pruned; its denial monitor
+/// (`terminate_process_on_network_denial`) stops the process on a denial. Here the denial stops
+/// the command through the attempt's environment, and this executor keeps a finished session in a
+/// retention window that no poll has to drain, so the approval is finished at closeout instead:
+/// the host's registration is released when the command ends rather than when the session is
+/// forgotten. A rejection stays in `approvals` for the `write_stdin` call that observes the end; a
+/// clean finish leaves nothing to report. The wait declares no watch, so the idle sweep still
+/// applies to the session.
+fn finish_network_approval_after_close(
     process_manager: Arc<ProcessManager>,
     session_id: ExecSessionId,
     approval: Arc<dyn ExecNetworkApproval>,
     approvals: Option<Arc<ExecNetworkApprovals>>,
 ) {
     tokio::spawn(async move {
-        while process_manager
-            .get_session_state(&session_id)
-            .await
-            .is_some_and(|state| !state.is_terminal())
-        {
-            tokio::time::sleep(SESSION_END_POLL).await;
-        }
-        if approval.finish_after_exit().await.is_ok()
+        process_manager.wait_for_close(&session_id).await;
+        if finish_approval(approval.as_ref()).await.is_ok()
             && let Some(approvals) = approvals
         {
             approvals.remove(&session_id);
@@ -530,6 +544,27 @@ pub trait ExecCommandPolicy: Send + Sync {
     ) -> Result<SandboxDenialAction> {
         Ok(SandboxDenialAction::Return)
     }
+
+    /// The attempt a [`SandboxDenialAction::Retry`] runs as, in the environment the retry chose.
+    /// Codex's orchestrator runs the retry as an attempt of its own and begins a network approval
+    /// for it; the refused attempt's approval has already been finished. The default runs the
+    /// retry in `environment` with `attempt`'s state and no network approval.
+    ///
+    /// # Errors
+    ///
+    /// A [`rejection`] refuses the retry with its reason; any other error is the call's failure.
+    fn retry_attempt(
+        &self,
+        _context: &ToolContext<'_>,
+        attempt: &ExecCommandAttempt,
+        environment: ExecEnvironment,
+    ) -> Result<ExecCommandAttempt> {
+        let retry = ExecCommandAttempt::new(environment);
+        Ok(match attempt.state() {
+            Some(state) => retry.with_state(state.clone()),
+            None => retry,
+        })
+    }
 }
 
 /// The environment one attempt runs a command in, with whatever the policy wants back if the
@@ -545,14 +580,21 @@ pub struct ExecCommandAttempt {
 /// The network approval an attempt's command runs under: Codex's deferred network approval,
 /// whose reviewed denial cancels the command through the attempt's environment and whose outcome
 /// replaces the command's result once it has ended.
+///
+/// The tools may finish one approval more than once, and from more than one task at a time: the
+/// background finish of a command left running can race the `write_stdin` call that observes its
+/// end, and a refused attempt is finished before its retry is decided. Every finish must report
+/// the same recorded rejection; finishing must not consume it. Codex caches the outcome it takes
+/// from the approval service for the same reason (`DeferredNetworkApproval::finish_outcome`).
 #[async_trait]
 pub trait ExecNetworkApproval: fmt::Debug + Send + Sync {
     /// Codex's `finish_deferred_network_approval_after_process_exit`, called once the command has
-    /// ended: `Err` holds the rejection a reviewed denial left, which becomes the call's result.
+    /// ended: `Err` holds the rejection the review left, which becomes the call's result. A denied
+    /// approval that finishes with `Ok` is reported with Codex's default denial message.
     async fn finish_after_exit(&self) -> std::result::Result<(), String>;
 
     /// Whether a reviewed denial has already cancelled the command: Codex's
-    /// `DeferredNetworkApproval::is_cancelled`.
+    /// `DeferredNetworkApproval::is_cancelled`. Once `true`, it stays `true`.
     fn is_denied(&self) -> bool;
 }
 
@@ -572,7 +614,27 @@ impl ExecNetworkApprovals {
         Self::default()
     }
 
-    fn insert(&self, session_id: ExecSessionId, approval: Arc<dyn ExecNetworkApproval>) {
+    /// Keeps `approval` for `session_id`, first dropping the entries of sessions `process_manager`
+    /// no longer retains: Codex drops a process entry, approval included, when the process is
+    /// pruned, and a rejection no poll can observe any more has nobody to report it to.
+    async fn insert(
+        &self,
+        process_manager: &ProcessManager,
+        session_id: ExecSessionId,
+        approval: Arc<dyn ExecNetworkApproval>,
+    ) {
+        let known: Vec<ExecSessionId> = self
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        for known in known {
+            if process_manager.get_session_state(&known).await.is_none() {
+                self.remove(&known);
+            }
+        }
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -603,15 +665,25 @@ impl ExecNetworkApprovals {
         session_id: &ExecSessionId,
         ended: bool,
     ) -> Option<String> {
-        let approval = self.get(session_id)?;
-        if !approval.is_denied() && !ended {
-            return None;
-        }
-        let rejection = approval.finish_after_exit().await.err();
+        let rejection = self.pending_rejection(session_id, ended).await;
         if rejection.is_some() || ended {
             self.remove(session_id);
         }
         rejection
+    }
+
+    /// The rejection [`Self::rejection`] would report, with the entry kept: for a call that
+    /// returns without the delivery lock while the call holding it reports and releases.
+    pub(crate) async fn pending_rejection(
+        &self,
+        session_id: &ExecSessionId,
+        ended: bool,
+    ) -> Option<String> {
+        let approval = self.get(session_id)?;
+        if !approval.is_denied() && !ended {
+            return None;
+        }
+        finish_approval(approval.as_ref()).await.err()
     }
 }
 
@@ -948,29 +1020,66 @@ impl ExecCommandTool {
         }
     }
 
-    async fn execute_attempt(
+    /// The request the call runs: the one an approval kept, or the one its arguments describe.
+    fn call_request(
         &self,
-        mut context: ToolContext<'_>,
+        context: &mut ToolContext<'_>,
         resume: Option<&ExecCommandResume>,
-        attempt: ExecCommandAttempt,
-        emitter: Option<&HostEventEmitter>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ExecRequest> {
         let request = if let Some(resume) = resume {
             resume.request.clone()
         } else {
             let input = if self.policy.is_some() && self.additional_permissions {
-                self.take_input::<PermissionsExecCommandInput>(&mut context)?
+                self.take_input::<PermissionsExecCommandInput>(context)?
                     .into()
             } else if self.policy.is_some() {
-                self.take_input::<PolicyExecCommandInput>(&mut context)?
-                    .into()
+                self.take_input::<PolicyExecCommandInput>(context)?.into()
             } else {
-                self.take_input::<ExecCommandInput>(&mut context)?
+                self.take_input::<ExecCommandInput>(context)?
             };
             self.request(input)
                 .map_err(ExecCommandFailure::into_error)?
+        };
+        Ok(request.with_call_id(context.call_id().as_str()))
+    }
+
+    /// Runs one process attempt. As in Codex's orchestrator, an execution error finishes that
+    /// attempt's approval first, so a reviewed rejection takes precedence over the process error.
+    async fn execute_process_attempt(
+        &self,
+        request: &ExecRequest,
+        attempt: &ExecCommandAttempt,
+        emitter: Option<&HostEventEmitter>,
+    ) -> Result<ExecExecutionResult> {
+        match self
+            .process_manager
+            .execute_with_environment(
+                self.launched(request, attempt, attempt.environment()),
+                emitter,
+                attempt.environment(),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if let Some(approval) = attempt.network_approval() {
+                    finish_approval(approval.as_ref())
+                        .await
+                        .map_err(self::rejection)?;
+                }
+                Err(ExecCommandFailure::from(&error).into_error())
+            }
         }
-        .with_call_id(context.call_id().as_str());
+    }
+
+    async fn execute_attempt(
+        &self,
+        mut context: ToolContext<'_>,
+        resume: Option<&ExecCommandResume>,
+        mut attempt: ExecCommandAttempt,
+        emitter: Option<&HostEventEmitter>,
+    ) -> Result<ToolOutput> {
+        let request = self.call_request(&mut context, resume)?;
         // Read before the request is handed over, because the yielded result reports how long it
         // waited and the effective figure is the one the request carries, not the one asked for.
         let yielded_after = request.limits().initial_yield_timeout();
@@ -985,36 +1094,41 @@ impl ExecCommandTool {
             .map(|events| &events.emitter)
             .or(emitter);
         let mut outcome = self
-            .process_manager
-            .execute_with_environment(
-                self.launched(&request, &attempt, attempt.environment()),
-                attempt_emitter,
-                attempt.environment(),
-            )
-            .await
-            .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+            .execute_process_attempt(&request, &attempt, attempt_emitter)
+            .await?;
 
         // Only startup refusals enter Codex's orchestrator. A later refusal is command output;
         // replaying the whole command could duplicate side effects from its earlier operations.
+        let mut approval_finished = false;
         if let (Some(policy), ExecExecutionResult::Completed(summary)) = (&self.policy, &outcome)
             && summary.duration() <= EARLY_EXIT_GRACE_PERIOD
             && is_likely_sandbox_denied(summary)
         {
+            // Codex's orchestrator finishes a refused attempt's network approval before it decides
+            // what follows: a rejection is the call's result, with neither a retry nor a request to
+            // run the command again.
+            if let Some(approval) = attempt.network_approval() {
+                finish_approval(approval.as_ref())
+                    .await
+                    .map_err(self::rejection)?;
+                approval_finished = true;
+            }
             match policy.on_sandbox_denial(
                 &self.policy_context(&context, resume),
                 &attempt,
                 summary,
             )? {
                 SandboxDenialAction::Retry(environment) => {
+                    let retry = policy.retry_attempt(
+                        &self.policy_context(&context, resume),
+                        &attempt,
+                        *environment,
+                    )?;
                     outcome = self
-                        .process_manager
-                        .execute_with_environment(
-                            self.launched(&request, &attempt, environment.as_ref()),
-                            emitter,
-                            environment.as_ref(),
-                        )
-                        .await
-                        .map_err(|error| ExecCommandFailure::from(&error).into_error())?;
+                        .execute_process_attempt(&request, &retry, emitter)
+                        .await?;
+                    attempt = retry;
+                    approval_finished = false;
                     if let Some(events) = &attempt_events {
                         events.discard();
                     }
@@ -1038,7 +1152,9 @@ impl ExecCommandTool {
             events.release();
         }
 
-        self.finish_network_approval(&attempt, &outcome).await?;
+        if !approval_finished {
+            self.finish_network_approval(&attempt, &outcome).await?;
+        }
 
         Ok(match outcome {
             ExecExecutionResult::Completed(summary) => completed_output(&summary),
@@ -1089,22 +1205,31 @@ impl ExecCommandTool {
         };
         match outcome {
             ExecExecutionResult::Completed(_) => {
-                if let Err(rejection) = approval.finish_after_exit().await {
+                if let Err(rejection) = finish_approval(approval.as_ref()).await {
                     return Err(self::rejection(rejection));
                 }
             }
             ExecExecutionResult::Yielded { session_id, .. } => {
-                // A denial that cancelled the command before it yielded is its result, as Codex
-                // fails the process with the denial message.
-                if approval.is_denied()
-                    && let Err(rejection) = approval.finish_after_exit().await
-                {
-                    return Err(self::rejection(rejection));
+                // A denial that cancelled the command before it yielded is its result: Codex fails
+                // the process with the denial message and releases its identifier.
+                if approval.is_denied() {
+                    let reason = finish_approval(approval.as_ref())
+                        .await
+                        .err()
+                        .unwrap_or_else(|| NETWORK_ACCESS_DENIED_MESSAGE.to_owned());
+                    self.process_manager.release(session_id).await;
+                    return Err(self::rejection(reason));
                 }
                 if let Some(approvals) = &self.network_approvals {
-                    approvals.insert(session_id.clone(), Arc::clone(approval));
+                    approvals
+                        .insert(
+                            &self.process_manager,
+                            session_id.clone(),
+                            Arc::clone(approval),
+                        )
+                        .await;
                 }
-                finish_network_approval_after_session(
+                finish_network_approval_after_close(
                     Arc::clone(&self.process_manager),
                     session_id.clone(),
                     Arc::clone(approval),
@@ -1112,7 +1237,7 @@ impl ExecCommandTool {
                 );
             }
             _ => {
-                let _ = approval.finish_after_exit().await;
+                let _ = finish_approval(approval.as_ref()).await;
             }
         }
         Ok(())

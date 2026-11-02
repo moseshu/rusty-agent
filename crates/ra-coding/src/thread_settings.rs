@@ -1147,6 +1147,30 @@ impl ExecCommandPolicy for CodingCommandPolicy {
         settings.with_thread_network(attempt, context, &state.decision)
     }
 
+    /// Codex's retry after a sandbox denial begins a network approval of its own, as the first
+    /// attempt did; an escalated decision skips the execution proxy as it does there.
+    fn retry_attempt(
+        &self,
+        context: &ToolContext<'_>,
+        attempt: &ExecCommandAttempt,
+        environment: ExecEnvironment,
+    ) -> Result<ExecCommandAttempt> {
+        let retry = ExecCommandAttempt::new(environment);
+        let (Some(settings), Some(state)) = (
+            context.run().app_context::<CodingThreadSettings>(),
+            attempt.state(),
+        ) else {
+            return Ok(retry);
+        };
+        let AttemptState { decision, .. } =
+            serde_json::from_value(state.clone()).map_err(|error| {
+                Error::caller(format!(
+                    "exec_command lost the state of its attempt: {error}"
+                ))
+            })?;
+        settings.with_thread_network(retry.with_state(state.clone()), context, &decision)
+    }
+
     fn launch_state(
         &self,
         attempt: &ExecCommandAttempt,
