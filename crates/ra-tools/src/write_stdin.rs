@@ -58,6 +58,7 @@ use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::exec_command::ExecNetworkApprovals;
 use crate::session_return::{ReturnReason, SessionReturn, Watched};
 
 const TOOL_NAME: &str = "write_stdin";
@@ -199,6 +200,7 @@ pub struct WriteStdinTool {
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
     policy: Option<Arc<dyn WriteStdinPolicy>>,
+    network_approvals: Option<Arc<ExecNetworkApprovals>>,
 }
 
 impl fmt::Debug for WriteStdinTool {
@@ -223,6 +225,7 @@ impl WriteStdinTool {
                 .with_concurrency(ToolConcurrency::Parallel),
             process_manager,
             policy: None,
+            network_approvals: None,
         })
     }
 
@@ -231,6 +234,15 @@ impl WriteStdinTool {
     pub fn with_policy(mut self, policy: Arc<dyn WriteStdinPolicy>) -> Self {
         self.policy = Some(policy);
         self.options = self.options.with_approval(ToolApprovalPolicy::Dynamic);
+        self
+    }
+
+    /// Reports a network denial of a session's command, or the rejection its network approval
+    /// ended with, in place of the call's result; `approvals` is the registry the tool that
+    /// started the sessions was given (see [`crate::exec_command::ExecCommandTool::with_network_approvals`]).
+    #[must_use]
+    pub fn with_network_approvals(mut self, approvals: Arc<ExecNetworkApprovals>) -> Self {
+        self.network_approvals = Some(approvals);
         self
     }
 
@@ -414,6 +426,11 @@ impl Tool for WriteStdinTool {
             .await
             .map_err(|error| WriteStdinFailure::from_job(&error).into_error())?;
 
+        // Codex checks a cancelled network approval before it reads the process state, and
+        // finishes the approval of a process that has exited once its output is collected.
+        self.fail_on_network_rejection(&session_id, outcome.snapshot().is_closed())
+            .await?;
+
         let stdout = self
             .deliver(&session_id, ExecStreamKind::Stdout, stdout_cursor)
             .await?;
@@ -457,6 +474,21 @@ impl Tool for WriteStdinTool {
 }
 
 impl WriteStdinTool {
+    /// Fails the call with the rejection a network approval left for `session_id`, if any.
+    async fn fail_on_network_rejection(
+        &self,
+        session_id: &ExecSessionId,
+        ended: bool,
+    ) -> Result<()> {
+        let Some(approvals) = &self.network_approvals else {
+            return Ok(());
+        };
+        match approvals.rejection(session_id, ended).await {
+            Some(rejection) => Err(WriteStdinFailure::Rejected(rejection).into_error()),
+            None => Ok(()),
+        }
+    }
+
     /// Bounds writes without pretending a timed-out write was atomic.
     async fn send_input(
         &self,

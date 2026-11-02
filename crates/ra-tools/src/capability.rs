@@ -165,12 +165,16 @@ impl ShellCapability {
         workspace: &Workspace,
         process_manager: Arc<ProcessManager>,
     ) -> Result<Self> {
+        let approvals = Arc::new(crate::exec_command::ExecNetworkApprovals::new());
         Ok(Self {
             exec_command: Arc::new(
                 ExecCommandTool::for_workspace(workspace)?
-                    .with_manager(Arc::clone(&process_manager)),
+                    .with_manager(Arc::clone(&process_manager))
+                    .with_network_approvals(Arc::clone(&approvals)),
             ),
-            write_stdin: Arc::new(WriteStdinTool::new(process_manager)?),
+            write_stdin: Arc::new(
+                WriteStdinTool::new(process_manager)?.with_network_approvals(approvals),
+            ),
         })
     }
 

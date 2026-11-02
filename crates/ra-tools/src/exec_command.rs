@@ -288,6 +288,7 @@ pub struct ExecCommandTool {
     root: Option<PathBuf>,
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
     policy: Option<Arc<dyn ExecCommandPolicy>>,
+    network_approvals: Option<Arc<ExecNetworkApprovals>>,
 }
 
 /// Prepared command and policy state kept with the approval. The request owns defaults and the
@@ -439,6 +440,34 @@ pub fn rejection(reason: impl Into<String>) -> Error {
     ExecCommandFailure::Rejected(reason.into()).into_error()
 }
 
+/// How often a command left running is checked for its end, to finish its network approval.
+const SESSION_END_POLL: Duration = Duration::from_millis(200);
+
+/// Finishes `approval` once the session it ran in has ended or is gone. A denial is kept in
+/// `approvals` for the `write_stdin` call that observes the end to report, as Codex reports it
+/// from the process entry; an approval that ended cleanly leaves nothing to report.
+fn finish_network_approval_after_session(
+    process_manager: Arc<ProcessManager>,
+    session_id: ExecSessionId,
+    approval: Arc<dyn ExecNetworkApproval>,
+    approvals: Option<Arc<ExecNetworkApprovals>>,
+) {
+    tokio::spawn(async move {
+        while process_manager
+            .get_session_state(&session_id)
+            .await
+            .is_some_and(|state| !state.is_terminal())
+        {
+            tokio::time::sleep(SESSION_END_POLL).await;
+        }
+        if approval.finish_after_exit().await.is_ok()
+            && let Some(approvals) = approvals
+        {
+            approvals.remove(&session_id);
+        }
+    });
+}
+
 /// Codex's launch grace period: only a sandbox refusal detected while opening the process
 /// enters the orchestrator's retry path. Later refusals are returned as command output.
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
@@ -510,6 +539,80 @@ pub trait ExecCommandPolicy: Send + Sync {
 pub struct ExecCommandAttempt {
     environment: ExecEnvironment,
     state: Option<serde_json::Value>,
+    network_approval: Option<Arc<dyn ExecNetworkApproval>>,
+}
+
+/// The network approval an attempt's command runs under: Codex's deferred network approval,
+/// whose reviewed denial cancels the command through the attempt's environment and whose outcome
+/// replaces the command's result once it has ended.
+#[async_trait]
+pub trait ExecNetworkApproval: fmt::Debug + Send + Sync {
+    /// Codex's `finish_deferred_network_approval_after_process_exit`, called once the command has
+    /// ended: `Err` holds the rejection a reviewed denial left, which becomes the call's result.
+    async fn finish_after_exit(&self) -> std::result::Result<(), String>;
+
+    /// Whether a reviewed denial has already cancelled the command: Codex's
+    /// `DeferredNetworkApproval::is_cancelled`.
+    fn is_denied(&self) -> bool;
+}
+
+/// The network approvals of the commands left running, by session: the part of Codex's process
+/// entry (`ProcessEntry::network_approval`) that `exec_command` and `write_stdin` share. Both
+/// tools are given the same registry; `write_stdin` consults it when it observes a session's end
+/// or a denial.
+#[derive(Debug, Default)]
+pub struct ExecNetworkApprovals {
+    entries: Mutex<std::collections::HashMap<ExecSessionId, Arc<dyn ExecNetworkApproval>>>,
+}
+
+impl ExecNetworkApprovals {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, session_id: ExecSessionId, approval: Arc<dyn ExecNetworkApproval>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_id, approval);
+    }
+
+    fn get(&self, session_id: &ExecSessionId) -> Option<Arc<dyn ExecNetworkApproval>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+
+    fn remove(&self, session_id: &ExecSessionId) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    /// The rejection a `write_stdin` result observing `session_id` is replaced by, if its command
+    /// was denied network access or has ended with a rejection: Codex checks a cancelled approval
+    /// first and finishes the approval once the process has exited and its output is collected.
+    /// The entry is released once reported.
+    pub(crate) async fn rejection(
+        &self,
+        session_id: &ExecSessionId,
+        ended: bool,
+    ) -> Option<String> {
+        let approval = self.get(session_id)?;
+        if !approval.is_denied() && !ended {
+            return None;
+        }
+        let rejection = approval.finish_after_exit().await.err();
+        if rejection.is_some() || ended {
+            self.remove(session_id);
+        }
+        rejection
+    }
 }
 
 impl ExecCommandAttempt {
@@ -519,7 +622,21 @@ impl ExecCommandAttempt {
         Self {
             environment,
             state: None,
+            network_approval: None,
         }
+    }
+
+    /// Runs the command under `approval`; see [`ExecNetworkApproval`].
+    #[must_use]
+    pub fn with_network_approval(mut self, approval: Arc<dyn ExecNetworkApproval>) -> Self {
+        self.network_approval = Some(approval);
+        self
+    }
+
+    /// The network approval the command runs under, if any.
+    #[must_use]
+    pub fn network_approval(&self) -> Option<&Arc<dyn ExecNetworkApproval>> {
+        self.network_approval.as_ref()
     }
 
     /// Keeps `state` for [`ExecCommandPolicy::on_sandbox_denial`].
@@ -601,6 +718,7 @@ impl ExecCommandTool {
             root: None,
             rooted_filesystem: None,
             policy: None,
+            network_approvals: None,
         })
     }
 
@@ -638,6 +756,7 @@ impl ExecCommandTool {
             root: Some(workspace.root().to_path_buf()),
             rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
             policy: None,
+            network_approvals: None,
         })
     }
 
@@ -647,6 +766,14 @@ impl ExecCommandTool {
     #[must_use]
     pub fn with_manager(mut self, manager: Arc<ProcessManager>) -> Self {
         self.process_manager = manager;
+        self
+    }
+
+    /// Keeps the network approval of every command left running in `approvals`, where the stdin
+    /// tool sharing it reports a denial that cancelled the command; see [`ExecNetworkApprovals`].
+    #[must_use]
+    pub fn with_network_approvals(mut self, approvals: Arc<ExecNetworkApprovals>) -> Self {
+        self.network_approvals = Some(approvals);
         self
     }
 
@@ -911,6 +1038,8 @@ impl ExecCommandTool {
             events.release();
         }
 
+        self.finish_network_approval(&attempt, &outcome).await?;
+
         Ok(match outcome {
             ExecExecutionResult::Completed(summary) => completed_output(&summary),
             ExecExecutionResult::Yielded {
@@ -945,6 +1074,48 @@ impl ExecCommandTool {
                 other.summary().total_bytes()
             )),
         })
+    }
+
+    /// Codex's unified exec finishes a command's network approval once the command has ended: a
+    /// reviewed denial replaces a finished command's result, and a command left running is
+    /// finished when its session ends.
+    async fn finish_network_approval(
+        &self,
+        attempt: &ExecCommandAttempt,
+        outcome: &ExecExecutionResult,
+    ) -> Result<()> {
+        let Some(approval) = attempt.network_approval() else {
+            return Ok(());
+        };
+        match outcome {
+            ExecExecutionResult::Completed(_) => {
+                if let Err(rejection) = approval.finish_after_exit().await {
+                    return Err(self::rejection(rejection));
+                }
+            }
+            ExecExecutionResult::Yielded { session_id, .. } => {
+                // A denial that cancelled the command before it yielded is its result, as Codex
+                // fails the process with the denial message.
+                if approval.is_denied()
+                    && let Err(rejection) = approval.finish_after_exit().await
+                {
+                    return Err(self::rejection(rejection));
+                }
+                if let Some(approvals) = &self.network_approvals {
+                    approvals.insert(session_id.clone(), Arc::clone(approval));
+                }
+                finish_network_approval_after_session(
+                    Arc::clone(&self.process_manager),
+                    session_id.clone(),
+                    Arc::clone(approval),
+                    self.network_approvals.clone(),
+                );
+            }
+            _ => {
+                let _ = approval.finish_after_exit().await;
+            }
+        }
+        Ok(())
     }
 
     /// Resolves a requested working directory against the workspace root.
