@@ -3655,6 +3655,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "core-foundation 0.9.4",
  "dirs",
  "dns-lookup",
  "dunce",
@@ -3665,7 +3666,6 @@ dependencies = [
  "libc",
  "multimap",
  "ra-core",
- "ra-exec",
  "ra-execpolicy",
  "ra-filesystem",
  "ra-paths",
@@ -3686,6 +3686,7 @@ dependencies = [
  "url",
  "wildmatch",
  "winapi-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3748,7 +3749,6 @@ dependencies = [
  "base64 0.22.1",
  "cap-primitives",
  "cap-std",
- "core-foundation 0.9.4",
  "dunce",
  "filedescriptor",
  "lazy_static",
@@ -3758,6 +3758,7 @@ dependencies = [
  "ra-core",
  "ra-executor-protocol",
  "ra-filesystem",
+ "ra-network-proxy",
  "ra-paths",
  "ra-uds",
  "regex-lite",
@@ -3770,6 +3771,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "which",
  "winapi",
  "windows-sys 0.61.2",

@@ -417,27 +417,23 @@ fn append_control_socket_protection(
 pub mod test_api {
     #![allow(missing_docs, reason = "Hidden bridges for source tests.")]
     use crate::sandbox::seatbelt_profile as profile;
-    use ra_filesystem::permissions::{FileSystemSandboxPolicy, NetworkSandboxPolicy};
+    pub use crate::sandbox::seatbelt_profile::test_api::{
+        CreateSeatbeltCommandArgsParams, ProxyPolicyInputs, UnixDomainSocketPolicy,
+        dynamic_network_policy, unix_socket_dir_params, unix_socket_policy,
+    };
     use ra_paths::AbsolutePathBuf;
-    use std::path::Path;
 
     #[must_use]
     pub const fn base_policy() -> &'static str {
         include_str!("seatbelt_profile/seatbelt_base_policy.sbpl")
     }
     pub fn command_args(
-        command: Vec<String>,
-        permissions: &FileSystemSandboxPolicy,
-        network: NetworkSandboxPolicy,
-        cwd: &Path,
+        args: CreateSeatbeltCommandArgsParams<'_>,
         helper: bool,
         home: Option<&AbsolutePathBuf>,
     ) -> Result<Vec<String>, String> {
         profile::create_seatbelt_command_args_with_profile(
-            command,
-            permissions,
-            cwd,
-            network,
+            args,
             if helper {
                 profile::MacosSeatbeltProfile::FileSystemHelper
             } else {

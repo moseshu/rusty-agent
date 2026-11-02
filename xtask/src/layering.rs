@@ -156,6 +156,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-paths",
             "ra-filesystem",
             "ra-executor-protocol",
+            // Codex's sandboxing crate consumes the managed proxy's sandbox context directly.
+            "ra-network-proxy",
         ],
     ),
     // Codex's command execution policy: Starlark rules files, their evaluation and amendments. It
@@ -167,13 +169,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ("ra-paths", &[]),
     (
         "ra-config",
-        &[
-            "ra-core",
-            "ra-paths",
-            "ra-filesystem",
-            "ra-execpolicy",
-            "ra-exec",
-        ],
+        &["ra-core", "ra-paths", "ra-filesystem", "ra-execpolicy"],
     ),
     ("ra-filesystem", &["ra-paths"]),
     ("ra-http", &["ra-tls"]),

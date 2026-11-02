@@ -1,10 +1,6 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! Privileged daemon sockets stay unreachable from a Seatbelt child, despite full network and
-//! `/tmp` write grants.
-//!
-//! Codex's case also passes the daemon root as an explicit Unix-socket allowance, a managed
-//! network input that is not ported; with network enabled every other Unix socket is already
-//! reachable, so the case keeps its assertions without it.
+//! Privileged daemon sockets stay unreachable from a Seatbelt child, despite full network,
+//! `/tmp` write and explicit Unix-socket grants.
 
 #![cfg(target_os = "macos")]
 
@@ -78,7 +74,7 @@ assert p.recv(2) == b'ok'
         managed_network: None,
         environment_id: None,
         network: None,
-        extra_allow_unix_sockets: &[],
+        extra_allow_unix_sockets: &[AbsolutePathBuf::from_absolute_path(root).unwrap()],
     })
     .unwrap();
     let output = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE)

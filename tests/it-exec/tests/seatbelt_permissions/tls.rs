@@ -1,11 +1,6 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Check TLS trust-service access in applied Seatbelt policies without external network
 //! dependencies.
-//!
-//! Only Codex's cases without a managed network or Unix-socket allowlist are ported: network
-//! disabled denies the trust service and outbound connections, network enabled allows both. The
-//! managed-proxy, missing-endpoint, Unix-socket and local-binding cases need the managed network
-//! proxy, which is not ported.
 
 #![cfg(target_os = "macos")]
 
@@ -14,6 +9,8 @@ use super::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
 use super::create_seatbelt_command_args;
 use ra_filesystem::permissions::FileSystemSandboxPolicy;
 use ra_filesystem::permissions::NetworkSandboxPolicy;
+use ra_network_proxy::ManagedNetworkSandboxContext;
+use ra_paths::AbsolutePathBuf;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::process::Command;
@@ -42,10 +39,106 @@ fn trust_evaluation_agent_access_follows_network_policy() {
     let other = TcpListener::bind("127.0.0.1:0").expect("unapproved listener");
     let proxy_address = proxy.local_addr().expect("proxy address");
     let other_address = other.local_addr().expect("unapproved address");
+    let unix_sockets = [
+        AbsolutePathBuf::from_absolute_path(workspace.path().join("service.sock"))
+            .expect("absolute Unix socket path"),
+    ];
+    let managed_network = ManagedNetworkSandboxContext {
+        loopback_ports: vec![proxy_address.port()],
+        ..Default::default()
+    };
+    let missing_endpoint = ManagedNetworkSandboxContext::default();
+    let unix_only = ManagedNetworkSandboxContext {
+        allow_unix_sockets: vec![unix_sockets[0].to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+    let all_unix_sockets = ManagedNetworkSandboxContext {
+        dangerously_allow_all_unix_sockets: true,
+        ..Default::default()
+    };
+    let local_binding = ManagedNetworkSandboxContext {
+        allow_local_binding: true,
+        ..Default::default()
+    };
     let module = module_path!().split_once("::").expect("test module path").1;
-    for (name, network_policy, expectation) in [
-        ("disabled", NetworkSandboxPolicy::Restricted, "deny"),
-        ("enabled", NetworkSandboxPolicy::Enabled, "allow"),
+    for (name, network_policy, managed_network, extra_unix_sockets, expectation) in [
+        (
+            "disabled",
+            NetworkSandboxPolicy::Restricted,
+            None,
+            &[][..],
+            "deny",
+        ),
+        (
+            "enabled",
+            NetworkSandboxPolicy::Enabled,
+            None,
+            &[][..],
+            "allow",
+        ),
+        (
+            "managed-proxy",
+            NetworkSandboxPolicy::Restricted,
+            Some(&managed_network),
+            &[][..],
+            "proxy",
+        ),
+        (
+            "managed-proxy-overrides-enabled",
+            NetworkSandboxPolicy::Enabled,
+            Some(&managed_network),
+            &[][..],
+            "proxy",
+        ),
+        (
+            "missing-endpoint",
+            NetworkSandboxPolicy::Restricted,
+            Some(&missing_endpoint),
+            &[][..],
+            "deny",
+        ),
+        (
+            "missing-endpoint-overrides-enabled",
+            NetworkSandboxPolicy::Enabled,
+            Some(&missing_endpoint),
+            &[][..],
+            "deny",
+        ),
+        (
+            "unix-only",
+            NetworkSandboxPolicy::Restricted,
+            None,
+            unix_sockets.as_slice(),
+            "deny",
+        ),
+        (
+            "managed-unix-only",
+            NetworkSandboxPolicy::Restricted,
+            Some(&unix_only),
+            &[][..],
+            "deny",
+        ),
+        (
+            "all-unix-sockets",
+            NetworkSandboxPolicy::Restricted,
+            Some(&all_unix_sockets),
+            &[][..],
+            "deny",
+        ),
+        (
+            "local-binding",
+            NetworkSandboxPolicy::Restricted,
+            Some(&local_binding),
+            &[][..],
+            "allow",
+        ),
+        (
+            "enabled-with-unix-socket",
+            NetworkSandboxPolicy::Enabled,
+            None,
+            unix_sockets.as_slice(),
+            "allow",
+        ),
     ] {
         let args = create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
             command: vec![
@@ -61,11 +154,11 @@ fn trust_evaluation_agent_access_follows_network_policy() {
             file_system_sandbox_policy: &FileSystemSandboxPolicy::read_only(),
             network_sandbox_policy: network_policy,
             sandbox_policy_cwd: workspace.path(),
-            enforce_managed_network: false,
-            managed_network: None,
+            enforce_managed_network: managed_network.is_some(),
+            managed_network,
             environment_id: None,
             network: None,
-            extra_allow_unix_sockets: &[],
+            extra_allow_unix_sockets: extra_unix_sockets,
         })
         .expect("generated Seatbelt arguments");
         let output = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE)

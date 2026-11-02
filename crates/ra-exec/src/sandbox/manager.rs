@@ -12,6 +12,8 @@ use super::policy_transforms::{effective_permission_profile, should_require_plat
 use super::{SandboxCommand, SandboxError};
 use ra_filesystem::models::{AdditionalPermissionProfile, PermissionProfile};
 use ra_filesystem::sandbox::SandboxType;
+use ra_network_proxy::{ManagedNetworkSandboxContext, NetworkProxy};
+use ra_paths::AbsolutePathBuf;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,13 @@ pub(crate) struct SandboxManager {
     allowed_symlinked_codex_home: Option<ra_paths::AbsolutePathBuf>,
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "Only Seatbelt consumes managed-network inputs until the Linux helper and Windows lowering are ported."
+    )
+)]
 pub(crate) struct SandboxTransformRequest<'a> {
     pub(crate) command: SandboxCommand,
     pub(crate) permissions: &'a PermissionProfile,
@@ -48,6 +57,13 @@ pub(crate) struct SandboxTransformRequest<'a> {
     /// them; callers that merged their grants already pass `None`.
     pub(crate) additional_permissions: Option<&'a AdditionalPermissionProfile>,
     pub(crate) sandbox: SandboxType,
+    pub(crate) enforce_managed_network: bool,
+    pub(crate) environment_id: Option<&'a str>,
+    pub(crate) network: Option<&'a NetworkProxy>,
+    /// The command's prepared managed-network context, which Codex carries on its
+    /// `SandboxCommand`; the local command type is the backend's spawn wrapper, so the context
+    /// travels with the request instead.
+    pub(crate) managed_network: Option<&'a ManagedNetworkSandboxContext>,
     pub(crate) sandbox_policy_cwd: &'a Path,
 }
 
@@ -71,6 +87,29 @@ pub(crate) fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<Sand
     } else {
         None
     }
+}
+
+/// Adds the managed MITM CA trust bundle as a readable root so sandboxed clients can load the
+/// bundle the proxy advertises through their CA environment variables.
+pub(crate) fn with_managed_mitm_ca_readable_root(
+    permission_profile: PermissionProfile,
+    managed_mitm_ca_trust_bundle_path: Option<&AbsolutePathBuf>,
+    sandbox_policy_cwd: &Path,
+) -> PermissionProfile {
+    let Some(managed_mitm_ca_trust_bundle_path) = managed_mitm_ca_trust_bundle_path else {
+        return permission_profile;
+    };
+    let (file_system_sandbox_policy, network_sandbox_policy) =
+        permission_profile.to_runtime_permissions();
+    let file_system_sandbox_policy = file_system_sandbox_policy.with_additional_readable_roots(
+        sandbox_policy_cwd,
+        std::slice::from_ref(managed_mitm_ca_trust_bundle_path),
+    );
+    PermissionProfile::from_runtime_permissions_with_enforcement(
+        permission_profile.enforcement(),
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+    )
 }
 
 impl SandboxManager {
@@ -151,22 +190,48 @@ impl SandboxManager {
                 detail: "sandbox policy cwd must be absolute on the executing host".to_owned(),
             });
         }
+        let managed_mitm_ca_trust_bundle_path = request
+            .network
+            .and_then(NetworkProxy::managed_mitm_ca_trust_bundle_path);
         let permissions =
             effective_permission_profile(request.permissions, request.additional_permissions);
+        // Codex adds the bundle while preparing a sandboxed request; an unsandboxed command keeps
+        // its base profile.
+        let permissions = if request.sandbox == SandboxType::None {
+            permissions
+        } else {
+            with_managed_mitm_ca_readable_root(
+                permissions,
+                managed_mitm_ca_trust_bundle_path.as_ref(),
+                request.sandbox_policy_cwd,
+            )
+        };
         let command = match request.sandbox {
             SandboxType::None => request.command,
             SandboxType::MacosSeatbelt => {
                 #[cfg(target_os = "macos")]
                 {
-                    use super::seatbelt_profile::{self, MacosSeatbeltProfile};
+                    use super::seatbelt_profile::{
+                        self, CreateSeatbeltCommandArgsParams, MacosSeatbeltProfile,
+                        SeatbeltPreparationError,
+                    };
                     let mut command =
                         vec![request.command.program().to_string_lossy().into_owned()];
                     command.extend_from_slice(request.command.args());
+                    let (file_system_sandbox_policy, network_sandbox_policy) =
+                        permissions.to_runtime_permissions();
                     let args = seatbelt_profile::create_seatbelt_command_args_with_profile(
-                        command,
-                        &permissions.file_system_sandbox_policy(),
-                        request.sandbox_policy_cwd,
-                        permissions.network_sandbox_policy(),
+                        CreateSeatbeltCommandArgsParams {
+                            command,
+                            file_system_sandbox_policy: &file_system_sandbox_policy,
+                            network_sandbox_policy,
+                            sandbox_policy_cwd: request.sandbox_policy_cwd,
+                            enforce_managed_network: request.enforce_managed_network,
+                            managed_network: request.managed_network,
+                            environment_id: request.environment_id,
+                            network: request.network,
+                            extra_allow_unix_sockets: &[],
+                        },
                         if self.file_system_helper {
                             MacosSeatbeltProfile::FileSystemHelper
                         } else {
@@ -174,9 +239,17 @@ impl SandboxManager {
                         },
                         self.allowed_symlinked_codex_home.as_ref(),
                     )
-                    .map_err(|error| SandboxError::Preparation {
-                        backend: "Seatbelt",
-                        detail: error.to_string(),
+                    .map_err(|error| match error {
+                        SeatbeltPreparationError::FileSystem(detail) => SandboxError::Preparation {
+                            backend: "Seatbelt",
+                            detail,
+                        },
+                        SeatbeltPreparationError::EnvironmentNetworkProxy(detail) => {
+                            SandboxError::Preparation {
+                                backend: "environment network proxy",
+                                detail,
+                            }
+                        }
                     })?;
                     SandboxCommand::new(seatbelt_profile::MACOS_PATH_TO_SEATBELT_EXECUTABLE, args)
                 }
@@ -212,8 +285,8 @@ pub mod test_api {
     #![allow(missing_docs, reason = "Hidden bridges for source tests.")]
     pub use super::SandboxablePreference;
     use super::{
-        AdditionalPermissionProfile, Path, PermissionProfile, SandboxCommand, SandboxError,
-        SandboxManager, SandboxTransformRequest, SandboxType,
+        AbsolutePathBuf, AdditionalPermissionProfile, Path, PermissionProfile, SandboxCommand,
+        SandboxError, SandboxManager, SandboxTransformRequest, SandboxType,
     };
 
     #[must_use]
@@ -236,6 +309,19 @@ pub mod test_api {
         )
     }
 
+    #[must_use]
+    pub fn with_managed_mitm_ca_readable_root(
+        permission_profile: PermissionProfile,
+        managed_mitm_ca_trust_bundle_path: Option<&AbsolutePathBuf>,
+        sandbox_policy_cwd: &Path,
+    ) -> PermissionProfile {
+        super::with_managed_mitm_ca_readable_root(
+            permission_profile,
+            managed_mitm_ca_trust_bundle_path,
+            sandbox_policy_cwd,
+        )
+    }
+
     /// The transformed argv and effective permission profile of a command manager launch.
     pub fn transform(
         program: &str,
@@ -250,6 +336,10 @@ pub mod test_api {
             permissions,
             additional_permissions,
             sandbox,
+            enforce_managed_network: false,
+            environment_id: None,
+            network: None,
+            managed_network: None,
             sandbox_policy_cwd,
         })?;
         let mut transformed = vec![request.command.program().to_string_lossy().into_owned()];

@@ -6,7 +6,7 @@ use std::{io, path::PathBuf};
     unsafe_code,
     reason = "SHGetKnownFolderPath returns an owned UTF-16 path freed with CoTaskMemFree."
 )]
-pub fn windows_program_data_dir() -> io::Result<PathBuf> {
+pub(crate) fn windows_program_data_dir() -> io::Result<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;

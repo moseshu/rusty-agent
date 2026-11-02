@@ -384,7 +384,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-exec/src/filesystem/fs_helper.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_helper.rs |
 | `crates/ra-exec/src/filesystem/fs_helper_main.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_helper_main.rs |
 | `crates/ra-exec/src/filesystem/fs_sandbox.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/fs_sandbox.rs |
-| `crates/ra-exec/src/sandbox/seatbelt_profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt.rs (shared process and filesystem-helper profile lowering; on/off network policy) |
+| `crates/ra-exec/src/sandbox/seatbelt_profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt.rs (shared process and filesystem-helper profile lowering; managed-network and Unix-socket policy) |
 | `crates/ra-exec/src/filesystem/local_file_system.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system.rs |
 | `crates/ra-exec/src/filesystem/local_file_system_read.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/local_file_system_read.rs |
 | `crates/ra-exec/src/filesystem/no_follow.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/exec-server/src/no_follow/mod.rs |
@@ -591,9 +591,9 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-config/src/loader/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos.rs (confirmed product namespace; native accessor delegated to ra-exec) |
 | `crates/ra-config/src/thread_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/thread_config.rs (account backend implementation excluded; typed source/lifecycle retained) |
 | `crates/ra-config/src/project_root_markers.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/project_root_markers.rs |
-| `crates/ra-exec/src/platform_config/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos.rs::native preferences |
-| `crates/ra-exec/src/platform_config/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/mod.rs::windows_program_data_dir_from_known_folder |
-| `crates/ra-exec/src/platform_config/windows_acl.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/windows-sandbox-rs/src/{acl,winutil}.rs::read-only owner, mutation ACE and SID inspection |
+| `crates/ra-config/src/platform_config/macos.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos.rs::native preferences |
+| `crates/ra-config/src/platform_config/windows.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/mod.rs::windows_program_data_dir_from_known_folder |
+| `crates/ra-config/src/platform_config/windows_acl.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/windows-sandbox-rs/src/{acl,winutil}.rs::read-only owner, mutation ACE and SID inspection |
 | `tests/it-config/tests/config_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/state_tests.rs |
 | `tests/it-config/tests/model_provider_requirements.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/model_provider_requirements_tests.rs |
 | `tests/it-config/tests/requirements_composition.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/requirements_layers/stack_tests.rs (OpenAI account requirements case excluded) |
@@ -604,7 +604,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `tests/it-config/tests/managed_project_discovery_tests.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/managed_project_discovery_tests.rs |
 | `crates/ra-config/src/shell_environment.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/shell_environment.rs |
 | `tests/it-config/tests/path_context.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/path_context_tests.rs |
-| `tests/it-exec/tests/managed_preferences.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos_tests.rs |
+| `tests/it-config/tests/managed_preferences.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/loader/macos_tests.rs |
 | `tests/it-config/tests/requirements_values.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_requirements.rs |
 | `crates/ra-config/src/home.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/home-dir/src/lib.rs |
 | `tests/it-config/tests/home.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/utils/home-dir/src/lib.rs |
@@ -819,21 +819,23 @@ An optional final license column overrides the default Apache-2.0 source license
 
 | `crates/ra-coding/src/thread_settings/profile.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/session/session.rs (set_permission_profile_projection and legacy sandbox updates preserving session denies) |
 
-| `crates/ra-exec/src/sandbox/manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/manager.rs (selection and native macOS transformation; proxy, Linux helper and Windows transformation deferred) |
+| `crates/ra-exec/src/sandbox/manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/manager.rs (selection, native macOS transformation with managed network and MITM CA readability; Linux helper and Windows transformation deferred) |
 
 | `crates/ra-exec/src/sandbox/policy_transforms.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/policy_transforms.rs (effective profiles and sandbox selection) |
 
-| `tests/it-exec/tests/seatbelt_permissions_upstream.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_tests.rs (process and helper filesystem cases; product .rusty-agent metadata protection added to expectations) |
+| `tests/it-exec/tests/seatbelt_permissions_upstream.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_tests.rs (process, helper and managed-network cases; product .rusty-agent metadata protection added to expectations) |
 
 | `tests/it-exec/tests/seatbelt_permissions/fcntl.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_fcntl_tests.rs |
+
+| `tests/it-exec/tests/seatbelt_permissions/network.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_network_tests.rs |
 
 | `tests/it-exec/tests/sandbox_policy_transforms.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/policy_transforms_tests.rs (effective and merged filesystem policies) |
 
 | `tests/it-exec/tests/sandbox_manager.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/manager_tests.rs (selection and transform cases the native manager covers) |
 
-| `tests/it-exec/tests/seatbelt_permissions/tls.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_tls_tests.rs (cases without a managed network) |
+| `tests/it-exec/tests/seatbelt_permissions/tls.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_tls_tests.rs |
 
-| `tests/it-exec/tests/seatbelt_permissions/daemon_socket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_daemon_socket_tests.rs (without the managed Unix-socket allowance) |
+| `tests/it-exec/tests/seatbelt_permissions/daemon_socket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/sandboxing/src/seatbelt_daemon_socket_tests.rs |
 
 | `crates/ra-network-proxy/src/authorization_path.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/network-proxy/src/authorization_path.rs |
 

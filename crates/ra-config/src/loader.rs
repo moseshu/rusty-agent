@@ -833,7 +833,7 @@ fn windows_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
 
 #[cfg(windows)]
 fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
-    ra_exec::platform_config::windows_program_data_dir()
+    crate::platform_config::windows_program_data_dir()
 }
 
 fn requirements_layers_from_legacy_scheme(
@@ -1863,6 +1863,16 @@ pub mod test_api {
             CredentialBrokerProjectState::Enabled => super::CredentialBrokerProjectState::Enabled,
         };
         super::sanitize_project_config(config, state, custom_environment_keys)
+    }
+
+    pub fn has_local_managed_configuration_with_system_requirements_path(
+        codex_home: &Path,
+        system_requirements_path: &Path,
+    ) -> io::Result<bool> {
+        super::has_local_managed_configuration_with_system_requirements_path(
+            codex_home,
+            system_requirements_path,
+        )
     }
 
     pub async fn load_local_config_layers_with_overrides(

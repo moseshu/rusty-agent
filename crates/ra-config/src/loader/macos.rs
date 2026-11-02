@@ -127,10 +127,10 @@ fn load_managed_admin_requirements() -> io::Result<Option<String>> {
 }
 
 pub(super) fn synchronize_managed_preferences() -> io::Result<()> {
-    ra_exec::platform_config::synchronize_managed_preferences(MANAGED_PREFERENCES_APPLICATION_ID)
+    crate::platform_config::synchronize_managed_preferences(MANAGED_PREFERENCES_APPLICATION_ID)
 }
 fn load_managed_preference(key_name: &str) -> io::Result<Option<String>> {
-    ra_exec::platform_config::load_managed_preference(MANAGED_PREFERENCES_APPLICATION_ID, key_name)
+    crate::platform_config::load_managed_preference(MANAGED_PREFERENCES_APPLICATION_ID, key_name)
 }
 
 fn parse_managed_config_base64(

@@ -265,13 +265,13 @@ unsafe fn dacl_mask_allows_with_scope(
 /// Whether a broad standard-user principal has an allow ACE that can mutate
 /// the path. This is intentionally conservative and does not evaluate deny
 /// ACEs against a concrete token.
-pub fn path_has_standard_user_mutation_allow(path: &Path) -> Result<bool> {
+pub(crate) fn path_has_standard_user_mutation_allow(path: &Path) -> Result<bool> {
     path_has_standard_user_mutation_allow_with_scope(path, AceScope::Effective)
 }
 
 /// Whether a broad standard-user principal has an allow ACE that can mutate
 /// the path or a directly inherited child file.
-pub fn path_or_child_file_has_standard_user_mutation_allow(path: &Path) -> Result<bool> {
+pub(crate) fn path_or_child_file_has_standard_user_mutation_allow(path: &Path) -> Result<bool> {
     path_has_standard_user_mutation_allow_with_scope(path, AceScope::EffectiveOrChildFile)
 }
 
@@ -313,7 +313,7 @@ fn path_has_standard_user_mutation_allow_with_scope(path: &Path, scope: AceScope
 
 /// Whether the path owner is one of the conservative administrator-controlled
 /// principals used by the Windows system-config shadow check.
-pub fn path_has_trusted_system_owner(path: &Path) -> Result<bool> {
+pub(crate) fn path_has_trusted_system_owner(path: &Path) -> Result<bool> {
     // These canonical labels map to fixed SIDs before any localized account lookup.
     let mut administrators = resolve_sid("Administrators")?;
     let mut system = resolve_sid("SYSTEM")?;

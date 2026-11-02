@@ -2,7 +2,7 @@
 //! Exercise managed preference trust checks with injected reads and in-memory values.
 
 #![cfg(target_os = "macos")]
-use ra_exec::platform_config::test_load_managed_preference_with as load_managed_preference_with;
+use ra_config::test_load_managed_preference_with as load_managed_preference_with;
 const MANAGED_PREFERENCES_APPLICATION_ID: &str = "io.github.moseshu.rusty-agent";
 const MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
 const MANAGED_PREFERENCES_REQUIREMENTS_KEY: &str = "requirements_toml_base64";

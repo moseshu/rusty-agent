@@ -1057,7 +1057,7 @@ impl ProcessManager {
             &request,
             (&session_id, &session),
             emitter,
-            temp_dir_use,
+            (temp_dir_use, environment.cancellation().cloned()),
         );
 
         tokio::select! {
@@ -1091,9 +1091,13 @@ impl ProcessManager {
         request: &ExecRequest,
         session: (&ExecSessionId, &Arc<Mutex<ExecSession>>),
         emitter: Option<&HostEventEmitter>,
-        temp_dir_use: Option<TempDirUse>,
+        lifetime: (
+            Option<TempDirUse>,
+            Option<tokio_util::sync::CancellationToken>,
+        ),
     ) -> tokio::task::JoinHandle<()> {
         let (session_id, session) = session;
+        let (temp_dir_use, cancellation) = lifetime;
         let stdout_task = spawn_stream_reader(
             pipes.stdout,
             Arc::clone(session),
@@ -1118,6 +1122,7 @@ impl ProcessManager {
             idle_timeout: request.limits().idle_timeout(),
             stdin: pipes.stdin,
             temp_dir_use,
+            cancellation,
         };
         tokio::spawn(supervise(
             child,
@@ -1821,6 +1826,9 @@ struct SupervisorContext {
     /// makes a run's scratch directory survive until the last thing using it is reaped, rather than
     /// until the call that happened to create it returned.
     temp_dir_use: Option<TempDirUse>,
+    /// Cancelled from outside the command, as a network denial does; see
+    /// [`ExecEnvironment::with_cancellation`].
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// What watching one process to its end produced.
@@ -1857,6 +1865,7 @@ async fn watch_process(
         .idle_timeout
         .map(|timeout| TokioInstant::now() + timeout);
     let mut accepting_requests = true;
+    let mut cancellation = context.cancellation.clone();
 
     outcome.status = loop {
         let escalation_at = hard_kill_at;
@@ -1881,6 +1890,13 @@ async fn watch_process(
                 // behind because the escalation went somewhere narrower than the signal it follows.
                 signal_group(Some(child), context.pid, TerminationSignal::Kill);
                 hard_kill_at = None;
+            }
+            () = cancelled(cancellation.as_ref()) => {
+                // Recorded as a cancellation, as an explicit `cancel` records it: the command was
+                // stopped from outside, not by a deadline or by itself.
+                cancellation = None;
+                context.session.lock().await.finish(ExecSessionState::Cancelled);
+                hard_kill_at = Some(begin_termination(child, context.pid, &mut outcome));
             }
             () = sleep_until(total_at) => {
                 outcome.expiry = Some(ExecEvictionReason::TotalTimeout);
@@ -1917,6 +1933,14 @@ async fn watch_process(
         }
     };
     outcome
+}
+
+/// Resolves once `token` is cancelled; never without one.
+async fn cancelled(token: Option<&tokio_util::sync::CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Starts the drain protocol: `SIGTERM` to the group now, `SIGKILL` to it once the grace elapses.
@@ -2215,15 +2239,30 @@ fn spawn_child(
     // makes the policy's answer the whole answer: without it every filter below would sit on top of
     // an inherited environment that still had everything in it.
     cmd.env_clear();
-    cmd.envs(environment.env_policy().derive());
+    let mut env: std::collections::HashMap<String, String> =
+        environment.env_policy().derive().into_iter().collect();
 
     // Terminal noise, set before the caller's own variables so a request can still override them.
-    cmd.env("NO_COLOR", "1");
-    cmd.env("TERM", "dumb");
-    cmd.env("PAGER", "cat");
+    env.insert("NO_COLOR".to_owned(), "1".to_owned());
+    env.insert("TERM".to_owned(), "dumb".to_owned());
+    env.insert("PAGER".to_owned(), "cat".to_owned());
     for (key, val) in request.env() {
-        cmd.env(key, val);
+        env.insert(key.clone(), val.clone());
     }
+
+    // Codex's `exec` applies the managed proxy to the command's assembled environment, so proxy
+    // variables replace any the policy or the request supplied.
+    if let Some(network) = environment.managed_network() {
+        network
+            .proxy()
+            .apply_to_env_for_optional_environment(&mut env, network.environment_id())
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to prepare the managed network proxy environment: {error}"
+                ))
+            })?;
+    }
+    cmd.envs(env);
 
     // Last, and deliberately not overridable by the request: this names the directory the run is
     // tracking and will later clean up. A command that could repoint it would send its scratch

@@ -1054,3 +1054,75 @@ async fn test_process_manager_reports_a_shell_that_does_not_exist() {
     assert!(matches!(error, ra_exec::session::ExecError::Spawn { .. }));
     assert!(manager.active_sessions().await.is_empty());
 }
+
+/// Not a Codex case: an environment's cancellation stops a command still inside its initial wait,
+/// as Codex's exec expiration cancels a command whose network access was denied.
+#[cfg(unix)]
+#[tokio::test]
+async fn environment_cancellation_stops_a_command_in_its_initial_wait() {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let environment =
+        ra_exec::sandbox::ExecEnvironment::new().with_cancellation(cancellation.clone());
+    let manager = ProcessManager::default();
+    let request = ExecRequest::new("sleep 30")
+        .with_limits(ExecLimits::new().with_initial_yield_timeout(Duration::from_secs(20)));
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancellation.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        RESPONSIVE,
+        manager.execute_with_environment(request, None, &environment),
+    )
+    .await
+    .expect("a cancelled command does not hold its caller")
+    .expect("execute");
+    canceller.await.unwrap();
+
+    let ExecExecutionResult::Completed(summary) = result else {
+        panic!("the cancelled command ended within its wait: {result:?}");
+    };
+    assert!(
+        summary.duration() < Duration::from_secs(10),
+        "the cancellation, not the command, ended it: {summary:?}"
+    );
+    assert_ne!(summary.exit_code(), Some(0), "{summary:?}");
+}
+
+/// Not a Codex case: an environment's cancellation also stops a command left running.
+#[cfg(unix)]
+#[tokio::test]
+async fn environment_cancellation_stops_a_backgrounded_command() {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let environment =
+        ra_exec::sandbox::ExecEnvironment::new().with_cancellation(cancellation.clone());
+    let manager = ProcessManager::default();
+    let request = ExecRequest::new("sleep 30")
+        .with_limits(ExecLimits::new().with_initial_yield_timeout(Duration::from_millis(100)));
+    let result = manager
+        .execute_with_environment(request, None, &environment)
+        .await
+        .expect("execute");
+    let ExecExecutionResult::Yielded { session_id, .. } = result else {
+        panic!("the command was left running: {result:?}");
+    };
+
+    cancellation.cancel();
+
+    tokio::time::timeout(RESPONSIVE, async {
+        while manager
+            .get_session_state(&session_id)
+            .await
+            .is_some_and(|state| !state.is_terminal())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cancelled command ends");
+    assert_eq!(
+        manager.get_session_state(&session_id).await,
+        Some(ExecSessionState::Cancelled)
+    );
+}

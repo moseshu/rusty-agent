@@ -183,6 +183,10 @@ impl FileSystemSandboxRunner {
                 permissions: permission_profile,
                 additional_permissions: None,
                 sandbox,
+                enforce_managed_network: false,
+                environment_id: None,
+                network: None,
+                managed_network: None,
                 sandbox_policy_cwd: cwd,
             })
             .map_err(|error| invalid_request(format!("failed to prepare fs sandbox: {error}")))?;

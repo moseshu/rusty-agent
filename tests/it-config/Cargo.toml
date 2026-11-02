@@ -24,3 +24,6 @@ ra-execpolicy = { path = "../../crates/ra-execpolicy" }
 dirs = "6"
 test-case = "3"
 toml_edit = "0.24.0"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-foundation = "0.9"

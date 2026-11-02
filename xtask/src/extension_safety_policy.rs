@@ -27,6 +27,12 @@ use syn::{Item, Visibility};
 /// triplet. The set is POSIX's, not an open classification, and code that turns a mode into bits
 /// must be able to cover all of it.
 const EXHAUSTIVE_ALLOWED: &[(&str, &str)] = &[
+    // Codex sandboxing/src/seatbelt.rs keeps allow-all and allowlist Unix-socket modes disjoint;
+    // policy lowering matches both, and a third mode must be handled there, not defaulted.
+    (
+        "crates/ra-exec/src/sandbox/seatbelt_profile.rs",
+        "UnixDomainSocketPolicy",
+    ),
     ("crates/ra-core/src/step.rs", "NextStep"),
     ("crates/ra-core/src/agent.rs", "ResolvedInstructions"),
     ("crates/ra-context/src/compaction/summary.rs", "SummarySlot"),
@@ -183,6 +189,16 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "SandboxExecRequest",
     ),
     ("crates/ra-exec/src/filesystem/fs_sandbox.rs", "SandboxCwd"),
+    // Codex sandboxing/src/seatbelt.rs managed-network inputs: the Seatbelt argument bundle and
+    // the derived proxy policy inputs the original seatbelt tests build by literal.
+    (
+        "crates/ra-exec/src/sandbox/seatbelt_profile.rs",
+        "CreateSeatbeltCommandArgsParams",
+    ),
+    (
+        "crates/ra-exec/src/sandbox/seatbelt_profile.rs",
+        "ProxyPolicyInputs",
+    ),
     (
         "crates/ra-exec/src/filesystem/local_file_system_read.rs",
         "CancellableReader",

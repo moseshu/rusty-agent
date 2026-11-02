@@ -47,6 +47,8 @@ regex-lite = { workspace = true }
 dunce = { workspace = true }
 base64 = { workspace = true }
 ra-paths = { workspace = true }
+ra-network-proxy = { workspace = true }
+url = { workspace = true }
 ra-filesystem = { workspace = true }
 ra-executor-protocol = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
@@ -77,6 +79,3 @@ lazy_static = "1"
 log = "0.4"
 shared_library = "0.1.9"
 winapi = { version = "0.3.9", features = ["std", "handleapi", "jobapi", "jobapi2", "libloaderapi", "minwinbase", "processthreadsapi", "synchapi", "winbase", "wincon", "winerror", "winnt"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.9"

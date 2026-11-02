@@ -8,16 +8,39 @@
     clippy::too_many_lines,
     reason = "Keep the source lifecycle and policy lowering order visible in one operation."
 )]
+#![allow(
+    clippy::format_push_string,
+    clippy::single_match_else,
+    reason = "Preserve the upstream managed-network policy assembly."
+)]
+#![allow(
+    missing_docs,
+    reason = "Preserve upstream Seatbelt records reachable only through the hidden test bridge."
+)]
+#[cfg(feature = "test-api")]
+use ra_filesystem::legacy::SandboxPolicy;
 use ra_filesystem::legacy::WritableRoot;
 use ra_filesystem::permissions::{
     FileSystemSandboxPolicy, NetworkSandboxPolicy, PROTECTED_METADATA_PATH_NAMES,
 };
+use ra_network_proxy::{
+    ManagedNetworkSandboxContext, NetworkProxy, PROXY_URL_ENV_KEYS, has_proxy_url_env_vars,
+    proxy_url_env_value,
+};
 use ra_paths::AbsolutePathBuf;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
 };
+use tracing::warn;
+use url::Url;
+
 const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_profile/seatbelt_base_policy.sbpl");
+const MACOS_SEATBELT_NETWORK_POLICY: &str =
+    include_str!("seatbelt_profile/seatbelt_network_policy.sbpl");
+// System libcurl needs this service for TLS; keep it out of Unix-only profiles.
+const MACOS_SEATBELT_TLS_TRUST_POLICY: &str =
+    "(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))\n";
 const MACOS_SEATBELT_PREFERENCES_POLICY: &str =
     include_str!("seatbelt_profile/seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
@@ -38,12 +61,15 @@ pub(crate) enum MacosSeatbeltProfile {
 #[derive(Debug)]
 pub(crate) enum SeatbeltPreparationError {
     FileSystem(String),
+    EnvironmentNetworkProxy(String),
 }
 
 impl std::fmt::Display for SeatbeltPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FileSystem(message) => f.write_str(message),
+            Self::FileSystem(message) | Self::EnvironmentNetworkProxy(message) => {
+                f.write_str(message)
+            }
         }
     }
 }
@@ -53,6 +79,173 @@ impl std::fmt::Display for SeatbeltPreparationError {
 /// PATH. If /usr/bin/sandbox-exec has been tampered with, then the attacker
 /// already has root access.
 pub(crate) const MACOS_PATH_TO_SEATBELT_EXECUTABLE: &str = "/usr/bin/sandbox-exec";
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn proxy_scheme_default_port(scheme: &str) -> u16 {
+    match scheme {
+        "https" => 443,
+        "socks5" | "socks5h" | "socks4" | "socks4a" => 1080,
+        _ => 80,
+    }
+}
+
+fn proxy_loopback_ports_from_env(env: &HashMap<String, String>) -> Vec<u16> {
+    let mut ports = BTreeSet::new();
+    for key in PROXY_URL_ENV_KEYS {
+        let Some(proxy_url) = proxy_url_env_value(env, key) else {
+            continue;
+        };
+        let trimmed = proxy_url.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let candidate = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else {
+            format!("http://{trimmed}")
+        };
+        let Ok(parsed) = Url::parse(&candidate) else {
+            continue;
+        };
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        if !is_loopback_host(host) {
+            continue;
+        }
+
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let port = parsed
+            .port()
+            .unwrap_or_else(|| proxy_scheme_default_port(scheme.as_str()));
+        ports.insert(port);
+    }
+    ports.into_iter().collect()
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(
+    not(feature = "test-api"),
+    allow(
+        unreachable_pub,
+        reason = "Reachable outside the crate only through the hidden test bridge."
+    )
+)]
+pub struct ProxyPolicyInputs {
+    pub ports: Vec<u16>,
+    pub has_proxy_config: bool,
+    pub allow_local_binding: bool,
+    pub unix_domain_socket_policy: UnixDomainSocketPolicy,
+}
+
+#[derive(Debug, Clone)]
+// Keep allow-all and allowlist modes disjoint so we don't carry ignored state.
+#[cfg_attr(
+    not(feature = "test-api"),
+    allow(
+        unreachable_pub,
+        reason = "Reachable outside the crate only through the hidden test bridge."
+    )
+)]
+pub enum UnixDomainSocketPolicy {
+    AllowAll,
+    Restricted { allowed: Vec<AbsolutePathBuf> },
+}
+
+impl Default for UnixDomainSocketPolicy {
+    fn default() -> Self {
+        Self::Restricted { allowed: vec![] }
+    }
+}
+
+impl UnixDomainSocketPolicy {
+    fn from_allowlist(paths: &[String], extra_allowed: Vec<AbsolutePathBuf>) -> Self {
+        let mut allowed = paths
+            .iter()
+            .filter_map(|socket_path| {
+                match normalize_path_for_sandbox(Path::new(socket_path)) {
+                    Some(path) => Some(path),
+                    None => {
+                        warn!(
+                            "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        allowed.extend(extra_allowed);
+        Self::Restricted { allowed }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnixSocketPathParam {
+    index: usize,
+    path: AbsolutePathBuf,
+}
+
+fn proxy_policy_inputs(
+    managed_network: Option<&ManagedNetworkSandboxContext>,
+    network: Option<&NetworkProxy>,
+    environment_id: Option<&str>,
+    extra_allow_unix_sockets: &[AbsolutePathBuf],
+) -> Result<ProxyPolicyInputs, String> {
+    let extra_allowed = extra_allow_unix_sockets
+        .iter()
+        .filter_map(|socket_path| normalize_path_for_sandbox(socket_path.as_path()))
+        .collect::<Vec<_>>();
+
+    // Prefer this command's prepared Unix-socket policy.
+    // Fall back to the live proxy only when no prepared context exists.
+    let unix_domain_socket_policy = match (managed_network, network) {
+        (Some(context), _) if context.dangerously_allow_all_unix_sockets => {
+            UnixDomainSocketPolicy::AllowAll
+        }
+        (Some(context), _) => {
+            UnixDomainSocketPolicy::from_allowlist(&context.allow_unix_sockets, extra_allowed)
+        }
+        (None, Some(network)) if network.dangerously_allow_all_unix_sockets() => {
+            UnixDomainSocketPolicy::AllowAll
+        }
+        (None, Some(network)) => {
+            UnixDomainSocketPolicy::from_allowlist(&network.allow_unix_sockets(), extra_allowed)
+        }
+        (None, None) => UnixDomainSocketPolicy::Restricted {
+            allowed: extra_allowed,
+        },
+    };
+    if let Some(managed_network) = managed_network {
+        return Ok(ProxyPolicyInputs {
+            ports: managed_network.loopback_ports.clone(),
+            has_proxy_config: true,
+            allow_local_binding: managed_network.allow_local_binding,
+            unix_domain_socket_policy,
+        });
+    }
+    match network {
+        Some(network) => {
+            let mut env = HashMap::new();
+            network
+                .apply_to_env_for_optional_environment(&mut env, environment_id)
+                .map_err(|err| err.to_string())?;
+            Ok(ProxyPolicyInputs {
+                ports: proxy_loopback_ports_from_env(&env),
+                has_proxy_config: has_proxy_url_env_vars(&env),
+                allow_local_binding: network.allow_local_binding(),
+                unix_domain_socket_policy,
+            })
+        }
+        None => Ok(ProxyPolicyInputs {
+            unix_domain_socket_policy,
+            ..Default::default()
+        }),
+    }
+}
 
 fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf> {
     // `AbsolutePathBuf::from_absolute_path()` normalizes relative paths against the current
@@ -68,6 +261,155 @@ fn normalize_path_for_sandbox(path: &Path) -> Option<AbsolutePathBuf> {
         .ok()
         .and_then(|canonical_path| AbsolutePathBuf::from_absolute_path(canonical_path).ok());
     normalized_path.or(Some(absolute_path))
+}
+
+fn unix_socket_path_params(proxy: &ProxyPolicyInputs) -> Vec<UnixSocketPathParam> {
+    let mut deduped_paths: BTreeMap<String, AbsolutePathBuf> = BTreeMap::new();
+    let UnixDomainSocketPolicy::Restricted { allowed } = &proxy.unix_domain_socket_policy else {
+        return vec![];
+    };
+    for path in allowed {
+        deduped_paths
+            .entry(path.to_string_lossy().to_string())
+            .or_insert_with(|| path.clone());
+    }
+
+    deduped_paths
+        .into_values()
+        .enumerate()
+        .map(|(index, path)| UnixSocketPathParam { index, path })
+        .collect()
+}
+
+fn unix_socket_path_param_key(index: usize) -> String {
+    format!("UNIX_SOCKET_PATH_{index}")
+}
+
+fn unix_socket_dir_params(proxy: &ProxyPolicyInputs) -> Vec<(String, PathBuf)> {
+    unix_socket_path_params(proxy)
+        .into_iter()
+        .map(|param| {
+            (
+                unix_socket_path_param_key(param.index),
+                param.path.into_path_buf(),
+            )
+        })
+        .collect()
+}
+
+/// Returns zero or more complete Seatbelt policy lines for unix socket rules.
+/// When non-empty, the returned string is newline-terminated so callers can
+/// append it directly to larger policy blocks.
+fn unix_socket_policy(proxy: &ProxyPolicyInputs) -> String {
+    let socket_params = unix_socket_path_params(proxy);
+    let has_unix_socket_access = matches!(
+        proxy.unix_domain_socket_policy,
+        UnixDomainSocketPolicy::AllowAll
+    ) || !socket_params.is_empty();
+    if !has_unix_socket_access {
+        return String::new();
+    }
+
+    let mut policy = String::new();
+    policy.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+    if matches!(
+        proxy.unix_domain_socket_policy,
+        UnixDomainSocketPolicy::AllowAll
+    ) {
+        // Keep AllowAll genuinely broad here; path qualifiers look narrower
+        // without a clear macOS behavioral benefit.
+        policy.push_str("(allow network-bind (local unix-socket))\n");
+        policy.push_str("(allow network-outbound (remote unix-socket))\n");
+        return policy;
+    }
+
+    for param in socket_params {
+        let key = unix_socket_path_param_key(param.index);
+        // Use subpath so allowlists cover sockets created beneath approved directories.
+        policy.push_str(&format!(
+            "(allow network-bind (local unix-socket (subpath (param \"{key}\"))))\n"
+        ));
+        policy.push_str(&format!(
+            "(allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n"
+        ));
+    }
+    policy
+}
+
+#[cfg(feature = "test-api")]
+fn dynamic_network_policy(
+    sandbox_policy: &SandboxPolicy,
+    enforce_managed_network: bool,
+    proxy: &ProxyPolicyInputs,
+) -> String {
+    dynamic_network_policy_for_network(
+        NetworkSandboxPolicy::from(sandbox_policy),
+        enforce_managed_network,
+        proxy,
+    )
+}
+
+fn dynamic_network_policy_for_network(
+    network_policy: NetworkSandboxPolicy,
+    enforce_managed_network: bool,
+    proxy: &ProxyPolicyInputs,
+) -> String {
+    let has_some_unix_socket_access = match &proxy.unix_domain_socket_policy {
+        UnixDomainSocketPolicy::AllowAll => true,
+        UnixDomainSocketPolicy::Restricted { allowed } => !allowed.is_empty(),
+    };
+    let should_use_restricted_network_policy = !proxy.ports.is_empty()
+        || proxy.has_proxy_config
+        || enforce_managed_network
+        || (!network_policy.is_enabled() && has_some_unix_socket_access);
+    if should_use_restricted_network_policy {
+        let mut policy = String::new();
+        if proxy.allow_local_binding {
+            policy.push_str("; allow local binding and loopback traffic\n");
+            policy.push_str("(allow network-bind (local ip \"*:*\"))\n");
+            policy.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+            policy.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        }
+        for port in &proxy.ports {
+            policy.push_str(&format!(
+                "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+            ));
+        }
+        if proxy.allow_local_binding || !proxy.ports.is_empty() {
+            policy.push_str(MACOS_SEATBELT_TLS_TRUST_POLICY);
+        }
+        let unix_socket_policy = unix_socket_policy(proxy);
+        if !unix_socket_policy.is_empty() {
+            policy.push_str("; allow unix domain sockets for local IPC\n");
+            policy.push_str(&unix_socket_policy);
+        }
+        return format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}");
+    }
+
+    if proxy.has_proxy_config {
+        // Proxy configuration is present but we could not infer any valid loopback endpoints.
+        // Fail closed to avoid silently widening network access in proxy-enforced sessions.
+        return String::new();
+    }
+
+    if enforce_managed_network {
+        // Managed network requirements are active but no usable proxy endpoints
+        // are available. Fail closed for network access.
+        return String::new();
+    }
+
+    if network_policy.is_enabled() {
+        // No proxy env is configured: retain the existing full-network behavior.
+        let mut policy = String::from("(allow network-outbound)\n(allow network-inbound)\n");
+        let unix_socket_policy = unix_socket_policy(proxy);
+        if !unix_socket_policy.is_empty() {
+            policy.push_str("; allow unix domain sockets for local IPC\n");
+            policy.push_str(&unix_socket_policy);
+        }
+        format!("{policy}{MACOS_SEATBELT_NETWORK_POLICY}{MACOS_SEATBELT_TLS_TRUST_POLICY}")
+    } else {
+        String::new()
+    }
 }
 
 fn root_absolute_path() -> AbsolutePathBuf {
@@ -517,15 +859,43 @@ fn seatbelt_regex_for_glob(pattern: &str, glob_match: GlobMatch) -> Option<Strin
     Some(regex)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+#[cfg_attr(
+    not(feature = "test-api"),
+    allow(
+        unreachable_pub,
+        reason = "Reachable outside the crate only through the hidden test bridge."
+    )
+)]
+pub struct CreateSeatbeltCommandArgsParams<'a> {
+    pub command: Vec<String>,
+    pub file_system_sandbox_policy: &'a FileSystemSandboxPolicy,
+    pub network_sandbox_policy: NetworkSandboxPolicy,
+    pub sandbox_policy_cwd: &'a Path,
+    pub enforce_managed_network: bool,
+    pub managed_network: Option<&'a ManagedNetworkSandboxContext>,
+    pub environment_id: Option<&'a str>,
+    pub network: Option<&'a NetworkProxy>,
+    pub extra_allow_unix_sockets: &'a [AbsolutePathBuf],
+}
+
 pub(crate) fn create_seatbelt_command_args_with_profile(
-    command: Vec<String>,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    sandbox_policy_cwd: &Path,
-    network_sandbox_policy: NetworkSandboxPolicy,
+    args: CreateSeatbeltCommandArgsParams<'_>,
     profile: MacosSeatbeltProfile,
     allowed_symlinked_codex_home: Option<&AbsolutePathBuf>,
 ) -> Result<Vec<String>, SeatbeltPreparationError> {
+    let CreateSeatbeltCommandArgsParams {
+        command,
+        file_system_sandbox_policy,
+        network_sandbox_policy,
+        sandbox_policy_cwd,
+        enforce_managed_network,
+        managed_network,
+        environment_id,
+        network,
+        extra_allow_unix_sockets,
+    } = args;
+
     let unreadable_roots =
         file_system_sandbox_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd);
     let mut writable_roots = file_system_sandbox_policy
@@ -662,16 +1032,16 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
             }
         };
 
-    // Without a managed proxy the upstream network section has only on/off behavior.
-    let network_policy = if network_sandbox_policy.is_enabled() {
-        format!(
-            "(allow network-outbound)\n(allow network-inbound)\n{}{}",
-            include_str!("seatbelt_profile/seatbelt_network_policy.sbpl"),
-            include_str!("seatbelt_profile/seatbelt_tls_trust.sbpl")
-        )
-    } else {
-        String::new()
-    };
+    let proxy = proxy_policy_inputs(
+        managed_network,
+        network,
+        environment_id,
+        extra_allow_unix_sockets,
+    )
+    .map_err(SeatbeltPreparationError::EnvironmentNetworkProxy)?;
+    let network_policy =
+        dynamic_network_policy_for_network(network_sandbox_policy, enforce_managed_network, &proxy);
+
     let deny_read_policy =
         build_seatbelt_unreadable_glob_policy(file_system_sandbox_policy, sandbox_policy_cwd);
     let mut policy_sections = vec![
@@ -722,6 +1092,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
         file_read_dir_params,
         file_write_dir_params,
         protected_ancestor_params,
+        unix_socket_dir_params(&proxy),
     ]
     .concat();
 
@@ -741,9 +1112,26 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
 pub(crate) mod test_api {
     #![allow(missing_docs, reason = "Hidden bridges for source tests.")]
     use super::{
-        AbsolutePathBuf, FileSystemSandboxPolicy, GlobMatch, Path,
+        AbsolutePathBuf, FileSystemSandboxPolicy, GlobMatch, Path, PathBuf, SandboxPolicy,
         build_seatbelt_unreadable_glob_policy, normalize_path_for_sandbox, seatbelt_regex_for_glob,
     };
+    pub use super::{CreateSeatbeltCommandArgsParams, ProxyPolicyInputs, UnixDomainSocketPolicy};
+    #[must_use]
+    pub fn dynamic_network_policy(
+        sandbox_policy: &SandboxPolicy,
+        enforce_managed_network: bool,
+        proxy: &ProxyPolicyInputs,
+    ) -> String {
+        super::dynamic_network_policy(sandbox_policy, enforce_managed_network, proxy)
+    }
+    #[must_use]
+    pub fn unix_socket_policy(proxy: &ProxyPolicyInputs) -> String {
+        super::unix_socket_policy(proxy)
+    }
+    #[must_use]
+    pub fn unix_socket_dir_params(proxy: &ProxyPolicyInputs) -> Vec<(String, PathBuf)> {
+        super::unix_socket_dir_params(proxy)
+    }
     #[must_use]
     pub fn unreadable_glob_policy(policy: &FileSystemSandboxPolicy, cwd: &Path) -> String {
         build_seatbelt_unreadable_glob_policy(policy, cwd)

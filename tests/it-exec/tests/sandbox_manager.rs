@@ -5,8 +5,7 @@
 //! The local manager receives native paths at the execution boundary, so a foreign cwd is a path
 //! this host cannot use rather than a `PathUri` of another convention, and a transformed request
 //! is observed as its argv and effective permission profile. Linux helper, WSL1, Windows and MXC
-//! direct-spawn cases, and the managed-network MITM bundle, are recorded with the slices that
-//! port those backends.
+//! direct-spawn cases are recorded with the slices that port those backends.
 
 use dunce::canonicalize;
 use ra_exec::sandbox::manager_test_api as manager;
@@ -260,5 +259,48 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
     assert_eq!(
         permission_profile.network_sandbox_policy(),
         NetworkSandboxPolicy::Enabled
+    );
+}
+
+#[test]
+fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
+    let cwd = TempDir::new().expect("create cwd");
+    let cwd =
+        AbsolutePathBuf::from_absolute_path(canonicalize(cwd.path()).expect("canonicalize cwd"))
+            .expect("absolute cwd");
+    let managed_bundle_dir = TempDir::new().expect("create managed bundle dir");
+    let managed_bundle_path =
+        AbsolutePathBuf::from_absolute_path(managed_bundle_dir.path().join("ca-bundle.pem"))
+            .expect("absolute managed bundle path");
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: cwd.clone().into(),
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        }]),
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    let permission_profile = manager::with_managed_mitm_ca_readable_root(
+        permission_profile,
+        Some(&managed_bundle_path),
+        cwd.as_path(),
+    );
+    let (file_system_sandbox_policy, _) = permission_profile.to_runtime_permissions();
+
+    assert_eq!(
+        file_system_sandbox_policy,
+        FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: cwd.into(),
+                access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
+            },
+            FileSystemSandboxEntry {
+                path: managed_bundle_path.into(),
+                access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
+            },
+        ])
     );
 }

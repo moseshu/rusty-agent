@@ -82,6 +82,47 @@ pub struct ExecEnvironment {
     limits: ResourceLimits,
     temp_dir: Option<Arc<RunTempDir>>,
     sandbox: Option<SandboxPolicy>,
+    managed_network: Option<ManagedNetwork>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// The managed network proxy a command's traffic is routed through: Codex's `network` and
+/// `network_environment_id` on its exec request.
+///
+/// Attaching one injects the proxy's environment into the child and makes the sandbox enforce
+/// that the command reaches the network only through the proxy, as Codex's `exec` does whenever
+/// its request carries a network.
+#[derive(Debug, Clone)]
+pub struct ManagedNetwork {
+    proxy: ra_network_proxy::NetworkProxy,
+    environment_id: Option<String>,
+}
+
+impl ManagedNetwork {
+    /// Routes commands through `proxy`, scoped to `environment_id` when the proxy serves several
+    /// execution environments.
+    #[must_use]
+    pub const fn new(
+        proxy: ra_network_proxy::NetworkProxy,
+        environment_id: Option<String>,
+    ) -> Self {
+        Self {
+            proxy,
+            environment_id,
+        }
+    }
+
+    /// The proxy commands are routed through.
+    #[must_use]
+    pub const fn proxy(&self) -> &ra_network_proxy::NetworkProxy {
+        &self.proxy
+    }
+
+    /// The execution environment the proxy scopes its policy to, if any.
+    #[must_use]
+    pub fn environment_id(&self) -> Option<&str> {
+        self.environment_id.as_deref()
+    }
 }
 
 impl ExecEnvironment {
@@ -118,6 +159,34 @@ impl ExecEnvironment {
     pub fn without_temp_dir(mut self) -> Self {
         self.temp_dir = None;
         self
+    }
+
+    /// Routes every child through a managed network proxy.
+    #[must_use]
+    pub fn with_managed_network(mut self, network: ManagedNetwork) -> Self {
+        self.managed_network = Some(network);
+        self
+    }
+
+    /// The managed network proxy children are routed through, when one is attached.
+    #[must_use]
+    pub const fn managed_network(&self) -> Option<&ManagedNetwork> {
+        self.managed_network.as_ref()
+    }
+
+    /// Stops every child started under this environment once `token` is cancelled, as Codex's
+    /// exec expiration does with its network-denial cancellation: the command is cancelled and
+    /// its process group terminated, whether its caller is still waiting or it was left running.
+    #[must_use]
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    /// What stops this environment's children from outside, when anything does.
+    #[must_use]
+    pub const fn cancellation(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.cancellation.as_ref()
     }
 
     /// How a child's environment is derived.
@@ -170,10 +239,16 @@ impl ExecEnvironment {
     /// Returns [`SandboxError`] when the requested guarantee cannot be delivered and no weaker one
     /// was authorised in advance.
     pub fn resolve_confinement(&self) -> Result<Confinement, SandboxError> {
-        let Some(policy) = &self.sandbox else {
-            return Ok(Confinement::baseline());
+        let mut confinement = match &self.sandbox {
+            Some(policy) => {
+                resolve_confinement(policy, self.temp_dir.as_ref().map(|dir| dir.path()))?
+            }
+            None => Confinement::baseline(),
         };
-        resolve_confinement(policy, self.temp_dir.as_ref().map(|dir| dir.path()))
+        confinement
+            .managed_network
+            .clone_from(&self.managed_network);
+        Ok(confinement)
     }
 }
 
@@ -765,6 +840,7 @@ pub struct Confinement {
     network: NetworkAccess,
     downgraded_from: Option<SandboxLevel>,
     request: Option<ConfinementRequest>,
+    managed_network: Option<ManagedNetwork>,
 }
 
 impl Confinement {
@@ -777,6 +853,7 @@ impl Confinement {
             network: NetworkAccess::Allowed,
             downgraded_from: None,
             request: None,
+            managed_network: None,
         }
     }
 
@@ -823,6 +900,7 @@ impl Confinement {
     ///
     /// Returns [`SandboxError`] when the backend cannot express the policy.
     pub fn apply(&self, command: SandboxCommand) -> Result<SandboxCommand, SandboxError> {
+        let enforce_managed_network = self.managed_network.is_some();
         if let Some(request) = self.request.as_ref()
             && let Some(permissions) = request.permissions.as_ref()
         {
@@ -835,7 +913,7 @@ impl Confinement {
                 &permissions.profile,
                 SandboxablePreference::Auto,
                 ra_filesystem::sandbox::SandboxType::None,
-                false,
+                enforce_managed_network,
             );
             if sandbox == ra_filesystem::sandbox::SandboxType::MacosSeatbelt
                 && let Some(backend) = self.backend
@@ -845,7 +923,11 @@ impl Confinement {
                     detail: "the selected backend does not support canonical command permission profiles".to_owned() });
             }
             if sandbox == ra_filesystem::sandbox::SandboxType::None
-                && manager.should_sandbox(&permissions.profile, SandboxablePreference::Auto, false)
+                && manager.should_sandbox(
+                    &permissions.profile,
+                    SandboxablePreference::Auto,
+                    enforce_managed_network,
+                )
             {
                 return Err(SandboxError::Unavailable {
                     source: SandboxUnavailable::new(
@@ -860,13 +942,31 @@ impl Confinement {
                     permissions: &permissions.profile,
                     additional_permissions: None,
                     sandbox,
+                    enforce_managed_network,
+                    environment_id: self
+                        .managed_network
+                        .as_ref()
+                        .and_then(ManagedNetwork::environment_id),
+                    network: self.managed_network.as_ref().map(ManagedNetwork::proxy),
+                    managed_network: None,
                     sandbox_policy_cwd: &permissions.cwd,
                 })
                 .map(|request| request.command);
         }
         let (Some(backend), Some(request)) = (self.backend, self.request.as_ref()) else {
+            // Codex's unsandboxed attempt keeps the proxy environment without enforcing it.
             return Ok(command);
         };
+        // Codex enforces a managed network only through its sandbox manager. A legacy backend
+        // would let the command bypass the proxy, so the command is refused rather than quietly
+        // unconfined.
+        if enforce_managed_network {
+            return Err(SandboxError::Preparation {
+                backend: backend.name(),
+                detail: "managed networking requires a canonical command permission profile"
+                    .to_owned(),
+            });
+        }
         backend.confine(request, command)
     }
 }
@@ -1047,6 +1147,7 @@ pub fn resolve_confinement_with(
             readable_roots: collect_roots(policy.readable_roots(), None),
             permissions: policy.permissions.clone(),
         }),
+        managed_network: None,
     })
 }
 

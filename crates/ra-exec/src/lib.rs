@@ -28,9 +28,6 @@ mod native_process;
 #[allow(unsafe_code)]
 pub mod shell_detect;
 
-/// Native managed preferences and system-directory discovery.
-pub mod platform_config;
-
 /// Trusted installed helper discovery for automatic product work.
 pub mod system_commands;
 

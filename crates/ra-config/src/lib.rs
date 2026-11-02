@@ -52,11 +52,20 @@ pub use types::{
 pub use tool_exposure::ToolExposureSurface;
 
 pub use constraint::{Constrained, ConstraintError, ConstraintResult};
+#[allow(
+    unsafe_code,
+    reason = "CoreFoundation preferences and Windows known-folder and ACL FFI ported from Codex."
+)]
+mod platform_config;
 /// Internal matcher access for ported integration tests.
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
 pub use mcp_requirements::test_api as mcp_requirements_test_api;
 pub use mcp_requirements::validate_mcp_server_requirement;
+/// Injected managed preference reads for ported integration tests.
+#[cfg(all(target_os = "macos", feature = "test-api"))]
+#[doc(hidden)]
+pub use platform_config::test_load_managed_preference_with;
 mod mcp_policy;
 pub use mcp_policy::{
     EnvironmentMcpPolicy, McpServerCommandMatcher, McpServerIdentity, McpServerRequirement,

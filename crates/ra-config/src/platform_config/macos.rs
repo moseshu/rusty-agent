@@ -20,7 +20,7 @@ unsafe extern "C" {
     reason = "CoreFoundation preference calls preserve source ownership and forced-value checks."
 )]
 /// Refreshes the requested managed preference domain before reading policy.
-pub fn synchronize_managed_preferences(application_id: &str) -> io::Result<()> {
+pub(crate) fn synchronize_managed_preferences(application_id: &str) -> io::Result<()> {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFPreferencesAppSynchronize(application_id: CFStringRef) -> u8;
@@ -35,7 +35,10 @@ pub fn synchronize_managed_preferences(application_id: &str) -> io::Result<()> {
 }
 
 /// Reads a string only while the key is forced, checking again after copying it.
-pub fn load_managed_preference(application_id: &str, key_name: &str) -> io::Result<Option<String>> {
+pub(crate) fn load_managed_preference(
+    application_id: &str,
+    key_name: &str,
+) -> io::Result<Option<String>> {
     let key = CFString::new(key_name);
     let application = CFString::new(application_id);
     load_managed_preference_with(
