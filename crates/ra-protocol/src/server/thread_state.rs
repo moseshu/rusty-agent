@@ -31,11 +31,12 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    approvals::ReviewDecision,
     outgoing::ConnectionRequestId,
     protocol::{
-        MessagePhase, PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, Thread,
-        ThreadItem, ThreadResumeInitialTurnsPageParams, ThreadSettingsRecord,
-        ToolRequestUserInputParams, Turn, TurnError, TurnStatus,
+        CommandExecutionRequestApprovalParams, MessagePhase, PermissionsRequestApprovalParams,
+        PermissionsRequestApprovalResponse, Thread, ThreadItem, ThreadResumeInitialTurnsPageParams,
+        ThreadSettingsRecord, ToolRequestUserInputParams, Turn, TurnError, TurnStatus,
     },
     thread_history::{ItemChange, ThreadHistoryBuilder, TurnEnding},
     tool_items::ThreadToolItems,
@@ -72,6 +73,13 @@ pub(crate) enum ThreadListenerCommand {
     RequestPermissions {
         params: PermissionsRequestApprovalParams,
         response_tx: tokio::sync::oneshot::Sender<PermissionsRequestApprovalResponse>,
+    },
+    /// Asks the client about a network access in flight after the listener has processed the
+    /// preceding turn events. The decision goes to the waiting proxy decider; dropping its
+    /// receiver withdraws a request not yet sent.
+    RequestNetworkApproval {
+        params: CommandExecutionRequestApprovalParams,
+        response_tx: tokio::sync::oneshot::Sender<ReviewDecision>,
     },
     /// Answers a `thread/resume` of the loaded thread and subscribes its connection, then tells
     /// the caller it is done.

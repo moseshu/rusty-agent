@@ -92,6 +92,7 @@ impl TurnRequestProcessor {
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
         let (input, model, effort, output_schema) = params.into_parts();
         let content = input_content(input)?;
+        let previous = thread.run_config();
         let overrides = Box::pin(prepare_overrides(
             "turn/start",
             &SettingsTarget::of(&thread),
@@ -107,6 +108,7 @@ impl TurnRequestProcessor {
         if let Some(schema) = output_schema {
             start = start.with_final_output_json_schema(schema);
         }
+        let commits_policy = !policy.is_empty();
         let request = TurnInputRequest::new(content)
             .with_thread_settings(overrides)
             .on_start(start);
@@ -132,6 +134,12 @@ impl TurnRequestProcessor {
                 )));
             }
         };
+        // A started or steered turn has applied its settings to the thread.
+        if commits_policy && let Some(adapter) = thread.adapter.as_deref() {
+            adapter
+                .settings_committed(&previous, &thread.run_config())
+                .await;
+        }
         response(TurnStartResponse::new(Turn::new(
             turn_id,
             TurnStatus::InProgress,
@@ -234,6 +242,7 @@ impl TurnRequestProcessor {
         let summary = params.summary();
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
         let (_, model, effort) = params.into_parts();
+        let previous = thread.run_config();
         let overrides = Box::pin(prepare_overrides(
             "thread/settings/update",
             &SettingsTarget::of(&thread),
@@ -247,6 +256,13 @@ impl TurnRequestProcessor {
         .await?;
         if !overrides.is_empty() {
             thread.update_settings(&overrides);
+            if !policy.is_empty()
+                && let Some(adapter) = thread.adapter.as_deref()
+            {
+                adapter
+                    .settings_committed(&previous, &thread.run_config())
+                    .await;
+            }
         }
         response(ThreadSettingsUpdateResponse::new())
     }

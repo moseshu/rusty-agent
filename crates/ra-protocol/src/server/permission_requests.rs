@@ -28,12 +28,14 @@ use ra_runtime::thread::AgentThreadBuilder;
 use tokio::sync::{Mutex, oneshot};
 
 use super::{
-    answers::request_permissions_response,
+    answers::{command_execution_approval_decision, request_permissions_response},
+    approvals::ReviewDecision,
     outgoing::{OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender},
     protocol::{
-        AdditionalFileSystemPermissions, ERROR_METHOD, ErrorNotification, FileSystemPath,
-        PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse, ServerRequestPayload,
-        TurnError,
+        AdditionalFileSystemPermissions, CommandExecutionRequestApprovalParams, ERROR_METHOD,
+        ErrorNotification, FileSystemPath, PermissionsRequestApprovalParams,
+        PermissionsRequestApprovalResponse, ServerRequestPayload, TurnError, WARNING_METHOD,
+        WarningNotification,
     },
     settings_adapter::ThreadSettingsAdapter,
     thread_manager::LoadedThread,
@@ -93,6 +95,79 @@ impl ThreadServerRequests {
             .ok()?;
         receiver.await.ok()
     }
+
+    /// Asks the client about the network access `params` describes while its command runs, and
+    /// waits for the decision: Codex's network `ExecApprovalRequest` event and its
+    /// `on_command_execution_request_approval_response`.
+    ///
+    /// `None` means no decision will come: the request's turn was gone before it was sent, or the
+    /// request was withdrawn. Codex's session reads a lost answer as `Abort`.
+    pub async fn request_network_approval(
+        &self,
+        params: CommandExecutionRequestApprovalParams,
+    ) -> Option<ReviewDecision> {
+        let state = self.outgoing.thread_state().thread_state(&self.thread_id);
+        let commands = state.lock().await.listener_command_tx()?;
+        let (sender, receiver) = oneshot::channel();
+        commands
+            .send(ThreadListenerCommand::RequestNetworkApproval {
+                params,
+                response_tx: sender,
+            })
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Tells the thread's connections `message` as Codex's `warning` notification: the delivery of
+    /// a session's `Warning` event.
+    pub async fn send_warning(&self, message: String) {
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&self.outgoing),
+            self.outgoing
+                .thread_state()
+                .subscribed_connection_ids(&self.thread_id),
+            self.thread_id.clone(),
+        );
+        let warning = WarningNotification::new(Some(self.thread_id.as_str().to_owned()), message);
+        match serde_json::to_value(warning) {
+            Ok(params) => {
+                outgoing
+                    .send_server_notification_to_current_connections(ServerNotification::new(
+                        WARNING_METHOD,
+                        params,
+                    ))
+                    .await;
+            }
+            // The notification is a plain record, so this does not happen.
+            Err(error) => tracing::error!("failed to serialize {WARNING_METHOD}: {error}"),
+        }
+    }
+}
+
+/// Sends a network approval in the listener's turn order, then waits for the answer in a task of
+/// its own, as Codex's app server handles its command approval request.
+pub(crate) async fn request_network_approval(
+    params: CommandExecutionRequestApprovalParams,
+    response_tx: oneshot::Sender<ReviewDecision>,
+    outgoing: ThreadScopedOutgoingMessageSender,
+    thread_watch: &Arc<ThreadWatchManager>,
+    loaded: &LoadedThread,
+) {
+    let permission_guard = thread_watch
+        .note_permission_requested(loaded.thread_id())
+        .await;
+    let (request_id, answer) = outgoing
+        .send_request(ServerRequestPayload::CommandExecutionRequestApproval(
+            params,
+        ))
+        .await;
+    tokio::spawn(async move {
+        let answer = outgoing.wait_for_answer(request_id, answer).await;
+        drop(permission_guard);
+        if let Some(decision) = command_execution_approval_decision(answer) {
+            let _ = response_tx.send(decision);
+        }
+    });
 }
 
 /// Sends a permission request in the listener's turn order, then waits for the answer in a task of

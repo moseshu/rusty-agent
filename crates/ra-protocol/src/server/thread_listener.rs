@@ -59,7 +59,7 @@ use super::{
         OutgoingMessageSender, ServerNotification, ThreadScopedOutgoingMessageSender,
         now_unix_timestamp_ms,
     },
-    permission_requests::request_permissions,
+    permission_requests::{request_network_approval, request_permissions},
     protocol::{
         AGENT_MESSAGE_DELTA_METHOD, AgentMessageDeltaNotification,
         COMMAND_EXECUTION_OUTPUT_DELTA_METHOD, CommandExecutionOutputDeltaNotification,
@@ -630,6 +630,28 @@ async fn handle_thread_listener_command(
                 context.outgoing.thread_state().thread_state(thread_id),
             )
             .await;
+        }
+        ThreadListenerCommand::RequestNetworkApproval {
+            params,
+            response_tx,
+        } => {
+            // A withdrawn decider or a turn that already ended must not leave a new pending request.
+            if response_tx.is_closed()
+                || thread_state.lock().await.active_turn_id() != Some(params.turn_id())
+            {
+                return;
+            }
+            let thread_id = loaded.thread_id();
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(&context.outgoing),
+                context
+                    .outgoing
+                    .thread_state()
+                    .subscribed_connection_ids(thread_id),
+                thread_id.clone(),
+            );
+            request_network_approval(params, response_tx, outgoing, &context.thread_watch, loaded)
+                .await;
         }
         ThreadListenerCommand::SendThreadResumeResponse {
             request,

@@ -99,6 +99,14 @@ pub trait ThreadSettingsAdapter: Send + Sync + 'static {
     /// Returns the product-owned fields of the effective thread settings.
     fn describe(&self, config: &RunConfig) -> Value;
 
+    /// Called once a prepared configuration has been committed to a loaded thread, with the
+    /// configuration it replaced: where a product brings thread-owned runtime state in line with
+    /// the settings in force, as Codex's session refreshes its managed network proxy after a
+    /// permission profile change. The default does nothing.
+    async fn settings_committed(&self, previous: &RunConfig, committed: &RunConfig) {
+        let _ = (previous, committed);
+    }
+
     /// Observes the listener's ordered thread events to release product-owned pending execution
     /// state after a call settles or a turn ends. No provider-neutral policy is implied.
     fn on_thread_event(&self, config: &RunConfig, event: &ThreadEvent) {
