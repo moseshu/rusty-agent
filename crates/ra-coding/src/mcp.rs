@@ -388,6 +388,91 @@ impl CodingMcpRuntime {
         self.apply(None, Operation::Reload).await
     }
 
+    /// Calls `tool` on the server registered as `server` with its current connection, without
+    /// waiting for it to start: Codex's `McpRuntime::latest_call_tool` with `wait_for_server`
+    /// false, for callers outside a model step such as MCP hooks.
+    ///
+    /// The checks follow Codex's `McpConnectionSet::call_tool`: an unknown server (a disabled
+    /// one included, as Codex's connection set holds enabled servers only), a server in another
+    /// environment than `environment_id`, a tool the server's filter excludes, and a server that
+    /// is not connected are refused before any request is sent. The deadline is the
+    /// shorter of the server's tool timeout and `requested_timeout`.
+    ///
+    /// # Differences from Codex
+    ///
+    /// - Every product server runs in the local environment, so any other `environment_id` is
+    ///   refused.
+    /// - A dynamic tool filter needs a run to evaluate, which a call outside a model step has
+    ///   not; such a tool is refused rather than called unchecked. Codex filters are static.
+    /// - Codex strips its host-owned entitlement key from `meta`; the product has no such key.
+    /// - The product client checks the arguments against the required properties of the tool's
+    ///   cached schema before sending, as it does for every call; Codex sends them as they are and
+    ///   lets the server refuse them. Either way the call fails, with a different message.
+    ///
+    /// # Errors
+    ///
+    /// The refusals above, the request's failure, or its deadline passing.
+    pub async fn call_tool_now(
+        &self,
+        server: &str,
+        tool: &str,
+        environment_id: Option<&str>,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
+        requested_timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<ra_mcp::rmcp::model::CallToolResult> {
+        let entries = self.entries();
+        // Codex's connection set holds enabled servers only, so a disabled one is unknown to it.
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.server.name() == server
+                    && entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .enabled
+            })
+            .ok_or_else(|| anyhow::anyhow!("unknown MCP server '{server}'"))?;
+        if let Some(environment_id) = environment_id
+            && environment_id != crate::approvals::LOCAL_ENVIRONMENT_ID
+        {
+            anyhow::bail!(
+                "MCP server `{server}` is running in environment `{}`, expected `{environment_id}`",
+                crate::approvals::LOCAL_ENVIRONMENT_ID
+            );
+        }
+        let view = entry.binding_view();
+        let allowed = match &view.filter {
+            ToolFilter::Static(filter) => filter.allows(tool),
+            _ => false,
+        };
+        if !allowed {
+            anyhow::bail!("tool '{tool}' is disabled for MCP server '{server}'");
+        }
+        let connected = {
+            let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.enabled && !state.stopped && state.status == Status::Connected
+        };
+        let client = connected
+            .then(|| entry.server.current_client().ok())
+            .flatten()
+            .map(|client| view.client(client))
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{server}' is not connected"))?;
+        if client.is_closed() {
+            anyhow::bail!("MCP server '{server}' is not connected");
+        }
+        let call = client.call_tool(tool, arguments, meta);
+        let result = match requested_timeout {
+            Some(deadline) => tokio::time::timeout(deadline, call)
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out after {deadline:?}"))
+                .and_then(|result| result.map_err(anyhow::Error::from)),
+            None => call.await.map_err(anyhow::Error::from),
+        };
+        result.map_err(|error| error.context(format!("tool call failed for `{server}/{tool}`")))
+    }
+
     /// Reads detached connection snapshots without network I/O or lifecycle locks.
     #[must_use]
     pub fn get_mcp_status(&self) -> Vec<McpServerStatus> {

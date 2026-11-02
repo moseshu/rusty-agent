@@ -670,6 +670,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/hooks/config_rules.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/config_rules.rs |
 | `crates/ra-coding/src/hooks/legacy_notify.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/legacy_notify.rs |
 | `crates/ra-coding/src/hooks/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/mcp.rs |
+| `crates/ra-coding/src/hook_mcp_executor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/hook_mcp_executor.rs |
 | `crates/ra-coding/src/hooks/output_spill.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/output_spill.rs |
 | `crates/ra-coding/src/hooks/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/types.rs |
 | `crates/ra-coding/src/hooks/engine.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/mod.rs |
@@ -725,7 +726,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/plugins/remote_legacy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/remote_legacy.rs (anonymous featured-plugin fetch and errors) |
 | `tests/it-coding/tests/plugin_featured.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core-plugins/src/manager_tests.rs; codex-rs/core-plugins/src/remote_legacy.rs; codex-rs/app-server/tests/suite/v2/plugin_list.rs |
 
-| `crates/ra-coding/src/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs (connection reuse and per-step policy; SDK manager retains worker ownership) |
+| `crates/ra-coding/src/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/codex-mcp/src/connection_manager.rs (connection reuse and per-step policy; SDK manager retains worker ownership; direct tool calls from `call_tool`), codex-rs/codex-mcp/src/runtime.rs (`latest_call_tool`) |
 | `tests/it-mcp/tests/product_runtime_binding/policy.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/config/config_tests.rs; codex-rs/core/src/mcp_tool_call_tests.rs; codex-rs/codex-mcp/src/connection_manager_tests.rs (real-loader and transport acceptance adaptations) |
 
 | `crates/ra-coding/src/mcp/approval.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/mcp_tool_call.rs; codex-rs/codex-mcp/src/mcp/mod.rs; codex-rs/protocol/src/mcp_approval_meta.rs |
