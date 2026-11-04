@@ -221,6 +221,7 @@ impl ThreadProductRuntime for CodingThreadHooks {
             let _ = events.send(ThreadEvent::Warning { message });
         }
         self.runtime.bind_thread_events(events);
+        self.runtime.bind_transcript(binding.thread_handle());
     }
 
     fn on_thread_event(&self, event: &ThreadEvent) {

@@ -147,6 +147,10 @@ impl std::fmt::Debug for LiveThreadRecorder {
 
 #[async_trait]
 impl RolloutRecorder for LiveThreadRecorder {
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.local_path()
+    }
+
     fn record(&self, item: RolloutItem) {
         // Codex observes only what its persistence policy keeps.
         if !is_persisted_rollout_item(&item) {

@@ -214,21 +214,21 @@ impl RunContext {
 
     /// Attaches a provider-facing model name without model settings or a callable model handle.
     ///
-    /// The runner sets this metadata only on the context passed to capability binding. It does
-    /// not propagate the metadata into tool, hook, guardrail, dynamic-instruction, resumed-run or
-    /// cancellation-notification contexts.
+    /// The runner supplies this metadata to capability binding and to live execution, resumed
+    /// execution and lifecycle notification contexts. A tool sees its captured step's model;
+    /// a thread's turn-scoped hooks see the initial turn's model.
     #[must_use]
     pub fn with_resolved_model_name(mut self, model: impl Into<String>) -> Self {
         self.resolved_model_name = Some(model.into());
         self
     }
 
-    /// The resolved model name supplied for capability binding, including the run-level override.
+    /// The resolved provider-facing model name, including the run-level override.
     ///
-    /// The runner sets this field only on capability-binding contexts. Tool, hook, guardrail,
-    /// dynamic-instruction, resumed-run and cancellation-notification contexts return `None`, even
-    /// when their model is known. Unnamed provider defaults and manually constructed contexts
-    /// without this metadata also return `None`.
+    /// Tools and execution callbacks see the captured step's model. Turn-scoped host hooks use
+    /// their initial turn's model, retained across approval pauses. Unnamed provider defaults,
+    /// unresolved cleanup metadata and manually constructed contexts without a supplied name
+    /// return `None`.
     #[must_use]
     pub fn resolved_model_name(&self) -> Option<&str> {
         self.resolved_model_name.as_deref()

@@ -1275,3 +1275,20 @@ settlement alone keeps the original snapshot, and a new executing step publishes
 move their lifecycle boundaries. Protocol factories can retain a `JsonRpcErrorObject` as a
 framework error source to preserve a typed client-validation response across construction;
 other factory failures keep their internal-error behavior.
+
+### Product hook request fields and transcripts
+
+`RunContext::resolved_model_name` is now populated in live, resumed and lifecycle contexts as well
+as capability binding; callers that previously observed `None` outside binding may now receive the
+resolved slug. Product-configured coding threads now populate hook model and permission-mode fields from the
+hook's runtime context. Turn-scoped hooks retain the initial turn settings; tool hooks use their
+captured step settings, including when approved calls resume. Network permission hooks retain the
+review's model and approval policy. Existing standalone bridge callers keep their explicit session
+values as a fallback when runtime metadata is absent.
+
+`RolloutRecorder::local_path` defaults to `None`; custom local recorders may return their transcript
+path. Recorder decorators should forward it to their underlying authoritative recorder. The runtime
+materializes a known local transcript before returning its path, logs persistence failures while
+still returning that path, and flushes before Interrupt and SessionEnd hooks. Non-local recorders
+are not materialized for hook queries. The default protocol/product binding uses a weak thread
+handle and queries on every dispatch. This adds no persistence requirement for non-local stores.

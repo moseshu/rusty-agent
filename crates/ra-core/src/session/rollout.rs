@@ -53,6 +53,11 @@ const fn default_schema_version() -> SchemaVersion {
 /// order they were recorded. A write that fails is reported by the next [`Self::flush`].
 #[async_trait]
 pub trait RolloutRecorder: Send + Sync + 'static {
+    /// The local transcript path, when this recorder writes to a local file.
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Queues `item` to be recorded.
     fn record(&self, item: RolloutItem);
 

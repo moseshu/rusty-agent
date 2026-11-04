@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! A live thread: a conversation whose turns the host starts, steers and interrupts while they
 //! run. Ported from Codex's `CodexThread` (`core/src/codex_thread.rs`) and the parts of its
 //! session that decide what submitted input does (`core/src/session/turn_input.rs`), how a turn
@@ -985,6 +986,16 @@ impl AgentThread {
         self.inner.model_resolver.resolve_model(model)
     }
 
+    /// The resolved model slug for a turn configuration, including the agent's model default.
+    #[must_use]
+    pub fn resolved_model_name(&self, config: &RunConfig) -> Option<String> {
+        crate::runner::hook_model_name(
+            self.inner.model_resolver.as_ref(),
+            config,
+            &self.inner.agent,
+        )
+    }
+
     /// The model settings declared by the agent instance that executes this thread.
     #[must_use]
     pub fn agent_model_settings(&self) -> &ModelSettings {
@@ -1308,14 +1319,16 @@ impl AgentThread {
             let mut state = self.inner.lock();
             let needed = !state.session_ended;
             state.session_ended = true;
-            needed.then(|| state.config.user_hooks().clone())
+            needed.then(|| state.config.clone())
         };
-        if let Some(hooks) = end_hooks {
-            let run = Arc::new(ra_core::context::RunContext::new(
+        if let Some(config) = end_hooks {
+            let run = Arc::new(thread_hook_context(
+                &self.inner,
                 RunId::new(format!("session-end-{}", self.inner.thread_id)),
-                self.inner.agent.public(),
+                &config,
             ));
-            let _ = hooks
+            let _ = config
+                .user_hooks()
                 .bind(run, CancelScope::root(), self.inner.services.clone())
                 .dispatch(ra_core::hook::HookEvent::SessionEnd {
                     session_id: &self.inner.thread_id,
@@ -1331,6 +1344,16 @@ impl AgentThread {
         {
             tracing::warn!(thread_id = %self.inner.thread_id, %error, "the thread's rollout could not be flushed");
         }
+    }
+
+    /// Returns the local transcript path after attempting to materialize it, as Codex does
+    /// before a hook. Persistence failure is logged and does not hide a known path.
+    pub async fn hook_transcript_path(&self) -> Option<std::path::PathBuf> {
+        let path = self.inner.rollout.as_ref()?.local_path()?;
+        if let Err(error) = self.ensure_rollout_materialized().await {
+            tracing::warn!(%error, "the hook transcript could not be materialized");
+        }
+        Some(path)
     }
 
     /// Writes out what the thread's rollout recorder still holds, so a reader of the store sees
@@ -1597,6 +1620,12 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
 
 #[async_trait::async_trait]
 impl RolloutRecorder for ThreadRecorder {
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        self.store
+            .as_ref()
+            .and_then(|recorder| recorder.local_path())
+    }
+
     fn trace_mode(&self) -> ra_core::session::rollout::RolloutTraceMode {
         self.store
             .as_ref()
@@ -1677,7 +1706,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let run_input = history;
     // What the turn's Interrupt notice needs, kept past the run that consumes the configuration.
     let interrupt_hooks = config.user_hooks().clone();
-    let app_context = config.app_context().cloned();
+    let interrupt_config = config.clone();
     let submitted: Vec<_> = input.map(ModelInputItem::Message).into_iter().collect();
     let recorder = Arc::new(ThreadRecorder {
         thread: Arc::downgrade(&inner),
@@ -1754,10 +1783,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     // prompt's own hooks, while the model or a tool ran, or while it waited for approval. The
     // runner leaves this to the thread for the runs it owns, so they run once.
     if interrupted && interrupt_hooks.has_event(ra_core::hook::HookEventName::Interrupt) {
-        let mut run = ra_core::context::RunContext::new(RunId::new(&turn_id), inner.agent.public());
-        if let Some(app_context) = app_context {
-            run = run.with_app_context(app_context);
-        }
+        let run = thread_hook_context(&inner, RunId::new(&turn_id), &interrupt_config);
         crate::runner::InterruptNotice::for_turn(
             interrupt_hooks,
             cancel.clone(),
@@ -1870,6 +1896,10 @@ async fn run_to_end(
     input: Vec<ModelInputItem>,
     history_len: usize,
 ) -> (TurnEnd, Vec<ModelInputItem>) {
+    let turn_hook_metadata = crate::runner::TurnHookMetadata {
+        model: crate::runner::hook_model_name(inner.model_resolver.as_ref(), &config, &inner.agent),
+        app_context: config.app_context().cloned(),
+    };
     let mut fallback = input.clone();
     let mut request = RunRequest::new(
         inner.agent.clone(),
@@ -1892,7 +1922,9 @@ async fn run_to_end(
                     .with_hook_context(hook_context.clone()),
             )
             .with_pending_input(pending.clone());
-        request = request.with_live_settings(settings.clone());
+        request = request
+            .with_live_settings(settings.clone())
+            .with_turn_hook_metadata(turn_hook_metadata.clone());
         if let Some(control) = &inner.agent_control {
             request = request.with_agent_control(control.root());
         }
@@ -2063,6 +2095,19 @@ fn unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
+fn thread_hook_context(
+    inner: &ThreadInner,
+    run_id: RunId,
+    config: &RunConfig,
+) -> ra_core::context::RunContext {
+    let model = crate::runner::hook_model_name(inner.model_resolver.as_ref(), config, &inner.agent);
+    crate::runner::hook_context_metadata(
+        ra_core::context::RunContext::new(run_id, inner.agent.public()),
+        model.as_deref(),
+        config.app_context(),
+    )
+}
+
 /// Session owners inspect new prompts before handing accepted input to the runner.
 async fn prepare_host_input(
     inner: &ThreadInner,
@@ -2074,9 +2119,10 @@ async fn prepare_host_input(
     submitted: Vec<ModelInputItem>,
 ) -> (Vec<ModelInputItem>, bool, ra_core::hook::HookContextQueue) {
     use ra_core::hook::{HookDecision, HookEvent};
-    let run = Arc::new(ra_core::context::RunContext::new(
+    let run = Arc::new(thread_hook_context(
+        inner,
         RunId::new(&recorder.turn_id),
-        inner.agent.public(),
+        config,
     ));
     let hooks = config.user_hooks().bind(
         run,

@@ -785,6 +785,7 @@ struct ReviewSession {
 impl NetworkApprovalSession for ReviewSession {
     fn active_turn(&self) -> Option<NetworkApprovalTurn> {
         Some(NetworkApprovalTurn {
+            model: Some("test-model".to_owned()),
             turn_id: "active-turn".to_string(),
             environment_id: "local".to_string(),
             approval_policy: AskForApproval::OnRequest,

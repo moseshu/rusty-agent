@@ -348,6 +348,12 @@ struct ChildTrace {
 
 #[async_trait]
 impl RolloutRecorder for ChildTrace {
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        self.recorder
+            .as_ref()
+            .and_then(|recorder| recorder.local_path())
+    }
+
     fn child_trace(
         &self,
         recorder: Option<Arc<dyn RolloutRecorder>>,
@@ -409,6 +415,12 @@ impl RolloutRecorder for ChildTrace {
 
 #[async_trait]
 impl RolloutRecorder for LocalTrace {
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        self.recorder
+            .as_ref()
+            .and_then(|recorder| recorder.local_path())
+    }
+
     fn child_trace(
         &self,
         recorder: Option<Arc<dyn RolloutRecorder>>,

@@ -98,6 +98,7 @@ enum Command {
 /// is closed, so the rollout can be reopened as soon as it returns.
 #[derive(Clone)]
 pub struct RolloutFileRecorder {
+    path: PathBuf,
     commands: mpsc::UnboundedSender<Command>,
 }
 
@@ -202,8 +203,9 @@ impl RolloutFileRecorder {
 
     fn start(state: WriterState) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
+        let path = state.path.clone();
         tokio::spawn(write_all(state, receiver));
-        Self { commands }
+        Self { path, commands }
     }
 }
 
@@ -217,6 +219,10 @@ impl std::fmt::Debug for RolloutFileRecorder {
 
 #[async_trait]
 impl RolloutRecorder for RolloutFileRecorder {
+    fn local_path(&self) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+
     fn record(&self, item: RolloutItem) {
         if is_persisted_rollout_item(&item) {
             // The task outlives every sender, so a send fails only once it has stopped, which a

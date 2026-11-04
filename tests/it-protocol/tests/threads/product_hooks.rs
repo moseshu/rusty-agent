@@ -639,3 +639,6 @@ async fn notified_turn(out: &Path) -> Value {
 
 #[path = "product_hooks/executor.rs"]
 mod executor;
+
+#[path = "product_hooks/fields.rs"]
+mod fields;

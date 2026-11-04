@@ -1028,3 +1028,13 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-protocol/src/server/protocol/environments.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/turn.rs |
 
 | `crates/ra-coding/src/mcp/hook_catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/rmcp-client/src/rmcp_client.rs (`list_tools_with_connector_ids`); codex-rs/codex-mcp/src/rmcp_client.rs (`codex_apps_tool_info_from_listed_tool`); codex-rs/codex-mcp/src/codex_apps.rs (`normalize_codex_apps_tool_title`) |
+
+The hook metadata and local transcript additions below adapt openai/codex at the fixed revision,
+with Rust-owned metadata retained across approval segments. Other runner behavior retains its
+existing upstream attribution and licensing.
+
+| Local file | Upstream | Revision | Source |
+| --- | --- | --- | --- |
+| `crates/ra-runtime/src/thread.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/session/mod.rs::hook_transcript_path; codex-rs/core/src/session/turn_context.rs (initial-turn hook metadata and lifecycle adaptation) |
+| `crates/ra-runtime/src/runner.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/hook_runtime.rs; codex-rs/core/src/session/turn_context.rs; codex-rs/core/src/session/step_settings.rs (turn/step hook metadata projection) |
+| `tests/it-runtime/tests/rollout_recording.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/session/tests.rs::hook_transcript_path_does_not_persist_non_local_thread_store; hook_transcript_path_materializes_lazy_local_thread |

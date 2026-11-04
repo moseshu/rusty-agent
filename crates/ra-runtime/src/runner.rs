@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! `Runner::run` and `run_streamed`: the body of the agent loop (R3-7).
 //!
 //! # One loop, not two
@@ -1104,6 +1105,7 @@ pub struct RunRequest {
     session: Option<Arc<dyn Session>>,
     pending_input: Option<PendingInput>,
     live_settings: Option<LiveRunSettings>,
+    turn_hook_metadata: Option<TurnHookMetadata>,
     output_schema: Option<OutputSchema>,
     /// What owns the run from above, when anything does.
     owner: Option<RunOwner>,
@@ -1150,6 +1152,7 @@ impl RunRequest {
             session: None,
             pending_input: None,
             live_settings: None,
+            turn_hook_metadata: None,
             output_schema: None,
             owner: None,
         }
@@ -1158,6 +1161,11 @@ impl RunRequest {
     /// Runs on behalf of `owner`; see [`RunOwner`].
     pub(crate) fn with_owner(mut self, owner: RunOwner) -> Self {
         self.owner = Some(owner);
+        self
+    }
+
+    pub(crate) fn with_turn_hook_metadata(mut self, metadata: TurnHookMetadata) -> Self {
+        self.turn_hook_metadata = Some(metadata);
         self
     }
 
@@ -1509,6 +1517,43 @@ impl Runner {
     }
 }
 
+/// The frozen initial-turn view Codex keeps separately from captured step settings.
+#[derive(Clone)]
+pub(crate) struct TurnHookMetadata {
+    pub(crate) model: Option<String>,
+    pub(crate) app_context: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+/// Projects the model and application settings available to every host hook context.
+pub(crate) fn hook_context_metadata(
+    mut run: RunContext,
+    model: Option<&str>,
+    app_context: Option<&Arc<dyn Any + Send + Sync>>,
+) -> RunContext {
+    if let Some(model) = model {
+        run = run.with_resolved_model_name(model);
+    }
+    if let Some(app_context) = app_context {
+        run = run.with_app_context(Arc::clone(app_context));
+    }
+    run
+}
+
+/// Resolves hook metadata without making a cleanup notification fail on a model error.
+pub(crate) fn hook_model_name(
+    models: &dyn ModelResolver,
+    config: &RunConfig,
+    agent: &AgentBinding,
+) -> Option<String> {
+    match models.resolve_model(config.model().or(agent.execution().model())) {
+        Ok(model) => model.selector().model().map(str::to_owned),
+        Err(error) => {
+            tracing::debug!(%error, "model could not be resolved for hook metadata");
+            None
+        }
+    }
+}
+
 /// Everything one turn reads but never changes.
 ///
 /// It exists so the loop can live in its own function: the alternative is a dozen parameters, and
@@ -1528,6 +1573,8 @@ struct TurnLoopContext<'a> {
     /// that input, so processors run only when this is true.
     authoritative_history_complete: bool,
     model_resolver: &'a Arc<dyn ModelResolver>,
+    resolved_model_name: Option<&'a str>,
+    turn_hook_metadata: &'a TurnHookMetadata,
     run_id: &'a RunId,
     app_context: Option<&'a Arc<dyn Any + Send + Sync>>,
     /// Structured agent-tool arguments this run answers, projected into every live context.
@@ -1993,9 +2040,19 @@ impl InterruptNotice {
         if let Some(parent) = request.state.parent_run_id() {
             run = run.with_parent_run_id(parent.clone());
         }
-        if let Some(app_context) = &request.app_context {
-            run = run.with_app_context(Arc::clone(app_context));
-        }
+        let model = hook_model_name(
+            request.model_resolver.as_ref(),
+            &request.config,
+            &request.agent,
+        );
+        run = hook_context_metadata(
+            run,
+            model.as_deref(),
+            request
+                .config
+                .app_context()
+                .or(request.app_context.as_ref()),
+        );
         if let Some(tool_input) = &request.tool_input {
             run = run.with_tool_input(Arc::clone(tool_input));
         }
@@ -2057,6 +2114,7 @@ async fn run_loop_inner(
         session,
         pending_input,
         live_settings,
+        turn_hook_metadata,
         output_schema,
         owner,
     } = request;
@@ -2304,7 +2362,14 @@ async fn run_loop_inner(
         .permission()
         .clone()
         .with_answered_rules(state.permission_rules().iter().cloned());
+    let resolved_model_name = hook_model_name(model_resolver.as_ref(), &config, &agent);
+    let turn_hook_metadata = turn_hook_metadata.unwrap_or_else(|| TurnHookMetadata {
+        model: resolved_model_name.clone(),
+        app_context: config.app_context().or(app_context.as_ref()).cloned(),
+    });
     let context = TurnLoopContext {
+        turn_hook_metadata: &turn_hook_metadata,
+        resolved_model_name: resolved_model_name.as_deref(),
         input_base: &input_base,
         authoritative_history_complete,
         model_resolver: &model_resolver,
@@ -2993,14 +3058,9 @@ async fn assemble_capabilities(
         .with_usage_totals(state.usage_totals().clone())
         .with_pending_control_requests(state.pending_control_requests().to_vec())
         .with_event_seq_allocator(event_seqs.clone());
-    if let Some(model) = resolved.selector().model() {
-        context = context.with_resolved_model_name(model);
-    }
+    context = hook_context_metadata(context, resolved.selector().model(), app_context);
     if let Some(parent) = state.parent_run_id() {
         context = context.with_parent_run_id(parent.clone());
-    }
-    if let Some(app_context) = app_context {
-        context = context.with_app_context(Arc::clone(app_context));
     }
     if let Some(tool_input) = tool_input {
         context = context.with_tool_input(Arc::clone(tool_input));
@@ -3919,21 +3979,7 @@ fn resumed_run_context(
     agent: &AgentBinding,
     state: &RunState,
 ) -> RunContext {
-    let mut run = RunContext::new(context.run_id.clone(), agent.public())
-        .with_budget(state.budget().clone())
-        .with_usage_totals(context.spend.shared_usage())
-        .with_pending_control_requests(state.pending_control_requests().to_vec())
-        .with_event_seq_allocator(context.event_seqs.clone());
-    if let Some(parent) = state.parent_run_id() {
-        run = run.with_parent_run_id(parent.clone());
-    }
-    if let Some(app_context) = context.app_context {
-        run = run.with_app_context(Arc::clone(app_context));
-    }
-    if let Some(tool_input) = context.tool_input {
-        run = run.with_tool_input(Arc::clone(tool_input));
-    }
-    run
+    live_context(context, agent, state)
 }
 
 /// A rejected in-call question settles an invocation that already announced its start.
@@ -4785,7 +4831,7 @@ async fn continue_from_stop_hook(
             .config
             .user_hooks()
             .bind(
-                Arc::new(live_context(context, agent, state)),
+                Arc::new(turn_hook_context(context, agent, state)),
                 context.cancel.clone(),
                 context.services.clone(),
             )
@@ -4976,7 +5022,9 @@ async fn run_one_turn(
     if let Some(prepared) = &prepared_capabilities {
         *agent = prepared.agent.clone();
     }
+    let resolved_model_name = hook_model_name(context.model_resolver.as_ref(), step_config, agent);
     let step_context = TurnLoopContext {
+        resolved_model_name: resolved_model_name.as_deref(),
         config: step_config,
         app_context: step_app_context,
         permission: permission.as_ref().unwrap_or(context.permission),
@@ -5085,7 +5133,7 @@ async fn run_one_turn(
         turn_scope,
         prepared,
         &turn_input,
-        preparation_context,
+        turn_hook_context(context, agent, state),
     )
     .await?;
     let first_item = progress.segment_items(state).len();
@@ -5726,7 +5774,7 @@ async fn deliver_pending_input(
             .config
             .user_hooks()
             .bind(
-                Arc::new(live_context(context, agent, state)),
+                Arc::new(turn_hook_context(context, agent, state)),
                 turn_scope.clone(),
                 context.services.clone(),
             )
@@ -6641,6 +6689,20 @@ fn record_tool_output_references(
         .record_turn(turn, new_outputs, referenced_outputs)
 }
 
+/// Turn-scoped hooks read the frozen initial turn, while tools read their captured step.
+fn turn_hook_context(
+    context: &TurnLoopContext<'_>,
+    agent: &AgentBinding,
+    state: &RunState,
+) -> RunContext {
+    let initial = TurnLoopContext {
+        resolved_model_name: context.turn_hook_metadata.model.as_deref(),
+        app_context: context.turn_hook_metadata.app_context.as_ref(),
+        ..*context
+    };
+    live_context(&initial, agent, state)
+}
+
 /// Builds the live context the stage about to run hands to third-party code.
 ///
 /// One function so every stage projects the same facts. Two of them matter enough to name:
@@ -6666,9 +6728,7 @@ fn live_context(
     if let Some(parent) = state.parent_run_id() {
         run = run.with_parent_run_id(parent.clone());
     }
-    if let Some(app_context) = context.app_context {
-        run = run.with_app_context(Arc::clone(app_context));
-    }
+    run = hook_context_metadata(run, context.resolved_model_name, context.app_context);
     if let Some(tool_input) = context.tool_input {
         run = run.with_tool_input(Arc::clone(tool_input));
     }

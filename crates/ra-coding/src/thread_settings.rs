@@ -1436,12 +1436,14 @@ fn sandboxed_environment(
 /// `active_turn_context_and_strict_auto_review` for the thread's one environment.
 fn network_approval_turn(
     turn_id: String,
+    model: Option<String>,
     settings: &CodingThreadSettings,
 ) -> Option<(crate::network_approval::NetworkApprovalTurn, bool)> {
     let cwd = ra_paths::AbsolutePathBuf::from_absolute_path(&settings.cwd).ok()?;
     Some((
         crate::network_approval::NetworkApprovalTurn {
             turn_id,
+            model,
             environment_id: LOCAL_NETWORK_ENVIRONMENT_ID.to_owned(),
             approval_policy: settings.approval_policy,
             permission_profile: settings.profile_permissions.permission_profile().clone(),

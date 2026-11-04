@@ -811,6 +811,8 @@ async fn session_start_command_matchers_receive_all_lifecycle_sources() {
 
 fn network_request(turn_id: &str) -> ra_coding::network_approval::NetworkApprovalRequest {
     ra_coding::network_approval::NetworkApprovalRequest {
+        model: Some("test-model".to_owned()),
+        approval_policy: ra_config::AskForApproval::OnRequest,
         item_id: "approval-1".to_owned(),
         turn_id: turn_id.to_owned(),
         environment_id: "local".to_owned(),
@@ -1276,4 +1278,239 @@ async fn stop_and_interrupt_ask_for_the_steps_executor_hooks() {
         .unwrap();
 
     assert_eq!(*provider.0.lock().unwrap(), ["turn-1", "turn-1"]);
+}
+
+#[tokio::test]
+async fn each_dispatch_uses_its_run_model_and_product_policy() {
+    use ra_coding::thread_settings::CodingThreadSettingsAdapter;
+    use ra_protocol::server::{ThreadSettingsAdapter, protocol::ThreadPolicyOverrides};
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("fields.jsonl");
+    let config = hooks_config(home.path(), &format!(
+        "[[hooks.UserPromptSubmit]]\n[[hooks.UserPromptSubmit.hooks]]\ntype = 'command'\ncommand = '''{}'''\n", logging(&log)
+    )).await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let adapter = CodingThreadSettingsAdapter::new(
+        home.path(),
+        ra_config::SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    )
+    .unwrap();
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .build()
+        .unwrap();
+    for (model, policy) in [
+        ("first-model", AskForApproval::OnRequest),
+        ("changed-model", AskForApproval::Never),
+    ] {
+        let config = adapter
+            .prepare(
+                &ra_runtime::runner::RunConfig::new(),
+                &ThreadPolicyOverrides::new().with_approval_policy(policy),
+            )
+            .unwrap();
+        let run = RunContext::new(RunId::new("turn-1"), &agent)
+            .with_resolved_model_name(model)
+            .with_app_context(config.app_context().unwrap().clone());
+        runtime
+            .user_hooks()
+            .bind(Arc::new(run), CancelScope::root(), ToolServices::new())
+            .dispatch(HookEvent::UserPromptSubmit {
+                input: &[ModelInputItem::Message(Message::user("hello"))],
+            })
+            .await
+            .unwrap();
+    }
+    let inputs = logged(&log);
+    assert_eq!(inputs[0]["model"], "first-model");
+    assert_eq!(inputs[0]["permission_mode"], "default");
+    assert_eq!(inputs[1]["model"], "changed-model");
+    assert_eq!(inputs[1]["permission_mode"], "bypassPermissions");
+}
+
+#[tokio::test]
+async fn network_hooks_use_the_captured_review_model_and_policy() {
+    use ra_coding::thread_settings::network_proxy_test_api::ThreadNetworkProxyProbe;
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("network-fields.jsonl");
+    let config = hooks_config(home.path(), &format!(
+        "[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]\ntype = 'command'\ncommand = '''{}; printf '%s' '{{\"hookSpecificOutput\":{{\"hookEventName\":\"PermissionRequest\",\"decision\":{{\"behavior\":\"allow\"}}}}}}' '''\n", logging(&log)
+    )).await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let proxy = ThreadNetworkProxyProbe::default();
+    proxy.attach_hooks(runtime);
+    let mut request = network_request("turn-1");
+    request.model = Some("review-model".to_owned());
+    request.approval_policy = AskForApproval::Never;
+    proxy.request_network_approval(request).await.unwrap();
+    let inputs = logged(&log);
+    assert_eq!(inputs[0]["model"], "review-model");
+    assert_eq!(inputs[0]["permission_mode"], "bypassPermissions");
+    let mut request = network_request("turn-1");
+    request.model = None;
+    proxy.request_network_approval(request).await.unwrap();
+    let inputs = logged(&log);
+    assert_eq!(inputs[1]["model"], "test-model");
+    assert_eq!(inputs[1]["permission_mode"], "default");
+}
+
+struct FailingTranscriptRecorder {
+    path: std::path::PathBuf,
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+#[async_trait::async_trait]
+impl ra_core::session::rollout::RolloutRecorder for FailingTranscriptRecorder {
+    fn local_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.path.clone())
+    }
+    fn record(&self, _: ra_core::session::rollout::RolloutItem) {}
+    async fn persist(
+        &self,
+        _: ra_core::session::rollout::PersistContext,
+    ) -> ra_core::error::Result<()> {
+        self.calls.lock().unwrap().push("persist");
+        Err(ra_core::error::Error::caller("persistence unavailable"))
+    }
+    async fn flush(&self) -> ra_core::error::Result<()> {
+        self.calls.lock().unwrap().push("flush");
+        Err(ra_core::error::Error::caller("flush unavailable"))
+    }
+}
+
+#[tokio::test]
+async fn interrupt_and_session_end_flush_after_query_and_keep_running_on_storage_failure() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("lifecycle.jsonl");
+    let config = hooks_config(home.path(), &["Interrupt", "SessionEnd"].map(|event| format!("[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = 'command'\ncommand = '''{}'''\n", logging(&log))).join("\n")).await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let recorder = Arc::new(FailingTranscriptRecorder {
+        path: home.path().join("unavailable.jsonl"),
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .build()
+        .unwrap();
+    // The thread supplies storage while the dispatcher is exercised independently of shutdown's
+    // final flush, proving the barriers happen before each hook even when they fail.
+    struct NoModel;
+    impl ra_core::model::ModelResolver for NoModel {
+        fn resolve_model(
+            &self,
+            _: Option<&str>,
+        ) -> ra_core::error::Result<ra_core::model::ResolvedModel> {
+            Err(ra_core::error::Error::caller("no inference in this test"))
+        }
+    }
+    let thread = ra_runtime::thread::AgentThread::builder(
+        SessionId::new("thread-1"),
+        ra_runtime::agent::AgentBinding::direct(agent),
+        Arc::new(NoModel),
+    )
+    .with_rollout_recorder(recorder.clone())
+    .build();
+    runtime.bind_transcript(thread.downgrade());
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_with_queue(&runtime, &queue);
+    bound
+        .dispatch(HookEvent::Interrupt {
+            reason: &ra_core::cancel::CancelReason::UserInterrupt,
+        })
+        .await
+        .unwrap();
+    assert_eq!(*recorder.calls.lock().unwrap(), ["persist", "flush"]);
+    assert_eq!(logged(&log).len(), 1);
+    bound
+        .dispatch(HookEvent::SessionEnd {
+            session_id: &SessionId::new("thread-1"),
+            reason: "other",
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        *recorder.calls.lock().unwrap(),
+        ["persist", "flush", "persist", "flush"]
+    );
+    let inputs = logged(&log);
+    assert_eq!(inputs.len(), 2);
+    for input in inputs {
+        assert_eq!(input["transcript_path"], recorder.path.to_str().unwrap());
+    }
+}
+
+/// A nested run records into its thread's rollout, so SubagentStop reports that transcript as the
+/// parent's and no transcript of the agent's own, querying the thread once.
+#[tokio::test]
+async fn subagent_stop_reports_the_threads_transcript_and_no_agent_transcript() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("subagent-stop.jsonl");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            "[[hooks.SubagentStop]]\n[[hooks.SubagentStop.hooks]]\ntype = 'command'\ncommand = '''{}'''\n",
+            logging(&log)
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let recorder = Arc::new(FailingTranscriptRecorder {
+        path: home.path().join("thread.jsonl"),
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    struct NoModel;
+    impl ra_core::model::ModelResolver for NoModel {
+        fn resolve_model(
+            &self,
+            _: Option<&str>,
+        ) -> ra_core::error::Result<ra_core::model::ResolvedModel> {
+            Err(ra_core::error::Error::caller("no inference in this test"))
+        }
+    }
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .build()
+        .unwrap();
+    let thread = ra_runtime::thread::AgentThread::builder(
+        SessionId::new("thread-1"),
+        ra_runtime::agent::AgentBinding::direct(agent),
+        Arc::new(NoModel),
+    )
+    .with_rollout_recorder(recorder.clone())
+    .build();
+    runtime.bind_transcript(thread.downgrade());
+    let nested = bound_run(
+        &runtime,
+        "nested-1",
+        Some("turn-1"),
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let message = Message::assistant("done", OutputPhase::Final);
+
+    nested
+        .dispatch(HookEvent::SubagentStop {
+            parent_run_id: &RunId::new("turn-1"),
+            delivery: StopHookData::new(FinishReason::Final, Some(&message), &[], false),
+        })
+        .await
+        .unwrap();
+
+    let inputs = logged(&log);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["hook_event_name"], "SubagentStop");
+    assert_eq!(
+        inputs[0]["transcript_path"],
+        recorder.path.to_str().unwrap()
+    );
+    assert!(
+        inputs[0]["agent_transcript_path"].is_null(),
+        "{}",
+        inputs[0]
+    );
+    assert_eq!(*recorder.calls.lock().unwrap(), ["persist"]);
 }

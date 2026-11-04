@@ -283,7 +283,8 @@ impl ThreadNetworkProxy {
         let settings = config
             .app_context()?
             .downcast_ref::<super::CodingThreadSettings>()?;
-        super::network_approval_turn(turn_id, settings)
+        let model = self.requests.get()?.resolved_model_name(&config);
+        super::network_approval_turn(turn_id, model, settings)
     }
 
     /// Codex's `begin_network_approval` for one command under `permission_profile`: `None` when
@@ -342,11 +343,13 @@ impl NetworkApprovalSession for ThreadNetworkProxy {
         // Codex's approval precedence is hooks first, then the reviewer.
         if let Some(hooks) = self.hooks.get() {
             match hooks
-                .run_permission_request_hooks(
+                .run_permission_request_hooks_with_settings(
                     &request.turn_id,
                     &request.hook_run_id,
                     &request.hook_command,
                     &format!("network-access {}", request.target),
+                    request.model.as_deref(),
+                    request.approval_policy,
                 )
                 .await
             {

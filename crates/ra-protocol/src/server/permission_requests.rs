@@ -96,6 +96,13 @@ impl ThreadServerRequests {
         Some((turn_id, config))
     }
 
+    /// Resolves the model slug for a captured turn configuration, including the agent default.
+    #[must_use]
+    pub fn resolved_model_name(&self, config: &RunConfig) -> Option<String> {
+        let thread = self.thread.upgrade()?;
+        thread.resolved_model_name(config)
+    }
+
     /// Adds `messages` to the running turn's context, or records them in the thread's history
     /// without starting a turn: Codex's `inject_no_new_turn`.
     pub async fn inject_context(&self, messages: Vec<Message>) {

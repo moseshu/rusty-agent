@@ -89,6 +89,14 @@ impl UserHook for RecordingHook {
         context: &UserHookContext<'_>,
         event: &HookEvent<'_>,
     ) -> Result<HookDecision> {
+        if !matches!(
+            event,
+            HookEvent::SessionStart { .. }
+                | HookEvent::UserPromptSubmit { .. }
+                | HookEvent::SessionEnd { .. }
+        ) {
+            assert_eq!(context.run().resolved_model_name(), Some("test"));
+        }
         assert!(
             !context.cancel().is_cancelled(),
             "cleanup hooks need a live scope"
@@ -1496,4 +1504,135 @@ async fn approval_recovery_preserves_background_follow_up_but_not_synchronous_fo
             assert_eq!(result.final_text(), "background answered");
         }
     }
+}
+
+struct StepSettingsHook {
+    thread: std::sync::OnceLock<ra_runtime::thread::WeakAgentThread>,
+    seen: Mutex<Vec<(HookEventName, String)>>,
+}
+
+#[async_trait]
+impl UserHook for StepSettingsHook {
+    fn name(&self) -> &str {
+        "step settings observer"
+    }
+
+    async fn call(
+        &self,
+        context: &UserHookContext<'_>,
+        event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        assert_eq!(context.run().resolved_model_name(), Some("test"));
+        let value = context.run().app_context::<String>().unwrap().clone();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((event.name(), value.clone()));
+        if event.name() == HookEventName::PreToolUse && value == "initial" {
+            let thread = self.thread.get().unwrap().upgrade().unwrap();
+            let run_id = context.run().run_id().as_str();
+            let config = thread
+                .turn_config(run_id)
+                .unwrap()
+                .with_app_context(Arc::new("updated".to_owned()));
+            assert_eq!(
+                thread.update_turn_settings(
+                    run_id,
+                    &ra_runtime::thread::ThreadSettingsOverrides::new().with_config(config)
+                ),
+                ra_runtime::thread::TurnSettingsUpdateOutcome::Applied
+            );
+        }
+        Ok(HookDecision::Continue)
+    }
+}
+
+async fn check_step_and_initial_turn_settings(approval: bool) {
+    use ra_runtime::thread::{AgentThread, ThreadEvent, TurnInputRequest};
+    let hook = Arc::new(StepSettingsHook {
+        thread: std::sync::OnceLock::new(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut config = RunConfig::new().with_app_context(Arc::new("initial".to_owned()));
+    for event in [
+        HookEventName::SessionStart,
+        HookEventName::UserPromptSubmit,
+        HookEventName::PreToolUse,
+        HookEventName::PostToolUse,
+        HookEventName::Stop,
+    ] {
+        config = config.with_user_hook(UserHookRegistration::new(event, hook.clone()));
+    }
+    let second = ModelResponse::new(vec![RunItem::new(
+        ItemId::new("second-call"),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new("call-2"),
+            "write_file",
+            json!({"path": if approval { "rewritten.txt" } else { "file.txt" }}),
+        )),
+    )]);
+    let model = ScriptedModel::new(vec![tool_response(), second, response("answer", "done")]);
+    let builder = AgentThread::builder(
+        SessionId::new("settings-thread"),
+        AgentBinding::direct(agent(
+            Some(CountingTool::new(if approval {
+                ToolApprovalPolicy::Always
+            } else {
+                ToolApprovalPolicy::Never
+            })),
+            false,
+        )),
+        Arc::new(FixedResolver(model)),
+    )
+    .with_config(config);
+    hook.thread.set(builder.thread_handle()).unwrap();
+    let thread = builder.build();
+    let _ = thread
+        .start_or_steer_turn(TurnInputRequest::new(vec![
+            ra_core::item::ContentBlock::text("hello"),
+        ]))
+        .await;
+    let mut pauses = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), thread.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ThreadEvent::TurnComplete { .. } => break,
+            ThreadEvent::TurnAwaitingApproval { .. } => {
+                pauses += 1;
+                let mut state: RunState = serde_json::from_value(
+                    serde_json::to_value(thread.paused_run().unwrap()).unwrap(),
+                )
+                .unwrap();
+                let pending = state.pending_interruption_items().next().unwrap().clone();
+                state.approve(&pending, false).unwrap();
+                thread.resume_turn(state).unwrap();
+            }
+            ThreadEvent::TurnAborted { .. } | ThreadEvent::Error { .. } => {
+                panic!("turn did not complete")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(pauses, if approval { 2 } else { 0 });
+    assert_eq!(
+        *hook.seen.lock().unwrap(),
+        [
+            (HookEventName::SessionStart, "initial".to_owned()),
+            (HookEventName::UserPromptSubmit, "initial".to_owned()),
+            (HookEventName::PreToolUse, "initial".to_owned()),
+            (HookEventName::PostToolUse, "initial".to_owned()),
+            (HookEventName::PreToolUse, "updated".to_owned()),
+            (HookEventName::PostToolUse, "updated".to_owned()),
+            (HookEventName::Stop, "initial".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn tool_hooks_capture_step_settings_and_stop_keeps_initial_turn_settings() {
+    check_step_and_initial_turn_settings(false).await;
+    check_step_and_initial_turn_settings(true).await;
 }

@@ -673,6 +673,7 @@ pub fn build_blocked_request_observer(
 #[derive(Debug, Clone)]
 pub struct NetworkApprovalTurn {
     pub turn_id: String,
+    pub model: Option<String>,
     pub environment_id: String,
     pub approval_policy: AskForApproval,
     pub permission_profile: PermissionProfile,
@@ -683,8 +684,10 @@ pub struct NetworkApprovalTurn {
 /// `ExecApprovalRequest` that its app server sends.
 #[derive(Debug, Clone)]
 pub struct NetworkApprovalRequest {
+    pub approval_policy: AskForApproval,
     pub item_id: String,
     pub turn_id: String,
+    pub model: Option<String>,
     pub environment_id: String,
     pub reason: String,
     pub network_approval_context: NetworkApprovalContext,
@@ -895,6 +898,8 @@ impl NetworkApprovalService {
             hook_command,
             hook_run_id,
             turn_id: turn.turn_id.clone(),
+            model: turn.model.clone(),
+            approval_policy: turn.approval_policy,
             environment_id,
             reason: prompt_reason,
             network_approval_context: network_approval_context.clone(),

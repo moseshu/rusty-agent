@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! A run recorded into its session's rollout, as Codex records a turn: its start and input, the
 //! context of its first model call, its session records, the host events attributed to it, the
 //! usage of each model call, and how it ended.
@@ -2830,4 +2831,67 @@ async fn a_thread_forked_before_a_user_message_runs_on_the_history_before_it() {
         third.continuation_input(ContinuationInput::PreserveAll)
     );
     assert_eq!(rollout_records(&source_path).await, source_records);
+}
+
+fn transcript_thread(recorder: Arc<dyn RolloutRecorder>) -> ra_runtime::thread::AgentThread {
+    ra_runtime::thread::AgentThread::builder(
+        SessionId::new("transcript-thread"),
+        AgentBinding::direct(agent("lead", vec![])),
+        Arc::new(ScriptedResolver(Arc::new(Scripts::default()))),
+    )
+    .with_rollout_recorder(recorder)
+    .build()
+}
+
+#[tokio::test]
+async fn hook_transcript_path_does_not_persist_non_local_thread_store() {
+    let recorder = Arc::new(MemoryRecorder::default());
+    let thread = transcript_thread(recorder.clone());
+    assert_eq!(thread.hook_transcript_path().await, None);
+    assert!(recorder.persists().is_empty());
+    assert_eq!(recorder.flushes(), 0);
+}
+
+#[tokio::test]
+async fn hook_transcript_path_materializes_lazy_local_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("transcript.jsonl");
+    let recorder = Arc::new(ra_session::RolloutFileRecorder::create_with_session_meta(
+        &path,
+        ra_session::RolloutSessionMeta::new(SessionId::new("transcript-thread")),
+    ));
+    let thread = transcript_thread(recorder);
+    assert!(!path.exists());
+    assert_eq!(thread.hook_transcript_path().await, Some(path.clone()));
+    let records = ra_session::RolloutReader::open(&path)
+        .read_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0].payload(),
+        Ok(ra_session::RolloutPayload::SessionMeta(_))
+    ));
+    thread.close_rollout().await.unwrap();
+}
+
+#[tokio::test]
+async fn hook_transcript_path_survives_materialization_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, "blocked").unwrap();
+    let path = blocker.join("transcript.jsonl");
+    let thread = transcript_thread(Arc::new(
+        ra_session::RolloutFileRecorder::create_with_session_meta(
+            &path,
+            ra_session::RolloutSessionMeta::new(SessionId::new("transcript-thread")),
+        ),
+    ));
+    assert_eq!(thread.hook_transcript_path().await, Some(path.clone()));
+    assert!(!path.exists());
+    // Once storage recovers the same recorder materializes the same path on the next request.
+    std::fs::remove_file(&blocker).unwrap();
+    assert_eq!(thread.hook_transcript_path().await, Some(path.clone()));
+    assert!(path.exists());
+    thread.close_rollout().await.unwrap();
 }

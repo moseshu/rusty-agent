@@ -3,7 +3,8 @@
 //!
 //! A factory that prepares one hands it over with [`super::PreparedThread::with_product_runtime`].
 //! The server binds it once the thread is built, giving it what only a built thread has — the
-//! sender of the thread's ordered events — and closes it once the thread has shut down. It is a
+//! sender of the thread's ordered events and a weak transcript source — and closes it once the
+//! thread has shut down. It is a
 //! separate port from [`super::ThreadSettingsAdapter`]: one applies settings, this one runs
 //! product machinery for the thread's life.
 
@@ -18,14 +19,26 @@ use tokio::sync::mpsc;
 pub struct ThreadProductBinding {
     thread_id: SessionId,
     events: mpsc::UnboundedSender<ThreadEvent>,
+    thread: ra_runtime::thread::WeakAgentThread,
 }
 
 impl ThreadProductBinding {
     pub(crate) const fn new(
         thread_id: SessionId,
         events: mpsc::UnboundedSender<ThreadEvent>,
+        thread: ra_runtime::thread::WeakAgentThread,
     ) -> Self {
-        Self { thread_id, events }
+        Self {
+            thread_id,
+            events,
+            thread,
+        }
+    }
+
+    /// A weak handle for querying and flushing the thread's transcript at dispatch time.
+    #[must_use]
+    pub fn thread_handle(&self) -> ra_runtime::thread::WeakAgentThread {
+        self.thread.clone()
     }
 
     /// The thread.

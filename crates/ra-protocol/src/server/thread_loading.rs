@@ -917,6 +917,7 @@ impl ThreadRequestProcessor {
             product.bind_thread(super::ThreadProductBinding::new(
                 thread.thread_id().clone(),
                 thread.event_sender(),
+                thread.downgrade(),
             ));
         }
         let loaded = self.thread_manager.add_thread(

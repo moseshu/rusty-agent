@@ -54,18 +54,18 @@ use super::events::user_prompt_submit::UserPromptSubmitRequest;
 use super::types::{HookEventAfterAgent, HookPayload, HookResult};
 use super::{Hooks, HooksConfig};
 
-/// Session-level values the source copies into every hook request.
+/// Session identity and fallback request values for hosts without runtime metadata.
 #[derive(Debug, Clone)]
 pub struct ProductHookSession {
     /// Thread identity serialized as `session_id`.
     pub session_id: SessionId,
     /// Host-side working directory; hooks always run on the host.
     pub cwd: AbsolutePathBuf,
-    /// Model slug serialized as `model`.
+    /// Fallback model slug when the run supplies no resolved model.
     pub model: String,
-    /// Approval policy, mapped to the source's `permission_mode` labels.
+    /// Fallback approval policy, mapped to the source's `permission_mode` labels.
     pub approval_policy: AskForApproval,
-    /// Transcript file shown to hooks, when the host keeps one.
+    /// Fallback transcript for a host without a late-bound thread source.
     pub transcript_path: Option<PathBuf>,
 }
 
@@ -127,6 +127,7 @@ pub struct ProductHookRuntime {
     background: BackgroundResults,
     context_delivery: Arc<Mutex<ContextDelivery>>,
     executor_hooks: OnceLock<Arc<dyn ExecutorHookSourceProvider>>,
+    transcript: OnceLock<ra_runtime::thread::WeakAgentThread>,
 }
 
 /// The receiving end of finished background handlers and the task that delivers them.
@@ -185,6 +186,7 @@ impl ProductHookRuntime {
             },
             context_delivery,
             executor_hooks: OnceLock::new(),
+            transcript: OnceLock::new(),
         }))
     }
 
@@ -208,6 +210,23 @@ impl ProductHookRuntime {
     /// sender.
     pub fn bind_thread_events(&self, events: mpsc::UnboundedSender<ThreadEvent>) {
         *self.events.lock().unwrap_or_else(PoisonError::into_inner) = Some(events);
+    }
+
+    /// Queries the loaded thread for each request without retaining the thread.
+    pub fn bind_transcript(&self, thread: ra_runtime::thread::WeakAgentThread) {
+        let _ = self.transcript.set(thread);
+    }
+
+    async fn transcript_path(&self, flush: bool) -> Option<PathBuf> {
+        let Some(source) = self.transcript.get() else {
+            return self.session.transcript_path.clone();
+        };
+        let thread = source.upgrade()?;
+        let path = thread.hook_transcript_path().await;
+        if flush && let Err(error) = thread.flush_rollout().await {
+            tracing::warn!(%error, "failed to flush transcript before lifecycle hook");
+        }
+        path
     }
 
     /// Stops reporting hook runs.
@@ -308,15 +327,40 @@ impl ProductHookRuntime {
         command: &str,
         description: &str,
     ) -> Option<PermissionRequestDecision> {
+        self.run_permission_request_hooks_with_settings(
+            turn_id,
+            run_id_suffix,
+            command,
+            description,
+            Some(&self.session.model),
+            self.session.approval_policy,
+        )
+        .await
+    }
+
+    /// Runs a non-tool approval with the model and policy captured by its review context.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_permission_request_hooks_with_settings(
+        &self,
+        turn_id: &str,
+        run_id_suffix: &str,
+        command: &str,
+        description: &str,
+        model: Option<&str>,
+        approval_policy: AskForApproval,
+    ) -> Option<PermissionRequestDecision> {
         let session = &self.session;
         let request = PermissionRequestRequest {
             session_id: session.session_id.clone(),
             turn_id: turn_id.to_owned(),
             subagent: None,
             cwd: session.cwd.to_path_buf(),
-            transcript_path: session.transcript_path.clone(),
-            model: session.model.clone(),
-            permission_mode: self.permission_mode(),
+            transcript_path: self.transcript_path(false).await,
+            model: model.map_or_else(|| {
+                tracing::debug!(%turn_id, "network review has no resolved model; using session fallback");
+                session.model.clone()
+            }, str::to_owned),
+            permission_mode: hook_permission_mode(approval_policy),
             tool_name: "Bash".to_owned(),
             matcher_aliases: Vec::new(),
             run_id_suffix: run_id_suffix.to_owned(),
@@ -476,14 +520,26 @@ impl ProductHookRuntime {
         let hooks = self.current();
         let session = &self.session;
         let turn_id = self.turn_id(context.run());
+        let model = context.run().resolved_model_name().map_or_else(
+            || {
+                tracing::debug!(%turn_id, "hook context has no resolved model; using session fallback");
+                session.model.clone()
+            },
+            str::to_owned,
+        );
+        let permission_mode = context.run().app_context::<crate::thread_settings::CodingThreadSettings>()
+            .map_or_else(|| {
+                tracing::debug!(%turn_id, "hook context has no product settings; using session fallback");
+                self.permission_mode()
+            }, |settings| hook_permission_mode(settings.approval_policy()));
         match *event {
             HookEvent::SessionStart { source, .. } => {
                 let request = SessionStartRequest {
                     session_id: session.session_id.clone(),
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     target: StartHookTarget::SessionStart { source },
                 };
                 self.emit_started(&turn_id, hooks.preview_session_start(&request));
@@ -511,7 +567,7 @@ impl ProductHookRuntime {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
+                    transcript_path: self.transcript_path(true).await,
                 };
                 self.emit_started(&turn_id, preview);
                 let outcome = hooks.run_session_end(request).await;
@@ -525,9 +581,9 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     prompt,
                 };
                 self.emit_started(&turn_id, hooks.preview_user_prompt_submit(&request));
@@ -549,9 +605,9 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     tool_name: tool.name.clone(),
                     matcher_aliases: tool.matcher_aliases.clone(),
                     tool_use_id: tool_use_id.clone(),
@@ -585,9 +641,9 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.to_path_buf(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     tool_name: tool.name,
                     matcher_aliases: tool.matcher_aliases,
                     run_id_suffix: call.call_id().to_string(),
@@ -615,9 +671,9 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     tool_name: tool.name,
                     matcher_aliases: tool.matcher_aliases,
                     tool_use_id: call.call_id().to_string(),
@@ -643,11 +699,15 @@ impl ProductHookRuntime {
             }
             HookEvent::Stop(delivery) | HookEvent::SubagentStop { delivery, .. } => {
                 let event_name = event.name();
+                // Codex's SubagentStop reports the parent thread's transcript and the child
+                // thread's own. A nested run records into its parent thread's rollout and has no
+                // transcript of its own, so only the parent path is known.
+                let transcript_path = self.transcript_path(false).await;
                 let target = if event_name == HookEventName::SubagentStop {
                     StopHookTarget::SubagentStop {
                         agent_id: context.run().run_id().to_string(),
                         agent_type: context.run().agent().name().to_owned(),
-                        agent_transcript_path: session.transcript_path.clone(),
+                        agent_transcript_path: None,
                     }
                 } else {
                     StopHookTarget::Stop
@@ -658,9 +718,9 @@ impl ProductHookRuntime {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     request_metadata: None,
                     stop_hook_active: delivery.stop_hook_active(),
                     last_assistant_message: last_assistant_message.clone(),
@@ -734,9 +794,9 @@ impl ProductHookRuntime {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
-                    permission_mode: self.permission_mode(),
+                    transcript_path: self.transcript_path(true).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
                     request_metadata: None,
                 };
                 self.emit_started(&turn_id, preview);
@@ -750,8 +810,8 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
                     trigger: compaction_trigger_label(trigger).to_owned(),
                 };
                 self.emit_started(&turn_id, hooks.preview_pre_compact(&request));
@@ -773,8 +833,8 @@ impl ProductHookRuntime {
                     turn_id: turn_id.clone(),
                     subagent: None,
                     cwd: session.cwd.clone(),
-                    transcript_path: session.transcript_path.clone(),
-                    model: session.model.clone(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
                     trigger: compaction_trigger_label(trigger).to_owned(),
                 };
                 self.emit_started(&turn_id, hooks.preview_post_compact(&request));
