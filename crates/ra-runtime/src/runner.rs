@@ -1561,13 +1561,18 @@ struct TurnLoopProgress {
     turn_record_owner: Arc<TurnRecordOwner>,
     turn_records: Vec<TurnRecord>,
     turns: u32,
-    /// Turns this run completed before the current segment began.
+    /// Turns this run started before the current segment began.
     ///
     /// `turns` counts the segment, because that is what `RunResult`, `TurnRecord`, and the stream
     /// events describe. The tool-output reference ledger measures staleness across the whole run
-    /// instead, so its two call sites add this base. Captured once, from the restored ledger, and
-    /// never recomputed: reading the high-water mark again mid-segment would count the turns this
-    /// segment has already recorded a second time.
+    /// instead, and the records the loop names itself — context records, stop-hook
+    /// continuations, mail, reminders — must not repeat an identity an earlier segment used, so
+    /// both add this base. It is the checkpoint's turn count, which every turn records whatever
+    /// the run is configured with, and never less than the ledger's own high-water mark: the
+    /// ledger records only while context filters are installed, so read alone it would restart
+    /// the numbering of a run without them each time it resumes. Captured once and never
+    /// recomputed: reading either mid-segment would count the turns this segment has already
+    /// recorded a second time.
     reference_turn_base: u64,
     budget_stop: Option<BudgetKind>,
     /// The records a resumed segment settled before its first turn, when those settled the run.
@@ -2260,7 +2265,8 @@ async fn run_loop_inner(
         reference_turn_base: state
             .tool_output_references()
             .last_completed_turn()
-            .unwrap_or(0),
+            .unwrap_or(0)
+            .max(u64::from(state.budget().turns_used())),
         budget_stop: None,
         resumed_conclusion: None,
         final_output: None,
