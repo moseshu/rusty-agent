@@ -20,6 +20,7 @@ use crate::{
     host::CodingHost,
     profile::CodingProfile,
     spawned,
+    thread_hooks::CodingThreadHooks,
     thread_settings::{CodingThreadSettingsAdapter, ProductPermissionSource},
 };
 
@@ -74,6 +75,9 @@ impl CodingThreadFactory {
     /// reviewer and permissions — the canonical profile and its requirement constraints — come
     /// from it, with the host workspace as its working directory, and named permission profiles
     /// are later resolved through it. Without it the settings adapter's own policy applies.
+    ///
+    /// Each thread's product hooks are built from that configuration too, as Codex builds a
+    /// session's: a thread without a product configuration has none.
     #[must_use]
     pub fn with_product_config(mut self, builder: ConfigBuilder) -> Self {
         self.product_config = Some(builder);
@@ -121,6 +125,7 @@ impl ThreadFactory for CodingThreadFactory {
 
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         let host = self.host.with_new_process_manager();
+        let mut hooks = None;
         let settings = match &self.product_config {
             Some(builder) => {
                 let mut builder = builder.clone();
@@ -143,6 +148,14 @@ impl ThreadFactory for CodingThreadFactory {
                     .start_network_proxy(&config)
                     .await
                     .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
+                // As Codex's session creation, a required managed hook that fails to load fails
+                // the thread.
+                let thread_hooks =
+                    CodingThreadHooks::build(&config, &host, request.thread_id().clone())
+                        .await
+                        .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
+                settings.attach_hook_runtime(Arc::clone(thread_hooks.runtime()));
+                hooks = Some(Arc::new(thread_hooks));
                 settings
             }
             None => self.settings.clone(),
@@ -155,18 +168,20 @@ impl ThreadFactory for CodingThreadFactory {
             self.profile,
         )
         .await?;
+        let mut config = settings.initialize(
+            host.build_run_config()
+                .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
+                .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
+        );
+        if let Some(hooks) = &hooks {
+            config = config.with_user_hooks(hooks.runtime().user_hooks());
+        }
         let mut builder = AgentThread::builder(
             request.thread_id().clone(),
             AgentBinding::direct(assembled.agent),
             Arc::clone(&self.models),
         )
-        .with_config(
-            settings.initialize(
-                host.build_run_config()
-                    .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
-                    .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
-            ),
-        )
+        .with_config(config)
         .with_services(host.build_tool_services());
         // Each thread owns a tree of its own, as each Codex session owns its agents; the thread
         // shuts it down when it closes.
@@ -180,9 +195,12 @@ impl ThreadFactory for CodingThreadFactory {
                 Some(crate::prompt_cache_key::session_id(request).clone()),
             )?);
         }
-        let prepared = PreparedThread::new(builder)
+        let mut prepared = PreparedThread::new(builder)
             .with_settings_adapter(Arc::new(settings))
             .with_background_terminals(Arc::new(host.background_terminals()));
+        if let Some(hooks) = hooks {
+            prepared = prepared.with_product_runtime(hooks);
+        }
         Ok(if self.product_config.is_some() {
             prepared.with_applied_policy()
         } else {

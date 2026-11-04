@@ -671,6 +671,13 @@ impl CodingThreadSettingsAdapter {
         })
     }
 
+    /// Lets the thread's product hooks decide its network accesses; see
+    /// [`CodingThreadSettings::attach_hook_runtime`]. The settings of every configuration the
+    /// thread runs with share them.
+    pub fn attach_hook_runtime(&self, hooks: Arc<crate::hooks::ProductHookRuntime>) {
+        self.initial.attach_hook_runtime(hooks);
+    }
+
     /// Decides commands with `exec_policy`'s rules, as Codex's session does with the rules its
     /// config layers load. Without one, no rule matches and every command is decided by Codex's
     /// heuristics for unmatched commands.

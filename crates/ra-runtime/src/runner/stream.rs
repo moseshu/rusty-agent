@@ -37,6 +37,10 @@ pub(crate) trait ModelStreamSink: Send + Sync {
     /// A failed model request is about to be sent again: Codex's `notify_stream_error`.
     /// `retry` is the 1-based retry about to start.
     fn retrying(&self, retry: u32, max_retries: u32, error: &ra_core::error::Error);
+
+    /// A background hook reported a warning, shown when its context is delivered: Codex's
+    /// `Warning` event from `drain_async_hook_results`.
+    fn warning(&self, _message: String) {}
 }
 
 /// One thing that happened during a run.

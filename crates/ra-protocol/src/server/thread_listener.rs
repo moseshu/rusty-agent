@@ -394,6 +394,10 @@ async fn handle_event(
         handle_host_event(event, loaded, &thread_outgoing, thread_state, item_changes).await;
         return;
     }
+    if let ThreadEvent::Notice(notice) = &event {
+        send_notice(notice, &thread_id, &thread_outgoing).await;
+        return;
+    }
     let ended = matches!(
         event,
         ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
@@ -761,6 +765,50 @@ async fn handle_pending_thread_resume_request(
         .replay_requests_to_connection_for_thread(connection_id, &thread_id)
         .await;
     spawned_approvals::replay(loaded, &context.outgoing, connection_id).await;
+}
+
+/// Tells the thread's connections about a product notice: the `HookStarted` and `HookCompleted`
+/// arms of Codex's `apply_bespoke_event_handling`. The product reports a hook run with its record;
+/// the client is told its camelCase form.
+async fn send_notice(
+    notice: &ra_runtime::thread::ThreadNotice,
+    thread_id: &SessionId,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    use super::protocol::{
+        HOOK_COMPLETED_METHOD, HOOK_STARTED_METHOD, HookCompletedEvent, HookCompletedNotification,
+        HookStartedEvent, HookStartedNotification, hook_notification::HookRunSummary,
+    };
+    let params = notice.params().clone();
+    match notice.method() {
+        HOOK_STARTED_METHOD => match serde_json::from_value::<HookStartedEvent>(params) {
+            Ok(event) => {
+                if let Some(run) = HookRunSummary::from_core(event.run) {
+                    let notification = HookStartedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: event.turn_id,
+                        run,
+                    };
+                    send_to_thread(outgoing, HOOK_STARTED_METHOD, notification).await;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "malformed hook/started notice"),
+        },
+        HOOK_COMPLETED_METHOD => match serde_json::from_value::<HookCompletedEvent>(params) {
+            Ok(event) => {
+                if let Some(run) = HookRunSummary::from_core(event.run) {
+                    let notification = HookCompletedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: event.turn_id,
+                        run,
+                    };
+                    send_to_thread(outgoing, HOOK_COMPLETED_METHOD, notification).await;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "malformed hook/completed notice"),
+        },
+        method => tracing::warn!(%method, "unknown thread notice"),
+    }
 }
 
 /// Tells the thread's connections what one event means: the turn arms of Codex's

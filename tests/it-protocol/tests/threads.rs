@@ -23,6 +23,9 @@ mod prompt_cache_key;
 #[path = "threads/coding_tools.rs"]
 mod coding_tools;
 
+#[cfg(unix)]
+#[path = "threads/product_hooks.rs"]
+mod product_hooks;
 #[path = "threads/product_permissions.rs"]
 mod product_permissions;
 #[path = "threads/skill_context.rs"]

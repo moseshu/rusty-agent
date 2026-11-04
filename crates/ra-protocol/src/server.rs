@@ -74,6 +74,7 @@ mod mcp;
 mod outgoing;
 mod permission_requests;
 mod processor;
+mod product_runtime;
 pub mod protocol;
 mod request_serialization;
 mod router;
@@ -100,6 +101,7 @@ pub use self::mcp::McpRuntimeControl;
 mod plugin_management;
 pub use self::permission_requests::ThreadServerRequests;
 pub use self::plugin_management::PluginManagement;
+pub use self::product_runtime::{ThreadProductBinding, ThreadProductRuntime};
 pub use self::session_source::{
     InternalSessionSource, SessionSource, SessionSourceArgs, SubAgentSource,
 };
@@ -1018,6 +1020,7 @@ pub mod test_api {
                 super::thread_manager::LoadedThreadInfo::unknown(),
                 adapter,
                 terminals,
+                None,
                 Arc::default(),
             );
             if let Some(adapter) = &loaded.adapter {

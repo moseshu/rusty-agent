@@ -1237,3 +1237,16 @@ upstream override semantics. MCP OAuth credential storage also retains Codex's d
 rule: Keyring/Auto resolve to File for package version `0.0.0`, while release builds preserve the
 configured mode. The Config test inventory is recorded in
 `tests/it-coding/UPSTREAM_CONFIG_TESTS.md`.
+
+### Sampled input across approval recovery
+
+RunState schema 19 adds optional `sampled_input`, retaining the latest actual model input when
+Stop or SubagentStop hooks are installed. This is a Rust persistence adaptation of Codex's
+`sampling_request_input`: a Rust run can pause for approval and conclude with a tool result in a
+new run segment without another model call. Reconstructing authoritative history at that point
+would undo context processors and filters. The saved projection is not reprocessed on recovery.
+An empty array means the actual sampled input was empty; an absent field means no sampling input
+was retained. A later model call replaces the retained input, or clears it when no stop hook is
+installed. Older checkpoints lack the actual projection and retain the history reconstruction
+fallback; their exact past sampling input cannot be recovered. Older runtimes preserve the new
+field as unknown data but cannot honor it when invoking stop hooks.

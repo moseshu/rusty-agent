@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(18);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(19);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -214,9 +214,14 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          retain this field but cannot deliver its messages after approval recovery.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(18),
         "Persisted background context follow-up intent separately from synchronous hook history. \
          Older runtimes cannot preserve a background wakeup when resumed tools conclude the run.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the actual sampled input for stop hooks across approval recovery, including an \
+         empty projection. Older runtimes reconstruct history and can expose projected-out input.",
     ),
 ];
 
@@ -1062,6 +1067,8 @@ pub struct RunState {
     input_guardrails_started: bool,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     stop_hook_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampled_input: Option<Vec<ModelInputItem>>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     subagent_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1195,6 +1202,8 @@ struct RunStateRecord {
     input_guardrails_started: bool,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     stop_hook_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampled_input: Option<Vec<ModelInputItem>>,
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     subagent_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1310,6 +1319,7 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_output_guardrail_results,
             input_guardrails_started,
             stop_hook_active,
+            sampled_input,
             subagent_started,
             parent_run_id,
             finish_reason,
@@ -1461,6 +1471,7 @@ impl TryFrom<RunStateRecord> for RunState {
             tool_output_guardrail_results,
             input_guardrails_started,
             stop_hook_active,
+            sampled_input,
             subagent_started,
             parent_run_id,
             budget,
@@ -1532,6 +1543,7 @@ impl RunState {
             tool_output_guardrail_results: Vec::new(),
             input_guardrails_started: false,
             stop_hook_active: false,
+            sampled_input: None,
             subagent_started: false,
             parent_run_id: None,
             budget: BudgetSnapshot::new(),
@@ -2733,6 +2745,21 @@ impl RunState {
     #[must_use]
     pub fn output_guardrail_results(&self) -> &[OutputGuardrailResult] {
         &self.output_guardrail_results
+    }
+
+    /// The latest actual model input retained for stop hooks across run segments.
+    /// `Some(&[])` is an empty sampled projection; `None` means no input was retained.
+    #[must_use]
+    pub fn sampled_input(&self) -> Option<&[ModelInputItem]> {
+        self.sampled_input.as_deref()
+    }
+
+    /// Retains the sampled projection rather than reconstructing it from authoritative history.
+    /// Runtime-owned persistence is necessary because approval recovery can conclude without a
+    /// new model call, while context processors may have transformed the original request.
+    #[doc(hidden)]
+    pub fn set_sampled_input(&mut self, input: Option<Vec<ModelInputItem>>) {
+        self.sampled_input = input;
     }
 
     /// Whether a stop hook has already requested continuation in this logical run.

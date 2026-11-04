@@ -3664,3 +3664,139 @@ async fn nested_turn_exhaustion_reaches_custom_failure_handling_or_propagates() 
         }
     }
 }
+
+/// A projection whose invocation count proves approval recovery does not replay processors.
+struct StopInputProjection {
+    input: Vec<ModelInputItem>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ra_core::capability::ContextProcessor for StopInputProjection {
+    async fn process_context(
+        &self,
+        _: ra_core::capability::ContextProcessorRequest,
+        _: &dyn ra_core::capability::ContextSummarizer,
+    ) -> Result<ra_core::capability::ContextProcessorResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ra_core::capability::ContextProcessorResult::new(
+            self.input.clone(),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct SampledStopInput(Mutex<Vec<Vec<ModelInputItem>>>);
+
+#[async_trait]
+impl UserHook for SampledStopInput {
+    fn name(&self) -> &str {
+        "sampled-stop-input"
+    }
+
+    async fn call(&self, _: &UserHookContext<'_>, event: &HookEvent<'_>) -> Result<HookDecision> {
+        let delivery = match event {
+            HookEvent::Stop(delivery) | HookEvent::SubagentStop { delivery, .. } => delivery,
+            _ => return Ok(HookDecision::Continue),
+        };
+        self.0.lock().unwrap().push(
+            delivery
+                .sampled_input()
+                .expect("the runtime supplies sampling input")
+                .to_vec(),
+        );
+        Ok(HookDecision::Continue)
+    }
+}
+
+/// Approved tools can conclude without another model call. Their stop hooks must read the exact
+/// pre-approval projection even after a serialized checkpoint, including an empty projection.
+#[tokio::test]
+async fn resumed_tool_stop_keeps_the_sampled_projection() {
+    for child in [false, true] {
+        for empty in [false, true] {
+            for serialized in [false, true] {
+                let parent = AgentSpec::builder()
+                    .id(AgentId::new("orchestrator"))
+                    .name("Orchestrator")
+                    .instructions("orchestrate")
+                    .tool(Arc::new(gated_probe("write", "written")))
+                    .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+                    .build()
+                    .unwrap();
+                let resolver =
+                    ScriptedResolver::new(vec![tool_call("p-1", "call-1", "write", json!({}))]);
+                let input = if empty {
+                    Vec::new()
+                } else {
+                    vec![ModelInputItem::Message(Message::user("projected prompt"))]
+                };
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let stop = Arc::new(SampledStopInput::default());
+                let event = if child {
+                    HookEventName::SubagentStop
+                } else {
+                    HookEventName::Stop
+                };
+                let config = RunConfig::new()
+                    .with_context_processor(Arc::new(StopInputProjection {
+                        input: input.clone(),
+                        calls: Arc::clone(&calls),
+                    }))
+                    .with_user_hook(UserHookRegistration::new(
+                        event,
+                        Arc::clone(&stop) as Arc<dyn UserHook>,
+                    ));
+                let mut initial =
+                    request(Arc::clone(&parent), &resolver).with_config(config.clone());
+                if child {
+                    initial = initial
+                        .with_parent_run_id(RunId::new("enclosing-run"))
+                        .unwrap();
+                }
+                let first = Runner::run(initial).await.unwrap();
+                assert!(stop.0.lock().unwrap().is_empty());
+                let mut state = approve_all(&first, false);
+                if serialized {
+                    state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+                }
+                let result = Runner::run(resume(parent, &resolver, state).with_config(config))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.outcome().finish_reason(),
+                    Some(FinishReason::ToolStop)
+                );
+                assert_eq!(resolver.calls().len(), 1);
+                assert_eq!(resolver.calls()[0].input, input);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "the processor is not replayed"
+                );
+                assert_eq!(*stop.0.lock().unwrap(), vec![input]);
+            }
+        }
+    }
+}
+
+/// Empty sampled input is distinct from a run that has not sampled yet.
+#[tokio::test]
+async fn stop_keeps_an_empty_sampled_projection() {
+    let resolver = ScriptedResolver::new(vec![final_message("final", "done")]);
+    let stop = Arc::new(SampledStopInput::default());
+    let config = RunConfig::new()
+        .with_context_processor(Arc::new(StopInputProjection {
+            input: Vec::new(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }))
+        .with_user_hook(UserHookRegistration::new(
+            HookEventName::Stop,
+            Arc::clone(&stop) as Arc<dyn UserHook>,
+        ));
+    Runner::run(request(agent("parent", "Parent", "answer"), &resolver).with_config(config))
+        .await
+        .unwrap();
+    assert!(resolver.calls()[0].input.is_empty());
+    assert_eq!(*stop.0.lock().unwrap(), vec![Vec::<ModelInputItem>::new()]);
+}

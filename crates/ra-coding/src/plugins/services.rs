@@ -277,6 +277,14 @@ impl PluginServices {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
+    /// The plugins `input` selects, as Codex's session asks its plugin manager when it builds the
+    /// session's hook configuration from the session's own configuration.
+    pub async fn plugins_for_config(
+        &self,
+        input: &super::PluginsConfigInput,
+    ) -> PluginLoadOutcome<McpServerConfig> {
+        self.plugins.plugins_for_config(input).await
+    }
     pub async fn snapshot(&self, cwd: AbsolutePathBuf) -> io::Result<PluginSnapshot> {
         let config = Arc::new(self.config_manager.load_for_cwd(cwd).await?);
         self.snapshot_for_config(config).await

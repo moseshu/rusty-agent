@@ -233,6 +233,7 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-coding/src/hooks/trust.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::NormalizedHookIdentity/hook_hash/hook_trust_status/hook_enabled/hook_trusted_hash |
 | `crates/ra-coding/src/hooks/timing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/discovery.rs::normalize_command_hook; hooks/src/events/session_end.rs (timeout constants) |
 | `crates/ra-protocol/src/server/protocol/hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/protocol/src/protocol.rs::HookTrustStatus (without TS/JsonSchema export; non-exhaustive Rust enum) |
+| `crates/ra-protocol/src/server/protocol/hook_notifications.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server-protocol/src/protocol/v2/hook.rs (hook run summary, HookStartedNotification, HookCompletedNotification; without TS export) |
 | `tests/it-config/tests/hook_config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/hooks_tests.rs (all ten original tests) |
 | `tests/it-coding/tests/hook_matcher.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/events/common.rs::tests (all matcher cases) |
 | `tests/it-coding/tests/hook_output_parser.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/output_parser.rs::tests (four original cases plus output-contract regressions) |
@@ -671,6 +672,7 @@ An optional final license column overrides the default Apache-2.0 source license
 | `crates/ra-coding/src/hooks/legacy_notify.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/legacy_notify.rs |
 | `crates/ra-coding/src/hooks/mcp.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/mcp.rs |
 | `crates/ra-coding/src/hook_mcp_executor.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/hook_mcp_executor.rs |
+| `crates/ra-coding/src/thread_hooks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/session/mod.rs::build_hooks_config; core/src/shell.rs::derive_exec_args (hook shell arguments) |
 | `crates/ra-coding/src/hooks/output_spill.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/output_spill.rs |
 | `crates/ra-coding/src/hooks/types.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/types.rs |
 | `crates/ra-coding/src/hooks/engine.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/hooks/src/engine/mod.rs |

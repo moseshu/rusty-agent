@@ -27,7 +27,7 @@ use ra_core::{
 use ra_runtime::thread::AgentThreadBuilder;
 
 use super::{
-    SessionSource, background_terminals::ThreadBackgroundTerminals,
+    SessionSource, ThreadProductRuntime, background_terminals::ThreadBackgroundTerminals,
     settings_adapter::ThreadSettingsAdapter,
 };
 
@@ -144,6 +144,7 @@ pub struct PreparedThread {
     builder: AgentThreadBuilder,
     adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
     terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+    product: Option<Arc<dyn ThreadProductRuntime>>,
     policy_applied: bool,
 }
 
@@ -153,6 +154,7 @@ impl std::fmt::Debug for PreparedThread {
             .field("thread_id", self.builder.thread_id())
             .field("has_adapter", &self.adapter.is_some())
             .field("has_terminals", &self.terminals.is_some())
+            .field("has_product_runtime", &self.product.is_some())
             .field("policy_applied", &self.policy_applied)
             .finish()
     }
@@ -165,6 +167,7 @@ impl PreparedThread {
             builder,
             adapter: None,
             terminals: None,
+            product: None,
             policy_applied: false,
         }
     }
@@ -195,13 +198,21 @@ impl PreparedThread {
         self
     }
 
+    /// Hands over the product's runtime for the thread, which the server binds once the thread is
+    /// built and closes once it has shut down.
+    pub fn with_product_runtime(mut self, product: Arc<dyn ThreadProductRuntime>) -> Self {
+        self.product = Some(product);
+        self
+    }
+
     pub(crate) fn into_parts(self) -> PreparedParts {
-        (
-            self.builder,
-            self.adapter,
-            self.terminals,
-            self.policy_applied,
-        )
+        PreparedParts {
+            builder: self.builder,
+            adapter: self.adapter,
+            terminals: self.terminals,
+            product: self.product,
+            policy_applied: self.policy_applied,
+        }
     }
 }
 
@@ -266,13 +277,15 @@ fn declared_tools(builder: &AgentThreadBuilder) -> Vec<(Arc<dyn Tool>, ra_core::
     tools
 }
 
-/// A prepared thread taken apart: builder, adapter, terminals and whether policy was applied.
-pub(crate) type PreparedParts = (
-    AgentThreadBuilder,
-    Option<Arc<dyn ThreadSettingsAdapter>>,
-    Option<Arc<dyn ThreadBackgroundTerminals>>,
-    bool,
-);
+/// A prepared thread taken apart.
+pub(crate) struct PreparedParts {
+    pub(crate) builder: AgentThreadBuilder,
+    pub(crate) adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
+    pub(crate) terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+    pub(crate) product: Option<Arc<dyn ThreadProductRuntime>>,
+    /// Whether the factory already applied the request's policy.
+    pub(crate) policy_applied: bool,
+}
 
 /// Prepares the threads the server loads (see the module's documentation).
 #[async_trait]

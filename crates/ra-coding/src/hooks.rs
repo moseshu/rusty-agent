@@ -148,7 +148,9 @@ pub use registry::{HookListOutcome, Hooks, HooksConfig, list_hooks};
 pub use types::{
     Hook, HookEvent, HookEventAfterAgent, HookFn, HookPayload, HookResponse, HookResult,
 };
-pub use user_hook_bridge::{ProductHookRuntime, ProductHookSession, UnappliedHookEffect};
+pub use user_hook_bridge::{
+    ExecutorHookSourceProvider, ProductHookRuntime, ProductHookSession, UnappliedHookEffect,
+};
 /// Stable event label used in persisted handler state.
 #[must_use]
 pub fn hook_event_key_label(event: ra_core::hook::HookEventName) -> &'static str {

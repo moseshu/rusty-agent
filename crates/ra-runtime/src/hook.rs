@@ -287,7 +287,9 @@ fn validate_decision(event: HookEventName, decision: &HookDecision) -> Option<&'
             | HookEventName::PostToolUse
             | HookEventName::PermissionRequest
             | HookEventName::Stop
-            | HookEventName::SubagentStop,
+            | HookEventName::SubagentStop
+            | HookEventName::PreCompact
+            | HookEventName::PostCompact,
             HookDecision::Deny { message },
         ) if !message.trim().is_empty() => None,
         (HookEventName::PreToolUse, HookDecision::UpdateInput { .. })

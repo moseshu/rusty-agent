@@ -40,6 +40,7 @@
 
 mod config;
 mod dynamic_tools;
+mod hook_notifications;
 mod hooks;
 mod item;
 mod mcp;
@@ -75,6 +76,16 @@ pub use self::config::{
     OverriddenMetadata, SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse,
     ToolsV2, WriteStatus,
 };
+pub use self::hook_notifications::{
+    HOOK_COMPLETED_METHOD, HOOK_STARTED_METHOD, HookCompletedNotification, HookStartedNotification,
+};
+/// The client form of a hook run summary, as `hook/started` and `hook/completed` carry it.
+pub mod hook_notification {
+    pub use super::hook_notifications::{
+        HookEventName, HookExecutionMode, HookHandlerType, HookOutputEntry, HookOutputEntryKind,
+        HookRunStatus, HookRunSummary, HookScope, HookSource,
+    };
+}
 pub use self::hooks::HookPromptFragment;
 pub use self::hooks::{
     HookCompletedEvent, HookExecutionMode, HookHandlerType, HookOutputEntry, HookOutputEntryKind,

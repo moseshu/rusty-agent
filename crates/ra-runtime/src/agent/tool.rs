@@ -94,7 +94,7 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use ra_core::{
     agent::AgentSpec,
-    cancel::ScopeKind,
+    cancel::{CancelScope, ScopeKind},
     context::{RunAgent, RunContext},
     error::{Error, Result, ToolErrorKind},
     finish::FinishReason,
@@ -121,6 +121,7 @@ pub use stream::{
 };
 
 use super::AgentBinding;
+use crate::runner::{NestedCompactionStop, RunOwner};
 use crate::{
     budget::NestedSpend,
     runner::{AgentToolInvocation, DEFAULT_MAX_TURNS, RunConfig, RunRequest, RunResult, Runner},
@@ -604,6 +605,7 @@ impl AgentTool {
             .unwrap_or_else(|| self.agent.id())
             .clone();
         let scope = call_scope.child(ScopeKind::Run);
+        let compaction_stop = Arc::new(NestedCompactionStop::new(run_id.clone()));
         let mut request = RunRequest::new(
             AgentBinding::direct(Arc::clone(&self.agent)),
             Arc::clone(parent.model_resolver()),
@@ -611,6 +613,7 @@ impl AgentTool {
             scope.clone(),
             input,
         )
+        .with_owner(RunOwner::AgentTool(Arc::clone(&compaction_stop)))
         .with_config(config)
         .with_services(
             context
@@ -650,7 +653,7 @@ impl AgentTool {
             context.call_id().clone(),
             context.arguments().clone(),
         );
-        let mut result = match &self.stream {
+        let outcome = match &self.stream {
             Some(stream) => {
                 Box::pin(stream.run(
                     request,
@@ -658,10 +661,13 @@ impl AgentTool {
                     starting_agent,
                     Arc::new(invocation.clone()),
                 ))
-                .await?
+                .await
             }
-            None => Box::pin(Runner::run(request)).await?,
+            None => Box::pin(Runner::run(request)).await,
         };
+        let mut result = outcome.map_err(|error| {
+            stopped_compaction_failure(name, &compaction_stop, call_scope, error)
+        })?;
         result.set_agent_tool_invocation(invocation);
         Ok(result)
     }
@@ -835,6 +841,36 @@ impl fmt::Debug for AgentTool {
             .field("stream", &self.stream)
             .finish_non_exhaustive()
     }
+}
+
+/// Turns the cancellation a nested run ends with when one of its compaction hooks stopped it into
+/// an ordinary failure of this call, so the parent's failure handling decides what follows: the
+/// default shows it to the parent agent, a custom `failure_error_function` formats it, and
+/// propagation fails the parent run.
+///
+/// A dispatched tool's cancellation otherwise bypasses failure handling and stops the parent, which
+/// is right for a cancellation from above and wrong for a stop that concerns the nested agent
+/// alone. The reference routes a nested run's internal cancellation the same way: `as_tool`
+/// cancels a nested run whose stream backlog fills and fails the tool through
+/// `failure_error_function`, which receives the cancellation wrapped as an ordinary error. Only a
+/// stop recorded for this very run counts, and only while the call itself still runs: an
+/// interrupt, a shutdown or a deadline above the call keeps its cancellation even when it races a
+/// stop.
+fn stopped_compaction_failure(
+    name: &str,
+    stop: &NestedCompactionStop,
+    call_scope: &CancelScope,
+    error: Error,
+) -> Error {
+    if !error.is_cancelled() || !stop.stopped() || call_scope.is_cancelled() {
+        return error;
+    }
+    Error::tool(
+        ToolErrorKind::ExecutionFailed,
+        name,
+        "a hook stopped the agent while it compacted its context",
+    )
+    .with_source(error)
 }
 
 /// Carries a nested run that stopped on an approval out of [`Tool::call`].

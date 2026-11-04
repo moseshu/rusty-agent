@@ -59,6 +59,8 @@ pub(crate) struct LoadedThread {
     pub(crate) adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
     /// The commands the thread's tools left running, if its host handed them over.
     pub(crate) terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+    /// The product's runtime for the thread, if its host prepared one.
+    pub(crate) product: Option<Arc<dyn super::ThreadProductRuntime>>,
     /// The calls of the tools its client provides that wait for the client's answer.
     pub(crate) dynamic_tool_calls: Arc<DynamicToolCalls>,
     pub(crate) settings_lock: Arc<tokio::sync::Mutex<()>>,
@@ -87,6 +89,9 @@ impl LoadedThread {
     /// unified-exec processes.
     pub(crate) async fn shutdown(&self) {
         self.thread.shutdown().await;
+        if let Some(product) = &self.product {
+            product.close().await;
+        }
         if let Some(terminals) = &self.terminals {
             terminals.clean().await;
         }
@@ -108,6 +113,7 @@ impl ThreadManager {
         info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
         terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
+        product: Option<Arc<dyn super::ThreadProductRuntime>>,
         dynamic_tool_calls: Arc<DynamicToolCalls>,
     ) -> LoadedThread {
         let loaded = LoadedThread {
@@ -115,6 +121,7 @@ impl ThreadManager {
             info,
             adapter,
             terminals,
+            product,
             dynamic_tool_calls,
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),

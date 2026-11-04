@@ -12,28 +12,38 @@
 //! model-visible result replacements are applied at the runtime admission boundaries.
 //! Session stop-processing is returned as a host-owned prompt rejection.
 //!
-//! Completed hook runs, including background handlers that finish later, are published on
-//! [`ProductHookRuntime::subscribe_completed`]. Refreshing the configuration keeps running
-//! background handlers, as the source's reconfiguration does.
+//! Each run is reported as the source reports it: the previewed runs as `hook/started` before
+//! they run and the finished ones as `hook/completed`, built-in and background runs left out, on
+//! the thread's ordered event stream once [`ProductHookRuntime::bind_thread_events`] connects it.
+//! A background handler that finishes later delivers its context and warnings to the current turn
+//! instead. Refreshing the configuration keeps running background handlers, as the source's
+//! reconfiguration does.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use ra_config::AskForApproval;
 use ra_core::error::Result;
 use ra_core::hook::HookContextQueue;
 use ra_core::hook::{
-    HookDecision, HookEvent, HookEventName, ToolHookData, UserHook, UserHookContext,
+    CompactTrigger, HookDecision, HookEvent, HookEventName, ToolHookData, UserHook, UserHookContext,
 };
 use ra_core::item::{Message, MessageRole, ModelInputItem};
 use ra_core::session::SessionId;
 use ra_paths::AbsolutePathBuf;
-use ra_protocol::server::protocol::HookCompletedEvent;
+use ra_protocol::server::protocol::{
+    HOOK_COMPLETED_METHOD, HOOK_STARTED_METHOD, HookCompletedEvent, HookExecutionMode,
+    HookOutputEntryKind, HookRunSummary, HookStartedEvent,
+};
 use ra_runtime::hook::{UserHookRegistration, UserHooks};
+use ra_runtime::thread::{ThreadEvent, ThreadNotice};
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
+use super::events::compact::{PostCompactRequest, PreCompactRequest};
+use super::events::interrupt::InterruptRequest;
 use super::events::permission_request::{PermissionRequestDecision, PermissionRequestRequest};
 use super::events::post_tool_use::PostToolUseRequest;
 use super::events::pre_tool_use::PreToolUseRequest;
@@ -41,6 +51,7 @@ use super::events::session_end::SessionEndRequest;
 use super::events::session_start::{SessionStartRequest, StartHookTarget};
 use super::events::stop::{StopHookTarget, StopRequest};
 use super::events::user_prompt_submit::UserPromptSubmitRequest;
+use super::types::{HookEventAfterAgent, HookPayload, HookResult};
 use super::{Hooks, HooksConfig};
 
 /// Session-level values the source copies into every hook request.
@@ -92,14 +103,37 @@ pub enum UnappliedHookEffect {
     },
 }
 
+/// Executor plugin hook sources for the step a run executes: Codex's
+/// `executor_hook_sources_for_step`.
+///
+/// Codex derives them from the step's executor capability discovery; an interrupted turn reuses
+/// its last executing step's. A provider answers for `run`'s current step, or for an interrupted
+/// run its last one. Without a provider, Stop and Interrupt see no executor hooks.
+pub trait ExecutorHookSourceProvider: Send + Sync {
+    /// The executor plugin hook sources of the step `run` executes or last executed.
+    fn executor_hook_sources(
+        &self,
+        run: &ra_core::context::RunContext,
+    ) -> Vec<crate::plugins::ExecutorPluginHookSource>;
+}
+
 /// One thread's product hooks, adapted to the runtime's host hook dispatcher.
 pub struct ProductHookRuntime {
     hooks: RwLock<Arc<Hooks>>,
     session: ProductHookSession,
-    completed: broadcast::Sender<HookCompletedEvent>,
     unapplied: Mutex<Vec<UnappliedHookEffect>>,
-    forwarder: tokio::task::JoinHandle<()>,
+    /// Where hook runs are reported: the thread's ordered event stream, once it is bound.
+    events: Mutex<Option<mpsc::UnboundedSender<ThreadEvent>>>,
+    background: BackgroundResults,
     context_delivery: Arc<Mutex<ContextDelivery>>,
+    executor_hooks: OnceLock<Arc<dyn ExecutorHookSourceProvider>>,
+}
+
+/// The receiving end of finished background handlers and the task that delivers them.
+struct BackgroundResults {
+    receiver: async_channel::Receiver<HookCompletedEvent>,
+    forwarder: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stopped: AtomicBool,
 }
 
 impl ProductHookRuntime {
@@ -113,39 +147,44 @@ impl ProductHookRuntime {
         session: ProductHookSession,
         mcp_executor: Arc<dyn super::HookMcpExecutor>,
     ) -> anyhow::Result<Arc<Self>> {
-        let (hooks, background) = Hooks::new(config, session.session_id.clone(), mcp_executor)?;
-        let (completed, _) = broadcast::channel(256);
-        let forward = completed.clone();
+        let (hooks, receiver) = Hooks::new(config, session.session_id.clone(), mcp_executor)?;
         let context_delivery = Arc::new(Mutex::new(ContextDelivery::default()));
         let delivery = Arc::clone(&context_delivery);
+        let results = receiver.clone();
+        // Codex drains finished background handlers at turn boundaries: their context and
+        // warnings reach the current turn, and no client notification is sent for them, as its
+        // notification filter drops background runs.
         let forwarder = tokio::spawn(async move {
-            while let Ok(event) = background.recv().await {
-                let messages = event
-                    .run
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        matches!(
-                            entry.kind,
-                            ra_protocol::server::protocol::HookOutputEntryKind::Context
-                        )
-                    })
-                    .map(|entry| Message::developer(entry.text.clone()))
-                    .collect();
+            while let Ok(event) = results.recv().await {
+                let mut contexts = Vec::new();
+                let mut warnings = Vec::new();
+                for entry in event.run.entries {
+                    match entry.kind {
+                        HookOutputEntryKind::Context => {
+                            contexts.push(Message::developer(entry.text));
+                        }
+                        HookOutputEntryKind::Warning => warnings.push(entry.text),
+                        _ => {}
+                    }
+                }
                 delivery
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .deliver_to(event.turn_id.as_deref(), messages, true);
-                let _ = forward.send(event);
+                    .deliver_background(contexts, warnings);
             }
         });
         Ok(Arc::new(Self {
             hooks: RwLock::new(Arc::new(hooks)),
             session,
-            completed,
             unapplied: Mutex::new(Vec::new()),
-            forwarder,
+            events: Mutex::new(None),
+            background: BackgroundResults {
+                receiver,
+                forwarder: Mutex::new(Some(forwarder)),
+                stopped: AtomicBool::new(false),
+            },
             context_delivery,
+            executor_hooks: OnceLock::new(),
         }))
     }
 
@@ -164,10 +203,58 @@ impl ProductHookRuntime {
             .clone()
     }
 
-    /// Receives completed hook runs, including background handlers.
+    /// Reports this thread's hook runs on `events`, the thread's ordered event stream: started
+    /// and completed runs as `hook/started` and `hook/completed` notices. Replaces an earlier
+    /// sender.
+    pub fn bind_thread_events(&self, events: mpsc::UnboundedSender<ThreadEvent>) {
+        *self.events.lock().unwrap_or_else(PoisonError::into_inner) = Some(events);
+    }
+
+    /// Stops reporting hook runs.
+    pub fn release_thread_events(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
+    /// Supplies the executor plugin hook sources Stop and Interrupt add, as Codex adds those of
+    /// the step they concern. Only the first provider is kept.
+    pub fn set_executor_hook_sources(&self, provider: Arc<dyn ExecutorHookSourceProvider>) {
+        let _ = self.executor_hooks.set(provider);
+    }
+
+    /// Warnings collected while the hooks were loaded, which Codex shows when the session starts.
     #[must_use]
-    pub fn subscribe_completed(&self) -> broadcast::Receiver<HookCompletedEvent> {
-        self.completed.subscribe()
+    pub fn startup_warnings(&self) -> Vec<String> {
+        self.current().startup_warnings().to_vec()
+    }
+
+    /// Stops background work as Codex's session shutdown does before its `SessionEnd` hooks: the
+    /// background concurrency gate closes and running background handlers are aborted and
+    /// awaited, the result channel closes, and results nobody took — including those waiting for
+    /// the next turn — are dropped. Idempotent.
+    pub async fn stop_background(&self) {
+        if self.background.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.current().shutdown().await;
+        self.background.receiver.close();
+        let forwarder = self
+            .background
+            .forwarder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(forwarder) = forwarder {
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
+        while self.background.receiver.try_recv().is_ok() {}
+        self.context_delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .discard_pending();
     }
 
     /// Legacy diagnostic drain retained for source compatibility. Implemented effects are applied
@@ -193,6 +280,9 @@ impl ProductHookRuntime {
             HookEventName::PostToolUse,
             HookEventName::Stop,
             HookEventName::SubagentStop,
+            HookEventName::Interrupt,
+            HookEventName::PreCompact,
+            HookEventName::PostCompact,
         ]
         .into_iter()
         .fold(
@@ -219,45 +309,163 @@ impl ProductHookRuntime {
         description: &str,
     ) -> Option<PermissionRequestDecision> {
         let session = &self.session;
-        let outcome = self
-            .current()
-            .run_permission_request(PermissionRequestRequest {
-                session_id: session.session_id.clone(),
-                turn_id: turn_id.to_owned(),
-                subagent: None,
-                cwd: session.cwd.to_path_buf(),
-                transcript_path: session.transcript_path.clone(),
-                model: session.model.clone(),
-                permission_mode: self.permission_mode(),
-                tool_name: "Bash".to_owned(),
-                matcher_aliases: Vec::new(),
-                run_id_suffix: run_id_suffix.to_owned(),
-                tool_input: serde_json::json!({"command": command, "description": description}),
-            })
-            .await;
-        self.publish(outcome.hook_events);
+        let request = PermissionRequestRequest {
+            session_id: session.session_id.clone(),
+            turn_id: turn_id.to_owned(),
+            subagent: None,
+            cwd: session.cwd.to_path_buf(),
+            transcript_path: session.transcript_path.clone(),
+            model: session.model.clone(),
+            permission_mode: self.permission_mode(),
+            tool_name: "Bash".to_owned(),
+            matcher_aliases: Vec::new(),
+            run_id_suffix: run_id_suffix.to_owned(),
+            tool_input: serde_json::json!({"command": command, "description": description}),
+        };
+        let hooks = self.current();
+        self.emit_started(turn_id, hooks.preview_permission_request(&request));
+        let outcome = hooks.run_permission_request(request).await;
+        self.emit_completed(outcome.hook_events);
         outcome.decision
     }
 
-    fn publish(&self, events: Vec<HookCompletedEvent>) {
-        for event in events {
-            let _ = self.completed.send(event);
+    /// Codex's `emit_hook_started_events`: the previewed runs, minus built-in and background ones.
+    fn emit_started(&self, turn_id: &str, runs: Vec<HookRunSummary>) {
+        for run in runs.into_iter().filter(should_emit_hook_notification) {
+            self.notice(
+                Some(turn_id.to_owned()),
+                HOOK_STARTED_METHOD,
+                &HookStartedEvent {
+                    turn_id: Some(turn_id.to_owned()),
+                    run,
+                },
+            );
+        }
+    }
+
+    /// Codex's `emit_hook_completed_events`, for its client notifications: completed runs, minus
+    /// built-in and background ones.
+    fn emit_completed(&self, events: Vec<HookCompletedEvent>) {
+        for event in events
+            .into_iter()
+            .filter(|event| should_emit_hook_notification(&event.run))
+        {
+            self.notice(event.turn_id.clone(), HOOK_COMPLETED_METHOD, &event);
+        }
+    }
+
+    fn notice(&self, turn_id: Option<String>, method: &str, params: &impl serde::Serialize) {
+        let Some(events) = self
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        match serde_json::to_value(params) {
+            Ok(params) => {
+                let _ = events.send(ThreadEvent::Notice(ThreadNotice::new(
+                    turn_id, method, params,
+                )));
+            }
+            Err(error) => tracing::warn!(%error, %method, "hook notice could not be serialized"),
         }
     }
 
     fn record_contexts(&self, context: &UserHookContext<'_>, contexts: Vec<String>) {
+        let messages: Vec<Message> = contexts.into_iter().map(Message::developer).collect();
+        if messages.is_empty() {
+            return;
+        }
+        let rejected = match context.context_output() {
+            Some(queue) => queue.push(messages).err().unwrap_or_default(),
+            None => messages,
+        };
         self.context_delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .deliver_to(
-                Some(context.run().run_id().as_str()),
-                contexts.into_iter().map(Message::developer).collect(),
-                false,
-            );
+            .pending
+            .extend(rejected);
+    }
+
+    /// The thread turn `run` belongs to: Codex's turn `sub_id`, the root run's identity.
+    fn turn_id(&self, run: &ra_core::context::RunContext) -> String {
+        let run_id = run.run_id().as_str();
+        if let Some(turn) = self
+            .context_delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .turn_of
+            .get(run_id)
+        {
+            return turn.clone();
+        }
+        tracing::debug!(%run_id, "hook run outside a bound turn; using the run's identity");
+        run_id.to_owned()
+    }
+
+    fn executor_hook_sources(
+        &self,
+        run: &ra_core::context::RunContext,
+    ) -> Vec<crate::plugins::ExecutorPluginHookSource> {
+        self.executor_hooks
+            .get()
+            .map(|provider| provider.executor_hook_sources(run))
+            .unwrap_or_default()
     }
 
     fn permission_mode(&self) -> String {
         hook_permission_mode(self.session.approval_policy)
+    }
+
+    /// Codex's `run_legacy_after_agent_hook`: the legacy `notify` program, told the turn completed.
+    /// Returns the error to end the turn with when a hook aborted it.
+    async fn run_legacy_after_agent(
+        &self,
+        hooks: &Hooks,
+        turn_id: &str,
+        input: &[ModelInputItem],
+        last_assistant_message: Option<String>,
+    ) -> Option<String> {
+        let input_messages = sampled_user_messages(input);
+        let mut abort_message = None;
+        for outcome in hooks
+            .dispatch(HookPayload {
+                session_id: self.session.session_id.clone(),
+                cwd: self.session.cwd.clone(),
+                client: None,
+                triggered_at: chrono::Utc::now(),
+                hook_event: super::HookEvent::AfterAgent {
+                    event: HookEventAfterAgent {
+                        thread_id: self.session.session_id.clone(),
+                        turn_id: turn_id.to_owned(),
+                        input_messages,
+                        last_assistant_message,
+                    },
+                },
+            })
+            .await
+        {
+            let hook_name = outcome.hook_name;
+            let (error, should_abort) = match outcome.result {
+                HookResult::Success => continue,
+                HookResult::FailedContinue(error) => (error, false),
+                HookResult::FailedAbort(error) => (error, true),
+            };
+            let action = if should_abort {
+                "aborting operation"
+            } else {
+                "continuing"
+            };
+            tracing::warn!(%turn_id, %hook_name, %error, "after_agent hook failed; {action}");
+            if should_abort && abort_message.is_none() {
+                abort_message = Some(format!(
+                    "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
+                ));
+            }
+        }
+        abort_message
     }
 
     #[allow(
@@ -267,7 +475,7 @@ impl ProductHookRuntime {
     async fn dispatch(&self, context: &UserHookContext<'_>, event: &HookEvent<'_>) -> HookDecision {
         let hooks = self.current();
         let session = &self.session;
-        let turn_id = context.run().run_id().to_string();
+        let turn_id = self.turn_id(context.run());
         match *event {
             HookEvent::SessionStart { source, .. } => {
                 let request = SessionStartRequest {
@@ -278,51 +486,57 @@ impl ProductHookRuntime {
                     permission_mode: self.permission_mode(),
                     target: StartHookTarget::SessionStart { source },
                 };
-                let outcome = hooks.run_session_start(request, None).await;
-                self.publish(outcome.hook_events);
+                self.emit_started(&turn_id, hooks.preview_session_start(&request));
+                let outcome = hooks
+                    .run_session_start(request, Some(turn_id.clone()))
+                    .await;
+                self.emit_completed(outcome.hook_events);
                 self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_stop {
                     return HookDecision::Deny {
-                        message: outcome
-                            .stop_reason
-                            .unwrap_or_else(|| "Hook stopped prompt processing".to_owned()),
+                        message: non_empty(outcome.stop_reason, "Hook stopped prompt processing"),
                     };
                 }
                 HookDecision::Continue
             }
             HookEvent::SessionEnd { .. } => {
-                let outcome = hooks
-                    .run_session_end(SessionEndRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        cwd: session.cwd.clone(),
-                        transcript_path: session.transcript_path.clone(),
-                    })
-                    .await;
-                self.publish(outcome.hook_events);
-                hooks.shutdown().await;
+                // Background work stops first, whether or not SessionEnd has handlers, so no
+                // background handler runs or reports after this point.
+                self.stop_background().await;
+                let preview = hooks.preview_session_end();
+                if preview.is_empty() {
+                    return HookDecision::Continue;
+                }
+                let request = SessionEndRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                };
+                self.emit_started(&turn_id, preview);
+                let outcome = hooks.run_session_end(request).await;
+                self.emit_completed(outcome.hook_events);
                 HookDecision::Continue
             }
             HookEvent::UserPromptSubmit { input } => {
-                let outcome = hooks
-                    .run_user_prompt_submit(UserPromptSubmitRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        subagent: None,
-                        cwd: session.cwd.clone(),
-                        transcript_path: session.transcript_path.clone(),
-                        model: session.model.clone(),
-                        permission_mode: self.permission_mode(),
-                        prompt: user_prompt(input),
-                    })
-                    .await;
-                self.publish(outcome.hook_events);
+                let prompt = user_prompt(input);
+                let request = UserPromptSubmitRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    prompt,
+                };
+                self.emit_started(&turn_id, hooks.preview_user_prompt_submit(&request));
+                let outcome = hooks.run_user_prompt_submit(request).await;
+                self.emit_completed(outcome.hook_events);
                 self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_stop {
                     return HookDecision::Deny {
-                        message: outcome
-                            .stop_reason
-                            .unwrap_or_else(|| "Hook stopped prompt processing".to_owned()),
+                        message: non_empty(outcome.stop_reason, "Hook stopped prompt processing"),
                     };
                 }
                 HookDecision::Continue
@@ -330,22 +544,22 @@ impl ProductHookRuntime {
             HookEvent::PreToolUse(call) => {
                 let tool = HookToolName::for_call(&call);
                 let tool_use_id = call.call_id().to_string();
-                let outcome = hooks
-                    .run_pre_tool_use(PreToolUseRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        subagent: None,
-                        cwd: session.cwd.clone(),
-                        transcript_path: session.transcript_path.clone(),
-                        model: session.model.clone(),
-                        permission_mode: self.permission_mode(),
-                        tool_name: tool.name.clone(),
-                        matcher_aliases: tool.matcher_aliases.clone(),
-                        tool_use_id: tool_use_id.clone(),
-                        tool_input: hook_input(&call),
-                    })
-                    .await;
-                self.publish(outcome.hook_events);
+                let request = PreToolUseRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    tool_name: tool.name.clone(),
+                    matcher_aliases: tool.matcher_aliases.clone(),
+                    tool_use_id: tool_use_id.clone(),
+                    tool_input: hook_input(&call),
+                };
+                self.emit_started(&turn_id, hooks.preview_pre_tool_use(&request));
+                let outcome = hooks.run_pre_tool_use(request).await;
+                self.emit_completed(outcome.hook_events);
                 self.record_contexts(context, outcome.additional_contexts);
                 if !outcome.should_block {
                     return outcome
@@ -366,22 +580,22 @@ impl ProductHookRuntime {
             }
             HookEvent::PermissionRequest(call) => {
                 let tool = HookToolName::for_call(&call);
-                let outcome = hooks
-                    .run_permission_request(PermissionRequestRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        subagent: None,
-                        cwd: session.cwd.to_path_buf(),
-                        transcript_path: session.transcript_path.clone(),
-                        model: session.model.clone(),
-                        permission_mode: self.permission_mode(),
-                        tool_name: tool.name,
-                        matcher_aliases: tool.matcher_aliases,
-                        run_id_suffix: call.call_id().to_string(),
-                        tool_input: hook_input(&call),
-                    })
-                    .await;
-                self.publish(outcome.hook_events);
+                let request = PermissionRequestRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.to_path_buf(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    tool_name: tool.name,
+                    matcher_aliases: tool.matcher_aliases,
+                    run_id_suffix: call.call_id().to_string(),
+                    tool_input: hook_input(&call),
+                };
+                self.emit_started(&turn_id, hooks.preview_permission_request(&request));
+                let outcome = hooks.run_permission_request(request).await;
+                self.emit_completed(outcome.hook_events);
                 match outcome.decision {
                     Some(PermissionRequestDecision::Allow) => HookDecision::Allow,
                     Some(PermissionRequestDecision::Deny { message }) => {
@@ -396,23 +610,23 @@ impl ProductHookRuntime {
                     || serde_json::to_value(output).unwrap_or(Value::Null),
                     |text| Value::String(text.to_owned()),
                 );
-                let outcome = hooks
-                    .run_post_tool_use(PostToolUseRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        subagent: None,
-                        cwd: session.cwd.clone(),
-                        transcript_path: session.transcript_path.clone(),
-                        model: session.model.clone(),
-                        permission_mode: self.permission_mode(),
-                        tool_name: tool.name,
-                        matcher_aliases: tool.matcher_aliases,
-                        tool_use_id: call.call_id().to_string(),
-                        tool_input: hook_input(&call),
-                        tool_response,
-                    })
-                    .await;
-                self.publish(outcome.hook_events);
+                let request = PostToolUseRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    tool_name: tool.name,
+                    matcher_aliases: tool.matcher_aliases,
+                    tool_use_id: call.call_id().to_string(),
+                    tool_input: hook_input(&call),
+                    tool_response,
+                };
+                self.emit_started(&turn_id, hooks.preview_post_tool_use(&request));
+                let outcome = hooks.run_post_tool_use(request).await;
+                self.emit_completed(outcome.hook_events);
                 self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_block {
                     return HookDecision::Deny {
@@ -438,56 +652,177 @@ impl ProductHookRuntime {
                 } else {
                     StopHookTarget::Stop
                 };
-                let mut outcome = hooks
-                    .run_stop(StopRequest {
-                        session_id: session.session_id.clone(),
-                        turn_id,
-                        cwd: session.cwd.clone(),
-                        transcript_path: session.transcript_path.clone(),
-                        model: session.model.clone(),
-                        permission_mode: self.permission_mode(),
-                        request_metadata: None,
-                        stop_hook_active: delivery.stop_hook_active(),
-                        last_assistant_message: delivery
-                            .message()
-                            .map(ra_core::item::Message::text_content),
-                        target,
-                    })
-                    .await;
-                self.publish(std::mem::take(&mut outcome.hook_events));
+                let last_assistant_message =
+                    delivery.message().map(ra_core::item::Message::text_content);
+                let request = StopRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    request_metadata: None,
+                    stop_hook_active: delivery.stop_hook_active(),
+                    last_assistant_message: last_assistant_message.clone(),
+                    target,
+                };
+                let stop_hooks =
+                    hooks.with_executor_hooks(self.executor_hook_sources(context.run()));
+                self.emit_started(&turn_id, stop_hooks.preview_stop(&request));
+                let mut outcome = stop_hooks.run_stop(request).await;
+                self.emit_completed(std::mem::take(&mut outcome.hook_events));
                 if outcome.should_stop {
                     return HookDecision::Deny {
-                        message: outcome
-                            .stop_reason
-                            .unwrap_or_else(|| "Stop hook stopped processing".to_owned()),
+                        message: non_empty(outcome.stop_reason, "Stop hook stopped processing"),
                     };
                 }
-                if !outcome.should_block {
+                if outcome.should_block {
+                    let prompt = outcome
+                        .continuation_fragments
+                        .iter()
+                        .filter(|fragment| !fragment.hook_run_id.trim().is_empty())
+                        .map(|fragment| {
+                            format!(
+                                "<hook_prompt hook_run_id=\"{}\">{}</hook_prompt>",
+                                escape_xml(&fragment.hook_run_id),
+                                escape_xml(&fragment.text)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !prompt.trim().is_empty() {
+                        return HookDecision::Block { prompt };
+                    }
+                    // Codex warns about a block without a prompt and goes on to end the turn.
+                    self.warn(
+                        "Stop hook requested continuation without a prompt; ignoring the block.",
+                    );
+                }
+                if event_name == HookEventName::Stop
+                    && let Some(message) = self
+                        .run_legacy_after_agent(
+                            &stop_hooks,
+                            &turn_id,
+                            delivery.sampled_input().unwrap_or_default(),
+                            last_assistant_message,
+                        )
+                        .await
+                {
+                    // Codex reports the abort as the turn's error and ends the turn.
+                    self.send_event(ThreadEvent::Error {
+                        turn_id: turn_id.clone(),
+                        message: message.clone(),
+                    });
+                    return HookDecision::Deny { message };
+                }
+                HookDecision::Continue
+            }
+            HookEvent::Interrupt { .. } => {
+                // Codex runs Interrupt hooks once, for the turn: a nested agent-tool run's own
+                // interruption is part of that turn's.
+                if context.run().parent_run_id().is_some() {
                     return HookDecision::Continue;
                 }
-                let prompt = outcome
-                    .continuation_fragments
-                    .iter()
-                    .filter(|fragment| !fragment.hook_run_id.trim().is_empty())
-                    .map(|fragment| {
-                        format!(
-                            "<hook_prompt hook_run_id=\"{}\">{}</hook_prompt>",
-                            escape_xml(&fragment.hook_run_id),
-                            escape_xml(&fragment.text)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                HookDecision::Block { prompt }
+                let executor_hook_sources = self.executor_hook_sources(context.run());
+                let has_executor_hooks = !executor_hook_sources.is_empty();
+                let hooks = hooks.with_executor_hooks(executor_hook_sources);
+                let preview = hooks.preview_interrupt();
+                if preview.is_empty() && !has_executor_hooks {
+                    return HookDecision::Continue;
+                }
+                let request = InterruptRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    permission_mode: self.permission_mode(),
+                    request_metadata: None,
+                };
+                self.emit_started(&turn_id, preview);
+                let outcome = hooks.run_interrupt(request).await;
+                self.emit_completed(outcome.hook_events);
+                HookDecision::Continue
+            }
+            HookEvent::PreCompact { trigger, .. } => {
+                let request = PreCompactRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    trigger: compaction_trigger_label(trigger).to_owned(),
+                };
+                self.emit_started(&turn_id, hooks.preview_pre_compact(&request));
+                let outcome = hooks.run_pre_compact(request).await;
+                self.emit_completed(outcome.hook_events);
+                if outcome.should_stop {
+                    return HookDecision::Deny {
+                        message: non_empty(
+                            outcome.stop_reason,
+                            "PreCompact hook stopped compaction",
+                        ),
+                    };
+                }
+                HookDecision::Continue
+            }
+            HookEvent::PostCompact { trigger, .. } => {
+                let request = PostCompactRequest {
+                    session_id: session.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    subagent: None,
+                    cwd: session.cwd.clone(),
+                    transcript_path: session.transcript_path.clone(),
+                    model: session.model.clone(),
+                    trigger: compaction_trigger_label(trigger).to_owned(),
+                };
+                self.emit_started(&turn_id, hooks.preview_post_compact(&request));
+                let outcome = hooks.run_post_compact(request).await;
+                self.emit_completed(outcome.hook_events);
+                if outcome.should_stop {
+                    return HookDecision::Deny {
+                        message: non_empty(
+                            outcome.stop_reason,
+                            "PostCompact hook stopped the turn",
+                        ),
+                    };
+                }
+                HookDecision::Continue
             }
             _ => HookDecision::Continue,
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        self.send_event(ThreadEvent::Warning {
+            message: message.to_owned(),
+        });
+    }
+
+    fn send_event(&self, event: ThreadEvent) {
+        if let Some(events) = self
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = events.send(event);
         }
     }
 }
 
 impl Drop for ProductHookRuntime {
     fn drop(&mut self) {
-        self.forwarder.abort();
+        if let Some(forwarder) = self
+            .background
+            .forwarder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            forwarder.abort();
+        }
     }
 }
 
@@ -507,14 +842,21 @@ impl UserHook for ProductHook {
             .context_delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        delivery.queues.retain(|_, queue| !queue.is_closed());
-        delivery
-            .queues
-            .insert(run.run_id().to_string(), output.clone());
-        if run.parent_run_id().is_none() {
-            delivery.root = Some(output.clone());
-            let pending = std::mem::take(&mut delivery.pending);
-            delivery.deliver_to(Some(run.run_id().as_str()), pending, true);
+        let run_id = run.run_id().to_string();
+        match run.parent_run_id() {
+            // A root run is the thread's turn; runs of other turns are forgotten.
+            None => {
+                delivery.turn_of.retain(|_, turn| *turn == run_id);
+                delivery.turn_of.insert(run_id.clone(), run_id);
+                delivery.root = Some(output.clone());
+                delivery.deliver_pending();
+            }
+            // A nested run belongs to the turn of the run that started it, which binds first.
+            Some(parent) => {
+                let parent = parent.to_string();
+                let turn = delivery.turn_of.get(&parent).cloned().unwrap_or(parent);
+                delivery.turn_of.insert(run_id, turn);
+            }
         }
     }
 
@@ -525,6 +867,44 @@ impl UserHook for ProductHook {
     ) -> Result<HookDecision> {
         Ok(self.runtime.dispatch(context, event).await)
     }
+}
+
+/// The user messages of the input a turn was sampled with, as Codex's after-agent hook reads them
+/// through `parse_turn_item`: hook prompts and model-only contextual messages are not the user's.
+fn sampled_user_messages(input: &[ModelInputItem]) -> Vec<String> {
+    input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message(message)
+                if message.role() == MessageRole::User
+                    && !ra_core::session::contextual::is_contextual_user_message(message) =>
+            {
+                let text = message.text_content();
+                (!text.trim_start().starts_with("<hook_prompt ")).then_some(text)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Codex's `should_emit_hook_notification`: built-in and background runs keep their telemetry but
+/// are not shown to clients.
+fn should_emit_hook_notification(run: &HookRunSummary) -> bool {
+    !run.builtin && run.execution_mode == HookExecutionMode::Sync
+}
+
+/// Codex's `compaction_trigger_label`.
+const fn compaction_trigger_label(trigger: CompactTrigger) -> &'static str {
+    match trigger {
+        CompactTrigger::Manual => "manual",
+        _ => "auto",
+    }
+}
+
+fn non_empty(reason: Option<String>, fallback: &str) -> String {
+    reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 /// The source's hook-facing tool identity: the serialized name and extra matcher inputs.
@@ -600,32 +980,44 @@ fn user_prompt(input: &[ModelInputItem]) -> String {
         .join("\n")
 }
 
+/// Where hook context goes: the current turn's queue, or, between turns, the next one's.
 #[derive(Default)]
 struct ContextDelivery {
-    queues: std::collections::HashMap<String, HookContextQueue>,
+    /// The current turn's context queue: its root run's.
     root: Option<HookContextQueue>,
+    /// Context and background warnings no open turn took yet, for the next turn.
     pending: Vec<Message>,
+    pending_warnings: Vec<String>,
+    /// The turn each bound run belongs to, by run identity.
+    turn_of: std::collections::HashMap<String, String>,
 }
+
 impl ContextDelivery {
-    fn deliver_to(&mut self, turn_id: Option<&str>, messages: Vec<Message>, background: bool) {
-        if messages.is_empty() {
+    /// Codex drains background results into the current turn whichever turn started them.
+    fn deliver_background(&mut self, messages: Vec<Message>, warnings: Vec<String>) {
+        if messages.is_empty() && warnings.is_empty() {
             return;
         }
-        let queue = turn_id
-            .and_then(|id| self.queues.get(id))
-            .or(self.root.as_ref());
-        let remaining = match queue {
-            Some(queue) => {
-                let result = if background {
-                    queue.push_background(messages)
-                } else {
-                    queue.push(messages)
-                };
-                result.err().unwrap_or_default()
-            }
-            None => messages,
+        let (messages, warnings) = match &self.root {
+            Some(queue) => match queue.push_background_with_warnings(messages, warnings) {
+                Ok(()) => return,
+                Err(rejected) => rejected,
+            },
+            None => (messages, warnings),
         };
-        self.pending.extend(remaining);
+        self.pending.extend(messages);
+        self.pending_warnings.extend(warnings);
+    }
+
+    fn deliver_pending(&mut self) {
+        let messages = std::mem::take(&mut self.pending);
+        let warnings = std::mem::take(&mut self.pending_warnings);
+        self.deliver_background(messages, warnings);
+    }
+
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.pending_warnings.clear();
     }
 }
 

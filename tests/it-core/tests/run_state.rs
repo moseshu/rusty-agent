@@ -2171,7 +2171,7 @@ fn current_schema_preserves_ownerless_rules_instead_of_applying_legacy_migration
     assert_eq!(state.permission_rules().len(), 1);
     assert_eq!(
         RUN_STATE_SCHEMA_VERSION,
-        ra_core::compat::SchemaVersion::new(18)
+        ra_core::compat::SchemaVersion::new(19)
     );
     assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }
@@ -2237,4 +2237,21 @@ fn pending_context_input_requires_a_started_run_identity() {
     let wire = serde_json::to_value(&state).unwrap();
     let error = serde_json::from_value::<RunState>(wire).unwrap_err();
     assert!(error.to_string().contains("names no current agent"));
+}
+
+#[test]
+fn sampled_input_distinguishes_empty_projection_and_older_checkpoints() {
+    let mut state = RunState::start(RunId::new("sampling-checkpoint"));
+    assert!(state.sampled_input().is_none());
+    state.set_sampled_input(Some(Vec::new()));
+    let mut record = serde_json::to_value(&state).unwrap();
+    assert_eq!(record["sampled_input"], serde_json::json!([]));
+    let restored: RunState = serde_json::from_value(record.clone()).unwrap();
+    assert_eq!(restored.sampled_input(), Some([].as_slice()));
+
+    record.as_object_mut().unwrap().remove("sampled_input");
+    record["schema_version"] = serde_json::json!(18);
+    let legacy: RunState = serde_json::from_value(record).unwrap();
+    assert_eq!(legacy.schema_version(), RUN_STATE_SCHEMA_VERSION);
+    assert!(legacy.sampled_input().is_none());
 }

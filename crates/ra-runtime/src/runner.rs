@@ -1082,6 +1082,8 @@ pub struct RunRequest {
     pending_input: Option<PendingInput>,
     live_settings: Option<LiveRunSettings>,
     output_schema: Option<OutputSchema>,
+    /// What owns the run from above, when anything does.
+    owner: Option<RunOwner>,
 }
 
 impl RunRequest {
@@ -1126,7 +1128,19 @@ impl RunRequest {
             pending_input: None,
             live_settings: None,
             output_schema: None,
+            owner: None,
         }
+    }
+
+    /// Runs on behalf of `owner`; see [`RunOwner`].
+    pub(crate) fn with_owner(mut self, owner: RunOwner) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Whether a thread owns the run's turn.
+    fn thread_owned(&self) -> bool {
+        matches!(self.owner, Some(RunOwner::Thread(_)))
     }
 
     pub(crate) fn with_model_stream_sink(mut self, sink: Arc<dyn stream::ModelStreamSink>) -> Self {
@@ -1529,6 +1543,8 @@ struct TurnLoopContext<'a> {
     continues_turn: bool,
     /// The session the run's history is read from and appended to.
     session: Option<&'a dyn Session>,
+    /// What owns the run from above, when anything does.
+    owner: Option<&'a RunOwner>,
 }
 
 /// What the loop produces, whichever way it ends.
@@ -1684,12 +1700,14 @@ async fn run_loop(
     }
     let started = Instant::now();
     // Everything a cancellation notification needs, captured before the loop consumes the request
-    // — and only when someone is listening, so the default run pays nothing for it.
-    let interrupt = request
+    // — and only when someone is listening, so the default run pays nothing for it. A thread runs
+    // its turn's Interrupt hooks itself, whichever stage its interrupt reached.
+    let interrupt = (request
         .config
         .user_hooks()
         .has_event(HookEventName::Interrupt)
-        .then(|| InterruptNotice::new(&request));
+        && !request.thread_owned())
+    .then(|| InterruptNotice::new(&request));
     // Settled after the loop, whichever way it ended: the sessions the run owns are cleaned up on
     // a failed or cancelled run exactly as on a finished one.
     //
@@ -1915,7 +1933,7 @@ async fn record_run_end(rollout: &dyn RolloutRecorder, run_id: &RunId, result: &
 /// of its own — the run's is already cancelled, and a callback under it would be dropped before it
 /// started — bounded by the same drain grace everything else gets on the way out. Its decision is
 /// discarded: cancellation is a notification, and nothing said here revives the run.
-struct InterruptNotice {
+pub(crate) struct InterruptNotice {
     hooks: UserHooks,
     cancel: CancelScope,
     run: Arc<RunContext>,
@@ -1923,6 +1941,22 @@ struct InterruptNotice {
 }
 
 impl InterruptNotice {
+    /// The notice of a thread's turn, sent once the turn has ended interrupted: Codex's
+    /// `run_turn_interrupt_hooks` from `handle_task_abort`, whichever stage the interrupt reached.
+    pub(crate) fn for_turn(
+        hooks: UserHooks,
+        cancel: CancelScope,
+        run: Arc<RunContext>,
+        services: ToolServices,
+    ) -> Self {
+        Self {
+            hooks,
+            cancel,
+            run,
+            services,
+        }
+    }
+
     fn new(request: &RunRequest) -> Self {
         let mut run = RunContext::new(request.run_id.clone(), request.agent.public())
             .with_budget(request.state.budget().clone())
@@ -1945,7 +1979,7 @@ impl InterruptNotice {
         }
     }
 
-    async fn notify(self) {
+    pub(crate) async fn notify(self) {
         let Some(reason) = self.cancel.reason() else {
             return;
         };
@@ -1996,6 +2030,7 @@ async fn run_loop_inner(
         pending_input,
         live_settings,
         output_schema,
+        owner,
     } = request;
     if let Some(saved) = state.max_turns() {
         config = config.with_max_turns(saved);
@@ -2278,6 +2313,7 @@ async fn run_loop_inner(
         spend,
         continues_turn,
         session: session.as_deref(),
+        owner: owner.as_ref(),
     };
     let _bound_hooks = config.user_hooks().bind(
         Arc::new(live_context(&context, &agent, &state)),
@@ -2497,8 +2533,16 @@ async fn run_loop_inner(
         }
     }
     if let Some(queue) = context.services.hook_context() {
-        let (messages, follow_up) = queue.close_with_follow_up();
-        state.queue_hook_context_with_follow_up(messages, follow_up);
+        if stepped.is_err() && matches!(context.owner, Some(RunOwner::Thread(_))) {
+            // A thread's run that fails or is cancelled leaves its undelivered context to the
+            // thread, which knows where each entry came from: a thread shutting down drops
+            // background results that a turn ending any other way records. Any other run keeps it
+            // in the checkpoint its error carries, for whoever resumes from that.
+            queue.seal();
+        } else {
+            let (messages, follow_up) = queue.close_with_follow_up();
+            state.queue_hook_context_with_follow_up(messages, follow_up);
+        }
     }
     if matches!(&stepped, Ok(RunOutcome::Completed { .. })) {
         deliver_hook_context(&context, &mut state);
@@ -4678,6 +4722,17 @@ async fn continue_from_stop_hook(
     if !context.config.user_hooks().has_event(event_name) {
         return Ok(false);
     }
+    // Old checkpoints without retained sampling input fall back to their history. New checkpoints
+    // preserve even an empty projection across approvals, without rerunning context processors.
+    let reconstructed;
+    let sampled_input = if let Some(input) = state.sampled_input() {
+        input
+    } else {
+        reconstructed = TurnInput::resolve(context, state, progress)
+            .map(|input| next_input(input.base(), input.carried(), None))
+            .unwrap_or_default();
+        &reconstructed
+    };
     let decision = {
         let outputs = concluding_turn_tool_outputs(state, progress);
         let delivery = StopHookData::new(
@@ -4688,7 +4743,8 @@ async fn continue_from_stop_hook(
                 .or_else(|| concluding_turn_message(state, progress)),
             &outputs,
             state.stop_hook_active(),
-        );
+        )
+        .with_sampled_input(sampled_input);
         let event = match state.parent_run_id() {
             Some(parent) => HookEvent::SubagentStop {
                 parent_run_id: parent,
@@ -4989,17 +5045,16 @@ async fn run_one_turn(
         context.tool_guardrails.preflight(prepared.tools())?;
     }
     let sandbox_processors = context.sandbox.context_processors(agent).await;
-    let (prepared, context_records, context_responses, compact_stopped) =
-        process_context_processors(
-            context,
-            &sandbox_processors,
-            progress,
-            turn_scope,
-            prepared,
-            &turn_input,
-            preparation_context,
-        )
-        .await?;
+    let (prepared, context_records, context_responses, context_end) = process_context_processors(
+        context,
+        &sandbox_processors,
+        progress,
+        turn_scope,
+        prepared,
+        &turn_input,
+        preparation_context,
+    )
+    .await?;
     let first_item = progress.segment_items(state).len();
     let context_usage = context_responses
         .iter()
@@ -5019,11 +5074,21 @@ async fn run_one_turn(
         state.record_generated_items(context_records);
     }
 
-    if compact_stopped {
-        progress.stop_processing = true;
-        return Ok(Some(RunOutcome::Completed {
-            reason: FinishReason::Final,
-        }));
+    match context_end {
+        ContextProcessingEnd::Continue => {}
+        ContextProcessingEnd::StoppedBySessionStart => {
+            progress.stop_processing = true;
+            return Ok(Some(RunOutcome::Completed {
+                reason: FinishReason::Final,
+            }));
+        }
+        // The compaction is recorded above; the run ends with the cancellation the stop raised.
+        ContextProcessingEnd::StoppedAfterCompaction => {
+            return Err(turn_scope
+                .ensure_not_cancelled()
+                .err()
+                .unwrap_or_else(|| CancelReason::custom(HOOK_STOPPED_COMPACTION).into()));
+        }
     }
     // The filter chain runs last, on whatever the coarse transforms produced. A context processor
     // reprojects whole regions of history; running a filter before it would only trim items the
@@ -5031,6 +5096,11 @@ async fn run_one_turn(
     let (prepared, context_filter_reports) =
         apply_context_filters(config, state, progress.reference_turn(), prepared)?;
     let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
+    let sampled_input = [HookEventName::Stop, HookEventName::SubagentStop]
+        .into_iter()
+        .any(|event| config.user_hooks().has_event(event))
+        .then(|| prepared.request().input().to_vec());
+    state.set_sampled_input(sampled_input);
 
     let streaming_dispatch = StreamedDispatchInput {
         agent_id: agent.public_id().clone(),
@@ -5906,7 +5976,12 @@ async fn process_context_processors(
     prepared: PreparedTurn,
     turn_input: &TurnInput,
     run: RunContext,
-) -> Result<(PreparedTurn, Vec<RunItem>, Vec<ModelResponse>, bool)> {
+) -> Result<(
+    PreparedTurn,
+    Vec<RunItem>,
+    Vec<ModelResponse>,
+    ContextProcessingEnd,
+)> {
     // Sandbox capabilities transform the current input even on caller-managed continuations,
     // as the reference's prepare_sandbox_input does. Only run-level processors require an
     // authoritative history decomposition.
@@ -5925,7 +6000,12 @@ async fn process_context_processors(
         )
         .collect();
     if processors.is_empty() {
-        return Ok((prepared, Vec::new(), Vec::new(), false));
+        return Ok((
+            prepared,
+            Vec::new(),
+            Vec::new(),
+            ContextProcessingEnd::Continue,
+        ));
     }
     let mut input = prepared.request().input().to_vec();
     // Without a reconstructible history, expose the caller's input as a prefix, not as records
@@ -5956,6 +6036,11 @@ async fn process_context_processors(
                 context.services.clone(),
             ),
             compacted: std::sync::atomic::AtomicBool::new(false),
+            owner: context.owner.cloned(),
+            run_id: context.run_id.clone(),
+            run_cancel: context.cancel.clone(),
+            turn_scope: turn_scope.clone(),
+            stopped_after_compaction: std::sync::atomic::AtomicBool::new(false),
         })
     });
 
@@ -5990,6 +6075,22 @@ async fn process_context_processors(
             generated_items.push(item.clone());
         }
         model_responses.extend(result.model_responses().iter().cloned());
+        // A PostCompact hook stopped the turn after this processor compacted: what it produced is
+        // kept, and nothing else runs under the cancelled turn — a later processor's cancellable
+        // work would fail and take the compaction record with it. The next turn re-establishes
+        // context instead of this one.
+        if hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .stopped_after_compaction
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            return Ok((
+                prepared.map_request(|request| request.with_input(input)),
+                generated_items,
+                model_responses,
+                ContextProcessingEnd::StoppedAfterCompaction,
+            ));
+        }
         let notified = hooks.as_ref().is_some_and(|hooks| {
             hooks
                 .compacted
@@ -6017,31 +6118,155 @@ async fn process_context_processors(
                     prepared.map_request(|request| request.with_input(input)),
                     generated_items,
                     model_responses,
-                    true,
+                    ContextProcessingEnd::StoppedBySessionStart,
                 ));
             }
         }
     }
 
     let prepared = prepared.map_request(|request| request.with_input(input));
-    Ok((prepared, generated_items, model_responses, false))
+    Ok((
+        prepared,
+        generated_items,
+        model_responses,
+        ContextProcessingEnd::Continue,
+    ))
 }
 
-/// Captures successful compaction notifications even when a processor projects without records.
+/// How context processing left the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextProcessingEnd {
+    /// The turn goes on to its model call.
+    Continue,
+    /// A `SessionStart` hook re-establishing context after compaction stopped processing.
+    StoppedBySessionStart,
+    /// A `PostCompact` hook stopped the turn; the compaction stands and the run ends cancelled.
+    StoppedAfterCompaction,
+}
+
+/// The cancellation reason a stopping compaction hook leaves.
+const HOOK_STOPPED_COMPACTION: &str = "hook_stopped_compaction";
+
+/// What owns a run from above, when anything does: who answers for its turn's end.
+///
+/// A thread's root run belongs to the thread's turn, whose end the thread records itself. The
+/// thread therefore aborts the turn when a compaction hook stops it (Codex's `PreCompact` and
+/// `PostCompact` `Stopped` end the turn with `TurnAborted`, through [`crate::thread::TurnAbort`]),
+/// runs the turn's Interrupt hooks whichever stage the interrupt reached (Codex's
+/// `handle_task_abort`), and drains the run's undelivered hook context knowing where each entry
+/// came from. An agent-tool run has no turn of its own: a compaction hook's stop ends that run
+/// alone and is recorded for the tool that started it, which turns it into an ordinary tool failure
+/// for the parent's failure handling. A run without an owner ends itself on a stop, notifies its
+/// own Interrupt hooks, and keeps undelivered context in a failed run's checkpoint.
+#[derive(Clone)]
+pub(crate) enum RunOwner {
+    /// The thread turn the run belongs to.
+    Thread(Arc<crate::thread::TurnAbort>),
+    /// The agent-tool call that started the run.
+    AgentTool(Arc<NestedCompactionStop>),
+}
+
+/// Records that a compaction hook stopped one agent-tool run, for the call that started it.
+///
+/// It travels beside the run rather than inside the error the run returns: a cancellation carries
+/// no source, and a typed record keyed by the run's identity cannot be mistaken for any other
+/// cancellation however the runner wraps it.
+#[derive(Debug)]
+pub(crate) struct NestedCompactionStop {
+    run_id: RunId,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl NestedCompactionStop {
+    /// A record for the nested run `run_id`.
+    pub(crate) fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn record(&self, run_id: &RunId) {
+        if *run_id == self.run_id {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a compaction hook stopped the run.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Captures successful compaction notifications even when a processor projects without records,
+/// and applies a compaction hook's stop.
 struct CompactionHookDispatcher {
     hooks: crate::hook::BoundUserHooks,
     compacted: std::sync::atomic::AtomicBool,
+    owner: Option<RunOwner>,
+    run_id: RunId,
+    /// The run's scope, which a stop with nothing above the run cancels.
+    run_cancel: CancelScope,
+    /// The scope the hooks are bound to, which every stop cancels.
+    turn_scope: CancelScope,
+    stopped_after_compaction: std::sync::atomic::AtomicBool,
 }
+
+impl CompactionHookDispatcher {
+    /// Ends the turn — or, with nothing above the run, the run — for a stopping hook.
+    fn stop(&self, then_session_start: Option<ra_core::hook::SessionStartSource>) {
+        let reason = CancelReason::custom(HOOK_STOPPED_COMPACTION);
+        match &self.owner {
+            Some(RunOwner::Thread(turn)) => {
+                turn.abort(reason, then_session_start);
+            }
+            Some(RunOwner::AgentTool(nested)) => {
+                nested.record(&self.run_id);
+                self.run_cancel.cancel(reason);
+            }
+            None => self.run_cancel.cancel(reason),
+        }
+    }
+
+    /// The cancellation the run ends with: the scope's own root cause, which an interrupt that came
+    /// first keeps.
+    fn cancellation(&self) -> Error {
+        self.turn_scope
+            .ensure_not_cancelled()
+            .err()
+            .unwrap_or_else(|| CancelReason::custom(HOOK_STOPPED_COMPACTION).into())
+    }
+}
+
 #[async_trait::async_trait]
 impl ra_core::hook::UserHookDispatcher for CompactionHookDispatcher {
     async fn dispatch(&self, event: HookEvent<'_>) -> Result<HookDecision> {
-        let compacted = matches!(event, HookEvent::PostCompact { .. });
+        let name = event.name();
         let decision = self.hooks.dispatch(event).await?;
-        if compacted {
-            self.compacted
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        let stopped = matches!(decision, HookDecision::Deny { .. });
+        match name {
+            // Nothing is compacted: the processor returns this error before it asks for a summary.
+            HookEventName::PreCompact if stopped => {
+                self.stop(None);
+                Err(self.cancellation())
+            }
+            HookEventName::PostCompact => {
+                self.compacted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                if stopped {
+                    // The compaction already happened and the processor goes on to return it, so
+                    // this answers normally; context processing ends the run once it is recorded.
+                    // As in Codex, the context re-established after compaction waits for the next
+                    // turn.
+                    self.stop(Some(ra_core::hook::SessionStartSource::Compact));
+                    self.stopped_after_compaction
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(decision)
+            }
+            _ => Ok(decision),
         }
-        Ok(decision)
     }
 }
 
@@ -7295,12 +7520,24 @@ fn emit(events: RunEvents<'_>, event: RunStreamEvent) {
     }
 }
 
-/// Records context after the tool batch without treating it as accepted user input.
+/// Records context after the tool batch without treating it as accepted user input, and shows the
+/// warnings background hooks reported alongside it.
 fn deliver_hook_context(context: &TurnLoopContext<'_>, state: &mut RunState) -> bool {
     let (messages, follow_up) = context.services.hook_context().map_or_else(
         || (Vec::new(), false),
         ra_core::hook::HookContextQueue::take_with_follow_up,
     );
+    let warnings = context
+        .services
+        .hook_context()
+        .map_or_else(Vec::new, ra_core::hook::HookContextQueue::take_warnings);
+    for warning in warnings {
+        if let Some(sink) = context.events.model_stream_sink {
+            sink.warning(warning);
+        } else {
+            tracing::warn!(%warning, "background hook warning");
+        }
+    }
     state.queue_hook_context_with_follow_up(messages, follow_up);
     let (messages, follow_up) = state.take_hook_context_with_follow_up();
     let offset = state.generated_items().len();

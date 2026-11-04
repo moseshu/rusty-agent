@@ -174,7 +174,13 @@ impl ThreadRequestProcessor {
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
             })?;
-        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
+        let super::thread_factory::PreparedParts {
+            builder,
+            adapter,
+            terminals,
+            product,
+            policy_applied,
+        } = prepared.into_parts();
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
         } else {
@@ -236,6 +242,7 @@ impl ThreadRequestProcessor {
             info,
             adapter,
             terminals,
+            product,
             dynamic_tool_calls,
         );
         self.attach(&request_id, &loaded, &context.listener).await;
@@ -327,7 +334,13 @@ impl ThreadRequestProcessor {
                 )));
             }
         };
-        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
+        let super::thread_factory::PreparedParts {
+            builder,
+            adapter,
+            terminals,
+            product,
+            policy_applied,
+        } = prepared.into_parts();
         let (model, effort) = if params.model.is_some() {
             (params.model.clone(), None)
         } else {
@@ -389,6 +402,7 @@ impl ThreadRequestProcessor {
             info,
             adapter,
             terminals,
+            product,
             dynamic_tool_calls,
         );
         self.attach(&request_id, &loaded, &context.listener).await;
@@ -497,7 +511,13 @@ impl ThreadRequestProcessor {
             .map_err(|error| {
                 JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
             })?;
-        let (builder, adapter, terminals, policy_applied) = prepared.into_parts();
+        let super::thread_factory::PreparedParts {
+            builder,
+            adapter,
+            terminals,
+            product,
+            policy_applied,
+        } = prepared.into_parts();
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
         } else {
@@ -595,6 +615,7 @@ impl ThreadRequestProcessor {
             info,
             adapter,
             terminals,
+            product,
             dynamic_tool_calls,
         );
         self.attach(&request_id, &loaded, &context.listener).await;
@@ -888,11 +909,24 @@ impl ThreadRequestProcessor {
         info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
         terminals: Option<Arc<dyn super::ThreadBackgroundTerminals>>,
+        product: Option<Arc<dyn super::ThreadProductRuntime>>,
         dynamic_tool_calls: Arc<DynamicToolCalls>,
     ) -> LoadedThread {
-        let loaded =
-            self.thread_manager
-                .add_thread(thread, info, adapter, terminals, dynamic_tool_calls);
+        // Bound before the thread is reachable, so nothing can start a turn on it first.
+        if let Some(product) = &product {
+            product.bind_thread(super::ThreadProductBinding::new(
+                thread.thread_id().clone(),
+                thread.event_sender(),
+            ));
+        }
+        let loaded = self.thread_manager.add_thread(
+            thread,
+            info,
+            adapter,
+            terminals,
+            product,
+            dynamic_tool_calls,
+        );
         // The product settings the thread was loaded with, for a later resume or fork to restore,
         // as Codex records the settings each turn runs with.
         if loaded.adapter.is_some() {

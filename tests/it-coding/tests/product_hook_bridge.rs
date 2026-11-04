@@ -79,6 +79,48 @@ fn session(home: &Path) -> ProductHookSession {
     }
 }
 
+/// Reports the runtime's hook runs on a thread event channel of the test's own.
+fn thread_events(
+    runtime: &ProductHookRuntime,
+) -> tokio::sync::mpsc::UnboundedReceiver<ra_runtime::thread::ThreadEvent> {
+    let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+    runtime.bind_thread_events(events);
+    receiver
+}
+
+/// The next completed hook run reported on `events`, which must follow its started report.
+async fn next_completed(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<ra_runtime::thread::ThreadEvent>,
+) -> ra_protocol::server::protocol::HookCompletedEvent {
+    let mut started = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let ra_runtime::thread::ThreadEvent::Notice(notice) = event {
+            if notice.method() == ra_protocol::server::protocol::HOOK_STARTED_METHOD {
+                started = true;
+            } else if notice.method() == ra_protocol::server::protocol::HOOK_COMPLETED_METHOD {
+                assert!(started, "a run is reported started before it completes");
+                return serde_json::from_value(notice.params().clone()).unwrap();
+            }
+        }
+    }
+}
+
+/// Waits for `take` to return background context.
+async fn background_context(take: impl Fn() -> Vec<Message>) -> Vec<Message> {
+    for _ in 0..500 {
+        let messages = take();
+        if !messages.is_empty() {
+            return messages;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("background context never arrived");
+}
+
 fn bound_with_queue(
     runtime: &Arc<ProductHookRuntime>,
     queue: &ra_core::hook::HookContextQueue,
@@ -116,7 +158,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
     )
     .await;
     let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
-    let mut completed = runtime.subscribe_completed();
+    let mut completed = thread_events(&runtime);
     let queue = ra_core::hook::HookContextQueue::default();
     let bound = bound_with_queue(&runtime, &queue);
     let call_id = CallId::new("call-1");
@@ -137,10 +179,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
                 .to_owned()
         }
     );
-    let event = tokio::time::timeout(Duration::from_secs(5), completed.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let event = next_completed(&mut completed).await;
     assert_eq!(event.run.event_name, HookEventName::PreToolUse);
 
     let patch = ToolOrigin::new("apply_patch").unwrap();
@@ -364,7 +403,6 @@ command = '''while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{{"hookSpeci
 "#, gate.display())).await;
         let runtime =
             ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
-        let mut completed = runtime.subscribe_completed();
         let queue = ra_core::hook::HookContextQueue::default();
         let bound = bound_with_queue(&runtime, &queue);
         let origin = ToolOrigin::new("echo").unwrap();
@@ -383,24 +421,23 @@ command = '''while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{{"hookSpeci
             assert!(queue.close().is_empty());
         }
         std::fs::write(&gate, "release").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), completed.recv())
+        let delivered = if close_first {
+            // A closed turn takes nothing; the result waits for the next turn's queue.
+            background_context(|| {
+                assert!(queue.is_empty());
+                let next = ra_core::hook::HookContextQueue::default();
+                let _next_bound = bound_with_queue(&runtime, &next);
+                // Closed again at once, so a result that arrives later waits for the next try.
+                next.close()
+            })
             .await
-            .unwrap()
-            .unwrap();
-        if close_first {
-            assert!(queue.is_empty());
-            let next = ra_core::hook::HookContextQueue::default();
-            let _next_bound = bound_with_queue(&runtime, &next);
-            assert_eq!(
-                next.take(),
-                vec![Message::developer("background $unselected")]
-            );
         } else {
-            assert_eq!(
-                queue.take(),
-                vec![Message::developer("background $unselected")]
-            );
-        }
+            background_context(|| queue.take()).await
+        };
+        assert_eq!(
+            delivered,
+            vec![Message::developer("background $unselected")]
+        );
         runtime.current().shutdown().await;
     }
 }
@@ -807,7 +844,7 @@ command = """cat > {capture}; printf '%s' '{{"hookSpecificOutput":{{"hookEventNa
     )
     .await;
     let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
-    let mut completed = runtime.subscribe_completed();
+    let mut completed = thread_events(&runtime);
 
     let decision = runtime
         .run_permission_request_hooks(
@@ -831,11 +868,9 @@ command = """cat > {capture}; printf '%s' '{{"hookSpecificOutput":{{"hookEventNa
         input["tool_input"]["description"],
         "network-access https://example.com:443"
     );
-    let event = tokio::time::timeout(Duration::from_secs(5), completed.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let event = next_completed(&mut completed).await;
     assert_eq!(event.run.event_name, HookEventName::PermissionRequest);
+    assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
 }
 
 #[tokio::test]
@@ -874,4 +909,371 @@ command = """printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionRequ
             "blocked by policy hook".to_owned()
         )
     );
+}
+
+/// Binds `runtime`'s hooks to the run `run_id`, a nested run of `parent` when one is given.
+fn bound_run(
+    runtime: &Arc<ProductHookRuntime>,
+    run_id: &str,
+    parent: Option<&str>,
+    queue: &ra_core::hook::HookContextQueue,
+) -> ra_runtime::hook::BoundUserHooks {
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("coder"))
+        .name("Coder")
+        .build()
+        .unwrap();
+    let mut run = RunContext::new(RunId::new(run_id), &agent);
+    if let Some(parent) = parent {
+        run = run.with_parent_run_id(RunId::new(parent));
+    }
+    runtime.user_hooks().bind(
+        Arc::new(run),
+        CancelScope::root(),
+        ToolServices::new().with_hook_context(queue.clone()),
+    )
+}
+
+fn logging(log: &Path) -> String {
+    format!("cat >> '{0}'; echo >> '{0}'", log.display())
+}
+
+fn logged(log: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn notices(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<ra_runtime::thread::ThreadEvent>,
+) -> Vec<(String, Option<String>)> {
+    let mut notices = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let ra_runtime::thread::ThreadEvent::Notice(notice) = event {
+            notices.push((
+                notice.method().to_owned(),
+                notice.turn_id().map(str::to_owned),
+            ));
+        }
+    }
+    notices
+}
+
+/// Codex's PreCompact and PostCompact hooks stop with `continue: false`, which the bridge returns
+/// as a stop the runtime applies; the request names Codex's trigger label.
+#[tokio::test]
+async fn compaction_hooks_stop_with_their_reason_and_name_the_trigger() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("hooks.log");
+    let stop = r#"printf '%s' '{"continue":false,"stopReason":"not now"}'"#;
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            "[[hooks.PreCompact]]\n[[hooks.PreCompact.hooks]]\ntype = \"command\"\ncommand = '''{0}; {1}'''\n[[hooks.PostCompact]]\n[[hooks.PostCompact.hooks]]\ntype = \"command\"\ncommand = '''{0}; {1}'''\n",
+            logging(&log),
+            stop
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let mut events = thread_events(&runtime);
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_run(&runtime, "turn-1", None, &queue);
+    let record = ra_core::item::ItemId::new("context-1.0");
+    let compaction = ra_core::item::Compaction::new("summary", Vec::new());
+
+    let pre = bound
+        .dispatch(HookEvent::PreCompact {
+            record_id: &record,
+            trigger: ra_core::hook::CompactTrigger::Automatic,
+        })
+        .await
+        .unwrap();
+    let post = bound
+        .dispatch(HookEvent::PostCompact {
+            record_id: &record,
+            trigger: ra_core::hook::CompactTrigger::Manual,
+            compaction: &compaction,
+        })
+        .await
+        .unwrap();
+
+    let stopped = HookDecision::Deny {
+        message: "not now".to_owned(),
+    };
+    assert_eq!((pre, post), (stopped.clone(), stopped));
+    let inputs = logged(&log);
+    assert_eq!(inputs[0]["hook_event_name"], "PreCompact");
+    assert_eq!(inputs[0]["trigger"], "auto");
+    assert_eq!(inputs[1]["hook_event_name"], "PostCompact");
+    assert_eq!(inputs[1]["trigger"], "manual");
+    assert_eq!(inputs[0]["turn_id"], "turn-1");
+    assert_eq!(notices(&mut events).len(), 4);
+}
+
+/// Codex runs Interrupt hooks once for an interrupted turn. The runtime notifies every cancelled
+/// run, so a nested run's notification runs no hook.
+#[tokio::test]
+async fn interrupt_hooks_run_for_the_turn_and_not_for_its_nested_runs() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("hooks.log");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            "[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\ntype = \"command\"\ncommand = '''{}'''\n",
+            logging(&log)
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let root = bound_run(&runtime, "turn-1", None, &queue);
+    let nested = bound_run(
+        &runtime,
+        "nested-1",
+        Some("turn-1"),
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let reason = ra_core::cancel::CancelReason::UserInterrupt;
+
+    nested
+        .dispatch(HookEvent::Interrupt { reason: &reason })
+        .await
+        .unwrap();
+    assert!(logged(&log).is_empty());
+    root.dispatch(HookEvent::Interrupt { reason: &reason })
+        .await
+        .unwrap();
+
+    let inputs = logged(&log);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["hook_event_name"], "Interrupt");
+    assert_eq!(inputs[0]["turn_id"], "turn-1");
+}
+
+/// A hook a nested agent-tool run fires is requested and reported under the thread turn, Codex's
+/// turn `sub_id`, rather than under the nested run's own identity.
+#[tokio::test]
+async fn a_nested_runs_hooks_belong_to_its_turn() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("hooks.log");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = '''{}'''\n",
+            logging(&log)
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let mut events = thread_events(&runtime);
+    let _root = bound_run(
+        &runtime,
+        "turn-1",
+        None,
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let _child = bound_run(
+        &runtime,
+        "nested-1",
+        Some("turn-1"),
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let grandchild = bound_run(
+        &runtime,
+        "nested-2",
+        Some("nested-1"),
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let origin = ToolOrigin::new("echo").unwrap();
+    let call_id = CallId::new("call-1");
+    let arguments = serde_json::json!({});
+
+    grandchild
+        .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+            &origin, &call_id, &arguments,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(logged(&log)[0]["turn_id"], "turn-1");
+    assert_eq!(
+        notices(&mut events),
+        [
+            (
+                ra_protocol::server::protocol::HOOK_STARTED_METHOD.to_owned(),
+                Some("turn-1".to_owned())
+            ),
+            (
+                ra_protocol::server::protocol::HOOK_COMPLETED_METHOD.to_owned(),
+                Some("turn-1".to_owned())
+            ),
+        ]
+    );
+}
+
+/// A background handler's result reaches the current turn with its warning, and as in Codex's
+/// notification filter its run is reported neither as started nor as completed.
+#[tokio::test]
+async fn background_results_bring_their_warnings_and_are_not_reported_as_runs() {
+    let home = TempDir::new().unwrap();
+    let config = hooks_config(
+        home.path(),
+        r#"
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+async = true
+command = '''printf '%s' '{"systemMessage":"background warning","hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"background context"}}' '''
+"#,
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let mut events = thread_events(&runtime);
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_run(&runtime, "turn-1", None, &queue);
+    let origin = ToolOrigin::new("echo").unwrap();
+    let call_id = CallId::new("call-1");
+    let arguments = serde_json::json!({});
+
+    bound
+        .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+            &origin, &call_id, &arguments,
+        )))
+        .await
+        .unwrap();
+    let context = background_context(|| queue.take()).await;
+
+    assert_eq!(context, vec![Message::developer("background context")]);
+    assert_eq!(queue.take_warnings(), vec!["background warning".to_owned()]);
+    assert!(notices(&mut events).is_empty());
+    runtime.stop_background().await;
+}
+
+/// Codex's session shutdown stops background work before its SessionEnd hooks: a background
+/// handler still running is aborted and delivers nothing, and SessionEnd's own handlers still run.
+#[tokio::test]
+async fn session_end_stops_background_handlers_before_running() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("hooks.log");
+    let started = home.path().join("started");
+    let gate = home.path().join("gate");
+    let finished = home.path().join("finished");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+async = true
+command = '''touch '{started}'; while [ ! -f '{gate}' ]; do sleep 0.01; done; touch '{finished}'; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","additionalContext":"late"}}}}' '''
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = '''{log}'''
+"#,
+            started = started.display(),
+            gate = gate.display(),
+            finished = finished.display(),
+            log = logging(&log),
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_run(&runtime, "turn-1", None, &queue);
+    let origin = ToolOrigin::new("echo").unwrap();
+    let call_id = CallId::new("call-1");
+    let arguments = serde_json::json!({});
+    bound
+        .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+            &origin, &call_id, &arguments,
+        )))
+        .await
+        .unwrap();
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(started.exists(), "the background handler started");
+
+    let session_id = SessionId::new("thread-1");
+    bound
+        .dispatch(HookEvent::SessionEnd {
+            session_id: &session_id,
+            reason: "other",
+        })
+        .await
+        .unwrap();
+    // A handler that survived would finish now and deliver its context.
+    std::fs::write(&gate, "go").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(logged(&log)[0]["hook_event_name"], "SessionEnd");
+    assert!(!finished.exists(), "the background handler was aborted");
+    assert!(queue.take().is_empty());
+}
+
+/// Records the runs Stop and Interrupt ask about, and supplies no executor hooks.
+#[derive(Default)]
+struct ExecutorSources(std::sync::Mutex<Vec<String>>);
+
+impl ra_coding::hooks::ExecutorHookSourceProvider for ExecutorSources {
+    fn executor_hook_sources(
+        &self,
+        run: &RunContext,
+    ) -> Vec<ra_coding::plugins::ExecutorPluginHookSource> {
+        self.0.lock().unwrap().push(run.run_id().to_string());
+        Vec::new()
+    }
+}
+
+/// Codex adds the executor plugin hooks of the step a Stop or Interrupt concerns; the provider is
+/// asked for that run at both, and not for a nested run's Interrupt, which runs no hook.
+#[tokio::test]
+async fn stop_and_interrupt_ask_for_the_steps_executor_hooks() {
+    let home = TempDir::new().unwrap();
+    let config = hooks_config(home.path(), "").await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let provider = Arc::new(ExecutorSources::default());
+    runtime.set_executor_hook_sources(provider.clone());
+    let root = bound_run(
+        &runtime,
+        "turn-1",
+        None,
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let nested = bound_run(
+        &runtime,
+        "nested-1",
+        Some("turn-1"),
+        &ra_core::hook::HookContextQueue::default(),
+    );
+    let message = Message::assistant("done", OutputPhase::Final);
+    let reason = ra_core::cancel::CancelReason::UserInterrupt;
+
+    root.dispatch(HookEvent::Stop(StopHookData::new(
+        FinishReason::Final,
+        Some(&message),
+        &[],
+        false,
+    )))
+    .await
+    .unwrap();
+    nested
+        .dispatch(HookEvent::Interrupt { reason: &reason })
+        .await
+        .unwrap();
+    root.dispatch(HookEvent::Interrupt { reason: &reason })
+        .await
+        .unwrap();
+
+    assert_eq!(*provider.0.lock().unwrap(), ["turn-1", "turn-1"]);
 }

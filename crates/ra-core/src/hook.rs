@@ -156,6 +156,7 @@ pub struct StopHookData<'a> {
     message: Option<&'a Message>,
     tool_outputs: &'a [ToolCallOutput],
     stop_hook_active: bool,
+    sampled_input: Option<&'a [ModelInputItem]>,
 }
 
 impl<'a> StopHookData<'a> {
@@ -172,7 +173,20 @@ impl<'a> StopHookData<'a> {
             message,
             tool_outputs,
             stop_hook_active,
+            sampled_input: None,
         }
+    }
+    /// Attaches the model input the concluding turn was sampled with.
+    #[must_use]
+    pub const fn with_sampled_input(mut self, input: &'a [ModelInputItem]) -> Self {
+        self.sampled_input = Some(input);
+        self
+    }
+    /// The model input the concluding turn was sampled with, when the runtime supplied it: what
+    /// Codex's turn-complete notification reads the turn's user messages from.
+    #[must_use]
+    pub const fn sampled_input(&self) -> Option<&'a [ModelInputItem]> {
+        self.sampled_input
     }
     /// Why the run proposes to deliver this output.
     #[must_use]
@@ -356,6 +370,8 @@ pub enum HookDecision {
     /// Grants this one pending permission request only.
     Allow,
     /// Rejects a tool result/request or host input. At stop, ends processing without continuation.
+    /// At a compaction event, stops the turn: before compaction nothing is compacted, after it the
+    /// compaction is kept and the turn ends.
     Deny {
         /// Model-facing explanation of the refused call.
         message: String,
@@ -540,10 +556,24 @@ impl HookReport {
     }
 }
 
+/// Where an entry of a [`HookContextQueue`] came from.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookContextOrigin {
+    /// A hook the run waited for.
+    Synchronous,
+    /// A background handler that finished after the event that started it.
+    Background,
+}
+
 /// Run-owned contextual history, separate from steered user input.
 ///
 /// Accepted entries are drained into authoritative history after tool outputs. Closing and
 /// accepting are atomic, so a host can retain late background results for the next run.
+///
+/// The queue also carries the warnings a background handler reported, which the runtime shows at
+/// the same boundaries it records context, and remembers which context came from a background
+/// handler, so an owner that discards background results while it shuts down can tell them apart.
 #[derive(Debug, Clone, Default)]
 pub struct HookContextQueue {
     state: std::sync::Arc<std::sync::Mutex<HookContextState>>,
@@ -553,45 +583,74 @@ pub struct HookContextQueue {
 struct HookContextState {
     closed: bool,
     messages: Vec<Message>,
+    /// Parallel to `messages`: whether each entry came from a background handler.
+    background: Vec<bool>,
+    /// Background warnings waiting to be shown, in arrival order.
+    warnings: Vec<String>,
     follow_up: bool,
 }
 
+impl HookContextState {
+    fn accept(&mut self, messages: Vec<Message>, background: bool) {
+        self.background
+            .extend(std::iter::repeat_n(background, messages.len()));
+        self.messages.extend(messages);
+    }
+
+    fn drain(&mut self) -> Vec<Message> {
+        self.background.clear();
+        std::mem::take(&mut self.messages)
+    }
+}
+
 impl HookContextQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HookContextState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Records synchronous context without requesting follow-up sampling.
     /// Returns ownership when the run no longer accepts messages.
     pub fn push(&self, messages: Vec<Message>) -> std::result::Result<(), Vec<Message>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if state.closed {
             return Err(messages);
         }
-        state.messages.extend(messages);
+        state.accept(messages, false);
         Ok(())
     }
     /// Queues a completed background result and requests follow-up sampling when necessary.
     pub fn push_background(&self, messages: Vec<Message>) -> std::result::Result<(), Vec<Message>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.push_background_with_warnings(messages, Vec::new())
+            .map_err(|(messages, _)| messages)
+    }
+    /// Queues a completed background result with the warnings it reported. Warnings alone do not
+    /// request follow-up sampling. Returns ownership of both when the run no longer accepts them.
+    #[allow(
+        clippy::type_complexity,
+        reason = "The rejected halves are returned exactly as they were given."
+    )]
+    pub fn push_background_with_warnings(
+        &self,
+        messages: Vec<Message>,
+        warnings: Vec<String>,
+    ) -> std::result::Result<(), (Vec<Message>, Vec<String>)> {
+        let mut state = self.lock();
         if state.closed {
-            return Err(messages);
+            return Err((messages, warnings));
         }
         if !messages.is_empty() {
             state.follow_up = true;
         }
-        state.messages.extend(messages);
+        state.accept(messages, true);
+        state.warnings.extend(warnings);
         Ok(())
     }
     /// Whether pending background context requires another model request.
     #[must_use]
     pub fn requires_follow_up(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .follow_up
+        self.lock().follow_up
     }
     /// Takes accepted context without closing the destination.
     #[must_use]
@@ -601,38 +660,30 @@ impl HookContextQueue {
     /// Atomically drains context and its background follow-up intent.
     #[must_use]
     pub fn take_with_follow_up(&self) -> (Vec<Message>, bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         let follow_up = std::mem::take(&mut state.follow_up);
-        (std::mem::take(&mut state.messages), follow_up)
+        (state.drain(), follow_up)
+    }
+    /// Takes the background warnings waiting to be shown, also once the queue is closed.
+    #[must_use]
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut self.lock().warnings)
     }
     /// Whether the run no longer accepts context through this handle.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed
+        self.lock().closed
     }
 
     /// Whether context is waiting for delivery.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .messages
-            .is_empty()
+        self.lock().messages.is_empty()
     }
     /// Closes atomically when no accepted context remains.
     #[must_use]
     pub fn close_if_empty(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if state.messages.is_empty() {
             state.closed = true;
         }
@@ -642,10 +693,7 @@ impl HookContextQueue {
     /// The other lane must close only when empty and return whether it closed.
     #[must_use]
     pub fn close_if_empty_with(&self, close_other: impl FnOnce() -> bool) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if !state.messages.is_empty() {
             return false;
         }
@@ -663,12 +711,37 @@ impl HookContextQueue {
     /// Closes acceptance and atomically drains messages with their persisted wakeup intent.
     #[must_use]
     pub fn close_with_follow_up(&self) -> (Vec<Message>, bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         state.closed = true;
         let follow_up = std::mem::take(&mut state.follow_up);
-        (std::mem::take(&mut state.messages), follow_up)
+        (state.drain(), follow_up)
+    }
+    /// Closes acceptance and leaves undelivered entries for the owner, which drains them with
+    /// [`Self::close_entries`] knowing where each came from.
+    pub fn seal(&self) {
+        self.lock().closed = true;
+    }
+    /// Closes acceptance and drains every undelivered entry with its origin, and the background
+    /// warnings not yet shown.
+    #[must_use]
+    pub fn close_entries(&self) -> (Vec<(Message, HookContextOrigin)>, Vec<String>) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.follow_up = false;
+        let origins = std::mem::take(&mut state.background);
+        let messages = std::mem::take(&mut state.messages);
+        let entries = messages
+            .into_iter()
+            .zip(origins)
+            .map(|(message, background)| {
+                let origin = if background {
+                    HookContextOrigin::Background
+                } else {
+                    HookContextOrigin::Synchronous
+                };
+                (message, origin)
+            })
+            .collect();
+        (entries, std::mem::take(&mut state.warnings))
     }
 }

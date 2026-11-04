@@ -140,6 +140,10 @@ pub enum ThreadEvent {
         /// What the client is told.
         message: String,
     },
+    /// A host notification delivered in order with turn events and never written to the rollout:
+    /// how a product reports its hook runs, as Codex's `HookStarted` and `HookCompleted` events
+    /// share the session's event channel without being persisted.
+    Notice(ThreadNotice),
     /// Persistent thread settings were applied. Consumers read the current thread snapshot.
     ThreadSettingsApplied,
     /// A turn started: Codex's `TurnStarted`.
@@ -218,6 +222,48 @@ pub enum ThreadEvent {
         /// How long it ran.
         duration_ms: i64,
     },
+}
+
+/// A host notification on the thread's event stream (see [`ThreadEvent::Notice`]).
+///
+/// The runtime does not interpret it: the product that sends it names the client method and its
+/// parameters, and the server that reads the thread's events decides how to deliver it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadNotice {
+    turn_id: Option<String>,
+    method: String,
+    params: Value,
+}
+
+impl ThreadNotice {
+    /// A notice of `method` with `params`, for the turn `turn_id` when it concerns one.
+    #[must_use]
+    pub fn new(turn_id: Option<String>, method: impl Into<String>, params: Value) -> Self {
+        Self {
+            turn_id,
+            method: method.into(),
+            params,
+        }
+    }
+
+    /// The turn it concerns, if one.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
+    }
+
+    /// The client method it is delivered as.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// The method's parameters.
+    #[must_use]
+    pub const fn params(&self) -> &Value {
+        &self.params
+    }
 }
 
 /// The outcome of publishing settings for one running turn: Codex's
@@ -1418,6 +1464,50 @@ impl ThreadInner {
     }
 }
 
+/// Ends the turn a run belongs to from inside the run, with the thread's own interrupt
+/// bookkeeping: Codex's `TurnAborted` raised by a stopping compaction hook, which its task end
+/// turns into an interrupted turn.
+///
+/// Cancelling a scope inside the run would not do: the run's scopes are children of the turn's,
+/// cancellation does not travel up, and a turn the thread did not mark interrupted ends as
+/// completed rather than aborted.
+pub(crate) struct TurnAbort {
+    thread: Weak<ThreadInner>,
+    turn_id: String,
+}
+
+impl TurnAbort {
+    /// Aborts the turn as [`AgentThread::interrupt`] does, cancelling it with `reason`, and when
+    /// `then_session_start` is given, has the next turn start by re-establishing context from that
+    /// source. Does nothing once the thread runs another turn or this one is ending; a turn the
+    /// host already interrupted keeps its first reason. Returns whether the turn is still this one.
+    pub(crate) fn abort(
+        &self,
+        reason: CancelReason,
+        then_session_start: Option<ra_core::hook::SessionStartSource>,
+    ) -> bool {
+        let Some(inner) = self.thread.upgrade() else {
+            return false;
+        };
+        let mut state = inner.lock();
+        let Some(active) = state
+            .active_turn
+            .as_mut()
+            .filter(|active| active.turn_id == self.turn_id && !active.ending)
+        else {
+            return false;
+        };
+        if !active.interrupted {
+            active.interrupted = true;
+            active.cancel.cancel(reason);
+        }
+        if let Some(source) = then_session_start {
+            state.pending_session_start = Some(source);
+        }
+        true
+    }
+}
+
 /// What a turn runs on, fixed when it starts.
 struct StartedTurn {
     turn_id: String,
@@ -1496,6 +1586,12 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
             message: format!("Reconnecting... {retry}/{max_retries}"),
             additional_details: error.to_string(),
         });
+    }
+
+    fn warning(&self, message: String) {
+        if let Some(thread) = self.thread.upgrade() {
+            thread.emit(ThreadEvent::Warning { message });
+        }
     }
 }
 
@@ -1579,6 +1675,9 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     } = turn;
     let history_len = history.len();
     let run_input = history;
+    // What the turn's Interrupt notice needs, kept past the run that consumes the configuration.
+    let interrupt_hooks = config.user_hooks().clone();
+    let app_context = config.app_context().cloned();
     let submitted: Vec<_> = input.map(ModelInputItem::Message).into_iter().collect();
     let recorder = Arc::new(ThreadRecorder {
         thread: Arc::downgrade(&inner),
@@ -1651,6 +1750,23 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         active.ending = true;
         interrupted
     };
+    // Codex runs Interrupt hooks for an interrupted turn whichever stage it reached: during the
+    // prompt's own hooks, while the model or a tool ran, or while it waited for approval. The
+    // runner leaves this to the thread for the runs it owns, so they run once.
+    if interrupted && interrupt_hooks.has_event(ra_core::hook::HookEventName::Interrupt) {
+        let mut run = ra_core::context::RunContext::new(RunId::new(&turn_id), inner.agent.public());
+        if let Some(app_context) = app_context {
+            run = run.with_app_context(app_context);
+        }
+        crate::runner::InterruptNotice::for_turn(
+            interrupt_hooks,
+            cancel.clone(),
+            Arc::new(run),
+            inner.services.clone(),
+        )
+        .notify()
+        .await;
+    }
     let mut history = history;
     if !interrupted && !leftover.is_empty() {
         for message in leftover {
@@ -1737,7 +1853,11 @@ async fn record_injected_context(inner: &ThreadInner, messages: Vec<Message>) {
 /// Runs a turn's run to its end — across any number of pauses for approval — and returns how it
 /// ended and the thread's history after it. A spawned agent's runs are driven the same way (see
 /// [`crate::agent::control`]).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep each segment's request, its end and the approval pause between segments together."
+)]
 async fn run_to_end(
     inner: &Arc<ThreadInner>,
     recorder: &Arc<ThreadRecorder>,
@@ -1778,6 +1898,10 @@ async fn run_to_end(
         }
         request = request.with_rollout_recorder(recorder.clone());
         request = request.with_model_stream_sink(recorder.clone());
+        request = request.with_owner(crate::runner::RunOwner::Thread(Arc::new(TurnAbort {
+            thread: Arc::downgrade(inner),
+            turn_id: recorder.turn_id.clone(),
+        })));
         if let Some(output_schema) = output_schema {
             request = request.with_output_schema(output_schema.clone());
         }
@@ -1792,11 +1916,16 @@ async fn run_to_end(
             Ok(result) => result,
             Err(error) => {
                 let mut history = partial_history(fallback, &produced);
-                let mut contexts = error
+                let contexts = error
                     .run_state()
                     .map_or_else(Vec::new, |state| state.clone().take_hook_context());
-                contexts.extend(hook_context.close());
-                record_context_history(recorder, &mut history, contexts);
+                record_context_history(
+                    inner,
+                    recorder,
+                    &mut history,
+                    contexts,
+                    hook_context.close_entries(),
+                );
                 if cancel.is_cancelled() {
                     return (TurnEnd::Cancelled, history);
                 }
@@ -1836,9 +1965,13 @@ async fn run_to_end(
         }
         let Some((agent, state)) = answered else {
             let mut history = history;
-            let mut context_on_cancel = context_on_cancel;
-            context_on_cancel.extend(hook_context.close());
-            record_context_history(recorder, &mut history, context_on_cancel);
+            record_context_history(
+                inner,
+                recorder,
+                &mut history,
+                context_on_cancel,
+                hook_context.close_entries(),
+            );
             let history = cancel_paused(recorder.as_ref(), &config, cancel, run_id, history);
             return (TurnEnd::Cancelled, history);
         };
@@ -1865,6 +1998,11 @@ fn park_paused_turn(
     paused: PausedTurn,
 ) {
     if hook_context.is_closed() {
+        // The run moved the closed lane's context into its checkpoint; the warnings that came
+        // with it are shown now, as they would have been at the run's next model call.
+        for message in hook_context.take_warnings() {
+            inner.emit(ThreadEvent::Warning { message });
+        }
         *hook_context = ra_core::hook::HookContextQueue::default();
     }
     let turn_id = paused.recorder.turn_id.clone();
@@ -1946,6 +2084,11 @@ async fn prepare_host_input(
         inner.services.clone().with_hook_context(queue.clone()),
     );
     history.extend(queue.take().into_iter().map(ModelInputItem::Message));
+    // Codex drains finished background hooks before the new prompt, recording their context and
+    // showing their warnings.
+    for message in queue.take_warnings() {
+        inner.emit(ThreadEvent::Warning { message });
+    }
     let source = {
         let mut state = inner.lock();
         state.pending_session_start.take()
@@ -1988,12 +2131,36 @@ async fn prepare_host_input(
     (history, stopped, queue)
 }
 
-/// Retains context when a thread ends a run instead of resuming its checkpoint.
+/// Retains context when a thread ends a run instead of resuming its checkpoint, and shows the
+/// warnings that came with it.
+///
+/// `checkpointed` is what the run had already accepted into its checkpoint; `queued` is what was
+/// still waiting in its context lane, with where each entry came from. While the thread shuts
+/// down, queued background results — context and warnings — are dropped, as Codex closes its
+/// background-result channel and discards what nobody took; context from hooks the run waited
+/// for is kept, as Codex has already recorded it.
 fn record_context_history(
+    inner: &ThreadInner,
     recorder: &ThreadRecorder,
     history: &mut Vec<ModelInputItem>,
-    messages: Vec<Message>,
+    checkpointed: Vec<Message>,
+    queued: (
+        Vec<(Message, ra_core::hook::HookContextOrigin)>,
+        Vec<String>,
+    ),
 ) {
+    let shutting_down = inner.lock().shut_down;
+    let (entries, warnings) = queued;
+    let queued = entries.into_iter().filter_map(|(message, origin)| {
+        (!shutting_down || origin == ra_core::hook::HookContextOrigin::Synchronous)
+            .then_some(message)
+    });
+    let messages: Vec<_> = checkpointed.into_iter().chain(queued).collect();
+    if !shutting_down {
+        for message in warnings {
+            inner.emit(ThreadEvent::Warning { message });
+        }
+    }
     for message in messages {
         recorder.record(RolloutItem::Item(RunItem::new(
             ItemId::new(uuid::Uuid::now_v7().to_string()),

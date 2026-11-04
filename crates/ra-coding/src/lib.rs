@@ -50,6 +50,7 @@ pub mod shell_command;
 pub mod skills;
 pub(crate) mod spawned;
 pub mod thread_factory;
+pub mod thread_hooks;
 pub mod thread_items;
 pub mod web_search;
 

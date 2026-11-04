@@ -818,8 +818,9 @@ async fn compact_events_announce_a_real_attempt_under_one_record_identity() {
 }
 
 /// A processor answering an explicit user request announces `manual`; nothing in the framework
-/// produces that trigger for it. Neither compact event carries a control effect, so a decision
-/// returned here is reported and ignored rather than changing the projection.
+/// produces that trigger for it. A compact event accepts only a stop, which
+/// `compaction_hook_stop.rs` covers; any other decision returned here is reported and ignored
+/// rather than changing the projection.
 struct ManualCompactor;
 #[async_trait]
 impl ContextProcessor for ManualCompactor {
@@ -838,8 +839,11 @@ impl ContextProcessor for ManualCompactor {
 }
 
 #[tokio::test]
-async fn a_host_processor_announces_a_manual_compaction_and_gets_no_control_effect() {
-    let hook = Arc::new(RecordingHook::new([block("keep working"), deny("stop")]));
+async fn a_host_processor_announces_a_manual_compaction_and_other_decisions_have_no_effect() {
+    let hook = Arc::new(RecordingHook::new([
+        block("keep working"),
+        HookDecision::Allow,
+    ]));
     let sink = Arc::new(InMemoryHostEventSink::new());
     let model = ScriptedModel::new(vec![response("final", "done")]);
     let config = RunConfig::new()

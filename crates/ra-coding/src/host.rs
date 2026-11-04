@@ -286,6 +286,11 @@ impl CodingHost {
         self
     }
 
+    /// The package services the host selected, if any.
+    pub(crate) fn plugin_services(&self) -> Option<&Arc<crate::plugins::PluginServices>> {
+        self.plugin_skills.as_ref()
+    }
+
     pub(crate) fn plugin_input_contributor(
         &self,
     ) -> ra_core::error::Result<Option<Arc<dyn Capability>>> {
