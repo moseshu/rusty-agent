@@ -390,7 +390,7 @@ impl ProductHookRuntime {
     }
 
     /// The thread turn `run` belongs to: Codex's turn `sub_id`, the root run's identity.
-    fn turn_id(&self, run: &ra_core::context::RunContext) -> String {
+    pub(crate) fn turn_id(&self, run: &ra_core::context::RunContext) -> String {
         let run_id = run.run_id().as_str();
         if let Some(turn) = self
             .context_delivery

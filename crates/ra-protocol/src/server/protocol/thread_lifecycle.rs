@@ -114,7 +114,7 @@ pub struct ThreadStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) daybreak_enabled: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) environments: Option<Value>,
+    pub(crate) environments: Option<Vec<super::TurnEnvironmentParams>>,
     #[serde(
         default,
         deserialize_with = "super::dynamic_tools::deserialize_dynamic_tool_specs",
@@ -122,7 +122,7 @@ pub struct ThreadStartParams {
     )]
     pub(crate) dynamic_tools: Option<Vec<DynamicToolSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selected_capability_roots: Option<Value>,
+    pub(crate) selected_capability_roots: Option<Vec<super::SelectedCapabilityRoot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mock_experimental_field: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -130,6 +130,35 @@ pub struct ThreadStartParams {
 }
 
 impl ThreadStartParams {
+    /// Selects the thread's execution environments; the product validates supported routes.
+    #[must_use]
+    pub fn with_environments(mut self, environments: Vec<super::TurnEnvironmentParams>) -> Self {
+        self.environments = Some(environments);
+        self
+    }
+
+    /// Selects capability roots for this thread, retaining their supplied order.
+    #[must_use]
+    pub fn with_selected_capability_roots(
+        mut self,
+        roots: Vec<super::SelectedCapabilityRoot>,
+    ) -> Self {
+        self.selected_capability_roots = Some(roots);
+        self
+    }
+
+    /// Explicit environment selection, or None to use the host's defaults.
+    #[must_use]
+    pub fn environments(&self) -> Option<&[super::TurnEnvironmentParams]> {
+        self.environments.as_deref()
+    }
+
+    /// Explicit root selection; an empty slice selects none.
+    #[must_use]
+    pub fn selected_capability_roots(&self) -> Option<&[super::SelectedCapabilityRoot]> {
+        self.selected_capability_roots.as_deref()
+    }
+
     /// Starts a thread with the host's defaults.
     #[must_use]
     pub fn new() -> Self {
@@ -263,11 +292,6 @@ impl ThreadStartParams {
             ),
             ("projectId", self.project_id.is_some()),
             ("daybreakEnabled", self.daybreak_enabled.is_some()),
-            ("environments", self.environments.is_some()),
-            (
-                "selectedCapabilityRoots",
-                self.selected_capability_roots.is_some(),
-            ),
             ("experimentalRawEvents", self.experimental_raw_events),
         ]
         .into_iter()

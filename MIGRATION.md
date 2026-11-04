@@ -1250,3 +1250,28 @@ was retained. A later model call replaces the retained input, or clears it when 
 installed. Older checkpoints lack the actual projection and retain the history reconstruction
 fallback; their exact past sampling input cannot be recovered. Older runtimes preserve the new
 field as unknown data but cannot honor it when invoking stop hooks.
+
+
+### Selected execution environments and executor hook steps
+
+Product-configured coding threads now consume `thread/start.environments`,
+`thread/start.selectedCapabilityRoots`, and `turn/start.environments`. The supported execution
+route is the registered local environment with the host's existing cwd and workspace roots;
+remote routing, changing cwd/roots, and disabling the local tool surface remain explicit errors.
+Omitted environments retain the loaded session's selection; cold resume and ordinary fork derive
+new defaults from the current host instead of persisting or restoring environments. This differs
+from Codex's history-cwd configuration loading: the local host currently has a fixed execution cwd
+and cannot route execution through the historical cwd. Selected capability roots retain their
+original environment and path meaning and are recorded at thread creation in `RolloutSessionMeta`,
+including on fork. Empty roots add no product-runtime requirement when reloading on an ordinary
+coding host. Neither `environments` nor `selectedCapabilityRoots` is added to thread settings
+snapshots or `thread/settings/updated.threadSettings`. Older builds ignore the additional session
+metadata and do not provide executor hook cleanup.
+
+`RunConfig::with_step_execution_observer` is optional and defaults off for SDK runs. The coding
+factory installs it to retain the selected immutable execution snapshot before compaction. The
+callback receives the run context and cancellation scope without a persisted step number; approval
+settlement alone keeps the original snapshot, and a new executing step publishes a new snapshot. It does not replace SDK LLM hooks or
+move their lifecycle boundaries. Protocol factories can retain a `JsonRpcErrorObject` as a
+framework error source to preserve a typed client-validation response across construction;
+other factory failures keep their internal-error behavior.

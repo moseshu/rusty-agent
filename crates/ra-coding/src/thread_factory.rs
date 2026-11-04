@@ -7,6 +7,7 @@
 //! own, as each Codex session has its own, so its background terminals are listed and stopped
 //! apart from other threads'.
 
+use ra_protocol::server::ThreadSettingsAdapter;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -140,6 +141,7 @@ impl ThreadFactory for CodingThreadFactory {
                 // As in Codex's thread start, resume and fork, a named profile requirements
                 // disallow falls back to the required value with a startup warning; only a
                 // settings or turn update refuses it.
+                let ignore_user_config = builder.ignores_user_config();
                 let settings = self
                     .settings
                     .clone()
@@ -150,10 +152,15 @@ impl ThreadFactory for CodingThreadFactory {
                     .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
                 // As Codex's session creation, a required managed hook that fails to load fails
                 // the thread.
-                let thread_hooks =
-                    CodingThreadHooks::build(&config, &host, request.thread_id().clone())
-                        .await
-                        .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
+                let thread_hooks = CodingThreadHooks::build(
+                    &config,
+                    &host,
+                    request.thread_id().clone(),
+                    ignore_user_config,
+                    request.policy().environments(),
+                )
+                .await
+                .map_err(|error| hook_construction_error(&error))?;
                 settings.attach_hook_runtime(Arc::clone(thread_hooks.runtime()));
                 hooks = Some(Arc::new(thread_hooks));
                 settings
@@ -174,7 +181,22 @@ impl ThreadFactory for CodingThreadFactory {
                 .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
         );
         if let Some(hooks) = &hooks {
-            config = config.with_user_hooks(hooks.runtime().user_hooks());
+            config = hooks.install(config);
+            let mut selection = ra_protocol::server::protocol::ThreadPolicyOverrides::new();
+            if let Some(environments) = request.policy().environments() {
+                selection = selection.with_environments(environments.to_vec());
+            }
+            if let Some(roots) = request.policy().selected_capability_roots() {
+                selection = selection.with_selected_capability_roots(roots.to_vec());
+            }
+            config = settings
+                .prepare_async(&config, &selection)
+                .await
+                .map_err(|reason| {
+                    ra_core::error::Error::config(reason.clone()).with_source(
+                        ra_protocol::frame::JsonRpcErrorObject::invalid_request(reason),
+                    )
+                })?;
         }
         let mut builder = AgentThread::builder(
             request.thread_id().clone(),
@@ -206,5 +228,14 @@ impl ThreadFactory for CodingThreadFactory {
         } else {
             prepared
         })
+    }
+}
+
+/// Keeps typed request validation failures for the server without changing framework error kinds.
+fn hook_construction_error(error: &anyhow::Error) -> ra_core::error::Error {
+    if let Some(request) = error.downcast_ref::<ra_protocol::frame::JsonRpcErrorObject>() {
+        ra_core::error::Error::config(request.message()).with_source(request.clone())
+    } else {
+        ra_core::error::Error::config(error.to_string())
     }
 }

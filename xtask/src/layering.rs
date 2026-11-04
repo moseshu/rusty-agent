@@ -204,6 +204,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     (
         "ra-protocol",
         &[
+            "ra-executor-protocol",
             "ra-config",
             "ra-core",
             "ra-runtime",

@@ -636,3 +636,6 @@ async fn notified_turn(out: &Path) -> Value {
     }
     panic!("the notify program never ran");
 }
+
+#[path = "product_hooks/executor.rs"]
+mod executor;

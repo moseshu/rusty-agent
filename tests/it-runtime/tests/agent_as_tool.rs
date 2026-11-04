@@ -3800,3 +3800,141 @@ async fn stop_keeps_an_empty_sampled_projection() {
     assert!(resolver.calls()[0].input.is_empty());
     assert_eq!(*stop.0.lock().unwrap(), vec![Vec::<ModelInputItem>::new()]);
 }
+
+#[derive(Default)]
+struct ExecutingSteps(Mutex<Vec<(RunId, Arc<()>)>>);
+#[async_trait]
+impl ra_runtime::runner::StepExecutionObserver for ExecutingSteps {
+    async fn capture(&self, run: &RunContext, _: &CancelScope) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((run.run_id().clone(), Arc::new(())));
+        Ok(())
+    }
+}
+struct IdentityStepFilter;
+impl ra_core::filter::ContextFilter for IdentityStepFilter {
+    fn name(&self) -> &str {
+        "identity-step-filter"
+    }
+    fn filter_model_input(
+        &self,
+        _: &ra_core::filter::ContextFilterRequest<'_>,
+        data: ra_core::filter::ModelInputData,
+    ) -> Result<ra_core::filter::ModelInputData> {
+        Ok(data)
+    }
+}
+
+/// Only a newly executing step publishes a snapshot, with or without context filters.
+#[tokio::test]
+async fn execution_snapshots_advance_across_repeated_serialized_approval_recovery() {
+    for filtered in [false, true] {
+        let steps = Arc::new(ExecutingSteps::default());
+        let parent = AgentSpec::builder()
+            .id(AgentId::new("parent"))
+            .name("Parent")
+            .instructions("write")
+            .tool(Arc::new(gated_probe("write", "written")))
+            .tool(Arc::new(ProbeTool::new("read", "read output")))
+            .build()
+            .unwrap();
+        let resolver = ScriptedResolver::new(vec![
+            ModelResponse::new(vec![
+                tool_call("s0", "c0", "read", json!({})).output()[0].clone(),
+                tool_call("s1", "c1", "write", json!({})).output()[0].clone(),
+            ]),
+            tool_call("s2", "c2", "write", json!({})),
+            tool_call("s3", "c3", "write", json!({})),
+            final_message("s4", "done"),
+        ]);
+        let mut config = RunConfig::new().with_step_execution_observer(steps.clone());
+        if filtered {
+            config = config.with_context_filter(Arc::new(IdentityStepFilter));
+        }
+        let mut result =
+            Runner::run(request(Arc::clone(&parent), &resolver).with_config(config.clone()))
+                .await
+                .unwrap();
+        for expected in 1..=3 {
+            assert_eq!(steps.0.lock().unwrap().len(), expected as usize);
+            if filtered {
+                let tracker = result.state().tool_output_references();
+                assert_eq!(tracker.last_completed_turn(), Some(expected));
+                assert_eq!(tracker.last_referenced_turn(&CallId::new("c0")), Some(1));
+                assert!(tracker.is_unreferenced_for(
+                    &CallId::new("c0"),
+                    expected + 1,
+                    expected - 1
+                ));
+                assert!(!tracker.is_unreferenced_for(&CallId::new("c0"), expected + 1, expected));
+            }
+            let state =
+                serde_json::from_str(&serde_json::to_string(&approve_all(&result, false)).unwrap())
+                    .unwrap();
+            result = Runner::run(
+                resume(Arc::clone(&parent), &resolver, state).with_config(config.clone()),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(result.final_text(), "done");
+        let captured = steps.0.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        for (index, (run, snapshot)) in captured.iter().enumerate() {
+            assert_eq!(run, &RunId::new("run-parent"));
+            for (_, previous) in &captured[..index] {
+                assert!(!Arc::ptr_eq(snapshot, previous));
+            }
+        }
+        if filtered {
+            let tracker = result.state().tool_output_references();
+            assert_eq!(tracker.last_completed_turn(), Some(4));
+            assert!(tracker.is_unreferenced_for(&CallId::new("c0"), 5, 3));
+            assert!(!tracker.is_unreferenced_for(&CallId::new("c0"), 5, 4));
+        }
+    }
+}
+
+#[tokio::test]
+async fn settling_an_approval_without_sampling_keeps_the_original_execution_step() {
+    for filtered in [false, true] {
+        let steps = Arc::new(ExecutingSteps::default());
+        let parent = AgentSpec::builder()
+            .id(AgentId::new("parent"))
+            .name("Parent")
+            .instructions("write")
+            .tool(Arc::new(gated_probe("write", "written")))
+            .tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+            .build()
+            .unwrap();
+        let resolver = ScriptedResolver::new(vec![tool_call("s1", "c1", "write", json!({}))]);
+        let mut config = RunConfig::new().with_step_execution_observer(steps.clone());
+        if filtered {
+            config = config.with_context_filter(Arc::new(IdentityStepFilter));
+        }
+        let first =
+            Runner::run(request(Arc::clone(&parent), &resolver).with_config(config.clone()))
+                .await
+                .unwrap();
+        let original = steps.0.lock().unwrap()[0].1.clone();
+        let completed =
+            Runner::run(resume(parent, &resolver, approve_all(&first, false)).with_config(config))
+                .await
+                .unwrap();
+        let captured = steps.0.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, RunId::new("run-parent"));
+        assert!(Arc::ptr_eq(&captured[0].1, &original));
+        if filtered {
+            assert_eq!(
+                completed
+                    .state()
+                    .tool_output_references()
+                    .last_completed_turn(),
+                Some(1)
+            );
+        }
+    }
+}

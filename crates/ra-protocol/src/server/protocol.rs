@@ -1243,3 +1243,7 @@ pub enum PluginManagementRequest {
     /// `config/batchWrite`.
     ConfigBatchWrite(ConfigBatchWriteParams),
 }
+
+mod environments;
+pub use environments::TurnEnvironmentParams;
+pub use ra_executor_protocol::capabilities::{CapabilityRootLocation, SelectedCapabilityRoot};

@@ -702,6 +702,11 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-protocol/src/server/protocol/hooks.rs",
         "HookCompletedEvent",
     ),
+    // Codex's environment-selection wire record retains public fields for client construction.
+    (
+        "crates/ra-protocol/src/server/protocol/environments.rs",
+        "TurnEnvironmentParams",
+    ),
     // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/hook.rs client projection of the hook
     // run summary and the hook/started and hook/completed notifications that carry it.
     (

@@ -40,6 +40,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 mod approval;
+mod hook_catalog;
 mod product;
 pub(crate) use approval::{McpApprovalKey, McpApprovalState};
 pub use approval::{McpPermissionPromptAutoApproveContext, mcp_permission_prompt_is_auto_approved};
@@ -958,6 +959,25 @@ impl CodingMcpRuntime {
             None => tool,
         }
     }
+    pub(crate) async fn hook_tool_infos(
+        &self,
+        run: &RunContext,
+    ) -> Result<Vec<ra_mcp::catalog::McpToolInfo>> {
+        let bindings = self.bindings();
+        let catalogs = self.tool_catalogs(&bindings).await;
+        let mut infos = Vec::new();
+        for (catalog, _, filter) in catalogs {
+            infos.extend(
+                catalog
+                    .enabled_tool_infos(&filter, run)
+                    .await?
+                    .into_iter()
+                    .map(hook_catalog::app_tool_info),
+            );
+        }
+        Ok(infos)
+    }
+
     pub(crate) async fn visible_server_names(&self, context: &RunContext) -> Result<Vec<String>> {
         let bindings = self.bindings();
         let catalogs = self.tool_catalogs(&bindings).await;

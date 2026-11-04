@@ -291,6 +291,8 @@ pub struct RolloutSessionMeta {
     git_info: Option<crate::store::GitInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_tools: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selected_capability_roots: Vec<serde_json::Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -313,6 +315,7 @@ impl RolloutSessionMeta {
             source: None,
             git_info: None,
             dynamic_tools: None,
+            selected_capability_roots: Vec::new(),
             unknown: Unknown::new(),
         }
     }
@@ -399,6 +402,19 @@ impl RolloutSessionMeta {
     pub fn with_dynamic_tools(mut self, tools: serde_json::Value) -> Self {
         self.dynamic_tools = Some(tools);
         self
+    }
+
+    /// Records selected capability roots as wire values without interpreting product paths.
+    #[must_use]
+    pub fn with_selected_capability_roots(mut self, roots: Vec<serde_json::Value>) -> Self {
+        self.selected_capability_roots = roots;
+        self
+    }
+
+    /// The capability roots recorded when this thread was created.
+    #[must_use]
+    pub fn selected_capability_roots(&self) -> &[serde_json::Value] {
+        &self.selected_capability_roots
     }
 
     /// The tools the thread's client provides, if any were recorded: Codex's `dynamic_tools`.

@@ -301,7 +301,9 @@ pub trait ThreadFactory: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if the thread cannot be prepared; the request that asked for it fails with
-    /// the error, and nothing is loaded.
+    /// the error, and nothing is loaded. A product may retain a
+    /// [`crate::frame::JsonRpcErrorObject`] as its error source to preserve a client-validation
+    /// response; other failures use the server's internal construction-error response.
     async fn prepare_thread(
         &self,
         request: &ThreadFactoryRequest,

@@ -392,3 +392,36 @@ async fn hook_executor_reports_an_error_result() {
     assert_eq!(error.to_string(), "MCP tool returned an error: boom");
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cleanup_catalog_keeps_app_only_tools_and_honors_both_filters() {
+    let tools = ["visible", "app_only", "server_disabled", "binding_disabled"].into_iter().map(|name| serde_json::from_value(json!({"name":name,"inputSchema":{"type":"object","properties":{}},"_meta":{"ui":{"visibility":["app"]}}})).unwrap()).collect();
+    let catalog = ra_mcp::tool::McpToolCatalog::new(
+        "cleanup",
+        tools,
+        McpClientOptions::default().with_tool_filter(ToolFilter::new(
+            None,
+            HashSet::from(["server_disabled".into()]),
+        )),
+    );
+    let agent = ra_core::agent::AgentSpec::builder()
+        .id(ra_core::agent::AgentId::new("test-agent"))
+        .name("test")
+        .build()
+        .unwrap();
+    let run = ra_core::context::RunContext::new(ra_core::state::RunId::new("run"), &agent);
+    let infos = catalog
+        .enabled_tool_infos(
+            &ToolFilter::new(None, HashSet::from(["binding_disabled".into()])),
+            &run,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        infos
+            .iter()
+            .map(|info| info.tool().name.as_ref())
+            .collect::<Vec<_>>(),
+        ["visible", "app_only"]
+    );
+}

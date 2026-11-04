@@ -48,6 +48,9 @@ pub trait ThreadProductRuntime: Send + Sync + 'static {
     /// Called once, after the thread is built and before anything can start a turn on it.
     fn bind_thread(&self, binding: ThreadProductBinding);
 
+    /// Observes ordered thread events after product callbacks have run, for terminal cleanup.
+    fn on_thread_event(&self, _event: &ThreadEvent) {}
+
     /// Called after the thread has shut down. Must be idempotent: a product that already released
     /// what it owns during the shutdown confirms it here.
     async fn close(&self);

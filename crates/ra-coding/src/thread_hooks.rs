@@ -85,6 +85,7 @@ fn hook_shell(shell: &DetectedShell) -> (String, Vec<String>) {
 /// One thread's product hooks, for the app server to bind and close with the thread.
 pub struct CodingThreadHooks {
     runtime: Arc<ProductHookRuntime>,
+    executor: Arc<crate::thread_environments::ThreadExecutorHooks>,
     /// Warnings from loading the hooks, shown once the thread can report them.
     startup_warnings: Mutex<Vec<String>>,
 }
@@ -106,6 +107,8 @@ impl CodingThreadHooks {
         config: &Config,
         host: &CodingHost,
         thread_id: SessionId,
+        ignore_user_config: bool,
+        environments: Option<&[ra_protocol::server::protocol::TurnEnvironmentParams]>,
     ) -> anyhow::Result<Self> {
         let hooks_config =
             build_hooks_config(config, host.plugin_services().map(Arc::as_ref), &[]).await;
@@ -128,11 +131,71 @@ impl CodingThreadHooks {
             },
             mcp_executor,
         )?;
+        let executor = crate::thread_environments::ThreadExecutorHooks::build(
+            config,
+            host,
+            &runtime,
+            ignore_user_config,
+            environments,
+        )
+        .await?;
+        runtime.set_executor_hook_sources(executor.clone());
         let startup_warnings = Mutex::new(runtime.startup_warnings());
         Ok(Self {
             runtime,
+            executor,
             startup_warnings,
         })
+    }
+
+    pub(crate) fn install(
+        &self,
+        config: ra_runtime::runner::RunConfig,
+    ) -> ra_runtime::runner::RunConfig {
+        let mut config = config;
+        if let Some(mut settings) = config
+            .app_context()
+            .and_then(|value| value.downcast_ref::<crate::thread_settings::CodingThreadSettings>())
+            .cloned()
+        {
+            settings.executor_environments = Some(self.executor.manager());
+            config = config.with_app_context(Arc::new(settings));
+        }
+        config
+            .with_user_hooks(self.runtime.user_hooks())
+            .with_step_execution_observer(self.executor.clone())
+    }
+
+    /// Tests the enabled projection of the production cleanup app policy.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn app_tool_enabled_for_test(
+        stack: &ra_config::ConfigLayerStack,
+        info: &ra_mcp::catalog::McpToolInfo,
+    ) -> bool {
+        crate::thread_environments::app_policy::app_tool_enabled(stack, info)
+    }
+
+    /// Builds the production hook runtime for external integration tests.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub async fn build_for_test(
+        config: &Config,
+        host: &CodingHost,
+        thread_id: SessionId,
+    ) -> anyhow::Result<Self> {
+        Self::build(config, host, thread_id, false, None).await
+    }
+
+    /// Installs the same production hook and step bindings as the default factory.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub fn install_for_test(
+        &self,
+        config: ra_runtime::runner::RunConfig,
+    ) -> ra_runtime::runner::RunConfig {
+        self.install(config)
     }
 
     /// The hooks, as the runtime's host hooks and the network approval path call them.
@@ -160,7 +223,16 @@ impl ThreadProductRuntime for CodingThreadHooks {
         self.runtime.bind_thread_events(events);
     }
 
+    fn on_thread_event(&self, event: &ThreadEvent) {
+        if let ThreadEvent::TurnComplete { turn_id, .. }
+        | ThreadEvent::TurnAborted { turn_id, .. } = event
+        {
+            self.executor.finish_turn(turn_id);
+        }
+    }
+
     async fn close(&self) {
+        self.executor.close();
         self.runtime.stop_background().await;
         self.runtime.release_thread_events();
     }

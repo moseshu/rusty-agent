@@ -15,6 +15,10 @@ pub use ra_config::{ApprovalsReviewer, AskForApproval, NetworkAccess, SandboxPol
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadPolicyOverrides {
+    #[serde(skip)]
+    pub(crate) environments: Option<Vec<super::TurnEnvironmentParams>>,
+    #[serde(skip)]
+    pub(crate) selected_capability_roots: Option<Vec<super::SelectedCapabilityRoot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval_policy: Option<AskForApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,35 @@ impl ThreadPolicyOverrides {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Carries a thread or turn environment selection to the product adapter.
+    #[must_use]
+    pub fn with_environments(mut self, environments: Vec<super::TurnEnvironmentParams>) -> Self {
+        self.environments = Some(environments);
+        self
+    }
+
+    /// Carries the thread's selected capability roots to the product adapter.
+    #[must_use]
+    pub fn with_selected_capability_roots(
+        mut self,
+        roots: Vec<super::SelectedCapabilityRoot>,
+    ) -> Self {
+        self.selected_capability_roots = Some(roots);
+        self
+    }
+
+    /// Explicit environment replacement, or None to retain the thread selection.
+    #[must_use]
+    pub fn environments(&self) -> Option<&[super::TurnEnvironmentParams]> {
+        self.environments.as_deref()
+    }
+
+    /// Explicit root replacement, or None to retain the thread roots.
+    #[must_use]
+    pub fn selected_capability_roots(&self) -> Option<&[super::SelectedCapabilityRoot]> {
+        self.selected_capability_roots.as_deref()
     }
 
     /// Sets the approval prompt policy.
@@ -126,7 +159,9 @@ impl ThreadPolicyOverrides {
     /// Whether no policy fields were supplied.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.approval_policy.is_none()
+        self.environments.is_none()
+            && self.selected_capability_roots.is_none()
+            && self.approval_policy.is_none()
             && self.approvals_reviewer.is_none()
             && self.sandbox_policy.is_none()
             && self.permissions.is_none()

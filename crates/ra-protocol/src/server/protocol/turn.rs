@@ -564,7 +564,7 @@ pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     additional_context: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    environments: Option<Value>,
+    environments: Option<Vec<super::TurnEnvironmentParams>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_workspace_roots: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,6 +580,19 @@ pub struct TurnStartParams {
 }
 
 impl TurnStartParams {
+    /// Replaces the thread's execution environment selection for this and later turns.
+    #[must_use]
+    pub fn with_environments(mut self, environments: Vec<super::TurnEnvironmentParams>) -> Self {
+        self.environments = Some(environments);
+        self
+    }
+
+    /// Environment selection replacing the thread's defaults when supplied.
+    #[must_use]
+    pub fn environments(&self) -> Option<&[super::TurnEnvironmentParams]> {
+        self.environments.as_deref()
+    }
+
     /// Host-owned permission and approval overrides.
     #[must_use]
     pub fn policy(&self) -> &ThreadPolicyOverrides {
@@ -748,7 +761,6 @@ impl TurnStartParams {
                 self.responsesapi_client_metadata.is_some(),
             ),
             ("additionalContext", self.additional_context.is_some()),
-            ("environments", self.environments.is_some()),
             (
                 "runtimeWorkspaceRoots",
                 self.runtime_workspace_roots.is_some(),

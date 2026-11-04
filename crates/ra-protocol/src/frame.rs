@@ -387,6 +387,8 @@ pub struct JsonRpcErrorObject {
     message: String,
 }
 
+impl std::error::Error for JsonRpcErrorObject {}
+
 impl JsonRpcErrorObject {
     /// An error of `code` saying `message`.
     #[must_use]

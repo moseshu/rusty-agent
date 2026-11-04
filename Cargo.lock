@@ -4032,6 +4032,7 @@ dependencies = [
  "quick-xml",
  "ra-config",
  "ra-core",
+ "ra-executor-protocol",
  "ra-paths",
  "ra-runtime",
  "ra-session",

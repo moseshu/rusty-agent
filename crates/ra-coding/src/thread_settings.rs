@@ -160,6 +160,10 @@ pub use product::ProductPermissionSource;
 pub struct CodingThreadSettings {
     pub(crate) mcp_approvals: Arc<Mutex<std::collections::BTreeSet<crate::mcp::McpApprovalKey>>>,
     cwd: PathBuf,
+    pub(crate) environments: Vec<ra_protocol::server::protocol::TurnEnvironmentParams>,
+    pub(crate) selected_capability_roots:
+        Vec<ra_protocol::server::protocol::SelectedCapabilityRoot>,
+    pub(crate) executor_environments: Option<Arc<ra_executor::EnvironmentManager>>,
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
     /// The compatibility view reported on the wire and used by backends awaiting canonical
@@ -182,6 +186,18 @@ pub struct CodingThreadSettings {
 }
 
 impl CodingThreadSettings {
+    pub(crate) fn discovery_sandbox(&self) -> Result<ra_filesystem::FileSystemSandboxContext> {
+        Ok(
+            ra_filesystem::FileSystemSandboxContext::from_permission_profile(
+                self.profile_permissions.permission_profile().clone(),
+                ra_paths::PathUri::from_abs_path(
+                    &ra_paths::AbsolutePathBuf::from_absolute_path(&self.cwd)
+                        .map_err(|error| Error::config(error.to_string()))?,
+                ),
+            ),
+        )
+    }
+
     /// Codex's per-attempt network: the turn's proxy unless the command runs with escalated
     /// permissions, which skip the execution proxy. A routed command runs as its own call, as
     /// Codex's orchestrator begins its network approval: the proxy is scoped to the call, a
@@ -648,6 +664,9 @@ impl CodingThreadSettingsAdapter {
         );
         Ok(Self {
             initial: CodingThreadSettings {
+                environments: vec![serde_json::from_value(json!({"environmentId": "local", "cwd": cwd, "runtimeWorkspaceRoots": null})).map_err(|error| Error::config(error.to_string()))?],
+                selected_capability_roots: Vec::new(),
+                executor_environments: None,
                 cwd,
                 sandbox_policy,
                 profile_permissions,
@@ -782,6 +801,24 @@ impl CodingThreadSettingsAdapter {
         mut settings: CodingThreadSettings,
         update: &ThreadPolicyOverrides,
     ) -> std::result::Result<CodingThreadSettings, String> {
+        if update.environments().is_some() || update.selected_capability_roots().is_some() {
+            let Some(manager) = &settings.executor_environments else {
+                return Err(
+                    "environment selection requires the product executor runtime".to_owned(),
+                );
+            };
+            if let Some(environments) = update.environments() {
+                crate::thread_environments::validate_local_selection(
+                    environments,
+                    &settings.cwd,
+                    manager,
+                )?;
+                settings.environments = environments.to_vec();
+            }
+            if let Some(roots) = update.selected_capability_roots() {
+                settings.selected_capability_roots = roots.to_vec();
+            }
+        }
         if let Some(policy) = update.approval_policy() {
             settings
                 .profile_permissions

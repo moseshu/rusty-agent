@@ -1256,6 +1256,12 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    pub(crate) fn ignores_user_config(&self) -> bool {
+        self.loader_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.ignore_user_config)
+    }
+
     #[must_use]
     pub fn codex_home(mut self, codex_home: PathBuf) -> Self {
         self.codex_home = Some(codex_home);

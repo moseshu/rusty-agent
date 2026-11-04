@@ -164,16 +164,17 @@ impl ThreadRequestProcessor {
         };
 
         let thread_id = new_thread_id();
+        let mut selection_policy = to_policy_overrides(&params.policy);
+        selection_policy.environments = params.environments.clone();
+        selection_policy.selected_capability_roots = params.selected_capability_roots.clone();
         let prepared = factory
             .prepare_thread(
                 &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Start)
                     .with_session_context(context.session_source.clone(), None, ephemeral, None)
-                    .with_policy(to_policy_overrides(&params.policy)),
+                    .with_policy(selection_policy.clone()),
             )
             .await
-            .map_err(|error| {
-                JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
-            })?;
+            .map_err(|error| factory_error("creating", &error))?;
         let super::thread_factory::PreparedParts {
             builder,
             adapter,
@@ -184,7 +185,7 @@ impl ThreadRequestProcessor {
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
         } else {
-            to_policy_overrides(&params.policy)
+            selection_policy
         };
         let builder = Box::pin(apply_settings(
             METHOD,
@@ -217,6 +218,10 @@ impl ThreadRequestProcessor {
                     params.thread_source.as_deref(),
                     &dynamic_tools,
                     &context.session_source,
+                    params
+                        .selected_capability_roots
+                        .as_deref()
+                        .unwrap_or_default(),
                 );
                 let recorder = store
                     .create_thread_with(&CreateThreadParams::new(meta))
@@ -329,9 +334,7 @@ impl ThreadRequestProcessor {
             Ok(prepared) => prepared,
             Err(error) => {
                 discard(&recorder).await;
-                return Err(JsonRpcErrorObject::internal_error(format!(
-                    "error resuming thread: {error}"
-                )));
+                return Err(factory_error("resuming", &error));
             }
         };
         let super::thread_factory::PreparedParts {
@@ -471,7 +474,8 @@ impl ThreadRequestProcessor {
         let tool_items = context.history.tool_items();
         // Settings belong to the source thread, independently of the history cutoff, and so do the
         // dynamic tools its session metadata records.
-        let persisted_policy = latest_settings_snapshot(&records);
+        let persisted_policy =
+            restore_persisted_policy(to_policy_overrides(&params.policy), &records, true);
         let dynamic_tools = dynamic_tools_from_records(&records);
         let records = match (&params.last_turn_id, &params.before_turn_id) {
             (Some(last_turn_id), None) => {
@@ -501,16 +505,10 @@ impl ThreadRequestProcessor {
                         |spawn| spawn.root_session_id().clone(),
                     )),
                 )
-                .with_policy(restore_policy_from_snapshot(
-                    to_policy_overrides(&params.policy),
-                    persisted_policy.as_ref(),
-                    true,
-                )),
+                .with_policy(persisted_policy.clone()),
             )
             .await
-            .map_err(|error| {
-                JsonRpcErrorObject::internal_error(format!("error forking thread: {error}"))
-            })?;
+            .map_err(|error| factory_error("forking", &error))?;
         let super::thread_factory::PreparedParts {
             builder,
             adapter,
@@ -520,12 +518,10 @@ impl ThreadRequestProcessor {
         } = prepared.into_parts();
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
+        } else if adapter.is_some() {
+            persisted_policy.clone()
         } else {
-            restore_policy_from_snapshot(
-                to_policy_overrides(&params.policy),
-                persisted_policy.as_ref(),
-                adapter.is_some(),
-            )
+            to_policy_overrides(&params.policy)
         };
         let builder = Box::pin(apply_settings(
             METHOD,
@@ -562,6 +558,10 @@ impl ThreadRequestProcessor {
                 params.thread_source.as_deref(),
                 &dynamic_tools,
                 &context.session_source,
+                persisted_policy
+                    .selected_capability_roots
+                    .as_deref()
+                    .unwrap_or_default(),
             );
             let forked = ForkedThread::fork_from_history(
                 store.as_ref(),
@@ -1018,8 +1018,23 @@ fn check_sandbox_and_permissions(policy: &ThreadPolicyFields) -> Result<(), Json
     Ok(())
 }
 
+/// Keeps a product's typed client validation error across the framework factory boundary.
+/// Other construction failures retain the server's existing internal-error response.
+fn factory_error(operation: &str, error: &ra_core::error::Error) -> JsonRpcErrorObject {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(request) = current.downcast_ref::<JsonRpcErrorObject>() {
+            return request.clone();
+        }
+        source = current.source();
+    }
+    JsonRpcErrorObject::internal_error(format!("error {operation} thread: {error}"))
+}
+
 fn to_policy_overrides(policy: &ThreadPolicyFields) -> ThreadPolicyOverrides {
     ThreadPolicyOverrides {
+        environments: None,
+        selected_capability_roots: None,
         approval_policy: policy.approval_policy,
         approvals_reviewer: policy.approvals_reviewer,
         sandbox_policy: policy.sandbox.map(super::protocol::SandboxMode::to_policy),
@@ -1095,10 +1110,22 @@ fn persisted_model_and_effort(
 /// from the thread's last recorded settings snapshot: Codex's `latest_persisted_resume_settings`
 /// as its resume and fork apply it. Only a thread loaded with a settings adapter has them.
 fn restore_persisted_policy(
-    policy: ThreadPolicyOverrides,
+    mut policy: ThreadPolicyOverrides,
     records: &[RolloutRecord],
     has_adapter: bool,
 ) -> ThreadPolicyOverrides {
+    if has_adapter && policy.selected_capability_roots.is_none() {
+        policy.selected_capability_roots = records
+            .iter()
+            .find_map(|record| match record.payload().ok()? {
+                RolloutPayload::SessionMeta(meta) => Some(meta),
+                _ => None,
+            })
+            .filter(|meta| !meta.selected_capability_roots().is_empty())
+            .and_then(|meta| {
+                serde_json::from_value(Value::Array(meta.selected_capability_roots().to_vec())).ok()
+            });
+    }
     restore_policy_from_snapshot(
         policy,
         latest_settings_snapshot(records).as_ref(),
@@ -1306,10 +1333,17 @@ fn new_session_meta(
     thread_source: Option<&str>,
     dynamic_tools: &[DynamicToolSpec],
     session_source: &SessionSource,
+    selected_capability_roots: &[super::protocol::SelectedCapabilityRoot],
 ) -> RolloutSessionMeta {
     let mut meta = RolloutSessionMeta::new(thread_id.clone())
         .with_cli_version(CLI_VERSION)
-        .with_source(session_source.metadata_value());
+        .with_source(session_source.metadata_value())
+        .with_selected_capability_roots(
+            selected_capability_roots
+                .iter()
+                .map(|root| json!(root))
+                .collect(),
+        );
     if let Some(tools) = recorded_dynamic_tools(dynamic_tools) {
         meta = meta.with_dynamic_tools(tools);
     }

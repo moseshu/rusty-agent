@@ -301,6 +301,10 @@ pub(crate) async fn ensure_listener_task_running(
 }
 
 /// Tracks one event and tells the thread's connections what it means.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep ordered event bookkeeping and its terminal notification together."
+)]
 async fn handle_event(
     event: ThreadEvent,
     loaded: &LoadedThread,
@@ -393,6 +397,9 @@ async fn handle_event(
     if let ThreadEvent::HostEvent(event) = &event {
         handle_host_event(event, loaded, &thread_outgoing, thread_state, item_changes).await;
         return;
+    }
+    if let Some(product) = &loaded.product {
+        product.on_thread_event(&event);
     }
     if let ThreadEvent::Notice(notice) = &event {
         send_notice(notice, &thread_id, &thread_outgoing).await;

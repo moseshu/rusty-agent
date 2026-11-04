@@ -218,6 +218,17 @@ impl PreinstalledCapabilityTool {
     }
 }
 
+/// Captures host-owned state for a step selected for execution, before context processing.
+///
+/// This is the runtime boundary corresponding to Codex's retained `StepContext`. The
+/// retained snapshot belongs to the run and survives in-process approval pauses; settling an
+/// approval alone does not invoke this callback. A failed capture must not publish partial state.
+#[async_trait::async_trait]
+pub trait StepExecutionObserver: Send + Sync {
+    /// Captures and retains this run's executing step under its cancellation scope.
+    async fn capture(&self, run: &RunContext, cancel: &CancelScope) -> Result<()>;
+}
+
 /// Run-level settings applied to every turn.
 ///
 /// These are the outermost layer of the four-layer model-settings merge and the run-level model
@@ -253,6 +264,7 @@ pub struct RunConfig {
     tool_output_guardrails: Vec<Arc<dyn ToolOutputGuardrail>>,
     pre_approval_tool_input_guardrails: bool,
     user_hooks: UserHooks,
+    step_observer: Option<Arc<dyn StepExecutionObserver>>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
     sandbox: Option<SandboxRunConfig>,
     group_id: Option<String>,
@@ -298,6 +310,7 @@ impl RunConfig {
             tool_output_guardrails: Vec::new(),
             pre_approval_tool_input_guardrails: false,
             user_hooks: UserHooks::default(),
+            step_observer: None,
             lifecycle_hooks: Vec::new(),
             sandbox: None,
             group_id: None,
@@ -847,6 +860,15 @@ impl RunConfig {
         self
     }
 
+    /// Captures host-owned state once for each selected execution step, before compaction.
+    pub fn with_step_execution_observer(
+        mut self,
+        observer: Arc<dyn StepExecutionObserver>,
+    ) -> Self {
+        self.step_observer = Some(observer);
+        self
+    }
+
     /// Installs a shared host hook registry, also usable for host-owned session events.
     pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
         self.user_hooks = hooks;
@@ -954,6 +976,7 @@ impl std::fmt::Debug for RunConfig {
         formatter
             .debug_struct("RunConfig")
             .field("has_app_context", &self.app_context.is_some())
+            .field("has_step_observer", &self.step_observer.is_some())
             .field("budget", &self.budget)
             .field(
                 "max_function_tool_concurrency",
@@ -4970,6 +4993,10 @@ async fn run_one_turn(
     };
     let context = &step_context;
     let config = context.config;
+    if let Some(observer) = &config.step_observer {
+        let run = live_context(context, agent, state);
+        turn_scope.run(observer.capture(&run, turn_scope)).await??;
+    }
     // Every turn, as the reference prepares: a transfer of control may have brought a sandbox agent
     // in, and a session that stopped since the last turn is started again.
     *agent = turn_scope

@@ -108,6 +108,24 @@ impl McpToolCatalog {
     pub fn server_name(&self) -> &str {
         &self.name
     }
+    /// Captures policy-enabled tool identities, including tools hidden from model exposure.
+    /// Cleanup hooks use this catalog before their own connector policy and routing checks.
+    pub async fn enabled_tool_infos(
+        &self,
+        filter: &ToolFilter,
+        run: &RunContext,
+    ) -> Result<Vec<McpToolInfo>> {
+        let catalog = self
+            .clone()
+            .filtered(filter, Some(run), Some(run.agent()))
+            .await?;
+        Ok(catalog
+            .tools
+            .into_iter()
+            .map(|tool| McpToolInfo::from_cached(&self.name, tool))
+            .collect())
+    }
+
     /// Raw unfiltered declarations for inventory consumers.
     #[must_use]
     pub fn tools(&self) -> Vec<rmcp::model::Tool> {

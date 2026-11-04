@@ -87,7 +87,10 @@ impl TurnRequestProcessor {
             return Err(unsupported("turn/start", field));
         }
         validate_input_limit(params.input())?;
-        let policy = params.policy().clone();
+        let mut policy = params.policy().clone();
+        if let Some(environments) = params.environments() {
+            policy = policy.with_environments(environments.to_vec());
+        }
         let summary = params.summary();
         let tier = params.service_tier().map(|tier| tier.map(str::to_owned));
         let (input, model, effort, output_schema) = params.into_parts();

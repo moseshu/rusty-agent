@@ -501,3 +501,84 @@ fn ignores_file_backed_executor_plugin_hooks() {
         Vec::<ExecutorPluginHookSource>::new()
     );
 }
+
+/// Ports the enablement precedence of the pinned connector evaluator: managed disable, app
+/// enablement, tool-name/title overrides, tool defaults, and annotation hint defaults.
+#[test]
+fn cleanup_app_policy_preserves_enablement_precedence() {
+    use ra_config::{
+        ConfigLayerEntry, ConfigLayerSource, ConfigLayerStack, ConfigRequirements,
+        ConfigRequirementsToml,
+    };
+    let info = ToolInfo::new("codex_apps", serde_json::from_value(json!({"name":"browser.turn_ended","title":"Cleanup", "inputSchema":{"type":"object","properties":{}}})).unwrap()).with_connector_id(Some("connector_openai_browser".into()));
+    for (config, managed, enabled) in [
+        ("", false, true),
+        ("[apps._default]\nenabled = false", false, false),
+        (
+            "[apps._default]\nenabled = false\n[apps.connector_openai_browser]\nenabled = true",
+            false,
+            true,
+        ),
+        (
+            "[apps.connector_openai_browser]\nenabled = true",
+            true,
+            false,
+        ),
+        (
+            "[apps.connector_openai_browser]\ndefault_tools_enabled = false",
+            false,
+            false,
+        ),
+        (
+            "[apps.connector_openai_browser]\ndestructive_enabled = false",
+            false,
+            false,
+        ),
+        (
+            "[apps.connector_openai_browser]\nopen_world_enabled = false",
+            false,
+            false,
+        ),
+        (
+            "[apps.connector_openai_browser]\ndestructive_enabled = false\n[apps.connector_openai_browser.tools.\"browser.turn_ended\"]\nenabled = true",
+            false,
+            true,
+        ),
+        (
+            "[apps.connector_openai_browser.tools.Cleanup]\nenabled = false",
+            false,
+            false,
+        ),
+        (
+            "[apps.connector_openai_browser.tools.Cleanup]\nenabled = false\n[apps.connector_openai_browser.tools.\"browser.turn_ended\"]\nenabled = true",
+            false,
+            true,
+        ),
+    ] {
+        let requirements: ConfigRequirementsToml = if managed {
+            toml::from_str("[apps.connector_openai_browser]\nenabled = false").unwrap()
+        } else {
+            Default::default()
+        };
+        let stack = ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    profile: None,
+                    file: ra_paths::AbsolutePathBuf::from_absolute_path(
+                        std::env::current_dir().unwrap().join("test-config.toml"),
+                    )
+                    .unwrap(),
+                },
+                toml::from_str(config).unwrap(),
+            )],
+            ConfigRequirements::default(),
+            requirements,
+        )
+        .unwrap();
+        assert_eq!(
+            ra_coding::thread_hooks::CodingThreadHooks::app_tool_enabled_for_test(&stack, &info),
+            enabled,
+            "{config}, managed: {managed}"
+        );
+    }
+}
