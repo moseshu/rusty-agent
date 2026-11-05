@@ -2215,3 +2215,21 @@ fn record_context_history(
         history.push(ModelInputItem::Message(message));
     }
 }
+
+/// Access to the thread-owned compaction abort boundary for deterministic ownership tests.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod test_api {
+    /// Tries the same turn identity check used by a compaction hook after its run has ended.
+    #[must_use]
+    pub fn abort_compaction_turn(thread: &super::AgentThread, expected_turn: &str) -> bool {
+        super::TurnAbort {
+            thread: std::sync::Arc::downgrade(&thread.inner),
+            turn_id: expected_turn.to_owned(),
+        }
+        .abort(
+            ra_core::cancel::CancelReason::Custom("hook_stopped_compaction".into()),
+            None,
+        )
+    }
+}

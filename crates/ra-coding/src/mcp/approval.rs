@@ -32,6 +32,7 @@ use std::{
 pub(super) struct ProductMcpPolicy {
     default_mode: AppToolApproval,
     overrides: BTreeMap<String, AppToolApproval>,
+    output_limits: BTreeMap<String, usize>,
     pub(super) plugin_id: Option<String>,
     allow_persistent: bool,
     pub(super) elicitation: bool,
@@ -49,6 +50,15 @@ impl ProductMcpPolicy {
                 .tools
                 .iter()
                 .filter_map(|(name, tool)| tool.approval_mode.map(|mode| (name.clone(), mode)))
+                .collect(),
+            output_limits: server
+                .config()
+                .tools
+                .iter()
+                .filter_map(|(name, tool)| {
+                    tool.output_token_limit
+                        .map(|limit| (name.clone(), limit.get()))
+                })
                 .collect(),
             plugin_id: match server.source() {
                 McpServerSource::Plugin(plugin) | McpServerSource::SelectedPlugin(plugin) => {
@@ -223,6 +233,31 @@ impl ProductMcpTool {
     pub(super) fn new(inner: Arc<McpTool>, policy: Arc<ProductMcpPolicy>) -> Self {
         Self { inner, policy }
     }
+    async fn invoke(&self, context: &ToolContext<'_>) -> Result<ToolOutput> {
+        let output = self.inner.invoke(context.arguments().clone()).await?;
+        if let Some(limits) = context
+            .run()
+            .app_context::<CodingThreadSettings>()
+            .and_then(|settings| settings.mcp_feedback_limits.as_ref())
+        {
+            let key = (context.run().run_id().clone(), context.call_id().clone());
+            let mut limits = limits.lock().unwrap_or_else(PoisonError::into_inner);
+            match self
+                .policy
+                .output_limits
+                .get(self.inner.info().tool().name.as_ref())
+            {
+                Some(limit) => {
+                    limits.insert(key, *limit);
+                }
+                None => {
+                    limits.remove(&key);
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn state(&self, context: &ToolContext<'_>) -> McpApprovalState {
         let info = self.inner.info();
         let mode = self
@@ -364,7 +399,7 @@ impl Tool for ProductMcpTool {
         if settings.is_some_and(|settings| auto_approved(settings, state.mode))
             || !self.inner.needs_approval(&context).await?
         {
-            return self.inner.invoke(context.arguments().clone()).await;
+            return self.invoke(&context).await;
         }
         if state.mode == AppToolApproval::Auto
             && settings.is_some_and(|settings| {
@@ -375,7 +410,7 @@ impl Tool for ProductMcpTool {
                     .contains(&state.key)
             })
         {
-            return self.inner.invoke(context.arguments().clone()).await;
+            return self.invoke(&context).await;
         }
         let refusal = |message| {
             Error::tool(
@@ -405,7 +440,7 @@ impl Tool for ProductMcpTool {
                 && saved.key == state.key
                 && saved.arguments == state.arguments
             {
-                return self.inner.invoke(context.arguments().clone()).await;
+                return self.invoke(&context).await;
             }
             return Err(refusal("MCP approval does not match this invocation"));
         }

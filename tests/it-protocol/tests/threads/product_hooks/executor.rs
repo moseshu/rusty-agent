@@ -1170,3 +1170,444 @@ async fn environment_validation_preserves_upstream_common_error_order() {
     }
     fixture.mcp.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_config_declared_mcp_handler_uses_the_thread_executor_and_hidden_tool() {
+    let fixture = ExecutorFixture::with_apps(true).await;
+    fixture.home.write_hooks(
+        r#"
+[features]
+codex_hooks = true
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "mcp_tool"
+server = "codex_apps"
+tool = "browser.turn_ended"
+input = {}
+"#,
+    );
+    let server = fixture.server(None);
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    fixture.home.script.answer("mcp handler");
+    server
+        .run_turn(&mut connection, &thread, "call configured hook")
+        .await;
+    fixture.wait_calls(1).await;
+    assert_eq!(fixture.calls.lock().unwrap()[0]["meta"]["threadId"], thread);
+    let tools = serde_json::to_string(fixture.home.script.last_request().tools()).unwrap();
+    assert!(!tools.contains("browser.turn_ended"), "{tools}");
+    fixture.mcp.shutdown().await.unwrap();
+}
+
+/// Port of the MCP feedback budget case: a tool override wins over the global limit, including
+/// the source's 20 percent serialization allowance, and the replacement reaches model history.
+#[tokio::test]
+async fn mcp_tool_output_limit_applies_to_hook_feedback() {
+    for override_limit in [None, Some(100)] {
+        let home = HooksHome::new();
+        let script = home.path("mcp_server.py");
+        std::fs::write(&script, r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if 'id' not in message:
+        continue
+    method = message['method']
+    if method == 'initialize':
+        result = {'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'echo','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':name,'inputSchema':{'type':'object','properties':{}},'annotations':{'readOnlyHint':True,'destructiveHint':False,'openWorldHint':False}} for name in ['echo','feedback']]}
+    elif method == 'tools/call':
+        text = json.dumps({'continue':False,'stopReason':'hook feedback ' * 100}) if message['params']['name'] == 'feedback' else 'original result'
+        result = {'content':[{'type':'text','text':text}]}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)
+"#).unwrap();
+        let tool_policy = override_limit
+            .map(|limit| format!("[mcp_servers.echo.tools.echo]\noutput_token_limit = {limit}\n"))
+            .unwrap_or_default();
+        home.write_hooks(&format!(
+            r#"
+tool_output_token_limit = 50
+[features]
+codex_hooks = true
+[mcp_servers.echo]
+command = "python3"
+default_tools_approval_mode = "approve"
+args = [{}]
+{tool_policy}
+[[hooks.PostToolUse]]
+matcher = "^echo$"
+[[hooks.PostToolUse.hooks]]
+type = "mcp_tool"
+server = "echo"
+tool = "feedback"
+"#,
+            ra_config::TomlValue::String(script.to_string_lossy().into_owned())
+        ));
+        let config = home.config_builder().build().await.unwrap();
+        let mut catalog = ra_mcp::ResolvedMcpCatalog::builder();
+        catalog.register(ra_mcp::McpServerRegistration::from_config(
+            "echo".into(),
+            config.mcp_servers.get()["echo"].clone(),
+        ));
+        let plan = ra_coding::mcp::product_mcp_servers(
+            &catalog.build(),
+            home.workspace.path(),
+            &config.http_client_factory(),
+        );
+        assert!(plan.unavailable.is_empty(), "{:?}", plan.unavailable);
+        let mcp = CodingMcpRuntime::new(plan.servers, McpDiscoveryOptions::new()).unwrap();
+        mcp.reload_mcp_servers().await.unwrap();
+        let fixture = ExecutorFixture {
+            home,
+            mcp,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let server = fixture.server(None);
+        let mut connection = server.connect(1).await;
+        let thread = start_thread(&server, &mut connection).await;
+        fixture
+            .home
+            .script
+            .push(Step::Respond(tool_response("echo")));
+        fixture.home.script.answer("reviewed");
+        server.run_turn(&mut connection, &thread, "call echo").await;
+        let output = last_tool_output(&fixture.home.script);
+        let text = output["blocks"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(text.starts_with("hook feedback "), "{output}");
+        assert!(text.contains("truncated"), "{output}");
+        let range = if override_limit.is_some() {
+            400..600
+        } else {
+            200..350
+        };
+        assert!(range.contains(&text.len()), "{} bytes: {text}", text.len());
+        fixture.mcp.shutdown().await.unwrap();
+    }
+}
+
+/// Codex truncates every tool's model-visible output, PostToolUse feedback included, with the
+/// turn's policy when the tool carries no limit of its own. Resolving that budget must not touch
+/// the MCP servers: a built-in tool's PostToolUse neither lists their tools nor waits for them.
+#[tokio::test]
+async fn builtin_tool_feedback_uses_the_turn_budget_without_listing_mcp_tools() {
+    let home = HooksHome::new();
+    let script = home.path("mcp_server.py");
+    let methods = home.path("mcp_methods.log");
+    std::fs::write(&script, format!(r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if 'id' not in message:
+        continue
+    method = message['method']
+    with open({methods:?}, 'a') as log:
+        log.write(method + '\n')
+    if method == 'initialize':
+        result = {{'protocolVersion':'2024-11-05','capabilities':{{'tools':{{}}}},'serverInfo':{{'name':'echo','version':'1'}}}}
+    elif method == 'tools/list':
+        result = {{'tools':[{{'name':'echo','inputSchema':{{'type':'object','properties':{{}}}}}}]}}
+    else:
+        result = {{}}
+    print(json.dumps({{'jsonrpc':'2.0','id':message['id'],'result':result}}), flush=True)
+"#, methods = methods.display().to_string())).unwrap();
+    home.write_hooks(&format!(
+        r#"
+tool_output_token_limit = 50
+[features]
+codex_hooks = true
+[mcp_servers.echo]
+command = "python3"
+args = [{}]
+{}"#,
+        ra_config::TomlValue::String(script.to_string_lossy().into_owned()),
+        hook_section(
+            "PostToolUse",
+            r#"python3 -c "import json; print(json.dumps({'continue': False, 'stopReason': 'hook feedback ' * 200}))""#
+        )
+    ));
+    let config = home.config_builder().build().await.unwrap();
+    let mut catalog = ra_mcp::ResolvedMcpCatalog::builder();
+    catalog.register(ra_mcp::McpServerRegistration::from_config(
+        "echo".into(),
+        config.mcp_servers.get()["echo"].clone(),
+    ));
+    let plan = ra_coding::mcp::product_mcp_servers(
+        &catalog.build(),
+        home.workspace.path(),
+        &config.http_client_factory(),
+    );
+    assert!(plan.unavailable.is_empty(), "{:?}", plan.unavailable);
+    let mcp = CodingMcpRuntime::new(plan.servers, McpDiscoveryOptions::new()).unwrap();
+    mcp.reload_mcp_servers().await.unwrap();
+    let fixture = ExecutorFixture {
+        home,
+        mcp,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = fixture.server(None);
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    let lists_before = std::fs::read_to_string(&methods)
+        .unwrap_or_default()
+        .lines()
+        .filter(|method| *method == "tools/list")
+        .count();
+    fixture.home.script.push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+        ItemId::new("command"),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new("call"),
+            "exec_command",
+            json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null}),
+        )),
+    )])));
+    fixture.home.script.answer("reviewed");
+    server
+        .run_turn(&mut connection, &thread, "run a command")
+        .await;
+
+    let output = last_tool_output(&fixture.home.script);
+    let text = output["blocks"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    assert!(text.starts_with("hook feedback "), "{output}");
+    assert!(text.contains("truncated"), "{output}");
+    // Fifty tokens are a 200-byte budget for the default byte policy, plus the 20 percent
+    // serialization allowance.
+    assert!(
+        (200..350).contains(&text.len()),
+        "{} bytes: {text}",
+        text.len()
+    );
+    // Each model request advertises the MCP tools once; the hook added no listing of its own.
+    let lists = std::fs::read_to_string(&methods)
+        .unwrap_or_default()
+        .lines()
+        .filter(|method| *method == "tools/list")
+        .count();
+    let requests = fixture.home.script.requests.lock().unwrap().len();
+    assert_eq!(lists - lists_before, requests);
+    fixture.mcp.shutdown().await.unwrap();
+}
+
+/// A later discovery must not replace the budget captured by an executing tool; the next turn
+/// reuses the same call ID deliberately, so the call-owned handoff must also be consumed.
+#[tokio::test]
+async fn mcp_feedback_keeps_the_invocations_budget_during_refresh_and_rediscovery() {
+    let home = HooksHome::new();
+    let script = home.path("owned_mcp.py");
+    let entered = home.path("entered");
+    let release = home.path("release");
+    std::fs::write(&script, format!(r#"
+import json, sys, threading, time
+lock = threading.Lock()
+def send(identifier, result):
+    with lock:
+        print(json.dumps({{'jsonrpc':'2.0','id':identifier,'result':result}}), flush=True)
+def call(identifier):
+    open({entered:?}, 'w').close()
+    while not __import__('os').path.exists({release:?}):
+        time.sleep(0.002)
+    send(identifier, {{'content':[{{'type':'text','text':'original result'}}]}})
+for line in sys.stdin:
+    message = json.loads(line)
+    if 'id' not in message:
+        continue
+    method = message['method']
+    if method == 'initialize':
+        send(message['id'], {{'protocolVersion':'2024-11-05','capabilities':{{'tools':{{}}}},'serverInfo':{{'name':'echo','version':'1'}}}})
+    elif method == 'tools/list':
+        send(message['id'], {{'tools':[{{'name':'echo','inputSchema':{{'type':'object','properties':{{}}}},'annotations':{{'readOnlyHint':True,'destructiveHint':False,'openWorldHint':False}}}}]}})
+    elif method == 'tools/call':
+        threading.Thread(target=call, args=(message['id'],), daemon=True).start()
+    else:
+        send(message['id'], {{}})
+"#, entered=entered.display().to_string(), release=release.display().to_string())).unwrap();
+    home.write_hooks(&format!(r#"
+tool_output_token_limit = 50
+[features]
+codex_hooks = true
+[mcp_servers.echo]
+command = "python3"
+default_tools_approval_mode = "approve"
+args = [{}]
+[mcp_servers.echo.tools.echo]
+output_token_limit = 100
+{}"#, ra_config::TomlValue::String(script.to_string_lossy().into_owned()), hook_section(
+        "PostToolUse", r#"python3 -c "import json; print(json.dumps({'continue': False, 'stopReason': 'hook feedback ' * 200}))""#
+    )));
+    let config = home.config_builder().build().await.unwrap();
+    let mut server_config = config.mcp_servers.get()["echo"].clone();
+    let plan = |server_config| {
+        let mut catalog = ra_mcp::ResolvedMcpCatalog::builder();
+        catalog.register(ra_mcp::McpServerRegistration::from_config(
+            "echo".into(),
+            server_config,
+        ));
+        ra_coding::mcp::product_mcp_servers(
+            &catalog.build(),
+            home.workspace.path(),
+            &config.http_client_factory(),
+        )
+    };
+    let mcp = CodingMcpRuntime::new(
+        plan(server_config.clone()).servers,
+        McpDiscoveryOptions::new(),
+    )
+    .unwrap();
+    mcp.reload_mcp_servers().await.unwrap();
+    server_config
+        .tools
+        .get_mut("echo")
+        .unwrap()
+        .output_token_limit = std::num::NonZeroUsize::new(10);
+    let replacement = plan(server_config).servers;
+    let fixture = ExecutorFixture {
+        home,
+        mcp,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server = fixture.server(None);
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    fixture
+        .home
+        .script
+        .push(Step::Respond(tool_response("echo")));
+    fixture.home.script.answer("first completed");
+    server.turn_start(&mut connection, &thread, "first").await;
+    timeout(PATIENCE, async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.mcp.replace_mcp_servers(replacement).await.unwrap();
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("other-run"))
+        .name("Other run")
+        .build()
+        .unwrap();
+    let context =
+        ra_core::context::RunContext::new(ra_core::state::RunId::new("other-run"), &agent);
+    let discovered =
+        ra_core::tool::ToolResolver::get_tools(fixture.mcp.as_ref(), &context, &Default::default())
+            .await
+            .unwrap();
+    assert!(discovered.iter().any(|tool| tool.origin().name() == "echo"));
+    std::fs::write(&release, "release").unwrap();
+    connection.notification("turn/completed").await;
+    let first = last_tool_output(&fixture.home.script);
+    let first = first["blocks"][0]["text"].as_str().unwrap();
+    assert!(
+        first.starts_with("hook feedback ") && first.contains("truncated"),
+        "{first}"
+    );
+    assert!(
+        (400..600).contains(&first.len()),
+        "{}: {first}",
+        first.len()
+    );
+    fixture
+        .home
+        .script
+        .push(Step::Respond(tool_response("echo")));
+    fixture.home.script.answer("second completed");
+    server.run_turn(&mut connection, &thread, "second").await;
+    let second = latest_feedback(&fixture.home.script);
+    assert!(
+        second.starts_with("hook ") && second.contains("truncated"),
+        "{second}"
+    );
+    assert!(
+        (40..160).contains(&second.len()),
+        "{}: {second}",
+        second.len()
+    );
+    fixture.mcp.shutdown().await.unwrap();
+}
+
+fn latest_feedback(script: &Script) -> String {
+    script
+        .last_request()
+        .input()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ModelInputItem::ToolCallOutput(output) => output.output()["blocks"][0]["text"]
+                .as_str()
+                .map(str::to_owned),
+            _ => None,
+        })
+        .expect("a model-visible tool output")
+}
+
+/// No MCP runtime and no global override: model changes must select their own catalog policy,
+/// matched by slug as Codex matches model metadata.
+#[tokio::test]
+async fn feedback_follows_the_current_turn_model_instead_of_the_initial_model() {
+    let home = HooksHome::new();
+    let catalog = home.path("catalog.json");
+    let model = |slug: &str, mode: &str, limit: usize| {
+        json!({
+            "slug":slug,"display_name":slug,"description":null,"supported_reasoning_levels":[],
+            "shell_type":"unified_exec","visibility":"list","supported_in_api":true,"priority":0,
+            "availability_nux":null,"upgrade":null,"support_verbosity":false,"default_verbosity":null,
+            "apply_patch_tool_type":null,"truncation_policy":{"mode":mode,"limit":limit},
+            "experimental_supported_tools":[],"base_instructions":"Test model instructions"
+        })
+    };
+    std::fs::write(
+        &catalog,
+        json!({"models":[model("wide", "tokens", 100),model("narrow", "bytes", 80)]}).to_string(),
+    )
+    .unwrap();
+    home.write_hooks(&format!("model = 'wide'\nmodel_catalog_json = {}\n{}",
+        ra_config::TomlValue::String(catalog.to_string_lossy().into_owned()),
+        hook_section("PostToolUse", r#"python3 -c "import json; print(json.dumps({'continue': False, 'stopReason': 'hook feedback ' * 200}))""#)
+    ));
+    let server = home.server();
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    // Dated and namespaced slugs resolve as Codex resolves model metadata: the longest catalog
+    // prefix, then one retry without a `namespace/` segment.
+    for (model, range) in [
+        ("wide", 400..600),
+        ("narrow", 80..180),
+        ("wide", 400..600),
+        ("narrow-2026-11-01", 80..180),
+        ("custom/narrow", 80..180),
+    ] {
+        home.script.push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("command"), RunItemKind::ToolCall(ToolCall::new(CallId::new("call"), "exec_command",
+                json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null}))),
+        )])));
+        home.script.answer("reviewed");
+        server
+            .call(
+                &mut connection,
+                "turn/start",
+                json!({
+                    "threadId":thread,"input":[{"type":"text","text":"run command"}],"model":model
+                }),
+            )
+            .await;
+        connection.notification("turn/completed").await;
+        let text = latest_feedback(&home.script);
+        assert!(
+            text.starts_with("hook feedback ") && text.contains("truncated"),
+            "{model}: {text}"
+        );
+        assert!(
+            range.contains(&text.len()),
+            "{model}: {}: {text}",
+            text.len()
+        );
+    }
+}

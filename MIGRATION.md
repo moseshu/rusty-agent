@@ -1293,6 +1293,11 @@ still returning that path, and flushes before Interrupt and SessionEnd hooks. No
 are not materialized for hook queries. The default protocol/product binding uses a weak thread
 handle and queries on every dispatch. This adds no persistence requirement for non-local stores.
 
+SubagentStop for an agent spawned through `AgentControl` currently reports `agent_transcript_path`
+as `null`: the product does not yet give spawned agents a rollout of their own. Codex reports the
+child's own rollout there, and the field will carry that path once spawned-agent rollouts are wired
+into the product. Its `transcript_path` is already the parent thread's transcript, as in Codex.
+
 ### Thread-owned product hook refresh
 
 Coding threads with PluginServices now rebuild hooks on service invalidation with the thread's
@@ -1307,8 +1312,30 @@ reconfiguration preserves running background handlers.
 Unlike Codex's distinct configuration and plugin refresh calls, the local watch signal combines
 both and reloads incoming configuration for either, so a plugin change can additionally bring in
 external user-file edits, but cannot replace other session layers or fixed runtime values.
-Invalidation is processed asynchronously and a config
-write response is not a barrier for every loaded thread; turn submission reconciles pending
-invalidation before proceeding. Activation also runs before steer submissions because per-turn
+Invalidation is processed asynchronously. As in Codex's `reload_user_config`, a
+`config/batchWrite` with `reloadUserConfig: true` responds only after every loaded thread has
+reconciled its hooks, so an idle thread unloaded right after the write runs the written SessionEnd
+handlers. Other config writes, including `config/value/write`, a batch without
+`reloadUserConfig`, `skills/config/write` and `skills/extraRoots/set`, clear shared source caches and reconcile consumers such as MCP, but keep loaded
+threads' hook configuration until an explicit reloading write, matching Codex. A separate hook
+configuration generation prevents a cache-only mutation from reloading the user layer during turn
+activation. Activation also runs before steer submissions because per-turn
 plugin disabling is unsupported. Hosts without PluginServices have no refresh trigger. These are
 product-layer adaptations; framework RunHooks and provider-neutral core contracts are unchanged.
+
+PostToolUse feedback that replaces a tool's output is cut to that tool's budget, with Codex's 20%
+serialization allowance: an MCP tool's configured `output_token_limit`, otherwise the turn's
+truncation policy (the model's policy, or `tool_output_token_limit` when set). This now covers every
+tool, not only MCP tools, and applies on hosts without an MCP runtime. Each successful MCP invocation
+hands the explicit limit captured by its immutable tool binding to its PostToolUse hook, keyed by run
+and call IDs, in a table the thread's product hook runtime owns; threads without product hooks record
+nothing. The hook consumes that entry, and when a turn ends the runtime drops any entry left by the
+turn's root or nested runs. Later discovery or configuration replacement cannot change an executing
+call's limit, and hooks never wait for, start or list an MCP server. The fallback policy is selected
+from the session catalog using the active run's resolved model on each call, including per-turn model
+overrides, matched as Codex matches model metadata: the longest catalog slug that prefixes the model,
+then one retry without a `namespace/` segment. Model descriptors bundled with Codex are not ported, so
+without `model_catalog_json` every model uses Codex's unknown-model budget of 10,000 bytes. This
+product-layer
+presentation happens before returning the hook replacement decision; the provider-neutral SDK
+retains the original tool observation and does not acquire Codex-specific history-envelope fields.

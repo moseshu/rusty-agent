@@ -645,3 +645,6 @@ mod fields;
 
 #[path = "product_hooks/refresh.rs"]
 mod refresh;
+
+#[path = "product_hooks/closeout.rs"]
+mod closeout;

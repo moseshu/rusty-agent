@@ -128,6 +128,36 @@ pub struct ProductHookRuntime {
     context_delivery: Arc<Mutex<ContextDelivery>>,
     executor_hooks: OnceLock<Arc<dyn ExecutorHookSourceProvider>>,
     transcript: OnceLock<ra_runtime::thread::WeakAgentThread>,
+    feedback_policy: OnceLock<FeedbackPolicy>,
+    feedback_limits: FeedbackLimits,
+}
+
+/// MCP output limits captured by successful invocations, keyed by run and call, for their own
+/// `PostToolUse` hooks.
+pub(crate) type FeedbackLimits =
+    Arc<Mutex<std::collections::HashMap<(ra_core::state::RunId, ra_core::item::CallId), usize>>>;
+
+/// Model metadata belongs to the session; the selected model belongs to each active run.
+struct FeedbackPolicy {
+    models: Vec<(String, ra_core::sandbox::token_truncation::TruncationPolicy)>,
+    token_limit: Option<usize>,
+}
+impl FeedbackPolicy {
+    fn for_model(&self, model: &str) -> ra_core::sandbox::token_truncation::TruncationPolicy {
+        use ra_core::sandbox::token_truncation::{TruncationMode, TruncationPolicy};
+        // Codex's unknown-model descriptor uses a byte budget.
+        let policy = crate::config::catalog::find_model_by_slug(model, &self.models)
+            .unwrap_or(TruncationPolicy::bytes(10_000));
+        match self.token_limit {
+            Some(limit) => match policy.mode() {
+                TruncationMode::Bytes => TruncationPolicy::bytes(
+                    i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX),
+                ),
+                _ => TruncationPolicy::tokens(i64::try_from(limit).unwrap_or(i64::MAX)),
+            },
+            None => policy,
+        }
+    }
 }
 
 /// The receiving end of finished background handlers and the task that delivers them.
@@ -187,7 +217,56 @@ impl ProductHookRuntime {
             context_delivery,
             executor_hooks: OnceLock::new(),
             transcript: OnceLock::new(),
+            feedback_policy: OnceLock::new(),
+            feedback_limits: FeedbackLimits::default(),
         }))
+    }
+
+    /// The table MCP invocations of this thread record their output limits in.
+    pub(crate) fn feedback_limits(&self) -> FeedbackLimits {
+        Arc::clone(&self.feedback_limits)
+    }
+
+    /// Drops limits no post hook consumed in `turn`, including those of its nested runs.
+    pub(crate) fn finish_turn_feedback(&self, turn: &str) {
+        let turn_of = self
+            .context_delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .turn_of
+            .clone();
+        self.feedback_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(run, _), _| {
+                let run = run.as_str();
+                run != turn && turn_of.get(run).is_none_or(|owner| owner != turn)
+            });
+    }
+
+    /// Captures the session model catalog; each post hook selects its active run's model budget.
+    pub(crate) fn set_feedback_policy(&self, config: &crate::config::Config) {
+        use ra_core::sandbox::token_truncation::TruncationPolicy;
+        let models = config
+            .model_catalog
+            .iter()
+            .flat_map(|catalog| catalog.models.iter())
+            .map(|model| {
+                let policy = match model.truncation_policy.mode {
+                    crate::config::catalog::TruncationMode::Bytes => {
+                        TruncationPolicy::bytes(model.truncation_policy.limit)
+                    }
+                    crate::config::catalog::TruncationMode::Tokens => {
+                        TruncationPolicy::tokens(model.truncation_policy.limit)
+                    }
+                };
+                (model.slug.clone(), policy)
+            })
+            .collect();
+        let _ = self.feedback_policy.set(FeedbackPolicy {
+            models,
+            token_limit: config.tool_output_token_limit,
+        });
     }
 
     /// Applies a refreshed configuration while background handlers keep running.
@@ -661,6 +740,38 @@ impl ProductHookRuntime {
                 }
             }
             HookEvent::PostToolUse { call, output } => {
+                // The successful invocation records the limit from its own immutable binding.
+                // Consume it by call identity, never by a mutable discovery name cache.
+                let token_limit = self
+                    .feedback_limits
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&(context.run().run_id().clone(), call.call_id().clone()));
+                let feedback_limit = self.feedback_policy.get().map(|policy| {
+                    token_limit.map_or_else(
+                        || policy.for_model(&model),
+                        |limit| {
+                            ra_core::sandbox::token_truncation::TruncationPolicy::tokens(
+                                i64::try_from(limit).unwrap_or(i64::MAX),
+                            )
+                        },
+                    )
+                });
+                let truncate_feedback = |message: String| match feedback_limit {
+                    Some(policy) => {
+                        use ra_core::sandbox::token_truncation::{
+                            TruncationMode, TruncationPolicy, truncate_text,
+                        };
+                        let allowance = policy.limit().saturating_mul(6) / 5;
+                        let allowance = i64::try_from(allowance).unwrap_or(i64::MAX);
+                        let policy = match policy.mode() {
+                            TruncationMode::Bytes => TruncationPolicy::bytes(allowance),
+                            _ => TruncationPolicy::tokens(allowance),
+                        };
+                        truncate_text(&message, policy)
+                    }
+                    None => message,
+                };
                 let tool = HookToolName::for_call(&call);
                 let tool_response = output.as_text().map_or_else(
                     || serde_json::to_value(output).unwrap_or(Value::Null),
@@ -686,15 +797,17 @@ impl ProductHookRuntime {
                 self.record_contexts(context, outcome.additional_contexts);
                 if outcome.should_block {
                     return HookDecision::Deny {
-                        message: outcome.feedback_message.unwrap_or_else(|| {
+                        message: truncate_feedback(outcome.feedback_message.unwrap_or_else(|| {
                             "PostToolUse hook blocked the tool result".to_owned()
-                        }),
+                        })),
                     };
                 }
                 outcome
                     .feedback_message
                     .map_or(HookDecision::Continue, |message| {
-                        HookDecision::ReplaceOutput { message }
+                        HookDecision::ReplaceOutput {
+                            message: truncate_feedback(message),
+                        }
                     })
             }
             HookEvent::Stop(delivery) | HookEvent::SubagentStop { delivery, .. } => {

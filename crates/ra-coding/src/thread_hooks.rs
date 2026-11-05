@@ -133,6 +133,7 @@ impl CodingThreadHooks {
             },
             mcp_executor,
         )?;
+        runtime.set_feedback_policy(config);
         let executor = crate::thread_environments::ThreadExecutorHooks::build(
             config,
             host,
@@ -188,6 +189,7 @@ impl CodingThreadHooks {
             builder,
             state: tokio::sync::Mutex::new(HookRefreshState { config, generation }),
         });
+        refresh.plugins.register_hook_reload(&refresh);
         let weak = Arc::downgrade(&refresh);
         self.refresh
             .set(refresh)
@@ -220,6 +222,7 @@ impl CodingThreadHooks {
             .cloned()
         {
             settings.executor_environments = Some(self.executor.manager());
+            settings.mcp_feedback_limits = Some(self.runtime.feedback_limits());
             config = config.with_app_context(Arc::new(settings));
         }
         config
@@ -259,7 +262,7 @@ impl CodingThreadHooks {
     ) -> anyhow::Result<Self> {
         let generation = host
             .plugin_services()
-            .map_or(0, |plugins| plugins.generation());
+            .map_or(0, |plugins| plugins.hook_generation());
         let config = builder.clone().build().await?;
         Box::pin(Self::build_refreshing(
             config, builder, host, thread_id, generation, None,
@@ -324,6 +327,7 @@ impl ThreadProductRuntime for CodingThreadHooks {
         | ThreadEvent::TurnAborted { turn_id, .. } = event
         {
             self.executor.finish_turn(turn_id);
+            self.runtime.finish_turn_feedback(turn_id);
         }
     }
 
@@ -364,7 +368,7 @@ struct HookRefreshState {
 /// Serializes thread-owned configuration loads and turn activation. The service generation is
 /// the local equivalent of Codex's session configuration owner; the disabled plugin set is empty
 /// until the product accepts per-turn plugin disabling.
-struct HookRefresh {
+pub(crate) struct HookRefresh {
     runtime: Arc<ProductHookRuntime>,
     plugins: Arc<crate::plugins::PluginServices>,
     builder: ConfigBuilder,
@@ -372,10 +376,10 @@ struct HookRefresh {
 }
 
 impl HookRefresh {
-    async fn reconcile(&self, activate: bool) {
+    pub(crate) async fn reconcile(&self, activate: bool) {
         let mut state = self.state.lock().await;
         loop {
-            let generation = self.plugins.generation();
+            let generation = self.plugins.hook_generation();
             let reload = generation != state.generation;
             if !reload && !activate {
                 return;
@@ -403,7 +407,7 @@ impl HookRefresh {
                     &hooks.plugin_hook_sources,
                     &hooks.plugin_hook_load_warnings,
                 );
-            if self.plugins.publish_if_current(generation, || {
+            if self.plugins.publish_hooks_if_current(generation, || {
                 if changed {
                     self.runtime.refresh(hooks);
                 }

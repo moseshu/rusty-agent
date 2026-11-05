@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! A thread's turns and items, rebuilt from what its turns recorded: Codex's
 //! `ThreadHistoryBuilder` (`app-server-protocol/src/protocol/thread_history.rs`).
 //!
@@ -768,22 +769,28 @@ fn hook_prompt_fragments(message: &Message) -> Option<Vec<super::protocol::HookP
         #[serde(rename = "$text", default)]
         text: String,
     }
-    let text = message.text_content();
-    if !text.trim_start().starts_with("<hook_prompt ") {
-        return None;
+    let mut fragments = Vec::new();
+    for block in message.content() {
+        let text = block.as_text()?;
+        if text.trim_start().starts_with("<hook_prompt ") {
+            let parsed: Fragments =
+                quick_xml::de::from_str(&format!("<root>{text}</root>")).ok()?;
+            fragments.extend(parsed.fragments);
+        } else if !is_contextual_user_message(&Message::user(text))
+            && !is_other_contextual_fragment(text)
+        {
+            return None;
+        }
     }
-    let parsed: Fragments = quick_xml::de::from_str(&format!("<root>{text}</root>")).ok()?;
-    if parsed.fragments.is_empty()
-        || parsed
-            .fragments
+    if fragments.is_empty()
+        || fragments
             .iter()
             .any(|fragment| fragment.hook_run_id.trim().is_empty())
     {
         return None;
     }
     Some(
-        parsed
-            .fragments
+        fragments
             .into_iter()
             .map(|fragment| super::protocol::HookPromptFragment {
                 text: fragment.text,
@@ -791,4 +798,19 @@ fn hook_prompt_fragments(message: &Message) -> Option<Vec<super::protocol::HookP
             })
             .collect(),
     )
+}
+
+/// Contextual fragments can accompany a visible hook prompt without becoming user text.
+fn is_other_contextual_fragment(text: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    [
+        "environment_context",
+        "agent_message_board_notification",
+        "subagent_notification",
+        "user_shell_command",
+        "turn_aborted",
+        "recommended_plugins",
+    ]
+    .iter()
+    .any(|tag| text.starts_with(&format!("<{tag}>")) && text.ends_with(&format!("</{tag}>")))
 }

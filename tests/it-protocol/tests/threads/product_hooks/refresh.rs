@@ -8,19 +8,32 @@ fn absolute(path: &Path) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).unwrap()
 }
 
-async fn server_with_plugins(home: &HooksHome) -> (Server, Arc<PluginServices>) {
+pub(super) async fn server_with_plugins(home: &HooksHome) -> (Server, Arc<PluginServices>) {
+    server_with_plugins_and_builder(home, home.config_builder()).await
+}
+
+pub(super) async fn server_with_plugins_and_builder(
+    home: &HooksHome,
+    builder: ConfigBuilder,
+) -> (Server, Arc<PluginServices>) {
     let root = home.workspace.path().canonicalize().unwrap();
+    let product_home = home.home.path().canonicalize().unwrap();
     let config = home.config_builder().build().await.unwrap();
     let services = PluginServices::new(
         PluginConfigManager::new(
             ra_executor::LOCAL_FS.clone(),
-            absolute(home.home.path()),
+            absolute(&product_home),
             absolute(&root),
-            ra_config::ConfigLoadOptions::from(LoaderOverrides::without_managed_config_for_tests()),
+            ra_config::ConfigLoadOptions::from(LoaderOverrides {
+                managed_config_path: Some(product_home.join("managed_config.toml")),
+                system_config_path: Some(product_home.join("system_config.toml")),
+                system_requirements_path: Some(product_home.join("requirements.toml")),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            }),
             Arc::new(ra_config::NoopThreadConfigLoader),
             config.http_client_factory().clone(),
         ),
-        Arc::new(HostSkillsService::new(absolute(home.home.path()), false)),
+        Arc::new(HostSkillsService::new(absolute(&product_home), false)),
     );
     let host = CodingHost::open(&root)
         .unwrap()
@@ -34,7 +47,7 @@ async fn server_with_plugins(home: &HooksHome) -> (Server, Arc<PluginServices>) 
     .unwrap()
     .with_rules_home(home.home.path());
     let factory = CodingThreadFactory::new(host, Arc::new(Resolver(home.script.clone())), settings)
-        .with_product_config(home.config_builder());
+        .with_product_config(builder);
     let app = AppServer::new(&root)
         .unwrap()
         .with_thread_store(home.store.clone())
@@ -60,11 +73,11 @@ async fn config_write_refreshes_hooks_on_a_turn_without_policy_overrides() {
     server
         .call(
             &mut connection,
-            "config/value/write",
-            json!({
+            "config/batchWrite",
+            json!({"reloadUserConfig":true, "edits":[{
                 "keyPath":"hooks.UserPromptSubmit", "mergeStrategy":"replace",
                 "value":[{"hooks":[{"type":"command","command":logging(&log)}]}]
-            }),
+            }]}),
         )
         .await;
     server
@@ -185,4 +198,181 @@ async fn config_write_does_not_enable_hooks_in_a_disabled_thread() {
         .await;
     connection.notification("turn/completed").await;
     assert!(!log.exists());
+}
+
+/// Codex reloads loaded threads only for a `config/batchWrite` that asks for it, and does so
+/// before it responds.
+async fn reload_write(server: &Server, connection: &mut Connection, key: &str, value: Value) {
+    server
+        .call(
+            connection,
+            "config/batchWrite",
+            json!({
+                "edits":[{"keyPath":key, "mergeStrategy":"replace", "value":value}],
+                "reloadUserConfig":true
+            }),
+        )
+        .await;
+}
+
+fn log_lines(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+/// Codex refreshes a loaded session from the user layer only, so hooks the thread's builder adds
+/// through CLI overrides survive a user-layer write alongside the hooks the write adds.
+#[tokio::test]
+async fn config_write_keeps_the_builders_cli_override_hooks() {
+    let home = HooksHome::new();
+    let cli_log = home.path("cli.log");
+    let user_log = home.path("user.log");
+    home.write_hooks("[features]\ncodex_hooks = true");
+    let cli = ra_config::TomlValue::try_from(
+        json!([{"hooks":[{"type":"command","command":logging(&cli_log)}]}]),
+    )
+    .unwrap();
+    let builder = home
+        .config_builder()
+        .cli_overrides(vec![("hooks.UserPromptSubmit".to_owned(), cli)]);
+    let (server, _) = server_with_plugins_and_builder(&home, builder).await;
+    let mut connection = server.connect(1).await;
+    let thread_id = start_thread(&server, &mut connection).await;
+    home.script.answer("before");
+    server.run_turn(&mut connection, &thread_id, "before").await;
+    assert_eq!((log_lines(&cli_log), log_lines(&user_log)), (1, 0));
+    reload_write(
+        &server,
+        &mut connection,
+        "hooks.UserPromptSubmit",
+        json!([{"hooks":[{"type":"command","command":logging(&user_log)}]}]),
+    )
+    .await;
+    home.script.answer("after");
+    server.run_turn(&mut connection, &thread_id, "after").await;
+    assert_eq!((log_lines(&cli_log), log_lines(&user_log)), (2, 1));
+}
+
+/// A write to an idle loaded thread's user configuration is what its SessionEnd runs when the
+/// thread is unloaded next, with no turn in between.
+#[tokio::test]
+async fn an_idle_threads_session_end_uses_the_handler_written_after_its_last_turn() {
+    let home = HooksHome::new();
+    let old_log = home.path("old-end.log");
+    let new_log = home.path("new-end.log");
+    home.write_hooks(&format!(
+        "[features]\ncodex_hooks = true\n{}",
+        hook_section("SessionEnd", &logging(&old_log))
+    ));
+    let (server, _) = server_with_plugins(&home).await;
+    let mut connection = server.connect(1).await;
+    let thread_id = start_thread(&server, &mut connection).await;
+    home.script.answer("done");
+    server.run_turn(&mut connection, &thread_id, "hello").await;
+    reload_write(
+        &server,
+        &mut connection,
+        "hooks.SessionEnd",
+        json!([{"hooks":[{"type":"command","command":logging(&new_log)}]}]),
+    )
+    .await;
+    super::super::unload(&server, &mut connection, &thread_id).await;
+    assert!(!old_log.exists());
+    assert_eq!(events_of(&logged(&new_log)), ["SessionEnd"]);
+}
+
+/// Enabling or disabling a plugin through a reloading config write adds or removes its hooks from a
+/// loaded thread's next turn.
+#[tokio::test]
+async fn plugin_enablement_writes_toggle_its_hooks_on_a_loaded_thread() {
+    let home = HooksHome::new();
+    home.write_hooks(
+        "[features]\ncodex_hooks = true\nplugins = true\n[plugins.\"sample@test\"]\nenabled = true",
+    );
+    let log = home.path("plugin.log");
+    install(&home, "1.0.0", &log);
+    let (server, _) = server_with_plugins(&home).await;
+    let mut connection = server.connect(1).await;
+    let thread_id = start_thread(&server, &mut connection).await;
+    let mut turn = async |enabled: Option<bool>, expected: usize| {
+        if let Some(enabled) = enabled {
+            reload_write(
+                &server,
+                &mut connection,
+                "plugins.\"sample@test\".enabled",
+                json!(enabled),
+            )
+            .await;
+        }
+        home.script.answer("done");
+        server.run_turn(&mut connection, &thread_id, "turn").await;
+        assert_eq!(log_lines(&log), expected, "enabled = {enabled:?}");
+    };
+    turn(None, 1).await;
+    turn(Some(false), 1).await;
+    turn(Some(true), 2).await;
+}
+
+/// Codex reloads loaded sessions only for a write that asks for it: single-value writes,
+/// non-reloading batches and skill writes clear caches and leave loaded hooks unchanged.
+#[tokio::test]
+async fn ordinary_config_writes_wait_for_an_explicit_reload_before_changing_loaded_hooks() {
+    let home = HooksHome::new();
+    let old = home.path("old.log");
+    let new = home.path("new.log");
+    home.write_hooks(&hook_section("UserPromptSubmit", &logging(&old)));
+    let (server, _) = server_with_plugins(&home).await;
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    let handlers = json!([{"hooks":[{"type":"command","command":logging(&new)}]}]);
+    server
+        .call(
+            &mut connection,
+            "config/value/write",
+            json!({
+                "keyPath":"hooks.UserPromptSubmit", "mergeStrategy":"replace", "value":handlers
+            }),
+        )
+        .await;
+    home.script.answer("after single write");
+    server
+        .run_turn(&mut connection, &thread, "single write")
+        .await;
+    assert_eq!((log_lines(&old), log_lines(&new)), (1, 0));
+    server.call(&mut connection, "config/batchWrite", json!({
+        "edits":[{"keyPath":"hooks.UserPromptSubmit", "mergeStrategy":"replace", "value":handlers}],
+        "reloadUserConfig":false
+    })).await;
+    home.script.answer("after batch write");
+    server
+        .run_turn(&mut connection, &thread, "batch write")
+        .await;
+    assert_eq!((log_lines(&old), log_lines(&new)), (2, 0));
+    // Codex's skill writes clear the skill and plugin caches only.
+    server
+        .call(
+            &mut connection,
+            "skills/config/write",
+            json!({"name":"sample:test","enabled":false}),
+        )
+        .await;
+    server
+        .call(
+            &mut connection,
+            "skills/extraRoots/set",
+            json!({"extraRoots":[]}),
+        )
+        .await;
+    home.script.answer("after skill writes");
+    server
+        .run_turn(&mut connection, &thread, "skill writes")
+        .await;
+    assert_eq!((log_lines(&old), log_lines(&new)), (3, 0));
+    reload_write(&server, &mut connection, "hooks.UserPromptSubmit", handlers).await;
+    home.script.answer("after reload");
+    server.run_turn(&mut connection, &thread, "reload").await;
+    assert_eq!((log_lines(&old), log_lines(&new)), (3, 1));
 }

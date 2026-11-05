@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Real configuration, installation, immutable contribution snapshots and app-server requests.
 use ra_coding::{
     plugins::{PluginConfigManager, PluginInstallRequest, PluginServices},
@@ -165,6 +166,13 @@ async fn management_wire_installs_reads_lists_and_uninstalls_with_real_config() 
     assert_eq!(
         response["result"]["plugin"]["summary"].get("mustShowInstallationInterstitial"),
         Some(&Value::Null)
+    );
+    assert_eq!(
+        response["result"]["plugin"]["hooks"],
+        json!([{
+            "key":"sample@company:hooks/hooks.json:session_start:0:0",
+            "eventName":"session_start"
+        }])
     );
     mutation_notifications.extend(notifications);
     if !mutation_notifications
@@ -566,4 +574,42 @@ async fn selected_product_installs_plugin_input_contributor_with_developer_instr
             .unwrap()
             .is_empty()
     );
+}
+
+/// The trusted-hash write must address one escaped leaf and retain sibling hook state.
+#[tokio::test]
+async fn hook_trusted_hash_write_targets_only_the_escaped_leaf() {
+    let home = TempDir::new().unwrap();
+    let key = r#"plugin."quoted"\path"#;
+    write(
+        &home.path().join("config.toml"),
+        &format!(
+            "[hooks.state.'{key}']\nenabled = false\n[hooks.state.other]\ntrusted_hash = 'keep'\n"
+        ),
+    );
+    services(home.path())
+        .write_config_value(
+            serde_json::from_value(json!({
+                "keyPath":r#"hooks.state."plugin.\"quoted\"\\path".trusted_hash"#,
+                "mergeStrategy":"replace", "value":"sha256:current"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(home.path().join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        config["hooks"]["state"][key]["trusted_hash"].as_str(),
+        Some("sha256:current")
+    );
+    assert_eq!(
+        config["hooks"]["state"][key]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        config["hooks"]["state"]["other"]["trusted_hash"].as_str(),
+        Some("keep")
+    );
+    assert_eq!(config["hooks"]["state"].as_table().unwrap().len(), 2);
 }

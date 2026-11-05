@@ -888,9 +888,11 @@ async fn background_results_waiting_for_a_turn_are_shown_before_its_prompt() {
     assert!(context < new_prompt, "{request:?}");
 }
 
+type DeferredHookEntries = Arc<Mutex<Option<(Vec<Message>, Vec<String>)>>>;
+
 /// Delivers results that arrived between turns as a host does: when the next turn binds its queue.
 struct DeliverOnBind {
-    pending: Arc<Mutex<Option<(Vec<Message>, Vec<String>)>>>,
+    pending: DeferredHookEntries,
 }
 
 #[async_trait]
@@ -1066,4 +1068,29 @@ async fn stop_hooks_see_the_input_the_turn_was_sampled_with() {
             "the hook saw exactly what the model was sent"
         );
     }
+}
+
+#[tokio::test]
+async fn a_stale_compaction_abort_cannot_cancel_the_next_turn() {
+    let script = Script::new([Step::Respond(final_message("first", "done"))]);
+    let thread = thread(&script, RunConfig::new());
+    let first = start(&thread, "first").await;
+    until_turn_end(&thread).await;
+    let (release, pending) = gate();
+    script.push(Step::After(
+        pending,
+        final_message("second", "still running"),
+    ));
+    let second = start(&thread, "second").await;
+    assert_ne!(first, second);
+    script.wait_for_calls(2).await;
+    assert!(!ra_runtime::thread::test_api::abort_compaction_turn(
+        &thread, &first
+    ));
+    release.notify_one();
+    let events = until_turn_end(&thread).await;
+    assert!(matches!(
+        events.last(),
+        Some(ThreadEvent::TurnComplete { .. })
+    ));
 }

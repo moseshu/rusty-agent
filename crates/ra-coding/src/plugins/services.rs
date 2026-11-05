@@ -242,8 +242,11 @@ pub struct PluginServices {
     pub plugins: Arc<PluginsManager>,
     pub skills: Arc<HostSkillsService>,
     changes: watch::Sender<u64>,
+    hook_generation: std::sync::atomic::AtomicU64,
     // Direct callers receive the same serialization as app-server's global config queue.
     writes: Mutex<()>,
+    // Loaded threads' hook refreshes, which a write asking to reload user config waits for.
+    hook_reloads: std::sync::Mutex<Vec<Weak<crate::thread_hooks::HookRefresh>>>,
 }
 impl PluginServices {
     pub fn new(config_manager: PluginConfigManager, skills: Arc<HostSkillsService>) -> Arc<Self> {
@@ -256,7 +259,9 @@ impl PluginServices {
             plugins,
             skills,
             changes: watch::channel(0).0,
+            hook_generation: std::sync::atomic::AtomicU64::new(0),
             writes: Mutex::new(()),
+            hook_reloads: std::sync::Mutex::new(Vec::new()),
         })
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -272,10 +277,36 @@ impl PluginServices {
     }
     /// Clears shared parse caches and marks every registered session for source reconciliation.
     pub fn invalidate(&self) {
-        self.plugins.clear_cache();
-        self.skills.clear_cache();
+        self.clear_source_caches();
+        self.changes.send_modify(|generation| {
+            self.hook_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            *generation = generation.wrapping_add(1);
+        });
+    }
+    /// Clears shared parse caches and tells cache consumers, without reloading the configuration
+    /// of loaded threads' hooks: Codex's `handle_config_mutation` for writes that do not ask for a
+    /// user-config reload.
+    pub(crate) fn invalidate_caches(&self) {
+        self.clear_source_caches();
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    pub(crate) fn hook_generation(&self) -> u64 {
+        self.hook_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn publish_hooks_if_current(&self, expected: u64, publish: impl FnOnce()) -> bool {
+        let _owner = self.changes.borrow();
+        if self.hook_generation() != expected {
+            return false;
+        }
+        publish();
+        true
+    }
+    fn clear_source_caches(&self) {
+        self.plugins.clear_cache();
+        self.skills.clear_cache();
     }
     /// The plugins `input` selects, as Codex's session asks its plugin manager when it builds the
     /// session's hook configuration from the session's own configuration.
@@ -362,7 +393,7 @@ impl PluginServices {
     > {
         let _write = self.writes.lock().await;
         let response = Box::pin(self.config_manager.write_value(params)).await?;
-        self.invalidate();
+        self.invalidate_caches();
         Ok(response)
     }
     /// Writes ordered user-config edits. Edits limited to session-static defaults do not clear
@@ -385,12 +416,44 @@ impl PluginServices {
                         | "personality"
                 )
             });
+        let reload = params.reload_user_config;
         let _write = self.writes.lock().await;
         let response = Box::pin(self.config_manager.batch_write(params)).await?;
         if !session_defaults_only {
-            self.invalidate();
+            if reload {
+                self.invalidate();
+                self.reload_loaded_thread_hooks().await;
+            } else {
+                self.invalidate_caches();
+            }
         }
         Ok(response)
+    }
+
+    /// Registers a loaded thread's hook refresh for writes that reload user configuration.
+    pub(crate) fn register_hook_reload(&self, refresh: &Arc<crate::thread_hooks::HookRefresh>) {
+        let mut reloads = self
+            .hook_reloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reloads.retain(|refresh| refresh.strong_count() > 0);
+        reloads.push(Arc::downgrade(refresh));
+    }
+
+    /// Codex's `reload_user_config` refreshes every loaded thread before the write responds, so
+    /// the next hook a thread runs, including the `SessionEnd` of an idle thread unloaded right
+    /// after the write, already uses the written handlers.
+    async fn reload_loaded_thread_hooks(&self) {
+        let reloads: Vec<_> = self
+            .hook_reloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for refresh in reloads {
+            Box::pin(refresh.reconcile(false)).await;
+        }
     }
     /// Persists a skill enablement override in the product home config.
     pub async fn write_skill_config(&self, edit: ra_config::ConfigEdit) -> anyhow::Result<()> {
@@ -399,7 +462,7 @@ impl PluginServices {
             .with_edits([edit])
             .apply()
             .await?;
-        self.invalidate();
+        self.invalidate_caches();
         Ok(())
     }
     pub async fn read(&self, request: PluginReadRequest) -> Result<PluginReadOutcome, String> {
@@ -557,17 +620,6 @@ impl PluginServices {
     /// The current invalidation generation; each successful mutation advances it.
     pub fn generation(&self) -> u64 {
         *self.changes.borrow()
-    }
-
-    /// Publishes only while the source owner is unchanged. Holding the watch read guard makes
-    /// the comparison and publication atomic with respect to invalidation.
-    pub(crate) fn publish_if_current(&self, expected: u64, publish: impl FnOnce()) -> bool {
-        let generation = self.changes.borrow();
-        if *generation != expected {
-            return false;
-        }
-        publish();
-        true
     }
 
     /// Applies the effective state for `cwd` now and after every invalidation. Requests coalesce:

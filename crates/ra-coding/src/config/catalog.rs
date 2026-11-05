@@ -910,3 +910,50 @@ impl ModelInfo {
         })
     }
 }
+
+/// Codex's model-metadata match (`models-manager` `construct_model_info_from_candidates`): the
+/// longest catalog slug that prefixes `model`, then one retry for a `namespace/model` slug.
+pub(crate) fn find_model_by_slug<S: AsRef<str>, T: Copy>(
+    model: &str,
+    candidates: &[(S, T)],
+) -> Option<T> {
+    find_model_by_longest_prefix(model, candidates)
+        .or_else(|| find_model_by_namespaced_suffix(model, candidates))
+}
+
+fn find_model_by_longest_prefix<S: AsRef<str>, T: Copy>(
+    model: &str,
+    candidates: &[(S, T)],
+) -> Option<T> {
+    let mut best: Option<&(S, T)> = None;
+    for candidate in candidates {
+        if !model.starts_with(candidate.0.as_ref()) {
+            continue;
+        }
+        if best.is_none_or(|current| candidate.0.as_ref().len() > current.0.as_ref().len()) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|candidate| candidate.1)
+}
+
+fn find_model_by_namespaced_suffix<S: AsRef<str>, T: Copy>(
+    model: &str,
+    candidates: &[(S, T)],
+) -> Option<T> {
+    // Retry metadata lookup for a single namespaced slug like `namespace/model-name`.
+    // This only strips one leading namespace segment and only when the namespace looks
+    // like a simple provider id to avoid broadly matching arbitrary aliases.
+    let (namespace, suffix) = model.split_once('/')?;
+    if suffix.contains('/') {
+        return None;
+    }
+    if namespace.is_empty()
+        || !namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    find_model_by_longest_prefix(suffix, candidates)
+}

@@ -131,7 +131,7 @@ impl ThreadFactory for CodingThreadFactory {
             Some(builder) => {
                 let generation = host
                     .plugin_services()
-                    .map_or(0, |plugins| plugins.generation());
+                    .map_or(0, |plugins| plugins.hook_generation());
                 let mut builder = builder.clone();
                 builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
                 ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())

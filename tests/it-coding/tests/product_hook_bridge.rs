@@ -587,7 +587,7 @@ command = '''printf '%s' '{{"continue":false,"stopReason":"replacement feedback"
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = '''if [ -f '{}' ]; then exit 0; fi; touch '{}'; echo 'continue & verify' >&2; exit 2'''
+command = '''if [ -f '{}' ]; then exit 0; fi; touch '{}'; echo 'continue with "waves" & <tides>' >&2; exit 2'''
 "#, stop_gate.display(), stop_gate.display())).await;
     let hooks = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
     let model = Arc::new(InjectionWireModel(std::sync::atomic::AtomicUsize::new(0)));
@@ -657,7 +657,10 @@ command = '''if [ -f '{}' ]; then exit 0; fi; touch '{}'; echo 'continue & verif
         .filter(|i| i["type"] == "hookPrompt")
         .collect();
     assert_eq!(prompts.len(), 1);
-    assert_eq!(prompts[0]["fragments"][0]["text"], "continue & verify");
+    assert_eq!(
+        prompts[0]["fragments"][0]["text"],
+        r#"continue with "waves" & <tides>"#
+    );
     assert!(prompts[0]["fragments"][0]["hookRunId"].is_string());
     assert_eq!(
         projected

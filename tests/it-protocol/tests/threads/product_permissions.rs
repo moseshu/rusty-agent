@@ -1303,3 +1303,27 @@ async fn an_escalation_kept_sandboxed_by_denied_reads_stays_under_network_review
         "unexpected tool output: {output}"
     );
 }
+
+/// A required managed permission hook answers the real proxy request before its client is asked.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_default_permission_hook_denies_network_access_without_asking_the_client() {
+    let (request, output, _) = network_review(NetworkReview {
+        requirements: r#"
+[hooks]
+managed_dir = "/tmp"
+[[hooks.PermissionRequest]]
+matcher = "Bash"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = '''printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"network denied by default hook"}}}' '''
+"#,
+        ..NetworkReview::default()
+    }).await;
+    assert!(request.is_none());
+    assert!(
+        output.contains("network denied by default hook"),
+        "{output}"
+    );
+    assert!(!output.contains("proxied status 200"), "{output}");
+}

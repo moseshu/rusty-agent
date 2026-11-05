@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! A thread's items, live and read back, as Codex's app-server has them
 //! (`app-server-protocol/src/protocol/v2/{item,thread}.rs`, `protocol/thread_history.rs`,
 //! `app-server/src/bespoke_event_handling.rs`,
@@ -2416,5 +2417,69 @@ fn incremental_notifications_match_codex_wire_shapes() {
     round_trip!(
         ReasoningSummaryPartAddedNotification,
         json!({"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","summaryIndex":2}),
+    );
+}
+
+/// Visible hook prompts ignore other contextual blocks and decode XML escaping, as in Codex's
+/// contextual-user-message and event-mapping tests. Ordinary user text is never discarded.
+#[tokio::test]
+async fn hook_prompts_roundtrip_escaping_and_hide_only_contextual_fragments() {
+    let server = Server::start(None);
+    let mut connection = server.connect(1).await;
+    let recorder = server.create_thread().await;
+    let prompt = r#"<hook_prompt hook_run_id="run-&quot;one&quot;">Retry with &quot;waves&quot; &amp; &lt;tides&gt;</hook_prompt>"#;
+    record(
+        &recorder,
+        [
+            run_started("run-1", Some("go")),
+            RolloutItem::Item(RunItem::new(
+                ItemId::new("mixed"),
+                RunItemKind::Message(Message::new(
+                    MessageRole::User,
+                    vec![
+                        ContentBlock::text("<environment_context>ctx</environment_context>"),
+                        ContentBlock::text(prompt),
+                    ],
+                )),
+            )),
+            RolloutItem::Item(RunItem::new(
+                ItemId::new("plain"),
+                RunItemKind::Message(Message::user(prompt)),
+            )),
+            RolloutItem::Item(RunItem::new(
+                ItemId::new("user"),
+                RunItemKind::Message(Message::new(
+                    MessageRole::User,
+                    vec![
+                        ContentBlock::text("real user text"),
+                        ContentBlock::text(prompt),
+                    ],
+                )),
+            )),
+            run_ended("run-1", RolloutRunEnd::Completed),
+        ],
+    )
+    .await;
+    let page = server
+        .turns_list(
+            &mut connection,
+            ThreadTurnsListParams::new(THREAD).with_items_view(TurnItemsView::Full),
+        )
+        .await;
+    let wire = serde_json::to_value(&page).unwrap();
+    let items = wire["data"][0]["items"].as_array().unwrap();
+    for id in ["mixed", "plain"] {
+        let item = items.iter().find(|item| item["id"] == id).unwrap();
+        assert_eq!(item["type"], "hookPrompt", "{item}");
+        assert_eq!(
+            item["fragments"][0]["text"],
+            "Retry with \"waves\" & <tides>"
+        );
+        assert_eq!(item["fragments"][0]["hookRunId"], "run-\"one\"");
+        assert!(!item.to_string().contains("environment_context"));
+    }
+    assert_eq!(
+        items.iter().find(|item| item["id"] == "user").unwrap()["type"],
+        "userMessage"
     );
 }

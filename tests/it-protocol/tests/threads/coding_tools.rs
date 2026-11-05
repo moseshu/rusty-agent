@@ -662,3 +662,115 @@ async fn ephemeral_fork_children_use_the_fork_prompt_cache_key() {
     assert_eq!(children[0].prompt_cache_key(), Some(fork.thread().id()));
     assert_ne!(children[0].prompt_cache_key(), Some(parent.id()));
 }
+
+/// Codex runs SessionEnd only for the session the user started: a spawned agent's thread ends
+/// without it (`session_end_skips_subagents`). Ending the root thread here shuts its whole agent
+/// tree down, which must run the root's SessionEnd once and none for the worker below it.
+#[tokio::test]
+async fn ending_a_thread_with_spawned_agents_runs_session_end_once_for_the_root() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let log = home_path.join("session-end.jsonl");
+    let stops = home_path.join("subagent-stop.jsonl");
+    let section = |event: &str, log: &std::path::Path| {
+        format!(
+            "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = '''cat >> '{0}'; echo >> '{0}' '''\n",
+            log.display()
+        )
+    };
+    std::fs::write(
+        home_path.join("config.toml"),
+        format!(
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\n\n{}{}",
+            section("SessionEnd", &log),
+            section("SubagentStop", &stops)
+        ),
+    )
+    .unwrap();
+    let read = |log: &std::path::Path| -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let builder = ra_coding::config::ConfigBuilder::default()
+        .codex_home(home_path.clone())
+        .loader_overrides(ra_config::LoaderOverrides {
+            managed_config_path: Some(home_path.join("managed_config.toml")),
+            system_config_path: Some(home_path.join("system_config.toml")),
+            system_requirements_path: Some(home_path.join("requirements.toml")),
+            ..ra_config::LoaderOverrides::without_managed_config_for_tests()
+        })
+        .harness_overrides(ra_coding::config::ConfigOverrides {
+            bypass_hook_trust: Some(true),
+            ..ra_coding::config::ConfigOverrides::default()
+        });
+    let script = Arc::new(Script::default());
+    let agents = Agents::new(&script);
+    let services = Arc::new(configured_host::Services::default());
+    let host = services.install(CodingHost::open(&root).unwrap());
+    let settings = CodingThreadSettingsAdapter::new(
+        &root,
+        SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    )
+    .unwrap()
+    .with_rules_home(&home_path);
+    let factory = CodingThreadFactory::new(
+        host,
+        Arc::new(AgentsResolver(Arc::clone(&agents))),
+        settings,
+    )
+    .with_profile(ra_coding::CodingProfile::CodexLike)
+    .with_request_user_input()
+    .with_product_config(builder);
+    let (server, _) = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(Arc::new(factory)),
+            unload_delay: Some(Duration::ZERO),
+        },
+        None,
+    );
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.push(Step::Respond(collab(
+        "spawn_agent",
+        json!({"task_name": "worker", "message": "worker task", "fork_turns": "none"}),
+    )));
+    script.push(Step::Respond(collab(
+        "wait_agent",
+        json!({"timeout_ms": 10000}),
+    )));
+    script.answer("delegated");
+    server
+        .run_turn(&mut connection, thread.id(), "delegate")
+        .await;
+    agents.wait_for_child_calls(1).await;
+    // The worker ran under the thread's hooks: its stop was reported as SubagentStop.
+    timeout(PATIENCE, async {
+        while read(&stops).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the worker's stop runs SubagentStop");
+    assert!(
+        !log.exists(),
+        "a spawned agent finishing its task must not run SessionEnd"
+    );
+
+    unload(&server, &mut connection, thread.id()).await;
+    assert_eq!(read(&stops).len(), 1);
+    let inputs = read(&log);
+    assert_eq!(inputs.len(), 1, "{inputs:?}");
+    assert_eq!(inputs[0]["hook_event_name"], "SessionEnd");
+    assert_eq!(inputs[0]["session_id"], thread.id());
+}

@@ -308,7 +308,8 @@ impl PluginManagement for PluginRequestProcessor {
             }
             wire::PluginManagementRequest::SkillsExtraRootsSet(params) => {
                 services.skills.set_extra_roots(params.extra_roots);
-                services.invalidate();
+                // Codex clears the skill cache only; loaded threads keep their hooks.
+                services.invalidate_caches();
                 json(wire::SkillsExtraRootsSetResponse {})
             }
             wire::PluginManagementRequest::HooksList(params) => {
