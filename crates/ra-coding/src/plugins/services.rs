@@ -559,6 +559,17 @@ impl PluginServices {
         *self.changes.borrow()
     }
 
+    /// Publishes only while the source owner is unchanged. Holding the watch read guard makes
+    /// the comparison and publication atomic with respect to invalidation.
+    pub(crate) fn publish_if_current(&self, expected: u64, publish: impl FnOnce()) -> bool {
+        let generation = self.changes.borrow();
+        if *generation != expected {
+            return false;
+        }
+        publish();
+        true
+    }
+
     /// Applies the effective state for `cwd` now and after every invalidation. Requests coalesce:
     /// only the newest state is applied. `consumer` is held weakly, so the binding ends with it.
     fn bind_consumer<T, F, Fut>(

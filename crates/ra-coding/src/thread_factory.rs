@@ -129,6 +129,9 @@ impl ThreadFactory for CodingThreadFactory {
         let mut hooks = None;
         let settings = match &self.product_config {
             Some(builder) => {
+                let generation = host
+                    .plugin_services()
+                    .map_or(0, |plugins| plugins.generation());
                 let mut builder = builder.clone();
                 builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
                 ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())
@@ -141,24 +144,24 @@ impl ThreadFactory for CodingThreadFactory {
                 // As in Codex's thread start, resume and fork, a named profile requirements
                 // disallow falls back to the required value with a startup warning; only a
                 // settings or turn update refuses it.
-                let ignore_user_config = builder.ignores_user_config();
                 let settings = self
                     .settings
                     .clone()
-                    .with_product_config(&config, ProductPermissionSource::new(builder));
+                    .with_product_config(&config, ProductPermissionSource::new(builder.clone()));
                 settings
                     .start_network_proxy(&config)
                     .await
                     .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
                 // As Codex's session creation, a required managed hook that fails to load fails
                 // the thread.
-                let thread_hooks = CodingThreadHooks::build(
-                    &config,
+                let thread_hooks = Box::pin(CodingThreadHooks::build_refreshing(
+                    config,
+                    builder,
                     &host,
                     request.thread_id().clone(),
-                    ignore_user_config,
+                    generation,
                     request.policy().environments(),
-                )
+                ))
                 .await
                 .map_err(|error| hook_construction_error(&error))?;
                 settings.attach_hook_runtime(Arc::clone(thread_hooks.runtime()));

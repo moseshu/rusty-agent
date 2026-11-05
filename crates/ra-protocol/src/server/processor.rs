@@ -671,7 +671,7 @@ impl MessageProcessor {
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::TurnStart { params, .. } => {
-                let result = self.turn_processor.turn_start(params).await;
+                let result = Box::pin(self.turn_processor.turn_start(params)).await;
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::TurnSteer { params, .. } => {

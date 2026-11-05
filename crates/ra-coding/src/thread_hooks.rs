@@ -15,7 +15,7 @@
 //! - The thread turn each hook run belongs to is resolved by the hook bridge from the runs it
 //!   binds, rather than kept here.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -25,7 +25,7 @@ use ra_core::session::SessionId;
 use ra_protocol::server::{ThreadProductBinding, ThreadProductRuntime};
 use ra_runtime::thread::ThreadEvent;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigBuilder};
 use crate::hook_mcp_executor::CodingHookMcpExecutor;
 use crate::hooks::{
     HookMcpCall, HookMcpExecutor, HooksConfig, ProductHookRuntime, ProductHookSession,
@@ -85,6 +85,8 @@ fn hook_shell(shell: &DetectedShell) -> (String, Vec<String>) {
 /// One thread's product hooks, for the app server to bind and close with the thread.
 pub struct CodingThreadHooks {
     runtime: Arc<ProductHookRuntime>,
+    refresh: OnceLock<Arc<HookRefresh>>,
+    refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     executor: Arc<crate::thread_environments::ThreadExecutorHooks>,
     /// Warnings from loading the hooks, shown once the thread can report them.
     startup_warnings: Mutex<Vec<String>>,
@@ -143,9 +145,68 @@ impl CodingThreadHooks {
         let startup_warnings = Mutex::new(runtime.startup_warnings());
         Ok(Self {
             runtime,
+            refresh: OnceLock::new(),
+            refresh_task: Mutex::new(None),
             executor,
             startup_warnings,
         })
+    }
+
+    pub(crate) async fn build_refreshing(
+        config: Config,
+        builder: ConfigBuilder,
+        host: &CodingHost,
+        thread_id: SessionId,
+        generation: u64,
+        environments: Option<&[ra_protocol::server::protocol::TurnEnvironmentParams]>,
+    ) -> anyhow::Result<Self> {
+        let hooks = Self::build(
+            &config,
+            host,
+            thread_id,
+            builder.ignores_user_config(),
+            environments,
+        )
+        .await?;
+        if let Some(plugins) = host.plugin_services() {
+            hooks.bind_refresh(config, builder, Arc::clone(plugins), generation);
+        }
+        Ok(hooks)
+    }
+
+    fn bind_refresh(
+        &self,
+        config: Config,
+        builder: ConfigBuilder,
+        plugins: Arc<crate::plugins::PluginServices>,
+        generation: u64,
+    ) {
+        let mut changes = plugins.subscribe();
+        let refresh = Arc::new(HookRefresh {
+            runtime: Arc::clone(&self.runtime),
+            plugins,
+            builder,
+            state: tokio::sync::Mutex::new(HookRefreshState { config, generation }),
+        });
+        let weak = Arc::downgrade(&refresh);
+        self.refresh
+            .set(refresh)
+            .unwrap_or_else(|_| unreachable!("bound once"));
+        let task = tokio::spawn(async move {
+            loop {
+                changes.borrow_and_update();
+                let Some(refresh) = weak.upgrade() else { break };
+                Box::pin(refresh.reconcile(false)).await;
+                drop(refresh);
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        *self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(task);
     }
 
     pub(crate) fn install(
@@ -188,6 +249,34 @@ impl CodingThreadHooks {
         Self::build(config, host, thread_id, false, None).await
     }
 
+    /// Builds and binds the production refresh path for integration tests.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub async fn build_refreshing_for_test(
+        builder: ConfigBuilder,
+        host: &CodingHost,
+        thread_id: SessionId,
+    ) -> anyhow::Result<Self> {
+        let generation = host
+            .plugin_services()
+            .map_or(0, |plugins| plugins.generation());
+        let config = builder.clone().build().await?;
+        Box::pin(Self::build_refreshing(
+            config, builder, host, thread_id, generation, None,
+        ))
+        .await
+    }
+
+    /// Returns the last successfully published source owner for integration tests.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub async fn refresh_generation_for_test(&self) -> Option<u64> {
+        match self.refresh.get() {
+            Some(refresh) => Some(refresh.state.lock().await.generation),
+            None => None,
+        }
+    }
+
     /// Installs the same production hook and step bindings as the default factory.
     #[cfg(feature = "test-api")]
     #[doc(hidden)]
@@ -224,6 +313,12 @@ impl ThreadProductRuntime for CodingThreadHooks {
         self.runtime.bind_transcript(binding.thread_handle());
     }
 
+    async fn activate_turn(&self) {
+        if let Some(refresh) = self.refresh.get() {
+            Box::pin(refresh.reconcile(true)).await;
+        }
+    }
+
     fn on_thread_event(&self, event: &ThreadEvent) {
         if let ThreadEvent::TurnComplete { turn_id, .. }
         | ThreadEvent::TurnAborted { turn_id, .. } = event
@@ -233,10 +328,115 @@ impl ThreadProductRuntime for CodingThreadHooks {
     }
 
     async fn close(&self) {
+        let task = self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
         self.executor.close();
         self.runtime.stop_background().await;
         self.runtime.release_thread_events();
     }
+}
+
+impl Drop for CodingThreadHooks {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .refresh_task
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+struct HookRefreshState {
+    config: Config,
+    generation: u64,
+}
+
+/// Serializes thread-owned configuration loads and turn activation. The service generation is
+/// the local equivalent of Codex's session configuration owner; the disabled plugin set is empty
+/// until the product accepts per-turn plugin disabling.
+struct HookRefresh {
+    runtime: Arc<ProductHookRuntime>,
+    plugins: Arc<crate::plugins::PluginServices>,
+    builder: ConfigBuilder,
+    state: tokio::sync::Mutex<HookRefreshState>,
+}
+
+impl HookRefresh {
+    async fn reconcile(&self, activate: bool) {
+        let mut state = self.state.lock().await;
+        loop {
+            let generation = self.plugins.generation();
+            let reload = generation != state.generation;
+            if !reload && !activate {
+                return;
+            }
+            let config = if reload {
+                match self
+                    .builder
+                    .clone()
+                    .build()
+                    .await
+                    .and_then(|incoming| refreshed_hook_config(&state.config, &incoming))
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reload thread hook configuration");
+                        return;
+                    }
+                }
+            } else {
+                state.config.clone()
+            };
+            let hooks = build_hooks_config(&config, Some(&self.plugins), &[]).await;
+            let changed = reload
+                || !self.runtime.current().matches_plugin_hooks(
+                    &hooks.plugin_hook_sources,
+                    &hooks.plugin_hook_load_warnings,
+                );
+            if self.plugins.publish_if_current(generation, || {
+                if changed {
+                    self.runtime.refresh(hooks);
+                }
+                state.config = config;
+                state.generation = generation;
+            }) {
+                return;
+            }
+            // A newer owner won while sources were loading. Rebuild from that owner's inputs.
+        }
+    }
+}
+
+/// The hooks subset of Codex's `resolve_runtime_refresh(User)`: refresh only the user
+/// layer and plugin policy. Feature flags, notify, trust and all non-user layers belong
+/// to the existing session, even when the incoming builder loaded newer values.
+fn refreshed_hook_config(current: &Config, incoming: &Config) -> std::io::Result<Config> {
+    #[derive(serde::Deserialize)]
+    struct RefreshToml {
+        #[serde(default)]
+        plugins: ra_config::types::PluginsConfigToml,
+    }
+    let layers = current
+        .config_layer_stack
+        .with_user_layer_from(&incoming.config_layer_stack);
+    let values: RefreshToml = layers
+        .effective_config()
+        .try_into()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut config = current.clone();
+    config.config_layer_stack = layers;
+    config.plugins = values.plugins;
+    Ok(config)
 }
 
 /// The MCP executor of a host without an MCP runtime: MCP hooks fail and command hooks still run.

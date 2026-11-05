@@ -1292,3 +1292,23 @@ materializes a known local transcript before returning its path, logs persistenc
 still returning that path, and flushes before Interrupt and SessionEnd hooks. Non-local recorders
 are not materialized for hook queries. The default protocol/product binding uses a weak thread
 handle and queries on every dispatch. This adds no persistence requirement for non-local stores.
+
+### Thread-owned product hook refresh
+
+Coding threads with PluginServices now rebuild hooks on service invalidation with the thread's
+own ConfigBuilder as incoming input. Following Codex's user refresh contract, only the incoming
+user layer replaces the current user layer, and plugin policy is recalculated from the merged
+layers. Features (including CodexHooks and Plugins), notify, bypass_hook_trust, CLI overrides,
+and project or managed layers retain their session values. Turn submission checks plugin sources
+against the last loaded configuration, including external installation-version changes. The
+existing service generation guards publication; stale builds retry with current inputs, and
+reconfiguration preserves running background handlers.
+
+Unlike Codex's distinct configuration and plugin refresh calls, the local watch signal combines
+both and reloads incoming configuration for either, so a plugin change can additionally bring in
+external user-file edits, but cannot replace other session layers or fixed runtime values.
+Invalidation is processed asynchronously and a config
+write response is not a barrier for every loaded thread; turn submission reconciles pending
+invalidation before proceeding. Activation also runs before steer submissions because per-turn
+plugin disabling is unsupported. Hosts without PluginServices have no refresh trigger. These are
+product-layer adaptations; framework RunHooks and provider-neutral core contracts are unchanged.

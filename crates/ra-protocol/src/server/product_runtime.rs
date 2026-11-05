@@ -61,6 +61,10 @@ pub trait ThreadProductRuntime: Send + Sync + 'static {
     /// Called once, after the thread is built and before anything can start a turn on it.
     fn bind_thread(&self, binding: ThreadProductBinding);
 
+    /// Reconciles product sources before each turn submission, including submissions without
+    /// settings overrides.
+    async fn activate_turn(&self) {}
+
     /// Observes ordered thread events after product callbacks have run, for terminal cleanup.
     fn on_thread_event(&self, _event: &ThreadEvent) {}
 

@@ -642,3 +642,6 @@ mod executor;
 
 #[path = "product_hooks/fields.rs"]
 mod fields;
+
+#[path = "product_hooks/refresh.rs"]
+mod refresh;

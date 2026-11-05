@@ -125,6 +125,9 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(content)
             .with_thread_settings(overrides)
             .on_start(start);
+        if let Some(product) = &thread.product {
+            product.activate_turn().await;
+        }
         let submission = thread.start_or_steer_turn(request).await;
         if !matches!(
             submission,
