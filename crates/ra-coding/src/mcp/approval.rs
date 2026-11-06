@@ -225,47 +225,60 @@ impl McpApprovalState {
     }
 }
 
-pub(super) struct ProductMcpTool {
+pub(crate) struct ProductMcpTool {
     inner: Arc<McpTool>,
-    policy: Arc<ProductMcpPolicy>,
+    policy: Option<Arc<ProductMcpPolicy>>,
 }
 impl ProductMcpTool {
-    pub(super) fn new(inner: Arc<McpTool>, policy: Arc<ProductMcpPolicy>) -> Self {
+    pub(super) fn new(inner: Arc<McpTool>, policy: Option<Arc<ProductMcpPolicy>>) -> Self {
         Self { inner, policy }
     }
+    pub(crate) fn hook_name(&self) -> &str {
+        self.inner.hook_name()
+    }
+
     async fn invoke(&self, context: &ToolContext<'_>) -> Result<ToolOutput> {
-        let output = self.inner.invoke(context.arguments().clone()).await?;
+        let result = self.inner.invoke_raw(context.arguments().clone()).await?;
         if let Some(limits) = context
             .run()
             .app_context::<CodingThreadSettings>()
-            .and_then(|settings| settings.mcp_feedback_limits.as_ref())
+            .and_then(|settings| settings.mcp_hook_results.as_ref())
         {
+            let output = ra_mcp::tool::map_tool_result(result.clone())?;
             let key = (context.run().run_id().clone(), context.call_id().clone());
-            let mut limits = limits.lock().unwrap_or_else(PoisonError::into_inner);
-            match self
+            let token_limit = self
                 .policy
-                .output_limits
-                .get(self.inner.info().tool().name.as_ref())
-            {
-                Some(limit) => {
-                    limits.insert(key, *limit);
-                }
-                None => {
-                    limits.remove(&key);
-                }
-            }
+                .as_ref()
+                .and_then(|policy| {
+                    policy
+                        .output_limits
+                        .get(self.inner.info().tool().name.as_ref())
+                })
+                .copied();
+            limits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    key,
+                    crate::hooks::McpHookResult {
+                        result,
+                        input: context.arguments().clone(),
+                        token_limit,
+                    },
+                );
+            Ok(output)
+        } else {
+            ra_mcp::tool::map_tool_result(result)
         }
-        Ok(output)
     }
 
-    fn state(&self, context: &ToolContext<'_>) -> McpApprovalState {
+    fn state(&self, context: &ToolContext<'_>, policy: &ProductMcpPolicy) -> McpApprovalState {
         let info = self.inner.info();
-        let mode = self
-            .policy
+        let mode = policy
             .overrides
             .get(info.tool().name.as_ref())
             .copied()
-            .unwrap_or(self.policy.default_mode);
+            .unwrap_or(policy.default_mode);
         McpApprovalState {
             product_mcp_approval: true,
             run_id: context.run().run_id().as_str().to_owned(),
@@ -273,15 +286,15 @@ impl ProductMcpTool {
             arguments: context.arguments().clone(),
             key: McpApprovalKey {
                 server: info.server_name().into(),
-                plugin_id: self.policy.plugin_id.clone(),
+                plugin_id: policy.plugin_id.clone(),
                 connector_id: info.connector_id().map(str::to_owned),
                 link_id: None,
                 tool_name: info.tool().name.to_string(),
             },
             mode,
-            elicitation: self.policy.elicitation,
-            allow_persistent: self.policy.allow_persistent,
-            persist_path: self.policy.persist_path.clone(),
+            elicitation: policy.elicitation,
+            allow_persistent: policy.allow_persistent,
+            persist_path: policy.persist_path.clone(),
             title: info.tool().title.clone(),
             description: info.tool().description.as_ref().map(ToString::to_string),
         }
@@ -386,15 +399,22 @@ impl Tool for ProductMcpTool {
     // Product approval is requested inside the invocation, as in the source. Framework
     // always-approve answers and action-class auto-allow cannot turn it into a persistent grant.
     fn options(&self) -> ToolOptions {
-        self.inner
-            .options()
-            .with_approval(ToolApprovalPolicy::Never)
+        if self.policy.is_some() {
+            self.inner
+                .options()
+                .with_approval(ToolApprovalPolicy::Never)
+        } else {
+            self.inner.options()
+        }
     }
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
         self.inner.needs_approval(context).await
     }
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
-        let state = self.state(&context);
+        let Some(policy) = self.policy.as_ref() else {
+            return self.invoke(&context).await;
+        };
+        let state = self.state(&context, policy);
         let settings = context.run().app_context::<CodingThreadSettings>();
         if settings.is_some_and(|settings| auto_approved(settings, state.mode))
             || !self.inner.needs_approval(&context).await?

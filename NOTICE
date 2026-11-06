@@ -1043,3 +1043,5 @@ existing upstream attribution and licensing.
 | `crates/ra-protocol/src/server/thread_history.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/context/contextual_user_message.rs; codex-rs/app-server-protocol/src/protocol/thread_history.rs |
 | `tests/it-protocol/tests/items.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/context/contextual_user_message_tests.rs; codex-rs/core/src/event_mapping_tests.rs |
 | `tests/it-coding/tests/plugin_management_flow.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/effective_plugin_change_tests.rs; codex-rs/app-server/tests/suite/v2/plugin_read.rs |
+| `tests/it-protocol/tests/threads/product_hooks/mcp_payload.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; codex-rs/core/src/tools/registry.rs |
+| `crates/ra-mcp/src/tool/prepared.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs |

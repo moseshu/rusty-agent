@@ -28,7 +28,7 @@ use crate::{
     item::{CallId, Compaction, ItemId, Message, ModelInputItem, ToolCallOutput},
     session::SessionId,
     state::RunId,
-    tool::{ToolOrigin, ToolOutput, ToolServices},
+    tool::{Tool, ToolOrigin, ToolOutput, ToolServices},
 };
 
 /// Lifecycle boundaries understood by host hooks.
@@ -111,11 +111,23 @@ impl CompactTrigger {
 }
 
 /// Facts about the call being checked, before provider-specific serialization.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ToolHookData<'a> {
     origin: &'a ToolOrigin,
     call_id: &'a CallId,
     arguments: &'a serde_json::Value,
+    tool: Option<&'a dyn Tool>,
+}
+
+impl std::fmt::Debug for ToolHookData<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolHookData")
+            .field("origin", self.origin)
+            .field("call_id", self.call_id)
+            .field("arguments", self.arguments)
+            .field("tool", &self.tool.map(Tool::origin))
+            .finish()
+    }
 }
 
 impl<'a> ToolHookData<'a> {
@@ -130,7 +142,19 @@ impl<'a> ToolHookData<'a> {
             origin,
             call_id,
             arguments,
+            tool: None,
         }
+    }
+    /// Borrows the actual selected executable, retaining its adapter-owned identity.
+    #[must_use]
+    pub fn with_tool(mut self, tool: &'a dyn Tool) -> Self {
+        self.tool = Some(tool);
+        self
+    }
+    /// The selected executable, when supplied by the runtime.
+    #[must_use]
+    pub const fn tool(&self) -> Option<&'a dyn Tool> {
+        self.tool
     }
     /// Routing identity of the tool, including its namespace.
     #[must_use]

@@ -158,10 +158,10 @@ pub use product::ProductPermissionSource;
 /// A policy captured by one model step and its tools.
 #[derive(Clone, Debug)]
 pub struct CodingThreadSettings {
-    // Where a successful MCP invocation hands its captured presentation limit to its own post
-    // hook. Present only when product hooks are installed, so no entry waits for a consumer that
+    // Where an MCP invocation hands its original protocol result and presentation limit to
+    // its own post hook. Present only when product hooks are installed, so no entry waits for a consumer that
     // never comes; the hook runtime owns the table and clears it per turn.
-    pub(crate) mcp_feedback_limits: Option<crate::hooks::FeedbackLimits>,
+    pub(crate) mcp_hook_results: Option<crate::hooks::McpHookResults>,
     pub(crate) mcp_approvals: Arc<Mutex<std::collections::BTreeSet<crate::mcp::McpApprovalKey>>>,
     cwd: PathBuf,
     pub(crate) environments: Vec<ra_protocol::server::protocol::TurnEnvironmentParams>,
@@ -687,7 +687,7 @@ impl CodingThreadSettingsAdapter {
                 permissions: Arc::default(),
                 network_proxy: Arc::default(),
                 mcp_approvals: Arc::default(),
-                mcp_feedback_limits: None,
+                mcp_hook_results: None,
             },
             profiles,
             file_system_read_profiles: BTreeMap::new(),

@@ -1239,7 +1239,7 @@ default_tools_approval_mode = "approve"
 args = [{}]
 {tool_policy}
 [[hooks.PostToolUse]]
-matcher = "^echo$"
+matcher = "^mcp__echo__echo$"
 [[hooks.PostToolUse.hooks]]
 type = "mcp_tool"
 server = "echo"
@@ -1611,3 +1611,6 @@ async fn feedback_follows_the_current_turn_model_instead_of_the_initial_model() 
         );
     }
 }
+
+#[path = "mcp_payload.rs"]
+mod mcp_payload;

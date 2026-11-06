@@ -129,13 +129,20 @@ pub struct ProductHookRuntime {
     executor_hooks: OnceLock<Arc<dyn ExecutorHookSourceProvider>>,
     transcript: OnceLock<ra_runtime::thread::WeakAgentThread>,
     feedback_policy: OnceLock<FeedbackPolicy>,
-    feedback_limits: FeedbackLimits,
+    mcp_hook_results: McpHookResults,
 }
 
-/// MCP output limits captured by successful invocations, keyed by run and call, for their own
-/// `PostToolUse` hooks.
-pub(crate) type FeedbackLimits =
-    Arc<Mutex<std::collections::HashMap<(ra_core::state::RunId, ra_core::item::CallId), usize>>>;
+/// MCP results captured by invocations, keyed by run and call, for their own `PostToolUse` hooks.
+pub(crate) type McpHookResults = Arc<
+    Mutex<std::collections::HashMap<(ra_core::state::RunId, ra_core::item::CallId), McpHookResult>>,
+>;
+
+#[derive(Debug)]
+pub(crate) struct McpHookResult {
+    pub(crate) result: ra_mcp::rmcp::model::CallToolResult,
+    pub(crate) input: Value,
+    pub(crate) token_limit: Option<usize>,
+}
 
 /// Model metadata belongs to the session; the selected model belongs to each active run.
 struct FeedbackPolicy {
@@ -218,24 +225,24 @@ impl ProductHookRuntime {
             executor_hooks: OnceLock::new(),
             transcript: OnceLock::new(),
             feedback_policy: OnceLock::new(),
-            feedback_limits: FeedbackLimits::default(),
+            mcp_hook_results: McpHookResults::default(),
         }))
     }
 
-    /// The table MCP invocations of this thread record their output limits in.
-    pub(crate) fn feedback_limits(&self) -> FeedbackLimits {
-        Arc::clone(&self.feedback_limits)
+    /// The invocation-owned MCP protocol results and presentation limits for this thread.
+    pub(crate) fn mcp_hook_results(&self) -> McpHookResults {
+        Arc::clone(&self.mcp_hook_results)
     }
 
-    /// Drops limits no post hook consumed in `turn`, including those of its nested runs.
-    pub(crate) fn finish_turn_feedback(&self, turn: &str) {
+    /// Drops results no post hook consumed in `turn`, including those of its nested runs.
+    pub(crate) fn finish_turn_mcp_results(&self, turn: &str) {
         let turn_of = self
             .context_delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .turn_of
             .clone();
-        self.feedback_limits
+        self.mcp_hook_results
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(run, _), _| {
@@ -740,13 +747,20 @@ impl ProductHookRuntime {
                 }
             }
             HookEvent::PostToolUse { call, output } => {
-                // The successful invocation records the limit from its own immutable binding.
+                // The invocation retains its original result and limit from its immutable binding.
                 // Consume it by call identity, never by a mutable discovery name cache.
-                let token_limit = self
-                    .feedback_limits
+                let mcp_result = self
+                    .mcp_hook_results
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&(context.run().run_id().clone(), call.call_id().clone()));
+                if mcp_result
+                    .as_ref()
+                    .is_some_and(|result| result.result.is_error == Some(true))
+                {
+                    return HookDecision::Continue;
+                }
+                let token_limit = mcp_result.as_ref().and_then(|result| result.token_limit);
                 let feedback_limit = self.feedback_policy.get().map(|policy| {
                     token_limit.map_or_else(
                         || policy.for_model(&model),
@@ -773,9 +787,14 @@ impl ProductHookRuntime {
                     None => message,
                 };
                 let tool = HookToolName::for_call(&call);
-                let tool_response = output.as_text().map_or_else(
-                    || serde_json::to_value(output).unwrap_or(Value::Null),
-                    |text| Value::String(text.to_owned()),
+                let tool_response = mcp_result.as_ref().map_or_else(
+                    || {
+                        output.as_text().map_or_else(
+                            || serde_json::to_value(output).unwrap_or(Value::Null),
+                            |text| Value::String(text.to_owned()),
+                        )
+                    },
+                    |result| serde_json::to_value(&result.result).unwrap_or(Value::Null),
                 );
                 let request = PostToolUseRequest {
                     session_id: session.session_id.clone(),
@@ -788,7 +807,9 @@ impl ProductHookRuntime {
                     tool_name: tool.name,
                     matcher_aliases: tool.matcher_aliases,
                     tool_use_id: call.call_id().to_string(),
-                    tool_input: hook_input(&call),
+                    tool_input: mcp_result
+                        .as_ref()
+                        .map_or_else(|| hook_input(&call), |result| result.input.clone()),
                     tool_response,
                 };
                 self.emit_started(&turn_id, hooks.preview_post_tool_use(&request));
@@ -1089,6 +1110,14 @@ struct HookToolName {
 
 impl HookToolName {
     fn for_call(call: &ToolHookData<'_>) -> Self {
+        if let Some(tool) = call.tool()
+            && let Some(name) = crate::mcp::hook_tool_name(tool)
+        {
+            return Self {
+                name: name.to_owned(),
+                matcher_aliases: Vec::new(),
+            };
+        }
         let origin = call.origin();
         match origin.name() {
             // Shell-like tools keep the historical hook name.
@@ -1195,6 +1224,9 @@ impl ContextDelivery {
 }
 
 fn hook_input(call: &ToolHookData<'_>) -> Value {
+    if call.tool().and_then(crate::mcp::hook_tool_name).is_some() {
+        return call.arguments().clone();
+    }
     if call.origin().namespace().is_none() {
         match call.origin().name() {
             "exec_command" => {
@@ -1209,6 +1241,9 @@ fn hook_input(call: &ToolHookData<'_>) -> Value {
     call.arguments().clone()
 }
 fn native_input(call: &ToolHookData<'_>, input: Value) -> std::result::Result<Value, String> {
+    if call.tool().and_then(crate::mcp::hook_tool_name).is_some() {
+        return Ok(input);
+    }
     if call.origin().namespace().is_none()
         && matches!(call.origin().name(), "exec_command" | "apply_patch")
     {

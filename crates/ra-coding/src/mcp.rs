@@ -954,10 +954,7 @@ impl CodingMcpRuntime {
             .iter()
             .find(|(entry, _)| entry.server.name() == tool.info().server_name())
             .and_then(|(_, view)| view.product_policy.clone());
-        match policy {
-            Some(policy) => Arc::new(approval::ProductMcpTool::new(tool, policy)),
-            None => tool,
-        }
+        Arc::new(approval::ProductMcpTool::new(tool, policy))
     }
     pub(crate) async fn hook_tool_infos(
         &self,
@@ -1310,4 +1307,11 @@ impl CodingMcpRuntime {
         .flatten()
         .collect::<Vec<McpToolCatalogSource>>()
     }
+}
+
+/// The captured product MCP recipient; ordinary tools with the same name remain ordinary tools.
+pub(crate) fn hook_tool_name(tool: &dyn Tool) -> Option<&str> {
+    let tool = tool as &dyn std::any::Any;
+    tool.downcast_ref::<approval::ProductMcpTool>()
+        .map(approval::ProductMcpTool::hook_name)
 }

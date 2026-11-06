@@ -200,15 +200,57 @@ pub fn normalize_tools_for_model_with_prefix<I>(
 where
     I: IntoIterator<Item = McpToolInfo>,
 {
+    normalize_tools_with_catalog_identity(
+        tools,
+        prefix_mcp_tool_names,
+        non_prefixed_mcp_tool_servers,
+        false,
+    )
+}
+
+/// Python naming modes can bind multiple catalog instances with the same server name.
+/// Keep those recipients distinct for hook allocation without changing model naming rules.
+pub(crate) fn normalize_tools_for_hooks(tools: Vec<McpToolInfo>) -> Vec<McpToolInfo> {
+    normalize_tools_with_catalog_identity(tools, true, &[], true)
+}
+
+fn normalize_tools_with_catalog_identity<I>(
+    tools: I,
+    prefix_mcp_tool_names: bool,
+    non_prefixed_mcp_tool_servers: &[String],
+    distinguish_catalogs: bool,
+) -> Vec<McpToolInfo>
+where
+    I: IntoIterator<Item = McpToolInfo>,
+{
+    let tools: Vec<_> = tools.into_iter().collect();
+    let mut catalogs_by_server = HashMap::<&str, HashSet<usize>>::new();
+    if distinguish_catalogs {
+        for tool in &tools {
+            catalogs_by_server
+                .entry(&tool.server_name)
+                .or_default()
+                .insert(tool.server_index);
+        }
+    }
+    let repeated_servers: HashSet<String> = catalogs_by_server
+        .into_iter()
+        .filter(|(_, indexes)| indexes.len() > 1)
+        .map(|(name, _)| name.to_owned())
+        .collect();
     let mut seen_raw_names = HashSet::new();
     let mut candidates = Vec::new();
     for tool in tools {
-        let raw_namespace_identity = format!(
+        let mut raw_namespace_identity = format!(
             "{}\0{}\0{}",
             tool.server_name,
             tool.callable_namespace,
             tool.connector_id.as_deref().unwrap_or_default()
         );
+        if repeated_servers.contains(&tool.server_name) {
+            raw_namespace_identity.push('\0');
+            raw_namespace_identity.push_str(&tool.server_index.to_string());
+        }
         let raw_tool_identity = format!(
             "{}\0{}\0{}",
             raw_namespace_identity, tool.callable_name, tool.tool.name

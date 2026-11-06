@@ -371,3 +371,181 @@ fn python_original(servers: &[(&str, &[&str])]) -> ra_core::error::Result<Vec<St
             .collect(),
     )
 }
+
+struct CatalogOnlyClient;
+
+#[async_trait::async_trait]
+impl ra_mcp::tool::McpToolClientSource for CatalogOnlyClient {
+    async fn client(&self) -> ra_core::error::Result<ra_mcp::client::McpClient> {
+        Err(ra_core::error::Error::caller(
+            "catalog allocation must not resolve a transport",
+        ))
+    }
+}
+
+async fn prepared_tools(
+    servers: &[(&str, Vec<&str>)],
+    naming: ra_mcp::tool::McpToolNaming,
+) -> ra_core::error::Result<Vec<std::sync::Arc<ra_mcp::tool::McpTool>>> {
+    let catalogs: Vec<ra_mcp::tool::McpToolCatalogSource> = servers
+        .iter()
+        .map(|(name, tools)| {
+            (
+                ra_mcp::tool::McpToolCatalog::new(
+                    *name,
+                    tools
+                        .iter()
+                        .map(|name| support::declaration(name))
+                        .collect(),
+                    ra_mcp::client::McpClientOptions::default(),
+                ),
+                std::sync::Arc::new(CatalogOnlyClient)
+                    as std::sync::Arc<dyn ra_mcp::tool::McpToolClientSource>,
+                ra_mcp::filter::ToolFilter::default(),
+            )
+        })
+        .collect();
+    ra_mcp::tool::discover_catalog_tools(
+        &catalogs,
+        &ra_mcp::tool::McpDiscoveryOptions::new().with_naming(naming),
+        &BTreeSet::new(),
+        None,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn hook_names_preserve_sanitization_shortening_and_collision_suffixes_in_all_modes() {
+    use ra_mcp::tool::McpToolNaming;
+    let long_server = format!("server.{}", "s".repeat(90));
+    let long_tool = format!("tool.{}", "t".repeat(100));
+    let servers = [
+        ("server.one", vec!["tool-name", "tool_name"]),
+        ("server_one", vec!["other"]),
+        (long_server.as_str(), vec![long_tool.as_str()]),
+    ];
+    let namespaced = prepared_tools(&servers, McpToolNaming::Namespaced)
+        .await
+        .unwrap();
+    assert_eq!(namespaced.len(), 4);
+    let expected: std::collections::BTreeMap<_, _> = namespaced
+        .iter()
+        .map(|tool| {
+            let info = tool.info();
+            let joined = format!(
+                "{}__{}",
+                info.callable_namespace().unwrap().trim_end_matches('_'),
+                info.callable_name().trim_start_matches('_')
+            );
+            assert_eq!(tool.hook_name(), joined);
+            assert!(joined.is_ascii() && joined.len() <= 128);
+            (
+                (info.server_name().to_owned(), info.tool().name.to_string()),
+                joined,
+            )
+        })
+        .collect();
+    let first = &expected[&("server.one".to_owned(), "tool-name".to_owned())];
+    let second = &expected[&("server.one".to_owned(), "tool_name".to_owned())];
+    assert_ne!(first, second);
+    assert_ne!(
+        namespaced
+            .iter()
+            .find(|tool| tool.info().server_name() == "server.one")
+            .unwrap()
+            .info()
+            .callable_namespace(),
+        Some("mcp__server_one")
+    );
+    assert_ne!(
+        namespaced
+            .iter()
+            .find(|tool| tool.info().tool().name == long_tool)
+            .unwrap()
+            .info()
+            .callable_name(),
+        long_tool
+    );
+    for naming in [McpToolNaming::Original, McpToolNaming::ServerPrefixed] {
+        let tools = prepared_tools(&servers, naming).await.unwrap();
+        let actual: std::collections::BTreeMap<_, _> = tools
+            .iter()
+            .map(|tool| {
+                (
+                    (
+                        tool.info().server_name().to_owned(),
+                        tool.info().tool().name.to_string(),
+                    ),
+                    tool.hook_name().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn hook_names_distinguish_same_named_catalogs_without_changing_python_model_names() {
+    use ra_core::tool::Tool;
+    use ra_mcp::tool::McpToolNaming;
+    let servers = [("same", vec!["first"]), ("same", vec!["second"])];
+    let mut hook_names = Vec::new();
+    for naming in [McpToolNaming::Original, McpToolNaming::ServerPrefixed] {
+        let tools = prepared_tools(&servers, naming).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_ne!(
+            tools[0].hook_name().rsplit_once("__").unwrap().0,
+            tools[1].hook_name().rsplit_once("__").unwrap().0
+        );
+        let model_names: Vec<_> = tools.iter().map(|tool| tool.origin().name()).collect();
+        assert_eq!(
+            model_names,
+            if naming == McpToolNaming::Original {
+                vec!["first", "second"]
+            } else {
+                vec!["mcp_same__first", "mcp_same__second"]
+            }
+        );
+        hook_names.push(
+            tools
+                .iter()
+                .map(|tool| tool.hook_name().to_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(hook_names[0], hook_names[1]);
+    assert!(
+        prepared_tools(&servers, McpToolNaming::Namespaced)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn prefixed_same_named_catalogs_keep_both_identical_raw_tool_names() {
+    use ra_core::tool::Tool;
+    use ra_mcp::tool::McpToolNaming;
+    let servers = [("same", vec!["echo"]), ("same", vec!["echo"])];
+    let tools = prepared_tools(&servers, McpToolNaming::ServerPrefixed)
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_ne!(tools[0].origin(), tools[1].origin());
+    assert_ne!(tools[0].hook_name(), tools[1].hook_name());
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool.info().server_name() == "same" && tool.info().tool().name == "echo")
+    );
+    assert!(
+        prepared_tools(&servers, McpToolNaming::Original)
+            .await
+            .is_err()
+    );
+    assert!(
+        prepared_tools(&servers, McpToolNaming::Namespaced)
+            .await
+            .is_err()
+    );
+}

@@ -89,6 +89,7 @@ impl McpDiscoveryOptions {
 /// Immutable metadata and a fixed or explicitly deferred connection binding.
 pub struct McpTool {
     info: McpToolInfo,
+    hook_name: String,
     client_source: Arc<dyn McpToolClientSource>,
     approval: crate::approval::RequireApprovalSetting,
     origin: ToolOrigin,
@@ -99,6 +100,7 @@ pub struct McpTool {
 impl McpTool {
     fn new(
         info: McpToolInfo,
+        hook_name: String,
         policy: &McpClientOptions,
         client_source: Arc<dyn McpToolClientSource>,
         tool_search_enabled: bool,
@@ -168,6 +170,7 @@ impl McpTool {
         // returning. A competing runner timer could drop it before that notification is sent.
         Ok(Self {
             info,
+            hook_name,
             client_source,
             approval: policy.require_approval().clone(),
             origin,
@@ -185,14 +188,25 @@ impl McpTool {
     /// The declaration's `_meta` is sent as request metadata, as Python's static tool meta is.
     /// This is a raw protocol call; local approval is enforced by runtime dispatch through [`Tool`].
     pub async fn invoke(&self, arguments: serde_json::Value) -> Result<ToolOutput> {
+        map_tool_result(self.invoke_raw(arguments).await?)
+    }
+
+    /// Calls the captured MCP recipient without projecting its protocol result into model output.
+    /// Product adapters can retain this result for their own lifecycle payloads and success policy.
+    /// Framework approval remains enforced by dispatch through [`Tool`].
+    pub async fn invoke_raw(&self, arguments: serde_json::Value) -> Result<CallToolResult> {
         let meta = self.info.tool.meta.as_ref().map(|meta| meta.0.clone());
-        map_tool_result(
-            self.client_source
-                .client()
-                .await?
-                .call_tool(&self.info.tool.name, arguments, meta)
-                .await?,
-        )
+        self.client_source
+            .client()
+            .await?
+            .call_tool(&self.info.tool.name, arguments, meta)
+            .await
+    }
+
+    /// Codex's canonical hook identity, independent of the selected model-facing naming mode.
+    #[must_use]
+    pub fn hook_name(&self) -> &str {
+        &self.hook_name
     }
 }
 #[async_trait]

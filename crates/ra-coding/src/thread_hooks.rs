@@ -222,7 +222,7 @@ impl CodingThreadHooks {
             .cloned()
         {
             settings.executor_environments = Some(self.executor.manager());
-            settings.mcp_feedback_limits = Some(self.runtime.feedback_limits());
+            settings.mcp_hook_results = Some(self.runtime.mcp_hook_results());
             config = config.with_app_context(Arc::new(settings));
         }
         config
@@ -327,7 +327,7 @@ impl ThreadProductRuntime for CodingThreadHooks {
         | ThreadEvent::TurnAborted { turn_id, .. } = event
         {
             self.executor.finish_turn(turn_id);
-            self.runtime.finish_turn_feedback(turn_id);
+            self.runtime.finish_turn_mcp_results(turn_id);
         }
     }
 

@@ -174,8 +174,10 @@ pub use timeout::ToolTimeoutError;
 ///
 /// Only identity, schema, and invocation are required. Runtime policies have safe defaults so a
 /// future framework release can add another optional hook without breaking third-party tools.
+/// The existing static lifetime also permits adapter-owned hooks to inspect the selected tool
+/// through [`std::any::Any`], without deriving adapter identity from a public tool name.
 #[async_trait]
-pub trait Tool: Send + Sync + 'static {
+pub trait Tool: std::any::Any + Send + Sync + 'static {
     /// Stable source and routing identity.
     fn origin(&self) -> &ToolOrigin;
     /// Stable adapter-owned recipient identity retained with an approval across rediscovery.

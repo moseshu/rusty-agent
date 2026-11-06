@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Prepared catalogs separate fallible server discovery from joint naming and executable binding.
 
 use super::{
@@ -5,6 +6,7 @@ use super::{
     normalize_tools_for_model_with_prefix, warn,
 };
 use crate::{
+    catalog::normalize_tools_for_hooks,
     client::{McpClient, McpClientOptions},
     filter::{ToolFilter, tool_is_model_visible},
     metadata::CachedTool,
@@ -15,7 +17,7 @@ use ra_core::{
     error::{Error, Result},
 };
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -186,26 +188,54 @@ pub async fn discover_catalog_tools(
         .chain(reserved)
         .cloned()
         .collect();
+    // Allocate the Codex identity jointly even when model tools use Python's naming mode.
+    // This retains the same sanitization and collision suffixes in all three modes.
+    let hook_names: HashMap<_, _> = normalize_tools_for_hooks(infos.clone())
+        .into_iter()
+        .map(|info| {
+            let namespace = &info.callable_namespace;
+            let joined = format!(
+                "{}__{}",
+                namespace.trim_end_matches('_'),
+                info.callable_name().trim_start_matches('_')
+            );
+            let name = if joined.starts_with("mcp__") {
+                joined
+            } else {
+                format!("mcp__{joined}")
+            };
+            ((info.server_index, info.tool.name.to_string()), name)
+        })
+        .collect();
     let infos = match options.naming {
         McpToolNaming::Original => name_tools_for_function_calling(infos, false, &reserved)?,
         McpToolNaming::ServerPrefixed => name_tools_for_function_calling(infos, true, &reserved)?,
         McpToolNaming::Namespaced => normalize_tools_for_model_with_prefix(infos, true, &[]),
     };
-    Ok(infos
-        .into_iter()
-        .filter_map(|info| {
-            let (catalog, source, _) = &catalogs[info.server_index];
-            let name = info.tool.name.to_string();
-            McpTool::new(
-                info,
-                &catalog.options,
-                source.clone(),
-                options.tool_search_enabled,
-                agent,
-            )
-            .map(Arc::new)
-            .inspect_err(|error| warn!("skipping MCP tool {name:?}: {error}"))
-            .ok()
-        })
-        .collect())
+    let mut tools = Vec::with_capacity(infos.len());
+    for info in infos {
+        let (catalog, source, _) = &catalogs[info.server_index];
+        let name = info.tool.name.to_string();
+        let hook_name = hook_names
+            .get(&(info.server_index, name.clone()))
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "missing canonical MCP hook identity for catalog {}, tool {name:?}",
+                    info.server_index
+                ))
+            })?
+            .clone();
+        match McpTool::new(
+            info,
+            hook_name,
+            &catalog.options,
+            source.clone(),
+            options.tool_search_enabled,
+            agent,
+        ) {
+            Ok(tool) => tools.push(Arc::new(tool)),
+            Err(error) => warn!("skipping MCP tool {name:?}: {error}"),
+        }
+    }
+    Ok(tools)
 }

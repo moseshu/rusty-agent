@@ -1339,3 +1339,37 @@ without `model_catalog_json` every model uses Codex's unknown-model budget of 10
 product-layer
 presentation happens before returning the hook replacement decision; the provider-neutral SDK
 retains the original tool observation and does not acquire Codex-specific history-envelope fields.
+
+### MCP product hook payloads and selected tool identity
+
+MCP product hooks use the jointly allocated Codex canonical `mcp__server__tool` identity in all
+three model-facing naming modes. Python's Original/ServerPrefixed model names and the optional
+Namespaced model surface are unchanged. The prepared MCP executable retains the canonical name,
+including Codex sanitization and collision suffixes; the adapter does not infer MCP from a bare
+name or a mutable discovery cache. MCP tools named like built-ins keep MCP inputs and rewrites.
+
+Hook-name lookup is keyed by catalog index and original tool name. Missing allocation is an explicit
+configuration error instead of silently removing the model tool. Python naming modes allow distinct
+catalog instances with the same server name; only hook allocation adds their catalog indexes to the
+existing namespace hash identity when necessary. This keeps their hooks distinct and retains both
+prepared tools, while preserving Python model names and the Namespaced duplicate-server rejection.
+Codex has no duplicate-server-name configuration, so this is an adapter representation of the
+Python-supported recipient identity, using the existing Codex collision allocator.
+
+`ToolHookData` can borrow the executable actually selected by dispatch. Its existing constructor
+still works without a tool; runtime dispatch supplies it through `with_tool`. `Tool` now explicitly
+inherits `Any`, which is already implemented automatically for every type satisfying its existing
+static lifetime. The product adapter inspects its own wrapper type; no provider-specific fields or
+semantics are added to the neutral hook data. This borrows the source handler's captured identity
+across Rust's trait-object boundary, rather than exposing Codex wire data in the core. Python SDK
+RunHooks/AgentHooks and their success/error lifecycle remain unchanged.
+
+`McpTool::invoke_raw` exposes the protocol result on the same immutable recipient, arguments and
+request metadata path as `invoke`; `invoke` still applies the unchanged framework result mapping.
+The coding adapter retains CallToolResult, effective arguments and the tool's captured output limit
+under `(RunId, CallId)` in the thread hook runtime. PostToolUse consumes that record once, skips
+product dispatch for `isError: true`, and otherwise serializes the complete protocol result,
+including structuredContent and `_meta`. Error content remains model-visible under the framework's
+mapping. Turn completion/abort clears residual root and nested records; threads without product
+hooks retain none. This ports Codex's handler-owned McpToolOutput without changing neutral ToolOutput
+or making MCP errors into SDK invocation exceptions.

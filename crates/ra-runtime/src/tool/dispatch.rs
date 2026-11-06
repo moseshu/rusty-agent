@@ -885,6 +885,7 @@ async fn run_chain(
 
 fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
     ToolHookData::new(request.tool.origin(), &request.call_id, &request.arguments)
+        .with_tool(request.tool.as_ref())
 }
 
 /// The view of one call the lifecycle narration is built from.
