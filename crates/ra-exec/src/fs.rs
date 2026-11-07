@@ -276,6 +276,56 @@ impl RootedFileSystem {
         Ok(())
     }
 
+    /// Writes a regular file at `path` with `content`, creating missing parents, and reports
+    /// whether an existing entry was replaced.
+    ///
+    /// Whatever stands at `path` is replaced as a directory entry, never opened: an existing
+    /// regular file keeps its permissions but gets a fresh inode, so other hard links keep their
+    /// contents, and a symbolic link is replaced itself rather than written through. A directory is
+    /// refused. The complete contents are written before the entry appears, and parent directories
+    /// are held by handles without traversing symbolic links. A new file, or one replacing a link,
+    /// gets the default permissions.
+    pub fn write_file_nofollow(
+        &self,
+        path: &Path,
+        content: &[u8],
+    ) -> Result<bool, RootedOpenError> {
+        let (parent, name) = self.write_parent(path, true)?;
+        let existing = match parent.symlink_metadata(&name) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(classify(error)),
+        };
+        if existing.as_ref().is_some_and(cap_std::fs::Metadata::is_dir) {
+            return Err(RootedOpenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a directory cannot be replaced by a file",
+            )));
+        }
+        let keep_permissions = existing
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+            .map(cap_std::fs::Metadata::permissions);
+        let (mut file, staged_name) =
+            create_staging_file_with(&parent, keep_permissions.is_none()).map_err(classify)?;
+        let mut cleanup = StagedFile {
+            parent: &parent,
+            name: &staged_name,
+            active: true,
+        };
+        file.write_all(content).map_err(RootedOpenError::Io)?;
+        if let Some(permissions) = keep_permissions {
+            file.set_permissions(permissions)
+                .map_err(RootedOpenError::Io)?;
+        }
+        drop(file);
+        parent
+            .rename(&staged_name, &parent, &name)
+            .map_err(classify)?;
+        cleanup.active = false;
+        Ok(existing.is_some())
+    }
+
     /// Removes a directory entry without following symbolic links in its parent path.
     pub fn remove_file_nofollow(&self, path: &Path) -> Result<(), RootedOpenError> {
         let (parent, name) = self.write_parent(path, false)?;
@@ -426,6 +476,15 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Exclusive creation owns a fresh inode even if another process races the generated name.
 fn create_staging_file(parent: &Dir) -> io::Result<(cap_std::fs::File, String)> {
+    create_staging_file_with(parent, false)
+}
+
+/// A staging file that is private until its permissions are set, or that starts with the default
+/// permissions of a new file when `default_permissions` is set.
+fn create_staging_file_with(
+    parent: &Dir,
+    default_permissions: bool,
+) -> io::Result<(cap_std::fs::File, String)> {
     for _ in 0..128 {
         let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let name = format!(".ra-patch-{}-{sequence}.tmp", std::process::id());
@@ -434,7 +493,7 @@ fn create_staging_file(parent: &Dir) -> io::Result<(cap_std::fs::File, String)> 
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options.mode(if default_permissions { 0o666 } else { 0o600 });
         }
         match parent.open_with(&name, &options) {
             Ok(file) => return Ok((file, name)),

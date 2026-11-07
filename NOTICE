@@ -39,6 +39,10 @@ The bundled system skills in crates/ra-coding/src/skills/assets/samples/ are cop
 openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
 codex-rs/skills/src/assets/samples/ (Apache-2.0), together with any license files they carry.
 
+The patch scenarios in tests/it-tools/fixtures/codex_apply_patch_scenarios/ are copied from
+openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
+codex-rs/apply-patch/tests/fixtures/scenarios/ (Apache-2.0).
+
 The native lexical absolute-path operations retain Codex's adaptation of
 path-absolutize 3.1.1, Copyright (c) 2018 magiclen.org (Ron Li), under the MIT
 license retained in third_party/path-absolutize.LICENSE.
@@ -1051,3 +1055,6 @@ existing upstream attribution and licensing.
 | `tests/it-protocol/tests/threads/product_hooks/in_call_permission.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/orchestrator.rs; codex-rs/core/src/tools/approvals.rs; codex-rs/core/src/tools/sandboxing.rs (exec permission requests) |
 | `tests/it-protocol/tests/threads/product_hooks/mcp_permission.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/hooks_mcp.rs; codex-rs/core/src/mcp_tool_call.rs (MCP permission requests) |
 | `tests/it-protocol/tests/threads/product_hooks/exec_arguments.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/unified_exec.rs; codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs; codex-rs/core/src/tools/handlers/mod.rs (exec arguments) |
+| `crates/ra-patch/src/apply_chunks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/apply-patch/src/file_update.rs (compute_replacements); seek_sequence.rs; text_file.rs |
+| `tests/it-patch/tests/codex_chunks.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/apply-patch/tests/suite/tool.rs (matching and line-ending cases); src/file_update_tests.rs (resulting contents); src/seek_sequence.rs (tests) |
+| `tests/it-tools/tests/apply_patch_codex.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/apply-patch/tests/suite/scenarios.rs; tests/suite/tool.rs (overwrite and move cases); src/lib.rs (apply_hunks_to_files, test_failed_move_returns_committed_destination_delta) |

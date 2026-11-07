@@ -6,15 +6,19 @@
 //! is the only writer, what the prompt says about reading before editing, and which approval a
 //! product attaches — and none of that lives here.
 //!
-//! The tool binds a confined filesystem capability to [`ra_patch`]'s parser and applier; it owns
-//! neither. Actions are committed one at a time and a later failure keeps the earlier ones, so the
-//! result reports what was actually written rather than claiming an atomicity this does not have.
+//! The tool binds a confined filesystem capability to [`ra_patch`]'s parser and its port of
+//! Codex's update application ([`apply_chunks()`]); it owns neither. Operations are committed one
+//! at a time in Codex's order and a later failure keeps the earlier ones, so the result reports
+//! what was actually written rather than claiming an atomicity this does not have. As in Codex, an
+//! added file overwrites one already at its path, a moved file overwrites its destination, and a
+//! move writes the destination before it removes the source.
 //!
-//! Updates replace the target with a fresh inode instead of rewriting a shared inode. Codex's
-//! in-place writer runs in a kernel sandbox; this in-process writer cannot rely on that to protect
-//! files outside the granted paths that share a hard link. File permissions are preserved, while
-//! ownership, extended attributes and hard-link relationships are not copied. New files use
-//! exclusive creation, and write paths cannot traverse symbolic-link directories.
+//! Every write replaces the target's directory entry with a fresh inode instead of rewriting a
+//! shared inode, and replaces a symbolic link rather than writing through it. Codex's in-place
+//! writer runs in a kernel sandbox; this in-process writer cannot rely on that to protect files
+//! outside the granted paths that share a hard link or are named by a link. An overwritten file
+//! keeps its permissions, while ownership, extended attributes and hard-link relationships are not
+//! copied. Write paths cannot traverse symbolic-link directories.
 
 use std::{fmt, io::Read as _, path::Path, sync::Arc};
 
@@ -32,7 +36,9 @@ use ra_core::{
 };
 use ra_exec::fs::{RootedFileSystem, Workspace};
 use ra_macros::ToolInput;
-use ra_patch::{CommittedPatchDelta, PatchAction, PatchConflict, apply_hunks, parse_patch};
+use ra_patch::{
+    CommittedPatchDelta, PatchAction, PatchConflict, PatchHunk, apply_chunks, parse_patch,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -162,14 +168,25 @@ impl Tool for ApplyPatchTool {
             Ok(plan) => plan,
             Err(error) => return Ok(ToolOutput::text(format!("Patch was not applied: {error}."))),
         };
+        let operations = match operations(plan.actions()) {
+            Ok(operations) => operations,
+            Err(error) => {
+                return Ok(ToolOutput::text(render_stop(
+                    &CommittedPatchDelta::empty(),
+                    &error,
+                )));
+            }
+        };
         let mut committed = CommittedPatchDelta::empty();
-        for action in plan.actions() {
-            match self.apply_action(action, &committed) {
-                Ok(delta) => {
-                    record_change(&context, action, &committed, &delta);
-                    committed = delta;
+        for operation in &operations {
+            match self.apply_operation(&context, operation, &committed) {
+                Ok(delta) => committed = delta,
+                Err(stop) => {
+                    return Ok(ToolOutput::text(render_stop(
+                        &stop.committed,
+                        &stop.failure,
+                    )));
                 }
-                Err(error) => return Ok(ToolOutput::text(render_stop(&committed, &error))),
             }
         }
         Ok(ToolOutput::text(render_success(&committed)))
@@ -181,78 +198,101 @@ impl Tool for ApplyPatchTool {
 }
 
 impl ApplyPatchTool {
-    fn apply_action(
+    /// Commits one operation in Codex's order, recording each change as it lands.
+    ///
+    /// An update that moves its file writes the destination first and removes the source only
+    /// once the destination is written, as Codex's `apply_hunks_to_files` does: a destination that
+    /// cannot be written leaves the source untouched, and a source that cannot be removed leaves
+    /// the written destination committed on its own.
+    fn apply_operation(
         &self,
-        action: &PatchAction,
+        context: &ToolContext<'_>,
+        operation: &Operation<'_>,
         committed: &CommittedPatchDelta,
-    ) -> std::result::Result<CommittedPatchDelta, PatchToolFailure> {
-        match action {
-            PatchAction::AddFile { path, content } => {
-                if self.filesystem.exists(path) {
-                    return Err(PatchToolFailure::Conflict(
-                        PatchConflict::FileAlreadyExists { path: path.clone() },
-                    ));
-                }
-                self.filesystem
-                    .create_new_file(path, content.as_bytes())
-                    .map_err(|error| PatchToolFailure::filesystem(&error))?;
-                Ok(append_delta(committed, path, content.lines().count(), 0))
+    ) -> std::result::Result<CommittedPatchDelta, Stop> {
+        let stop = |failure| Stop {
+            committed: committed.clone(),
+            failure,
+        };
+        match *operation {
+            Operation::Add { path, content } => {
+                let replaced = self
+                    .filesystem
+                    .write_file_nofollow(path, content.as_bytes())
+                    .map_err(|error| stop(PatchToolFailure::filesystem(&error)))?;
+                let added = content.lines().count();
+                let kind = if replaced {
+                    FileChangeKind::Updated
+                } else {
+                    FileChangeKind::Added
+                };
+                record_change(context, path, kind, None, added, 0);
+                Ok(append_delta(committed, path, added, 0))
             }
-            PatchAction::DeleteFile { path } => {
+            Operation::Delete { path } => {
                 if !self.filesystem.exists(path) {
-                    return Err(PatchToolFailure::Conflict(PatchConflict::FileNotFound {
-                        path: path.clone(),
-                    }));
+                    return Err(stop(PatchToolFailure::Conflict(
+                        PatchConflict::FileNotFound {
+                            path: path.to_path_buf(),
+                        },
+                    )));
                 }
                 self.filesystem
                     .remove_file_nofollow(path)
-                    .map_err(|error| PatchToolFailure::filesystem(&error))?;
+                    .map_err(|error| stop(PatchToolFailure::filesystem(&error)))?;
+                record_change(context, path, FileChangeKind::Deleted, None, 0, 0);
                 Ok(append_delta(committed, path, 0, 0))
             }
-            PatchAction::UpdateFile { path, hunks } => {
-                let original = self.read_text(path)?;
-                let update =
-                    apply_hunks(path, &original, hunks).map_err(PatchToolFailure::Conflict)?;
-                self.filesystem
-                    .replace_file(path, update.content().as_bytes())
-                    .map_err(|error| PatchToolFailure::filesystem(&error))?;
-                Ok(append_delta(
-                    committed,
+            Operation::Update {
+                path,
+                hunks,
+                move_to,
+            } => {
+                let original = self.read_text(path).map_err(stop)?;
+                let update = apply_chunks(path, &original, hunks)
+                    .map_err(|conflict| stop(PatchToolFailure::Conflict(conflict)))?;
+                let (added, removed) = (update.lines_added(), update.lines_removed());
+                let Some(destination) = move_to else {
+                    self.filesystem
+                        .replace_file(path, update.content().as_bytes())
+                        .map_err(|error| stop(PatchToolFailure::filesystem(&error)))?;
+                    record_change(context, path, FileChangeKind::Updated, None, added, removed);
+                    return Ok(append_delta(committed, path, added, removed));
+                };
+                let replaced = self
+                    .filesystem
+                    .write_file_nofollow(destination, update.content().as_bytes())
+                    .map_err(|error| stop(PatchToolFailure::filesystem(&error)))?;
+                if let Err(error) = self.filesystem.remove_file_nofollow(path) {
+                    let kind = if replaced {
+                        FileChangeKind::Updated
+                    } else {
+                        FileChangeKind::Added
+                    };
+                    // Only the destination write committed. Account for its complete contents,
+                    // as an Add or overwrite does, rather than counting edits to the source
+                    // that remains unchanged.
+                    let written = count_file_lines(update.content());
+                    record_change(context, destination, kind, None, written, 0);
+                    return Err(Stop {
+                        committed: append_delta(committed, destination, written, 0),
+                        failure: PatchToolFailure::Message(format!(
+                            "failed to remove the original `{}`: {error}",
+                            path.display()
+                        )),
+                    });
+                }
+                record_change(
+                    context,
                     path,
-                    update.lines_added(),
-                    update.lines_removed(),
-                ))
+                    FileChangeKind::Moved,
+                    Some(destination),
+                    added,
+                    removed,
+                );
+                let delta = append_delta(committed, path, added, removed);
+                Ok(append_delta(&delta, destination, 0, 0))
             }
-            PatchAction::MoveFile { from, to } => {
-                if !self.filesystem.exists(from) {
-                    return Err(PatchToolFailure::Conflict(
-                        PatchConflict::SourceFileNotFound { path: from.clone() },
-                    ));
-                }
-                if self.filesystem.exists(to) {
-                    return Err(PatchToolFailure::Conflict(
-                        PatchConflict::DestinationAlreadyExists { path: to.clone() },
-                    ));
-                }
-                self.filesystem
-                    .rename_nofollow(from, to)
-                    .map_err(|error| PatchToolFailure::filesystem(&error))?;
-                let mut files = committed.applied_files().to_vec();
-                if !files.contains(from) {
-                    files.push(from.clone());
-                }
-                if !files.contains(to) {
-                    files.push(to.clone());
-                }
-                Ok(CommittedPatchDelta::new(
-                    files,
-                    committed.lines_added(),
-                    committed.lines_removed(),
-                ))
-            }
-            _ => Err(PatchToolFailure::Message(
-                "this build cannot apply this patch action".to_owned(),
-            )),
         }
     }
 
@@ -270,9 +310,22 @@ impl ApplyPatchTool {
     }
 }
 
+/// Counts logical lines using the applier's LF, CRLF, and lone-CR terminators.
+fn count_file_lines(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let terminators = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, byte)| {
+            *byte == b'\n' || (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+        })
+        .count();
+    terminators + usize::from(!content.is_empty() && !content.ends_with(['\r', '\n']))
+}
+
 /// Records one committed change on the host's event channel, as it lands.
 ///
-/// **Per action, not per patch.** Application is best effort: three files written and the
+/// **Per operation, not per patch.** Application is best effort: three files written and the
 /// fourth refused is three files changed, and a record written once at the end would describe
 /// that run as having changed nothing — while the three files sit changed on disk. A channel
 /// that refuses the record says so in the log rather than silently, for the same reason: the
@@ -280,33 +333,24 @@ impl ApplyPatchTool {
 /// than no log.
 fn record_change(
     context: &ToolContext<'_>,
-    action: &PatchAction,
-    before: &CommittedPatchDelta,
-    after: &CommittedPatchDelta,
+    path: &Path,
+    kind: FileChangeKind,
+    moved_to: Option<&Path>,
+    added: usize,
+    removed: usize,
 ) {
     let Some(emitter) = context.event_emitter() else {
         return;
     };
-    // An action this build cannot name is an action it could not have applied — `apply_action`
-    // refuses those — so there is nothing committed here to record.
-    let Some(change) = FileChange::of(action) else {
-        return;
-    };
-    let mut event = FileChangedEvent::new(
-        context.call_id().clone(),
-        change.path.display().to_string(),
-        change.kind,
-    )
-    .with_line_counts(
-        as_u64(after.lines_added().saturating_sub(before.lines_added())),
-        as_u64(after.lines_removed().saturating_sub(before.lines_removed())),
-    );
-    if let Some(destination) = change.moved_to {
+    let mut event =
+        FileChangedEvent::new(context.call_id().clone(), path.display().to_string(), kind)
+            .with_line_counts(as_u64(added), as_u64(removed));
+    if let Some(destination) = moved_to {
         event = event.with_moved_to(destination.display().to_string());
     }
     if let Err(error) = emitter.emit_file(FileEvent::Changed(event)) {
         tracing::warn!(
-            path = %change.path.display(),
+            path = %path.display(),
             call_id = %context.call_id(),
             %error,
             "a committed file change could not be recorded on the host event channel"
@@ -314,39 +358,67 @@ fn record_change(
     }
 }
 
-/// What one committed action did, as the session record needs it.
-struct FileChange<'a> {
-    path: &'a Path,
-    kind: FileChangeKind,
-    moved_to: Option<&'a Path>,
+/// One Codex operation. The parser gives an update's move as an action of its own after the
+/// update; Codex applies the two as one, so a moved file is written once, at its destination.
+enum Operation<'a> {
+    Add {
+        path: &'a Path,
+        content: &'a str,
+    },
+    Delete {
+        path: &'a Path,
+    },
+    Update {
+        path: &'a Path,
+        hunks: &'a [PatchHunk],
+        move_to: Option<&'a Path>,
+    },
 }
 
-impl<'a> FileChange<'a> {
-    fn of(action: &'a PatchAction) -> Option<Self> {
-        match action {
-            PatchAction::AddFile { path, .. } => Some(Self {
-                path,
-                kind: FileChangeKind::Added,
-                moved_to: None,
-            }),
-            PatchAction::UpdateFile { path, .. } => Some(Self {
-                path,
-                kind: FileChangeKind::Updated,
-                moved_to: None,
-            }),
-            PatchAction::DeleteFile { path } => Some(Self {
-                path,
-                kind: FileChangeKind::Deleted,
-                moved_to: None,
-            }),
-            PatchAction::MoveFile { from, to } => Some(Self {
+/// The plan's actions as Codex's operations.
+fn operations(
+    actions: &[PatchAction],
+) -> std::result::Result<Vec<Operation<'_>>, PatchToolFailure> {
+    let mut operations = Vec::new();
+    let mut actions = actions.iter().peekable();
+    while let Some(action) = actions.next() {
+        operations.push(match action {
+            PatchAction::AddFile { path, content } => Operation::Add { path, content },
+            PatchAction::DeleteFile { path } => Operation::Delete { path },
+            PatchAction::UpdateFile { path, hunks } => {
+                let move_to = match actions.peek() {
+                    Some(PatchAction::MoveFile { from, to }) if from == path => {
+                        actions.next();
+                        Some(to.as_path())
+                    }
+                    _ => None,
+                };
+                Operation::Update {
+                    path,
+                    hunks,
+                    move_to,
+                }
+            }
+            // A move without changes is an update with no chunks.
+            PatchAction::MoveFile { from, to } => Operation::Update {
                 path: from,
-                kind: FileChangeKind::Moved,
-                moved_to: Some(to),
-            }),
-            _ => None,
-        }
+                hunks: &[],
+                move_to: Some(to),
+            },
+            _ => {
+                return Err(PatchToolFailure::Message(
+                    "this build cannot apply this patch action".to_owned(),
+                ));
+            }
+        });
     }
+    Ok(operations)
+}
+
+/// Where application stopped: what was committed before it, and why.
+struct Stop {
+    committed: CommittedPatchDelta,
+    failure: PatchToolFailure,
 }
 
 fn as_u64(value: usize) -> u64 {

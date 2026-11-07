@@ -117,6 +117,10 @@ pub struct PatchHunk {
     context_after: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     end_of_file: bool,
+    /// Whether this hunk continues the `@@` section of the one before it, which the parser
+    /// splits wherever context follows a change. Records without it start a section each.
+    #[serde(default, skip_serializing_if = "is_false")]
+    continues_previous: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -134,6 +138,7 @@ impl PatchHunk {
             added_lines: Vec::new(),
             context_after: Vec::new(),
             end_of_file: false,
+            continues_previous: false,
             unknown: Unknown::new(),
         }
     }
@@ -242,6 +247,11 @@ impl PatchHunk {
     #[must_use]
     pub const fn end_of_file(&self) -> bool {
         self.end_of_file
+    }
+
+    /// Whether this hunk continues the `@@` section of the previous one.
+    pub(crate) const fn continues_previous(&self) -> bool {
+        self.continues_previous
     }
 
     pub(crate) fn pattern_lines(&self) -> Vec<String> {
@@ -544,6 +554,7 @@ fn parse_hunks(lines: &[&str], cursor: &mut usize) -> Result<Vec<PatchHunk>, Pat
     let mut added = Vec::new();
     let mut after = Vec::new();
     let mut saw_change = false;
+    let mut continues = false;
     let mut result = Vec::new();
     while *cursor + 1 < lines.len()
         && !lines[*cursor].trim_start().starts_with("*** ")
@@ -571,7 +582,9 @@ fn parse_hunks(lines: &[&str], cursor: &mut usize) -> Result<Vec<PatchHunk>, Pat
                         &added,
                         &after,
                         std::mem::take(&mut anchors),
+                        continues,
                     ));
+                    continues = true;
                     before = std::mem::take(&mut after);
                     removed.clear();
                     added.clear();
@@ -587,7 +600,9 @@ fn parse_hunks(lines: &[&str], cursor: &mut usize) -> Result<Vec<PatchHunk>, Pat
                         &added,
                         &after,
                         std::mem::take(&mut anchors),
+                        continues,
                     ));
+                    continues = true;
                     before = std::mem::take(&mut after);
                     removed.clear();
                     added.clear();
@@ -610,7 +625,7 @@ fn parse_hunks(lines: &[&str], cursor: &mut usize) -> Result<Vec<PatchHunk>, Pat
             "a hunk needs at least one added or removed line",
         ));
     }
-    let mut hunk = build_hunk(&before, &removed, &added, &after, anchors);
+    let mut hunk = build_hunk(&before, &removed, &added, &after, anchors, continues);
     if *cursor + 1 < lines.len() && lines[*cursor].trim() == "*** End of File" {
         hunk = hunk.with_end_of_file();
         *cursor += 1;
@@ -625,12 +640,14 @@ fn build_hunk(
     added: &[String],
     after: &[String],
     anchors: Vec<String>,
+    continues_previous: bool,
 ) -> PatchHunk {
-    let hunk = PatchHunk::new()
+    let mut hunk = PatchHunk::new()
         .with_context_before(before.iter().cloned())
         .with_removed_lines(removed.iter().cloned())
         .with_added_lines(added.iter().cloned())
         .with_context_after(after.iter().cloned());
+    hunk.continues_previous = continues_previous;
     anchors
         .into_iter()
         .fold(hunk, PatchHunk::with_context_anchor)

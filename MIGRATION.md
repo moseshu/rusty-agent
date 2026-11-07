@@ -7,6 +7,39 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### `apply_patch` applies and writes as Codex does
+
+`ra_tools::apply_patch::ApplyPatchTool` now applies updates with Codex's matching and commits
+files in Codex's order. Patches that used to be refused now apply, and a few results differ:
+
+- **Matching.** Each `@@` section applies at its first match; repeated context is no longer refused
+  as ambiguous. A section is matched as one contiguous block even where context follows a change
+  inside it. A chunk that only adds lines appends them to the end of the file instead of inserting
+  them at the search position. A `@@` scope line must match a whole line at one of the usual
+  tolerance levels; the trimmed-prefix fallback is gone. A lone CR is a line ending, and an updated
+  file always ends with a line ending.
+- **Overwrites.** An added file overwrites a file already at its path, and a moved file overwrites
+  its destination, instead of failing with `FileAlreadyExists` or `DestinationAlreadyExists`. A
+  directory is never replaced.
+- **Moves.** A move writes its destination first and removes the source afterwards. A destination
+  that cannot be written leaves the source untouched; a source that cannot be removed leaves the
+  destination written and is reported as a partial application naming only the destination. A
+  move without changes is written anew at its destination rather than renamed, so other hard links
+  to the source keep its contents. A move onto its own path follows the same write-then-delete
+  sequence as Codex and removes the file.
+- **Isolation is unchanged.** Every write replaces the directory entry with a fresh inode, a
+  symbolic link at the target is replaced rather than written through, and an overwritten file
+  keeps its permissions.
+- **Records.** An overwrite is recorded as `FileChangeKind::Updated`, and a move with changes as a
+  single `Moved` change carrying its line counts (it used to be an `Updated` change followed by a
+  `Moved` one). If removing a move's source fails, only the destination write is recorded, with
+  the full written line count and no source-line removals, as for an Add or overwrite.
+
+`ra_patch::apply_chunks` is the new applier; `ra_patch::apply_hunks` keeps its stricter behaviour
+for callers who want ambiguous context refused. A `PatchHunk` that continues the `@@` section of
+the one before it now serializes `continues_previous: true`; records without the field read as
+before. `RootedFileSystem::write_file_nofollow` is the new write primitive behind overwrites.
+
 ### macOS command sandboxing through canonical permission profiles
 
 On macOS, coding shell commands — including background terminals, their stdin, approved

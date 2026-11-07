@@ -93,6 +93,19 @@ pub struct AppliedFileUpdate {
 }
 
 impl AppliedFileUpdate {
+    pub(crate) const fn new(
+        content: String,
+        match_level: PatchMatchLevel,
+        lines_added: usize,
+        lines_removed: usize,
+    ) -> Self {
+        Self {
+            content,
+            match_level,
+            lines_added,
+            lines_removed,
+        }
+    }
     /// Updated text, ready for the filesystem boundary to write.
     #[must_use]
     pub fn content(&self) -> &str {
