@@ -298,8 +298,8 @@ pub enum ExecError {
     },
     /// An incremental read named a stream that has no single position to read from.
     ///
-    /// A cursor is one offset. `stdout` and `stderr` arrive on two pipes whose interleaving is
-    /// never recorded, so a combined offset cannot be split back into the two it came from — and a
+    /// A cursor is one offset. `stdout` and `stderr` arrive on two pipes whose interleaving may be
+    /// captured separately, but a combined offset cannot be split back into the two it came from — and a
     /// reader that resumed from one would silently re-deliver or skip output.
     #[error("an incremental read addresses one stream; `{stream}` has no single cursor")]
     UnaddressableStream {
@@ -339,6 +339,104 @@ impl ExecExecutionResult {
             Self::Completed(_) => None,
             Self::Yielded { session_id, .. } => Some(session_id),
         }
+    }
+}
+
+/// A completion claimed while holding the session, independent of registry retention.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ExecCompletion {
+    session_id: ExecSessionId,
+    origin_call_id: Option<String>,
+    command: String,
+    output: Option<String>,
+    total_bytes: usize,
+    omitted_bytes: usize,
+}
+
+impl ExecCompletion {
+    /// The completed session.
+    #[must_use]
+    pub const fn session_id(&self) -> &ExecSessionId {
+        &self.session_id
+    }
+    /// The call that started the command.
+    #[must_use]
+    pub fn origin_call_id(&self) -> Option<&str> {
+        self.origin_call_id.as_deref()
+    }
+    /// The original shell command.
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+    /// Arrival-ordered output for this delivery; absent only when capture was disabled.
+    #[must_use]
+    pub fn output(&self) -> Option<&str> {
+        self.output.as_deref()
+    }
+    /// Source bytes covered by this delivery, including omitted bytes.
+    #[must_use]
+    pub const fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+    /// Source bytes omitted within this delivery.
+    #[must_use]
+    pub const fn omitted_bytes(&self) -> usize {
+        self.omitted_bytes
+    }
+}
+
+/// Execution result with an optional, once-only completion report.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ObservedExecution {
+    result: ExecExecutionResult,
+    completion: Option<ExecCompletion>,
+}
+
+impl ObservedExecution {
+    /// The ordinary execution result.
+    #[must_use]
+    pub const fn result(&self) -> &ExecExecutionResult {
+        &self.result
+    }
+    /// The completion claimed by this execution.
+    #[must_use]
+    pub const fn completion(&self) -> Option<&ExecCompletion> {
+        self.completion.as_ref()
+    }
+    /// Takes both parts of the observation.
+    #[must_use]
+    pub fn into_parts(self) -> (ExecExecutionResult, Option<ExecCompletion>) {
+        (self.result, self.completion)
+    }
+}
+
+/// Both stream spans and the completion claimed atomically with their delivery.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct InteractiveDelivery {
+    stdout: Option<ExecRead>,
+    stderr: Option<ExecRead>,
+    completion: Option<ExecCompletion>,
+}
+
+impl InteractiveDelivery {
+    /// Newly delivered standard output.
+    #[must_use]
+    pub const fn stdout(&self) -> Option<&ExecRead> {
+        self.stdout.as_ref()
+    }
+    /// Newly delivered standard error.
+    #[must_use]
+    pub const fn stderr(&self) -> Option<&ExecRead> {
+        self.stderr.as_ref()
+    }
+    /// The completion claimed by this delivery.
+    #[must_use]
+    pub const fn completion(&self) -> Option<&ExecCompletion> {
+        self.completion.as_ref()
     }
 }
 
@@ -405,6 +503,8 @@ struct ExecSession {
     state: ExecSessionState,
     stdout_buffer: HeadTailBuffer,
     stderr_buffer: HeadTailBuffer,
+    arrival_buffer: Option<HeadTailBuffer>,
+    completion_reported: bool,
     last_active_at: Instant,
     started_at: Option<Instant>,
     ended_at: Option<Instant>,
@@ -509,11 +609,13 @@ impl BackgroundTerminal {
 }
 
 impl ExecSession {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, observed: bool) -> Self {
         Self {
             state: ExecSessionState::Reserved,
             stdout_buffer: HeadTailBuffer::new(capacity),
             stderr_buffer: HeadTailBuffer::new(capacity),
+            arrival_buffer: observed.then(|| HeadTailBuffer::new(capacity)),
+            completion_reported: false,
             last_active_at: Instant::now(),
             started_at: None,
             ended_at: None,
@@ -531,6 +633,39 @@ impl ExecSession {
             sandbox: None,
             origin: SessionOrigin::default(),
         }
+    }
+
+    fn claim_completion(
+        &mut self,
+        session_id: &ExecSessionId,
+        offset: usize,
+    ) -> Option<ExecCompletion> {
+        if !self.closed || !self.state.is_terminal() || self.completion_reported {
+            return None;
+        }
+        self.completion_reported = true;
+        let total = self
+            .stdout_buffer
+            .total_bytes()
+            .saturating_add(self.stderr_buffer.total_bytes());
+        let output = self.arrival_buffer.as_ref().map(|buffer| {
+            debug_assert_eq!(buffer.total_bytes(), total);
+            let bytes = buffer
+                .read_bytes_from(offset)
+                .map_or_else(Vec::new, |(bytes, _)| bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        Some(ExecCompletion {
+            session_id: session_id.clone(),
+            origin_call_id: self.origin.call_id.clone(),
+            command: self.origin.command.clone(),
+            output,
+            total_bytes: total.saturating_sub(offset),
+            omitted_bytes: self
+                .arrival_buffer
+                .as_ref()
+                .map_or(0, |buffer| buffer.omitted_from(offset)),
+        })
     }
 
     fn duration(&self) -> Duration {
@@ -829,10 +964,60 @@ impl Drop for SessionWatch {
 ///
 /// Opaque rather than the lock it holds. Every handle this crate hands out is its own type, and the
 /// one exception would be this one — returning the runtime's guard directly would make which async
-/// runtime `ra-exec` happens to use, and which version of it, part of this crate's public contract
-/// for callers that only ever pass the value back to a `drop`.
+/// runtime `ra-exec` happens to use, and which version of it, part of this crate's public contract.
+///
+/// The guard also keeps the session it locked, so [`Self::cursors`] and [`Self::deliver`] read and
+/// advance that session even if the registry has since let go of its identifier.
 pub struct InteractionGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    session: Arc<Mutex<ExecSession>>,
+    session_id: ExecSessionId,
+}
+
+impl InteractionGuard {
+    /// Reads the shared interactive delivery positions without consulting the registry.
+    pub async fn cursors(&self) -> (u64, u64) {
+        let session = self.session.lock().await;
+        (
+            session.interactive_stdout_cursor,
+            session.interactive_stderr_cursor,
+        )
+    }
+
+    /// Reads and advances both streams, claiming completion only for a closed snapshot.
+    pub async fn deliver(&self, observed_closed: bool) -> InteractiveDelivery {
+        let mut session = self.session.lock().await;
+        let stdout_from = session.interactive_stdout_cursor;
+        let stderr_from = session.interactive_stderr_cursor;
+        let read = |buffer: &HeadTailBuffer, stream, from| {
+            let offset = usize::try_from(from).unwrap_or(usize::MAX);
+            buffer.read_from(offset).map(|(text, next)| ExecRead {
+                text,
+                next: ExecCursor::new(stream, u64::try_from(next).unwrap_or(u64::MAX)),
+                omitted_bytes: buffer.omitted_from(offset),
+            })
+        };
+        let stdout = read(&session.stdout_buffer, ExecStreamKind::Stdout, stdout_from);
+        let stderr = read(&session.stderr_buffer, ExecStreamKind::Stderr, stderr_from);
+        if let Some(read) = &stdout {
+            session.interactive_stdout_cursor = read.next.offset();
+        }
+        if let Some(read) = &stderr {
+            session.interactive_stderr_cursor = read.next.offset();
+        }
+        if stdout.is_some() || stderr.is_some() {
+            session.last_active_at = Instant::now();
+        }
+        let offset = usize::try_from(stdout_from.saturating_add(stderr_from)).unwrap_or(usize::MAX);
+        let completion = observed_closed
+            .then(|| session.claim_completion(&self.session_id, offset))
+            .flatten();
+        InteractiveDelivery {
+            stdout,
+            stderr,
+            completion,
+        }
+    }
 }
 
 impl fmt::Debug for InteractionGuard {
@@ -846,6 +1031,8 @@ pub struct ProcessManager {
     registry: Arc<SessionRegistry>,
     limits: ExecLimits,
     environment: Arc<ExecEnvironment>,
+    #[cfg(feature = "test-api")]
+    completion_gate: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl Default for ProcessManager {
@@ -867,7 +1054,19 @@ impl ProcessManager {
             registry: Arc::new(SessionRegistry::new(retention)),
             limits,
             environment: Arc::new(ExecEnvironment::new()),
+            #[cfg(feature = "test-api")]
+            completion_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Pauses one observed synchronous completion before claiming it, holding no session lock.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub fn test_pause_completion(&self, reached: Arc<Notify>, resume: Arc<Notify>) {
+        *self
+            .completion_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((reached, resume));
     }
 
     /// Records a session that was registered but never got a process, and takes it back out.
@@ -977,6 +1176,29 @@ impl ProcessManager {
         emitter: Option<&HostEventEmitter>,
         environment: &ExecEnvironment,
     ) -> Result<ExecExecutionResult, ExecError> {
+        self.execute_inner(request, emitter, environment, false)
+            .await
+            .map(|observation| observation.result)
+    }
+
+    /// Executes with arrival capture and claims synchronous completion while retaining the session.
+    pub async fn execute_observed(
+        &self,
+        request: ExecRequest,
+        emitter: Option<&HostEventEmitter>,
+        environment: &ExecEnvironment,
+    ) -> Result<ObservedExecution, ExecError> {
+        self.execute_inner(request, emitter, environment, true)
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        request: ExecRequest,
+        emitter: Option<&HostEventEmitter>,
+        environment: &ExecEnvironment,
+        observed: bool,
+    ) -> Result<ObservedExecution, ExecError> {
         // Resolved once, into the request itself, so that nothing downstream can reach past it to
         // the untightened values — the bug that comes back otherwise is one code path reading
         // `request.limits()` directly and quietly running without the host's ceiling.
@@ -988,6 +1210,7 @@ impl ProcessManager {
         let session_id = ExecSessionId::generate();
         let session = Arc::new(Mutex::new(ExecSession::new(
             request.limits().max_capture_bytes(),
+            observed,
         )));
         // Registered before the process exists, so that a session which yields is already
         // addressable by the identifier the caller is about to be handed.
@@ -1083,21 +1306,66 @@ impl ProcessManager {
         tokio::select! {
             () = &mut exit_notified => {
                 let _ = wait_task.await;
-                let summary = session.lock().await.summary();
-                Ok(ExecExecutionResult::Completed(summary))
+                Ok(self.observe_completed(&session_id, &session, observed).await)
             }
             () = tokio::time::sleep(request.limits().initial_yield_timeout()) => {
-                let summary = session.lock().await.summary();
-                if let Some(em) = emitter {
-                    let _ = em.emit(ExecEvent::Yielded(ExecYieldedEvent::new(
-                        session_id.clone(),
-                        summary.duration_ms(),
-                        summary.total_bytes(),
-                        ExecYieldReason::InitialTimeout,
-                    )));
-                }
-                Ok(ExecExecutionResult::Yielded { session_id, summary })
+                Ok(Self::observe_yielded(session_id, &session, emitter).await)
             }
+        }
+    }
+
+    /// Reports the initial yield; a running session has no completion to claim.
+    async fn observe_yielded(
+        session_id: ExecSessionId,
+        session: &Arc<Mutex<ExecSession>>,
+        emitter: Option<&HostEventEmitter>,
+    ) -> ObservedExecution {
+        let summary = session.lock().await.summary();
+        if let Some(em) = emitter {
+            let _ = em.emit(ExecEvent::Yielded(ExecYieldedEvent::new(
+                session_id.clone(),
+                summary.duration_ms(),
+                summary.total_bytes(),
+                ExecYieldReason::InitialTimeout,
+            )));
+        }
+        ObservedExecution {
+            result: ExecExecutionResult::Yielded {
+                session_id,
+                summary,
+            },
+            completion: None,
+        }
+    }
+
+    async fn observe_completed(
+        &self,
+        session_id: &ExecSessionId,
+        session: &Arc<Mutex<ExecSession>>,
+        observed: bool,
+    ) -> ObservedExecution {
+        #[cfg(feature = "test-api")]
+        if observed {
+            let gate = self
+                .completion_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((reached, resume)) = gate {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
+        let mut sess = session.lock().await;
+        let summary = sess.summary();
+        let completion = if observed {
+            sess.claim_completion(session_id, 0)
+        } else {
+            None
+        };
+        ObservedExecution {
+            result: ExecExecutionResult::Completed(summary),
+            completion,
         }
     }
 
@@ -1429,6 +1697,8 @@ impl ProcessManager {
         let lock = Arc::clone(&session.lock().await.interaction);
         Ok(InteractionGuard {
             _guard: lock.lock_owned().await,
+            session,
+            session_id: session_id.clone(),
         })
     }
 
@@ -1437,6 +1707,12 @@ impl ProcessManager {
     /// Positions advance only and are clamped to output the session has actually produced. That
     /// makes a delayed or repeated completion unable to move the cursor backward or skip output
     /// by naming a future offset.
+    ///
+    /// Take both positions from one snapshot, such as the byte counts of one
+    /// [`ExecOutputSummary`]. For a session started by [`Self::execute_observed`], the completion report
+    /// begins at the sum of the two positions in arrival order. That sum marks the end of what was
+    /// delivered only when both counts were read together; positions read at different moments can
+    /// make the report repeat or skip output.
     ///
     /// # Errors
     ///
@@ -2186,6 +2462,15 @@ fn spawn_stream_reader(
                 };
                 sink.push_bytes(chunk);
                 truncated = sink.is_truncated();
+                if let Some(buffer) = &mut sess.arrival_buffer {
+                    buffer.push_bytes(chunk);
+                    debug_assert_eq!(
+                        buffer.total_bytes(),
+                        sess.stdout_buffer
+                            .total_bytes()
+                            .saturating_add(sess.stderr_buffer.total_bytes())
+                    );
+                }
                 sess.last_active_at = Instant::now();
                 Arc::clone(&sess.output_notify)
             };

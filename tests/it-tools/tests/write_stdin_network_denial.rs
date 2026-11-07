@@ -636,3 +636,40 @@ mod sandbox_retry {
         assert!(error.to_string().contains(DENIED), "{error}");
     }
 }
+
+#[tokio::test]
+async fn network_rejection_does_not_notify_completion_observer() {
+    use ra_tools::exec_command::ExecCompletionObserver;
+    #[derive(Default)]
+    struct Observer(AtomicUsize);
+    impl ExecCompletionObserver for Observer {
+        fn completed(&self, _: &ToolContext<'_>, _: &ra_exec::session::ExecCompletion) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let workspace = TempDir::new().unwrap();
+    let approval = approval(Some("rejected by test"));
+    let (exec, stdin) = tools(&workspace, &approval, false);
+    let observer = Arc::new(Observer::default());
+    let exec = exec.with_completion_observer(observer.clone());
+    let stdin = stdin.with_completion_observer(observer.clone());
+    call(&exec, command("read l; printf finished", 10))
+        .await
+        .unwrap();
+    let id = exec
+        .process_manager()
+        .active_sessions()
+        .await
+        .pop()
+        .unwrap();
+    approval.denied.cancel();
+    exec.process_manager()
+        .write_stdin(&id, Some("q\n"), false, None)
+        .await
+        .unwrap();
+    exec.process_manager().wait_for_close(&id).await;
+    let error = call(&stdin, json!({"session_id": id.as_str(), "chars":"", "until":"done", "match_text":null, "control":null, "yield_time_ms":1000})).await.unwrap_err();
+    assert!(error.to_string().contains("rejected by test"));
+    assert_eq!(observer.0.load(Ordering::SeqCst), 0);
+    assert!(exec.process_manager().terminal(&id).await.is_none());
+}

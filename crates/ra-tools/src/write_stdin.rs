@@ -50,7 +50,6 @@ use ra_core::{
     },
 };
 use ra_exec::{
-    command::ExecCursor,
     job::{BackgroundJob, JobError, JobWaitResult, JobWaitUntil},
     session::{BackgroundTerminal, ExecError, ProcessManager},
 };
@@ -201,6 +200,7 @@ pub struct WriteStdinTool {
     process_manager: Arc<ProcessManager>,
     policy: Option<Arc<dyn WriteStdinPolicy>>,
     network_approvals: Option<Arc<ExecNetworkApprovals>>,
+    completion_observer: Option<Arc<dyn crate::exec_command::ExecCompletionObserver>>,
 }
 
 impl fmt::Debug for WriteStdinTool {
@@ -213,6 +213,16 @@ impl fmt::Debug for WriteStdinTool {
 }
 
 impl WriteStdinTool {
+    /// Installs observation of captured session completion.
+    #[must_use]
+    pub fn with_completion_observer(
+        mut self,
+        observer: Arc<dyn crate::exec_command::ExecCompletionObserver>,
+    ) -> Self {
+        self.completion_observer = Some(observer);
+        self
+    }
+
     /// Creates a tool that addresses sessions owned by `process_manager`.
     pub fn new(process_manager: Arc<ProcessManager>) -> Result<Self> {
         Ok(Self {
@@ -226,6 +236,7 @@ impl WriteStdinTool {
             process_manager,
             policy: None,
             network_approvals: None,
+            completion_observer: None,
         })
     }
 
@@ -381,7 +392,7 @@ impl Tool for WriteStdinTool {
             return Err(self.failed_write(&session_id, error).await);
         }
 
-        let _interaction = if let Ok(result) =
+        let interaction = if let Ok(result) =
             tokio::time::timeout_at(deadline, self.process_manager.lock_interaction(&session_id))
                 .await
         {
@@ -397,11 +408,7 @@ impl Tool for WriteStdinTool {
                 )
                 .await;
         };
-        let (stdout_cursor, stderr_cursor) = self
-            .process_manager
-            .interactive_output_cursors(&session_id)
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
+        let (stdout_cursor, stderr_cursor) = interaction.cursors().await;
         if input.control.is_none()
             && let Err(error) = self
                 .send_input(&session_id, &input.chars, deadline, emitter.as_ref())
@@ -420,16 +427,18 @@ impl Tool for WriteStdinTool {
         self.fail_on_network_rejection(&session_id, outcome.snapshot().is_closed())
             .await?;
 
-        let stdout = self
-            .deliver(&session_id, ExecStreamKind::Stdout, stdout_cursor)
-            .await?;
-        let stderr = self
-            .deliver(&session_id, ExecStreamKind::Stderr, stderr_cursor)
-            .await?;
-        self.process_manager
-            .mark_interactive_output_delivered(&session_id, stdout.next, stderr.next)
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
+        let delivery = interaction
+            .deliver(outcome.snapshot().is_closed() && outcome.snapshot().state().is_terminal())
+            .await;
+        let stdout = Delivery::of(delivery.stdout(), stdout_cursor);
+        let stderr = Delivery::of(delivery.stderr(), stderr_cursor);
+        if let Some(observer) = &self.completion_observer
+            && observer.wants_completion(&context)
+            && let Some(completion) = delivery.completion()
+            && completion.output().is_some()
+        {
+            observer.completed(&context, completion);
+        }
 
         let snapshot = outcome.snapshot();
         Ok(SessionReturn {
@@ -567,45 +576,30 @@ impl WriteStdinTool {
         }
         Ok(())
     }
-
-    /// Reads one stream from the position this call is delivering from.
-    ///
-    /// The delivery position advances to what this read covers and no further, so bytes that arrive
-    /// between the read and the next call stay undelivered rather than being marked as sent.
-    async fn deliver(
-        &self,
-        session_id: &ExecSessionId,
-        stream: ExecStreamKind,
-        from: u64,
-    ) -> Result<Delivery> {
-        let read = self
-            .process_manager
-            .read_output(session_id, ExecCursor::new(stream, from))
-            .await
-            .map_err(|error| WriteStdinFailure::from_exec(&error).into_error())?;
-        Ok(read.map_or_else(
-            || Delivery {
-                text: String::new(),
-                next: from,
-                delivered: 0,
-                omitted: 0,
-            },
-            |read| Delivery {
-                next: read.next().offset(),
-                delivered: read.next().offset().saturating_sub(from),
-                omitted: as_u64(read.omitted_bytes()),
-                text: read.into_text(),
-            },
-        ))
-    }
 }
 
 /// One stream's contribution to a result.
 struct Delivery {
     text: String,
-    next: u64,
     delivered: u64,
     omitted: u64,
+}
+
+impl Delivery {
+    fn of(read: Option<&ra_exec::session::ExecRead>, from: u64) -> Self {
+        read.map_or_else(
+            || Self {
+                text: String::new(),
+                delivered: 0,
+                omitted: 0,
+            },
+            |read| Self {
+                text: read.text().to_owned(),
+                delivered: read.next().offset().saturating_sub(from),
+                omitted: as_u64(read.omitted_bytes()),
+            },
+        )
+    }
 }
 
 /// The validated wait this call performs.

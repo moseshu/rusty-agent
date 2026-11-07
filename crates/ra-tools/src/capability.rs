@@ -178,6 +178,25 @@ impl ShellCapability {
         })
     }
 
+    /// Installs the same completion observer on both shell tools.
+    #[must_use]
+    pub fn with_completion_observer(
+        mut self,
+        observer: Arc<dyn crate::exec_command::ExecCompletionObserver>,
+    ) -> Self {
+        self.exec_command = Arc::new(
+            (*self.exec_command)
+                .clone()
+                .with_completion_observer(Arc::clone(&observer)),
+        );
+        self.write_stdin = Arc::new(
+            (*self.write_stdin)
+                .clone()
+                .with_completion_observer(observer),
+        );
+        self
+    }
+
     /// Installs per-step execution policy while retaining the session manager.
     #[must_use]
     pub fn with_policy_resolvers(

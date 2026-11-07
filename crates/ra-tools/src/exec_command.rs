@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Runs a command in a shell; returns output or a `session_id` for background execution.
 //!
 //! # Three layers, and what each one is allowed to know
@@ -271,6 +272,50 @@ impl ExecCommandLimits {
     }
 }
 
+/// Host observation of the final effective command completion.
+pub trait ExecCompletionObserver: Send + Sync {
+    /// Whether this invocation needs a completion notification.
+    fn wants_completion(&self, _context: &ToolContext<'_>) -> bool {
+        true
+    }
+    /// Receives a once-only completion after retries and network approval have settled.
+    fn completed(&self, context: &ToolContext<'_>, completion: &ra_exec::session::ExecCompletion);
+}
+
+/// Formats captured exec output with Codex's three truncation branches.
+#[must_use]
+pub fn truncated_exec_output(
+    text: &str,
+    omitted_bytes: usize,
+    total_bytes: usize,
+    policy: ra_core::sandbox::token_truncation::TruncationPolicy,
+) -> String {
+    use ra_core::sandbox::token_truncation::{
+        approx_tokens_from_byte_count, formatted_truncate_text, truncate_text,
+    };
+    if omitted_bytes == 0 {
+        return formatted_truncate_text(text, policy);
+    }
+    let marker = ra_exec::output::omission_marker(omitted_bytes);
+    if text.len() <= policy.byte_budget() {
+        return if text.contains(&marker) {
+            text.to_owned()
+        } else {
+            format!("{marker}\n{text}")
+        };
+    }
+    let truncated = truncate_text(text, policy);
+    let notice = if truncated.contains(&marker) {
+        String::new()
+    } else {
+        format!("{marker}\n")
+    };
+    let original_token_count = approx_tokens_from_byte_count(total_bytes);
+    format!(
+        "Warning: truncated output (original token count: {original_token_count})\n{notice}\n{truncated}"
+    )
+}
+
 /// The `exec_command` tool.
 #[derive(Clone)]
 pub struct ExecCommandTool {
@@ -289,6 +334,7 @@ pub struct ExecCommandTool {
     rooted_filesystem: Option<Arc<RootedFileSystem>>,
     policy: Option<Arc<dyn ExecCommandPolicy>>,
     network_approvals: Option<Arc<ExecNetworkApprovals>>,
+    completion_observer: Option<Arc<dyn ExecCompletionObserver>>,
 }
 
 /// Prepared command and policy state kept with the approval. The request owns defaults and the
@@ -791,6 +837,7 @@ impl ExecCommandTool {
             rooted_filesystem: None,
             policy: None,
             network_approvals: None,
+            completion_observer: None,
         })
     }
 
@@ -829,6 +876,7 @@ impl ExecCommandTool {
             rooted_filesystem: Some(Arc::clone(workspace.filesystem())),
             policy: None,
             network_approvals: None,
+            completion_observer: None,
         })
     }
 
@@ -838,6 +886,13 @@ impl ExecCommandTool {
     #[must_use]
     pub fn with_manager(mut self, manager: Arc<ProcessManager>) -> Self {
         self.process_manager = manager;
+        self
+    }
+
+    /// Installs observation of the final effective command result.
+    #[must_use]
+    pub fn with_completion_observer(mut self, observer: Arc<dyn ExecCompletionObserver>) -> Self {
+        self.completion_observer = Some(observer);
         self
     }
 
@@ -1050,16 +1105,24 @@ impl ExecCommandTool {
         request: &ExecRequest,
         attempt: &ExecCommandAttempt,
         emitter: Option<&HostEventEmitter>,
-    ) -> Result<ExecExecutionResult> {
-        match self
-            .process_manager
-            .execute_with_environment(
-                self.launched(request, attempt, attempt.environment()),
-                emitter,
-                attempt.environment(),
-            )
-            .await
-        {
+        observed: bool,
+    ) -> Result<(
+        ExecExecutionResult,
+        Option<ra_exec::session::ExecCompletion>,
+    )> {
+        let request = self.launched(request, attempt, attempt.environment());
+        let result = if observed {
+            self.process_manager
+                .execute_observed(request, emitter, attempt.environment())
+                .await
+                .map(ra_exec::session::ObservedExecution::into_parts)
+        } else {
+            self.process_manager
+                .execute_with_environment(request, emitter, attempt.environment())
+                .await
+                .map(|result| (result, None))
+        };
+        match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 if let Some(approval) = attempt.network_approval() {
@@ -1093,8 +1156,12 @@ impl ExecCommandTool {
             .as_ref()
             .map(|events| &events.emitter)
             .or(emitter);
-        let mut outcome = self
-            .execute_process_attempt(&request, &attempt, attempt_emitter)
+        let observed = self
+            .completion_observer
+            .as_ref()
+            .is_some_and(|observer| observer.wants_completion(&context));
+        let (mut outcome, mut completion) = self
+            .execute_process_attempt(&request, &attempt, attempt_emitter, observed)
             .await?;
 
         // Only startup refusals enter Codex's orchestrator. A later refusal is command output;
@@ -1124,8 +1191,8 @@ impl ExecCommandTool {
                         &attempt,
                         *environment,
                     )?;
-                    outcome = self
-                        .execute_process_attempt(&request, &retry, emitter)
+                    (outcome, completion) = self
+                        .execute_process_attempt(&request, &retry, emitter, observed)
                         .await?;
                     attempt = retry;
                     approval_finished = false;
@@ -1156,6 +1223,9 @@ impl ExecCommandTool {
             self.finish_network_approval(&attempt, &outcome).await?;
         }
 
+        if let (Some(observer), Some(completion)) = (&self.completion_observer, &completion) {
+            observer.completed(&context, completion);
+        }
         Ok(match outcome {
             ExecExecutionResult::Completed(summary) => completed_output(&summary),
             ExecExecutionResult::Yielded {

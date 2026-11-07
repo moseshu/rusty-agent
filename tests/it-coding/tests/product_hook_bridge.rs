@@ -1517,3 +1517,46 @@ async fn subagent_stop_reports_the_threads_transcript_and_no_agent_transcript() 
     );
     assert_eq!(*recorder.calls.lock().unwrap(), ["persist"]);
 }
+
+/// Default assembly reserves exec_command; this fixture supplies a real dynamic instance directly.
+#[tokio::test]
+async fn dynamic_exec_named_tool_keeps_ordinary_hook_name_and_input() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("dynamic.jsonl");
+    let config = hooks_config(home.path(), &format!("[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = 'command'\ncommand = '''{}'''\n[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ntype = 'command'\ncommand = '''{}'''", logging(&log), logging(&log))).await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let bound = bound_with_queue(&runtime, &ra_core::hook::HookContextQueue::default());
+    let tool = InjectionWireTool {
+        origin: ToolOrigin::new("exec_command").unwrap(),
+        schema: ra_core::tool::ToolSchema::new(
+            "dynamic tool",
+            serde_json::json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+        )
+        .unwrap(),
+    };
+    use ra_core::tool::Tool;
+    let id = CallId::new("dynamic");
+    let input = serde_json::json!({"cmd":"ordinary input"});
+    let call = || ToolHookData::new(tool.origin(), &id, &input).with_tool(&tool);
+    assert_eq!(
+        bound.dispatch(HookEvent::PreToolUse(call())).await.unwrap(),
+        HookDecision::Continue
+    );
+    assert_eq!(
+        bound
+            .dispatch(HookEvent::PostToolUse {
+                call: call(),
+                output: &ra_core::tool::ToolOutput::text("dynamic output")
+            })
+            .await
+            .unwrap(),
+        HookDecision::Continue
+    );
+    let payloads = logged(&log);
+    assert_eq!(payloads.len(), 2);
+    for payload in &payloads {
+        assert_eq!(payload["tool_name"], "exec_command");
+        assert_eq!(payload["tool_input"], input);
+    }
+    assert_eq!(payloads[1]["tool_response"], "dynamic output");
+}

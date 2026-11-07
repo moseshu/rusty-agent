@@ -129,13 +129,44 @@ pub struct ProductHookRuntime {
     executor_hooks: OnceLock<Arc<dyn ExecutorHookSourceProvider>>,
     transcript: OnceLock<ra_runtime::thread::WeakAgentThread>,
     feedback_policy: OnceLock<FeedbackPolicy>,
-    mcp_hook_results: McpHookResults,
+    tool_hook_results: ToolHookResults,
 }
 
-/// MCP results captured by invocations, keyed by run and call, for their own `PostToolUse` hooks.
-pub(crate) type McpHookResults = Arc<
-    Mutex<std::collections::HashMap<(ra_core::state::RunId, ra_core::item::CallId), McpHookResult>>,
+/// Tool results captured by invocations, keyed by run and call, for their own `PostToolUse` hooks.
+pub(crate) type ToolHookResults = Arc<
+    Mutex<
+        std::collections::HashMap<(ra_core::state::RunId, ra_core::item::CallId), ToolHookRecord>,
+    >,
 >;
+
+#[derive(Debug)]
+pub(crate) enum ToolHookRecord {
+    Mcp(McpHookResult),
+    Exec(ra_exec::session::ExecCompletion),
+}
+
+pub(crate) struct CodingExecCompletionObserver;
+impl ra_tools::exec_command::ExecCompletionObserver for CodingExecCompletionObserver {
+    fn completed(
+        &self,
+        context: &ra_core::tool::ToolContext<'_>,
+        completion: &ra_exec::session::ExecCompletion,
+    ) {
+        if let Some(results) = context
+            .run()
+            .app_context::<crate::thread_settings::CodingThreadSettings>()
+            .and_then(|settings| settings.tool_hook_results.as_ref())
+        {
+            results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    (context.run().run_id().clone(), context.call_id().clone()),
+                    ToolHookRecord::Exec(completion.clone()),
+                );
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct McpHookResult {
@@ -225,24 +256,24 @@ impl ProductHookRuntime {
             executor_hooks: OnceLock::new(),
             transcript: OnceLock::new(),
             feedback_policy: OnceLock::new(),
-            mcp_hook_results: McpHookResults::default(),
+            tool_hook_results: ToolHookResults::default(),
         }))
     }
 
-    /// The invocation-owned MCP protocol results and presentation limits for this thread.
-    pub(crate) fn mcp_hook_results(&self) -> McpHookResults {
-        Arc::clone(&self.mcp_hook_results)
+    /// The invocation-owned tool results and presentation limits for this thread.
+    pub(crate) fn tool_hook_results(&self) -> ToolHookResults {
+        Arc::clone(&self.tool_hook_results)
     }
 
     /// Drops results no post hook consumed in `turn`, including those of its nested runs.
-    pub(crate) fn finish_turn_mcp_results(&self, turn: &str) {
+    pub(crate) fn finish_turn_tool_results(&self, turn: &str) {
         let turn_of = self
             .context_delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .turn_of
             .clone();
-        self.mcp_hook_results
+        self.tool_hook_results
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(run, _), _| {
@@ -684,6 +715,9 @@ impl ProductHookRuntime {
                 HookDecision::Continue
             }
             HookEvent::PreToolUse(call) => {
+                if exec_kind(&call) == Some(ExecKind::Stdin) {
+                    return HookDecision::Continue;
+                }
                 let tool = HookToolName::for_call(&call);
                 let tool_use_id = call.call_id().to_string();
                 let request = PreToolUseRequest {
@@ -749,11 +783,19 @@ impl ProductHookRuntime {
             HookEvent::PostToolUse { call, output } => {
                 // The invocation retains its original result and limit from its immutable binding.
                 // Consume it by call identity, never by a mutable discovery name cache.
-                let mcp_result = self
-                    .mcp_hook_results
+                let record = self
+                    .tool_hook_results
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&(context.run().run_id().clone(), call.call_id().clone()));
+                let (mcp_result, exec_result) = match record {
+                    Some(ToolHookRecord::Mcp(result)) => (Some(result), None),
+                    Some(ToolHookRecord::Exec(result)) => (None, Some(result)),
+                    None => (None, None),
+                };
+                if call.tool().is_some() && exec_kind(&call).is_some() && exec_result.is_none() {
+                    return HookDecision::Continue;
+                }
                 if mcp_result
                     .as_ref()
                     .is_some_and(|result| result.result.is_error == Some(true))
@@ -796,6 +838,49 @@ impl ProductHookRuntime {
                     },
                     |result| serde_json::to_value(&result.result).unwrap_or(Value::Null),
                 );
+                let (tool, tool_use_id, tool_input, tool_response) =
+                    if let Some(completion) = &exec_result {
+                        use ra_core::sandbox::token_truncation::TruncationPolicy;
+                        let requested = TruncationPolicy::tokens(10_000);
+                        let model_policy = self
+                            .feedback_policy
+                            .get()
+                            .map_or(TruncationPolicy::bytes(10_000), |policy| {
+                                policy.for_model(&model)
+                            });
+                        let policy = if requested.byte_budget() < model_policy.byte_budget() {
+                            requested
+                        } else {
+                            model_policy
+                        };
+                        (
+                            HookToolName {
+                                name: "Bash".to_owned(),
+                                matcher_aliases: Vec::new(),
+                            },
+                            completion
+                                .origin_call_id()
+                                .filter(|id| !id.is_empty())
+                                .unwrap_or(call.call_id().as_str())
+                                .to_owned(),
+                            serde_json::json!({"command": completion.command()}),
+                            Value::String(ra_tools::exec_command::truncated_exec_output(
+                                completion.output().unwrap_or_default(),
+                                completion.omitted_bytes(),
+                                completion.total_bytes(),
+                                policy,
+                            )),
+                        )
+                    } else {
+                        (
+                            tool,
+                            call.call_id().to_string(),
+                            mcp_result
+                                .as_ref()
+                                .map_or_else(|| hook_input(&call), |result| result.input.clone()),
+                            tool_response,
+                        )
+                    };
                 let request = PostToolUseRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
@@ -806,10 +891,8 @@ impl ProductHookRuntime {
                     permission_mode: permission_mode.clone(),
                     tool_name: tool.name,
                     matcher_aliases: tool.matcher_aliases,
-                    tool_use_id: call.call_id().to_string(),
-                    tool_input: mcp_result
-                        .as_ref()
-                        .map_or_else(|| hook_input(&call), |result| result.input.clone()),
+                    tool_use_id,
+                    tool_input,
                     tool_response,
                 };
                 self.emit_started(&turn_id, hooks.preview_post_tool_use(&request));
@@ -1101,6 +1184,40 @@ fn non_empty(reason: Option<String>, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+/// Selected shell transport, identified by instance whenever available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecKind {
+    Command,
+    Stdin,
+}
+
+fn exec_kind(call: &ToolHookData<'_>) -> Option<ExecKind> {
+    if let Some(tool) = call.tool() {
+        let tool = tool as &dyn std::any::Any;
+        if tool
+            .downcast_ref::<ra_tools::exec_command::ExecCommandTool>()
+            .is_some()
+        {
+            return Some(ExecKind::Command);
+        }
+        if tool
+            .downcast_ref::<ra_tools::write_stdin::WriteStdinTool>()
+            .is_some()
+        {
+            return Some(ExecKind::Stdin);
+        }
+        return None;
+    }
+    if call.origin().namespace().is_none() {
+        match call.origin().name() {
+            "exec_command" => return Some(ExecKind::Command),
+            "write_stdin" => return Some(ExecKind::Stdin),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The source's hook-facing tool identity: the serialized name and extra matcher inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HookToolName {
@@ -1118,11 +1235,17 @@ impl HookToolName {
                 matcher_aliases: Vec::new(),
             };
         }
+        if exec_kind(call) == Some(ExecKind::Command) {
+            return Self {
+                name: "Bash".to_owned(),
+                matcher_aliases: Vec::new(),
+            };
+        }
         let origin = call.origin();
         match origin.name() {
             // Shell-like tools keep the historical hook name.
             "exec_command" | "shell" | "shell_command" | "local_shell"
-                if origin.namespace().is_none() =>
+                if call.tool().is_none() && origin.namespace().is_none() =>
             {
                 Self {
                     name: "Bash".to_owned(),
@@ -1227,16 +1350,11 @@ fn hook_input(call: &ToolHookData<'_>) -> Value {
     if call.tool().and_then(crate::mcp::hook_tool_name).is_some() {
         return call.arguments().clone();
     }
-    if call.origin().namespace().is_none() {
-        match call.origin().name() {
-            "exec_command" => {
-                return serde_json::json!({"command": call.arguments().get("cmd").cloned().unwrap_or(Value::Null)});
-            }
-            "apply_patch" => {
-                return serde_json::json!({"command": call.arguments().as_str().map(str::to_owned).or_else(|| call.arguments().get("patch").and_then(Value::as_str).map(str::to_owned))});
-            }
-            _ => {}
-        }
+    if exec_kind(call) == Some(ExecKind::Command) {
+        return serde_json::json!({"command": call.arguments().get("cmd").cloned().unwrap_or(Value::Null)});
+    }
+    if call.origin().namespace().is_none() && call.origin().name() == "apply_patch" {
+        return serde_json::json!({"command": call.arguments().as_str().map(str::to_owned).or_else(|| call.arguments().get("patch").and_then(Value::as_str).map(str::to_owned))});
     }
     call.arguments().clone()
 }
@@ -1245,7 +1363,7 @@ fn native_input(call: &ToolHookData<'_>, input: Value) -> std::result::Result<Va
         return Ok(input);
     }
     if call.origin().namespace().is_none()
-        && matches!(call.origin().name(), "exec_command" | "apply_patch")
+        && (exec_kind(call) == Some(ExecKind::Command) || call.origin().name() == "apply_patch")
     {
         let command = input
             .get("command")

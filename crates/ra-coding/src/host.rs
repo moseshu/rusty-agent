@@ -693,6 +693,7 @@ impl CodingHost {
             capability = capability.with_additional_permissions();
         }
         Ok(capability
+            .with_completion_observer(Arc::new(crate::hooks::CodingExecCompletionObserver))
             .with_command_policy(Arc::new(policy))
             .with_stdin_policy(Arc::new(crate::thread_settings::CodingStdinPolicy)))
     }

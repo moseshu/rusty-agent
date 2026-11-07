@@ -1045,3 +1045,6 @@ existing upstream attribution and licensing.
 | `tests/it-coding/tests/plugin_management_flow.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/app-server/src/effective_plugin_change_tests.rs; codex-rs/app-server/tests/suite/v2/plugin_read.rs |
 | `tests/it-protocol/tests/threads/product_hooks/mcp_payload.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs; codex-rs/core/src/tools/registry.rs |
 | `crates/ra-mcp/src/tool/prepared.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/mcp.rs |
+| `crates/ra-exec/src/output.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/unified_exec/head_tail_buffer.rs (byte projection) |
+| `crates/ra-tools/src/exec_command.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/context.rs::truncated_output_with_policy; codex-rs/core/src/unified_exec/process_manager.rs (effective completion) |
+| `tests/it-protocol/tests/threads/product_hooks/exec_completion.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/tools/handlers/unified_exec_tests.rs; codex-rs/core/src/tools/registry_tests.rs (exec hook payloads) |

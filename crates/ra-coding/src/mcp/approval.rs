@@ -242,7 +242,7 @@ impl ProductMcpTool {
         if let Some(limits) = context
             .run()
             .app_context::<CodingThreadSettings>()
-            .and_then(|settings| settings.mcp_hook_results.as_ref())
+            .and_then(|settings| settings.tool_hook_results.as_ref())
         {
             let output = ra_mcp::tool::map_tool_result(result.clone())?;
             let key = (context.run().run_id().clone(), context.call_id().clone());
@@ -260,11 +260,11 @@ impl ProductMcpTool {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(
                     key,
-                    crate::hooks::McpHookResult {
+                    crate::hooks::ToolHookRecord::Mcp(crate::hooks::McpHookResult {
                         result,
                         input: context.arguments().clone(),
                         token_limit,
-                    },
+                    }),
                 );
             Ok(output)
         } else {

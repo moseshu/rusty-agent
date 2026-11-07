@@ -1373,3 +1373,39 @@ including structuredContent and `_meta`. Error content remains model-visible und
 mapping. Turn completion/abort clears residual root and nested records; threads without product
 hooks retain none. This ports Codex's handler-owned McpToolOutput without changing neutral ToolOutput
 or making MCP errors into SDK invocation exceptions.
+
+### Exec product hook completion and raw output
+
+The coding product treats `write_stdin` as transport for an existing command: it emits no
+PreToolUse, and emits Bash PostToolUse only on the delivery that first observes complete output.
+The payload uses the original exec call ID and command, with that delivery's arrival-ordered raw
+output (including newlines and empty output) under Codex's three-branch truncation policy. Equal
+requested/model byte budgets select the model policy. SDK tool lifecycle hooks still run per call.
+Dynamic tools sharing an exec tool's name retain their ordinary identity; selected Rust tool
+instances determine product exec handling. Manually constructed ToolHookData without an executable
+keeps the legacy name-based compatibility path.
+
+`ProcessManager::execute_observed` opts into a third head/tail byte buffer. Ordinary execution
+allocates no arrival buffer. Both projections are written under the session lock; interactive
+positions sum to the merged position. Retained bytes and omission-marker bytes are joined before
+UTF-8 decoding. `InteractionGuard::deliver` atomically reads both streams, advances delivery
+positions and claims completion while retaining the session Arc, even after registry removal.
+Synchronous observed execution also retains that Arc through claim. Cancellation after claim need
+not run the hook; there is no persistent delivery protocol. The existing ExecRequest wire shape,
+approval resume state, Completed variant, per-stream reads and model output remain unchanged.
+
+`ExecCompletionObserver` is optional for SDK callers. Exec capture is selected at execution time,
+including approval resume, by `wants_completion` (default true). Poll notification opt-out still
+consumes completion and advances output; reenabling never replays it. Uncaptured sessions also
+consume completion without notification. Retries report only the final effective result; network
+rejection replacing a result reports none. Thread-owned ToolHookResults now holds both MCP and
+exec records with the same run/call ownership and turn cleanup.
+
+The default coding product installs this observer for every exec invocation, even without configured
+user hook handlers, so every such session preallocates one extra effective `max_capture_bytes`
+buffer. ProcessManager defaults to 1 MiB, but ExecCommandLimits tightens the default product to
+100 KiB: product capture grows from 200 KiB to 300 KiB per session. This corrects the design's earlier
+1 MiB product-memory estimate; neither ceiling changed. Registered deviations remain: local omission
+marker spelling (`... [omitted N bytes] ...`), retained completed sessions accepting later polls,
+no max_output_tokens input and no PTY. PermissionRequest stdin payload parity is a separate pending
+acceptance item.

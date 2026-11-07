@@ -648,3 +648,6 @@ mod refresh;
 
 #[path = "product_hooks/closeout.rs"]
 mod closeout;
+
+#[path = "product_hooks/exec_completion.rs"]
+mod exec_completion;

@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Execution output collection, eviction reasons, and summary metadata.
 
 use std::{collections::VecDeque, fmt::Write as _, time::Duration};
@@ -392,7 +393,7 @@ impl HeadTailBuffer {
         }
         let omitted = tail_start.saturating_sub(head_end.max(offset));
         if omitted > 0 {
-            let _ = write!(text, "\n... [omitted {omitted} bytes] ...\n");
+            let _ = write!(text, "\n{}\n", omission_marker(omitted));
         }
         let tail_from = offset.saturating_sub(tail_start).min(self.tail.len());
         if tail_from < self.tail.len() {
@@ -400,6 +401,33 @@ impl HeadTailBuffer {
             text.push_str(&String::from_utf8_lossy(&tail));
         }
         Some((text, self.total_bytes))
+    }
+
+    /// Reads one retained byte span before any UTF-8 decoding.
+    pub(crate) fn read_bytes_from(&self, offset: usize) -> Option<(Vec<u8>, usize)> {
+        if offset >= self.total_bytes {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        if offset < self.head.len() {
+            bytes.extend_from_slice(&self.head[offset..]);
+        }
+        let omitted = self.omitted_from(offset);
+        if omitted > 0 {
+            bytes.extend_from_slice(format!("\n{}\n", omission_marker(omitted)).as_bytes());
+        }
+        let tail_start = self.total_bytes.saturating_sub(self.tail.len());
+        let tail_from = offset.saturating_sub(tail_start).min(self.tail.len());
+        bytes.extend(self.tail.iter().skip(tail_from).copied());
+        Some((bytes, self.total_bytes))
+    }
+
+    /// Exposes raw span projection only to the external test workspace.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_read_bytes_from(&self, offset: usize) -> Option<(Vec<u8>, usize)> {
+        self.read_bytes_from(offset)
     }
 
     /// Bytes this buffer dropped inside the span a read from `offset` covers.
@@ -464,4 +492,10 @@ impl HeadTailBuffer {
         out.extend(self.tail.iter().copied());
         out
     }
+}
+
+/// Renders the capture buffer's omission marker without surrounding newlines.
+#[must_use]
+pub fn omission_marker(omitted: usize) -> String {
+    format!("... [omitted {omitted} bytes] ...")
 }
