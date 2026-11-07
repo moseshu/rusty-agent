@@ -490,20 +490,8 @@ fn done() -> ModelResponse {
 )]
 async fn a_session_approval_answered_through_the_runner_spans_turns() {
     let fixture = fixture(AskForApproval::UnlessTrusted).await;
-    // The runner checks arguments against the strict schema, which lists every field.
-    let mut arguments = command("echo ran >> ran.log");
-    for field in [
-        "workdir",
-        "shell",
-        "tty",
-        "login",
-        "timeout_ms",
-        "sandbox_permissions",
-        "justification",
-        "prefix_rule",
-    ] {
-        arguments[field] = Value::Null;
-    }
+    // Only `cmd` is required, as in Codex's `ExecCommandArgs`; omitted fields take their defaults.
+    let arguments = command("echo ran >> ran.log");
 
     let interrupted = Runner::run(run_request(
         &fixture,
