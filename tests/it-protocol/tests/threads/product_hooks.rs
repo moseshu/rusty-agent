@@ -651,3 +651,6 @@ mod closeout;
 
 #[path = "product_hooks/exec_completion.rs"]
 mod exec_completion;
+
+#[path = "product_hooks/in_call_permission.rs"]
+mod in_call_permission;

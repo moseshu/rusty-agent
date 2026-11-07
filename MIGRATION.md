@@ -1409,3 +1409,22 @@ buffer. ProcessManager defaults to 1 MiB, but ExecCommandLimits tightens the def
 marker spelling (`... [omitted N bytes] ...`), retained completed sessions accepting later polls,
 no max_output_tokens input and no PTY. PermissionRequest stdin payload parity is a separate pending
 acceptance item.
+
+### Permission hooks for approvals asked during a call
+
+A tool that asks for approval from inside its invocation (`ToolApprovalRequest`) now has that
+request put to PermissionRequest hooks before the host is asked, as Codex's `request_approval`
+asks hooks before any reviewer. A grant continues the invocation with the kept state as an
+approved continuation, without recording an approval or caching anything; a denial refuses the
+call with the hook's message (`hook.permission_request`) and closes the started invocation; no
+decision leaves the approval for the host as before. Every such request inside one invocation is
+asked; the runtime adds no limit of its own. `ToolHookData::approval_state()` carries the state the
+tool kept, `None` for permission requests made before the call starts.
+
+In the coding product this covers the retry outside a refusing sandbox, asked under the run id
+`{call_id}:retry`, and product MCP approvals, which now reach hooks before any elicitation. Exec
+permission requests carry the model's `justification` as `description` whenever it is a string,
+an empty one included. MCP hook input keeps the call's arguments unchanged: a blank argument string
+is already `{}` and JSON `null` stays `null`. A denied MCP call reads as the error result Codex
+builds from the hook's message; the `Wall time` header and MCP item projection remain separate,
+pre-existing differences of the MCP output path.

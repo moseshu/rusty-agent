@@ -766,8 +766,8 @@ impl ProductHookRuntime {
                     permission_mode: permission_mode.clone(),
                     tool_name: tool.name,
                     matcher_aliases: tool.matcher_aliases,
-                    run_id_suffix: call.call_id().to_string(),
-                    tool_input: hook_input(&call),
+                    run_id_suffix: permission_run_id_suffix(&call),
+                    tool_input: permission_input(&call),
                 };
                 self.emit_started(&turn_id, hooks.preview_permission_request(&request));
                 let outcome = hooks.run_permission_request(request).await;
@@ -1357,6 +1357,38 @@ fn hook_input(call: &ToolHookData<'_>) -> Value {
         return serde_json::json!({"command": call.arguments().as_str().map(str::to_owned).or_else(|| call.arguments().get("patch").and_then(Value::as_str).map(str::to_owned))});
     }
     call.arguments().clone()
+}
+/// Codex's `PermissionRequestPayload` input: exec carries the model's `justification` as
+/// `description` whenever it was given, an empty one included; every other tool is unchanged.
+fn permission_input(call: &ToolHookData<'_>) -> Value {
+    let mut input = hook_input(call);
+    if exec_kind(call) == Some(ExecKind::Command)
+        && let Some(description) = call
+            .arguments()
+            .get("justification")
+            .and_then(Value::as_str)
+        && let Some(object) = input.as_object_mut()
+    {
+        object.insert(
+            "description".to_owned(),
+            Value::String(description.to_owned()),
+        );
+    }
+    input
+}
+
+/// Codex's permission-request run id: a retry outside the sandbox is asked under
+/// `{call_id}:retry`, every other approval under the call's id.
+fn permission_run_id_suffix(call: &ToolHookData<'_>) -> String {
+    let retry = exec_kind(call) == Some(ExecKind::Command)
+        && call
+            .approval_state()
+            .is_some_and(crate::thread_settings::is_sandbox_retry_approval);
+    if retry {
+        format!("{}:retry", call.call_id())
+    } else {
+        call.call_id().to_string()
+    }
 }
 fn native_input(call: &ToolHookData<'_>, input: Value) -> std::result::Result<Value, String> {
     if call.tool().and_then(crate::mcp::hook_tool_name).is_some() {

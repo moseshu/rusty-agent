@@ -1614,3 +1614,6 @@ async fn feedback_follows_the_current_turn_model_instead_of_the_initial_model() 
 
 #[path = "mcp_payload.rs"]
 mod mcp_payload;
+
+#[path = "mcp_permission.rs"]
+mod mcp_permission;

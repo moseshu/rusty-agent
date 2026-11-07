@@ -695,109 +695,165 @@ async fn run_chain(
         return Ok(refusal);
     }
 
-    // 5. Dynamic resource claims evaluation.
-    // Exclusive tools run alone under a global write gate and skip fine-grained claims.
-    let claims = if matches!(options.concurrency(), ToolConcurrency::Parallel) {
-        let claims_result = request
-            .cancel
-            .run(tool.resource_claims(&request.context()))
-            .await;
-        match claims_result {
-            Ok(Ok(claims)) => claims,
-            Ok(Err(error)) => {
-                return shape_failure(
-                    tool,
-                    request,
-                    &options,
-                    &name,
-                    error,
-                    &output_guardrails,
-                    records,
-                )
+    // Stages 5 to 7 repeat only when the tool asks for approval from inside its invocation and a
+    // permission hook grants it: the approved call continues as a continuation would after a host
+    // answer, re-acquiring the resources it released. Every such request is put to the hooks; how
+    // often a tool may ask is its own contract, not a limit of this chain.
+    let mut continuation = continuation;
+    let mut decoded_input = decoded_input;
+    let (outcome, deadline_elapsed) = loop {
+        // 5. Dynamic resource claims evaluation.
+        // Exclusive tools run alone under a global write gate and skip fine-grained claims.
+        let claims = if matches!(options.concurrency(), ToolConcurrency::Parallel) {
+            let claims_result = request
+                .cancel
+                .run(tool.resource_claims(&request.context()))
                 .await;
+            match claims_result {
+                Ok(Ok(claims)) => claims,
+                Ok(Err(error)) => {
+                    return shape_failure(
+                        tool,
+                        request,
+                        &options,
+                        &name,
+                        error,
+                        &output_guardrails,
+                        records,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        }
-    } else {
-        Vec::new()
-    };
+        } else {
+            Vec::new()
+        };
 
-    // 6. Concurrency & Resource Admission (if gate is provided).
-    let permits = if let Some(gate) = admission {
-        let permits = gate
-            .acquire_permits(&request.cancel, options.concurrency(), &claims)
+        // 6. Concurrency & Resource Admission (if gate is provided).
+        let permits = if let Some(gate) = admission {
+            let permits = gate
+                .acquire_permits(&request.cancel, options.concurrency(), &claims)
+                .await?;
+            tracing::Span::current().record(
+                ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
+                duration_ms(admission_started.elapsed()),
+            );
+            request.cancel.ensure_not_cancelled()?;
+            Some(permits)
+        } else {
+            None
+        };
+
+        // Lifecycle narration, immediately around the invocation and nowhere wider. It is not a
+        // stage: it decides nothing, and it is unnumbered so the numbering keeps meaning "a point
+        // where this call can still be refused". Every stage above decides whether the call happens
+        // at all, so announcing a tool start ahead of them would announce tools the chain then
+        // refuses to run, and a host counting invocations would be counting decisions. It sits
+        // below the admission gate too, so the pair brackets execution rather than execution plus
+        // queueing — the waiting already has its own field.
+        //
+        // A continuation was announced when it first started, and its end is announced once,
+        // below, when it has a result.
+        if !continuation {
+            lifecycle_dispatch::tool_start(
+                &request.lifecycle,
+                &lifecycle_call(request),
+                &request.cancel,
+            )
             .await?;
-        tracing::Span::current().record(
-            ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
-            duration_ms(admission_started.elapsed()),
-        );
-        request.cancel.ensure_not_cancelled()?;
-        Some(permits)
-    } else {
-        None
-    };
+        }
 
-    // Lifecycle narration, immediately around the invocation and nowhere wider. It is not a stage:
-    // it decides nothing, and it is unnumbered so the numbering keeps meaning "a point where this
-    // call can still be refused". Every stage above decides whether the call happens at all, so
-    // announcing a tool start ahead of them would announce tools the chain then refuses to run, and
-    // a host counting invocations would be counting decisions. It sits below the admission gate
-    // too, so the pair brackets execution rather than execution plus queueing — the waiting already
-    // has its own field.
-    //
-    // A continuation was announced when it first started, and its end is announced once, below,
-    // when it has a result.
-    if !continuation {
-        lifecycle_dispatch::tool_start(
-            &request.lifecycle,
-            &lifecycle_call(request),
+        // 7. Invoke tool.
+        let (outcome, deadline_elapsed) = invoke(
+            tool,
+            request.context_with_decoded(decoded_input.take()),
+            &options,
             &request.cancel,
+            &name,
+            request.nested_resume.clone(),
+        )
+        .await;
+
+        // Release fine-grained resource locks immediately upon invoke completion.
+        drop(permits);
+
+        // An agent tool whose nested run paused has not settled: nothing is announced, checked
+        // or rendered for it until it has, which is the reference skipping output guardrails and
+        // `on_tool_end` for a call with nested interruptions.
+        if let Err(error) = &outcome
+            && let Some(state) = crate::agent::tool::nested_interruption(error)
+        {
+            return Ok(ToolDispatch::AwaitingNestedApproval(Box::new(
+                NestedRunRef::interrupted(
+                    request.run.run_id().as_str(),
+                    tool.origin(),
+                    request.call_id.clone(),
+                    request.arguments.clone(),
+                    state.clone(),
+                ),
+            )));
+        }
+
+        // A tool that asked for approval from inside its invocation has not settled either. The
+        // permission hooks are asked first, as they are before any approval a host is asked for;
+        // without their decision the approval keeps its state, and the approved call continues
+        // the invocation.
+        let Err(error) = &outcome else {
+            break (outcome, deadline_elapsed);
+        };
+        let Some(asked) = ToolApprovalRequest::of(error) else {
+            break (outcome, deadline_elapsed);
+        };
+        let state = asked.state().clone();
+        let decision = run_user_hook(
+            request,
+            HookEvent::PermissionRequest(tool_hook_data(request).with_approval_state(&state)),
         )
         .await?;
-    }
-
-    // 7. Invoke tool.
-    let (outcome, deadline_elapsed) = invoke(
-        tool,
-        request.context_with_decoded(decoded_input),
-        &options,
-        &request.cancel,
-        &name,
-        request.nested_resume.clone(),
-    )
-    .await;
-
-    // Release fine-grained resource locks immediately upon invoke completion.
-    drop(permits);
-
-    // An agent tool whose nested run paused has not settled: nothing is announced, checked or
-    // rendered for it until it has, which is the reference skipping output guardrails and
-    // `on_tool_end` for a call with nested interruptions.
-    if let Err(error) = &outcome
-        && let Some(state) = crate::agent::tool::nested_interruption(error)
-    {
-        return Ok(ToolDispatch::AwaitingNestedApproval(Box::new(
-            NestedRunRef::interrupted(
-                request.run.run_id().as_str(),
-                tool.origin(),
-                request.call_id.clone(),
-                request.arguments.clone(),
-                state.clone(),
-            ),
-        )));
-    }
-
-    // A tool that asked for approval from inside its invocation has not settled either: the
-    // approval keeps its state, and the approved call continues the invocation.
-    if let Err(error) = &outcome
-        && let Some(asked) = ToolApprovalRequest::of(error)
-    {
-        return Ok(ToolDispatch::AwaitingApproval(
-            request
-                .approval()
-                .with_resume(ToolResume::during_call(asked.state().clone())),
-        ));
-    }
+        match decision {
+            HookDecision::Allow => {
+                // A call cancelled while its hooks decided is not invoked again.
+                request.cancel.ensure_not_cancelled()?;
+                request.resume = Some(ToolResume::during_call(state));
+                request.approval_granted = true;
+                continuation = true;
+                decoded_input = match tool.decode_input(&request.arguments) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        return shape_failure(
+                            tool,
+                            request,
+                            &options,
+                            &name,
+                            error,
+                            &output_guardrails,
+                            records,
+                        )
+                        .await;
+                    }
+                };
+            }
+            HookDecision::Deny { message } => {
+                let denied = Err(Error::tool(
+                    ToolErrorKind::PermissionDenied,
+                    &name,
+                    "a permission hook denied the approval this call asked for",
+                ));
+                announce_invocation_end(request, &denied).await?;
+                return Ok(ToolDispatch::Refused(ToolRefusal::new(
+                    pre_invocation_rejection(request, message)?,
+                    PERMISSION_REQUEST_HOOK_CODE,
+                )));
+            }
+            _ => {
+                return Ok(ToolDispatch::AwaitingApproval(
+                    request
+                        .approval()
+                        .with_resume(ToolResume::during_call(state)),
+                ));
+            }
+        }
+    };
 
     // A failed Session append retains completed child work. It must leave through the parent
     // checkpoint rather than become a model-visible tool failure that invites another execution.

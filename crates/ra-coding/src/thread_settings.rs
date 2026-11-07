@@ -1324,6 +1324,17 @@ enum CommandResume {
     },
 }
 
+/// Whether the state `exec_command` kept with an approval asks to retry a command its sandbox
+/// refused: the approval Codex's orchestrator asks with a `retry_reason`.
+pub(crate) fn is_sandbox_retry_approval(state: &Value) -> bool {
+    ra_tools::exec_command::approval_policy_state(state).is_some_and(|policy| {
+        matches!(
+            serde_json::from_value::<CommandResume>(policy.clone()),
+            Ok(CommandResume::SandboxRetry { .. })
+        )
+    })
+}
+
 impl CommandResume {
     /// The decision the call was asked about with.
     const fn decision(&self) -> &CommandDecision {

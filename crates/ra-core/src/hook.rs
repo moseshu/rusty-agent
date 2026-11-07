@@ -117,6 +117,7 @@ pub struct ToolHookData<'a> {
     call_id: &'a CallId,
     arguments: &'a serde_json::Value,
     tool: Option<&'a dyn Tool>,
+    approval_state: Option<&'a serde_json::Value>,
 }
 
 impl std::fmt::Debug for ToolHookData<'_> {
@@ -126,6 +127,7 @@ impl std::fmt::Debug for ToolHookData<'_> {
             .field("call_id", self.call_id)
             .field("arguments", self.arguments)
             .field("tool", &self.tool.map(Tool::origin))
+            .field("approval_state", &self.approval_state.is_some())
             .finish()
     }
 }
@@ -143,6 +145,7 @@ impl<'a> ToolHookData<'a> {
             call_id,
             arguments,
             tool: None,
+            approval_state: None,
         }
     }
     /// Borrows the actual selected executable, retaining its adapter-owned identity.
@@ -170,6 +173,22 @@ impl<'a> ToolHookData<'a> {
     #[must_use]
     pub const fn arguments(&self) -> &'a serde_json::Value {
         self.arguments
+    }
+    /// Marks a permission request the tool raised from inside its invocation, carrying the state
+    /// it kept with that request (see [`ToolApprovalRequest`](crate::tool::ToolApprovalRequest)).
+    #[must_use]
+    pub const fn with_approval_state(mut self, state: &'a serde_json::Value) -> Self {
+        self.approval_state = Some(state);
+        self
+    }
+    /// The state a tool kept with an approval it requested from inside its invocation.
+    ///
+    /// `None` for every event except a permission request raised that way; a permission request
+    /// made before the invocation starts has no tool state. The runtime passes the value through
+    /// without reading it, so its format belongs to the tool that produced it.
+    #[must_use]
+    pub const fn approval_state(&self) -> Option<&'a serde_json::Value> {
+        self.approval_state
     }
 }
 
