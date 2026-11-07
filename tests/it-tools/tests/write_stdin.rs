@@ -73,7 +73,7 @@ async fn background(exec_command: &ExecCommandTool, command: &str) -> String {
             "cmd": command,
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 100,
             "timeout_ms": null
@@ -141,7 +141,7 @@ async fn test_write_stdin_delivers_bytes_to_a_pipe_backed_session() {
             "cmd": "printf 'before\\n'; read line; printf 'reply:%s\\n' \"$line\"; sleep 30",
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 100,
             "timeout_ms": null
@@ -205,7 +205,7 @@ async fn test_an_empty_poll_outlives_the_session_it_polls() {
             "cmd": "printf 'before\\n'; sleep 2; printf 'after\\n'",
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             // Long enough for a loaded machine to start the shell and print the first line, short
             // of the sleep so the command is still running when the call yields.
@@ -292,7 +292,7 @@ async fn test_writing_to_a_finished_session_is_reported_to_the_model() {
             "cmd": "printf 'before\\n'; sleep 1",
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 100,
             "timeout_ms": null

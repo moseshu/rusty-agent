@@ -407,7 +407,7 @@ async fn test_every_shell_entry_the_host_builds_shares_its_session_manager() {
         "cmd": "read line; printf 'reply:%s\\n' \"$line\"; sleep 30",
         "workdir": null,
         "shell": null,
-        "tty": null,
+        "tty": false,
         "login": null,
         "yield_time_ms": 100,
         "timeout_ms": null

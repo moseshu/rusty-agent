@@ -217,7 +217,7 @@ fn command_response(call_id: &str, escalated: bool) -> ModelResponse {
             json!({
                 "cmd":"echo hook-fields", "justification": "test approval", "prefix_rule":null,
                 "sandbox_permissions": if escalated { Some("require_escalated") } else { None },
-                "workdir":null, "shell":"/bin/sh", "tty":null, "login":false,
+                "workdir":null, "shell":"/bin/sh", "tty":false, "login":false,
                 "yield_time_ms":1000, "timeout_ms":null,
             }),
         )),

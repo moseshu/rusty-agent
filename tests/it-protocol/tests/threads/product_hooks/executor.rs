@@ -1363,7 +1363,7 @@ args = [{}]
         RunItemKind::ToolCall(ToolCall::new(
             CallId::new("call"),
             "exec_command",
-            json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null}),
+            json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":1000,"timeout_ms":null}),
         )),
     )])));
     fixture.home.script.answer("reviewed");
@@ -1586,7 +1586,7 @@ async fn feedback_follows_the_current_turn_model_instead_of_the_initial_model() 
     ] {
         home.script.push(Step::Respond(ModelResponse::new(vec![RunItem::new(
             ItemId::new("command"), RunItemKind::ToolCall(ToolCall::new(CallId::new("call"), "exec_command",
-                json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null}))),
+                json!({"cmd":"echo original","justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":1000,"timeout_ms":null}))),
         )])));
         home.script.answer("reviewed");
         server

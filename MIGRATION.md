@@ -1428,3 +1428,25 @@ an empty one included. MCP hook input keeps the call's arguments unchanged: a bl
 is already `{}` and JSON `null` stays `null`. A denied MCP call reads as the error result Codex
 builds from the hook's message; the `Wall time` header and MCP item projection remain separate,
 pre-existing differences of the MCP output path.
+
+### `exec_command` arguments follow Codex's `ExecCommandArgs`
+
+`exec_command` is now declared `strict: false`, as Codex declares it, and decodes its arguments
+the way Codex's `ExecCommandArgs` does: only `cmd` is required, every optional argument may be
+omitted, and arguments the tool does not read are ignored instead of refused. A call that omits
+`justification` therefore reaches its approval, where its PermissionRequest carries no
+`description`. `tty` defaults to `false` and `yield_time_ms` to the host's configured default; both
+refuse an explicit `null`, as Codex's non-optional fields do, and are advertised as plain boolean and
+integer. Other optional arguments still take `null` as their absent value. The advertised object
+stays closed (`additionalProperties: false`), as Codex's declaration is: the model is told which
+fields exist, while a call that sends others anyway still runs. This applies to the plain, policy
+and additional-permissions forms alike and changes the advertised tool schema
+(`TOOL_SCHEMA_REVISION` 12).
+
+Arguments a form does not offer are left to the host policy, as Codex leaves them to its handler:
+the coding product refuses `additional_permissions` with Codex's messages while
+`exec_permission_approvals` is off. A tool built without any policy has nothing to honor them with
+and ignores them. Remaining differences: malformed arguments are reported with this crate's
+`Invalid arguments` diagnostic rather than Codex's `failed to parse function arguments`, and with
+the feature off a `sandbox_permissions` of `with_additional_permissions` is refused as an
+unadvertised value before the policy sees it.

@@ -77,8 +77,14 @@ macro_rules! exec_command_input {
         // tools doing the work carry short descriptions and the dangerous ones carry contracts;
         // this is both, so the description says what the tool returns and the argument
         // descriptions carry the rest.
+        //
+        // Codex declares this tool `strict: false` and decodes it with every optional field
+        // defaulted and unknown fields ignored (`ExecCommandArgs`): a call may omit what it does
+        // not need. `tty` and `yield_time_ms` have defaults rather than a null, so an explicit
+        // `null` for either is refused there and here. The advertised schema still closes the
+        // object, as Codex's declaration does; see `ExecSchema`.
         #[derive(Debug, Clone, Deserialize, JsonSchema, ToolInput)]
-        #[serde(deny_unknown_fields)]
+        #[tool_input(strict = false)]
         /// Runs a command in a shell. Returns its output, or a `session_id` when the command is still
         /// running after the yield timeout.
         struct $name {
@@ -89,17 +95,68 @@ macro_rules! exec_command_input {
             /// Shell to run the command with. Defaults to `/bin/sh`.
             shell: Option<String>,
             /// Request a terminal. Not available; leave unset or false.
-            tty: Option<bool>,
+            // `skip_serializing_if` keeps schemars from advertising the default, as Codex's
+            // declaration does not.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            tty: bool,
             /// Run the shell as a login shell, so that profile files are read.
             login: Option<bool>,
             /// Milliseconds to wait before the command yields to the background (default: 10000). The host
             /// may cap this; asking for longer than it allows yields at the cap.
+            #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+            #[schemars(with = "u64")]
             yield_time_ms: Option<u64>,
             /// Milliseconds after which the command is stopped for good. Unset means the host's limit.
             timeout_ms: Option<u64>,
             $($extra)*
         }
     };
+}
+
+/// A value that may be omitted but not sent as `null`: Codex's `#[serde(default = ..)]` on a
+/// non-optional field. Omission keeps `None`, so the host's configured default still applies.
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// One argument form of `exec_command`: what the model is shown and how a call is decoded.
+///
+/// Codex keeps two contracts apart here. Its declaration closes the argument object
+/// (`additionalProperties: false`), so the model is told not to invent fields, while
+/// `ExecCommandArgs` ignores any field it does not read. [`FuncSchema::for_input`] validates a
+/// call against the schema it advertises, so the closed object is advertised separately and the
+/// decoder keeps the open one.
+#[derive(Clone)]
+struct ExecSchema {
+    decoder: FuncSchema,
+    advertised: ToolSchema,
+}
+
+impl ExecSchema {
+    fn for_input<T: ra_core::tool::ToolInput>() -> Result<Self> {
+        let decoder = FuncSchema::for_input::<T>(TOOL_NAME)?;
+        let open = decoder.tool_schema();
+        let mut input_schema = open.input_schema().clone();
+        input_schema
+            .as_object_mut()
+            .ok_or_else(|| Error::config("exec_command arguments must have an object schema"))?
+            .insert(
+                "additionalProperties".to_owned(),
+                serde_json::Value::Bool(false),
+            );
+        let mut advertised = ToolSchema::loose(TOOL_NAME, input_schema)?;
+        if let Some(description) = open.description() {
+            advertised = advertised.with_description(description);
+        }
+        Ok(Self {
+            decoder,
+            advertised,
+        })
+    }
 }
 
 exec_command_input!(ExecCommandInput {});
@@ -320,12 +377,12 @@ pub fn truncated_exec_output(
 #[derive(Clone)]
 pub struct ExecCommandTool {
     origin: ToolOrigin,
-    func_schema: FuncSchema,
+    schema: ExecSchema,
     /// The schema with the approval arguments, advertised once policy resolvers are installed.
-    policy_func_schema: FuncSchema,
+    policy_schema: ExecSchema,
     /// The approval arguments with Codex's additional permissions, advertised in their place once
     /// the host also turns those on.
-    permissions_func_schema: FuncSchema,
+    permissions_schema: ExecSchema,
     additional_permissions: bool,
     options: ToolOptions,
     process_manager: Arc<ProcessManager>,
@@ -824,11 +881,9 @@ impl ExecCommandTool {
     pub fn new() -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
-            policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
-            permissions_func_schema: FuncSchema::for_input::<PermissionsExecCommandInput>(
-                TOOL_NAME,
-            )?,
+            schema: ExecSchema::for_input::<ExecCommandInput>()?,
+            policy_schema: ExecSchema::for_input::<PolicyExecCommandInput>()?,
+            permissions_schema: ExecSchema::for_input::<PermissionsExecCommandInput>()?,
             additional_permissions: false,
             options: base_options(),
             process_manager: Arc::new(ProcessManager::default()),
@@ -862,11 +917,9 @@ impl ExecCommandTool {
     pub fn for_workspace(workspace: &Workspace) -> Result<Self> {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
-            func_schema: FuncSchema::for_input::<ExecCommandInput>(TOOL_NAME)?,
-            policy_func_schema: FuncSchema::for_input::<PolicyExecCommandInput>(TOOL_NAME)?,
-            permissions_func_schema: FuncSchema::for_input::<PermissionsExecCommandInput>(
-                TOOL_NAME,
-            )?,
+            schema: ExecSchema::for_input::<ExecCommandInput>()?,
+            policy_schema: ExecSchema::for_input::<PolicyExecCommandInput>()?,
+            permissions_schema: ExecSchema::for_input::<PermissionsExecCommandInput>()?,
             additional_permissions: false,
             options: base_options()
                 .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
@@ -939,16 +992,16 @@ impl ExecCommandTool {
     pub fn with_additional_permissions(mut self) -> Self {
         self.additional_permissions = true;
         if self.policy.is_some() {
-            self.func_schema = self.permissions_func_schema.clone();
+            self.schema = self.permissions_schema.clone();
         }
         self
     }
 
     fn install_policy(&mut self, policy: Arc<dyn ExecCommandPolicy>) {
-        self.func_schema = if self.additional_permissions {
-            self.permissions_func_schema.clone()
+        self.schema = if self.additional_permissions {
+            self.permissions_schema.clone()
         } else {
-            self.policy_func_schema.clone()
+            self.policy_schema.clone()
         };
         self.policy = Some(policy);
         self.options = self
@@ -991,7 +1044,7 @@ impl ExecCommandTool {
             || {
                 serde_json::from_value(context.arguments().clone()).map_err(|error| {
                     ExecCommandFailure::BadArguments(ToolArgumentDecodeError::Deserialize {
-                        input_type: self.func_schema.input_type_name(),
+                        input_type: self.schema.decoder.input_type_name(),
                         message: error.to_string(),
                     })
                     .into_error()
@@ -1017,7 +1070,7 @@ impl ExecCommandTool {
 
     /// Turns decoded arguments into the request `ra-exec` runs.
     fn request(&self, input: ExecCommandInput) -> ExecResult<ExecRequest> {
-        if input.tty == Some(true) {
+        if input.tty {
             return Err(ExecCommandFailure::PtyUnavailable);
         }
         let cwd = self.resolve_cwd(input.workdir.as_deref())?;
@@ -1377,15 +1430,16 @@ impl Tool for ExecCommandTool {
     }
 
     fn schema(&self) -> &ToolSchema {
-        self.func_schema.tool_schema()
+        &self.schema.advertised
     }
 
     fn func_schema(&self) -> Option<&FuncSchema> {
-        Some(&self.func_schema)
+        Some(&self.schema.decoder)
     }
 
     fn decode_input(&self, arguments: &serde_json::Value) -> Result<Option<DecodedToolInput>> {
-        self.func_schema
+        self.schema
+            .decoder
             .decode_value_diagnostic(arguments.clone())
             .map(Some)
             .map_err(|error| ExecCommandFailure::BadArguments(error).into_error())

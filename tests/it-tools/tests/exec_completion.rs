@@ -49,7 +49,7 @@ async fn call(tool: &dyn Tool, id: &str, args: Value) -> ToolOutput {
         .unwrap()
 }
 fn args(command: &str, wait: u64) -> Value {
-    json!({"cmd":command,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":wait,"timeout_ms":null})
+    json!({"cmd":command,"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":wait,"timeout_ms":null})
 }
 fn poll(id: &ExecSessionId, chars: &str, wait: u64) -> Value {
     json!({"session_id":id.as_str(),"chars":chars,"until":"done","match_text":null,"control":null,"yield_time_ms":wait})

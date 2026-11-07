@@ -151,7 +151,7 @@ fn command(command: &str, yield_time_ms: u64) -> serde_json::Value {
         "cmd": command,
         "workdir": null,
         "shell": null,
-        "tty": null,
+        "tty": false,
         "login": null,
         "yield_time_ms": yield_time_ms,
         "timeout_ms": null,

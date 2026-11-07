@@ -1494,7 +1494,7 @@ async fn the_coding_hosts_commands_show_as_command_executions() {
             RunItemKind::ToolCall(ToolCall::new(
                 CallId::new(id),
                 "exec_command",
-                json!({"cmd": cmd, "workdir": null, "shell": null, "tty": null, "login": null,
+                json!({"cmd": cmd, "workdir": null, "shell": null, "tty": false, "login": null,
                        "yield_time_ms": yield_time_ms, "timeout_ms": null,
                        "sandbox_permissions": null, "justification": null, "prefix_rule": null}),
             )),

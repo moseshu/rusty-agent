@@ -85,7 +85,7 @@ fn command(cmd: &str, escalated: bool) -> ModelResponse {
         RunItemKind::ToolCall(ToolCall::new(
             CallId::new("command"),
             "exec_command",
-            json!({"cmd":cmd,"justification":escalated.then_some("test approval"),"prefix_rule":null,"sandbox_permissions":escalated.then_some("require_escalated"),"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null}),
+            json!({"cmd":cmd,"justification":escalated.then_some("test approval"),"prefix_rule":null,"sandbox_permissions":escalated.then_some("require_escalated"),"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":1000,"timeout_ms":null}),
         )),
     )])
 }

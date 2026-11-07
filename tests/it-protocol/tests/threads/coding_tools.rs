@@ -251,7 +251,7 @@ async fn each_coding_thread_owns_its_tree_and_unloading_it_stops_the_agents_belo
             "sandbox_permissions": null,
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 500,
             "timeout_ms": null
@@ -456,7 +456,7 @@ async fn spawned_command_approval_resumes_the_child() {
         json!({
             "cmd": "printf approved-child", "sandbox_permissions": "require_escalated",
             "justification": "test the child approval", "prefix_rule": null,
-            "workdir": null, "shell": null, "tty": null, "login": null,
+            "workdir": null, "shell": null, "tty": false, "login": null,
             "yield_time_ms": 1000, "timeout_ms": null
         }),
     ));

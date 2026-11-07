@@ -290,7 +290,7 @@ async fn a_pre_tool_use_hook_blocks_a_command_on_the_default_path() {
                 "exec_command",
                 json!({"cmd": format!("touch '{}'", marker.display()), "justification": null,
                    "prefix_rule": null, "sandbox_permissions": null, "workdir": null,
-                   "shell": "/bin/sh", "tty": null, "login": false, "yield_time_ms": 1000,
+                   "shell": "/bin/sh", "tty": false, "login": false, "yield_time_ms": 1000,
                    "timeout_ms": null}),
             )),
         )])));
@@ -551,7 +551,7 @@ async fn an_interrupt_while_waiting_for_approval_runs_interrupt_hooks_once() {
                 "exec_command",
                 json!({"cmd": "touch made.txt", "justification": "needs the real file system",
                    "prefix_rule": null, "sandbox_permissions": "require_escalated",
-                   "workdir": null, "shell": "/bin/sh", "tty": null, "login": false,
+                   "workdir": null, "shell": "/bin/sh", "tty": false, "login": false,
                    "yield_time_ms": 1000, "timeout_ms": null}),
             )),
         )])));
@@ -654,3 +654,6 @@ mod exec_completion;
 
 #[path = "product_hooks/in_call_permission.rs"]
 mod in_call_permission;
+
+#[path = "product_hooks/exec_arguments.rs"]
+mod exec_arguments;

@@ -907,7 +907,7 @@ async fn a_spawned_agent_is_assembled_with_its_own_processes_and_tool_plan() {
             "sandbox_permissions": null,
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 500,
             "timeout_ms": null

@@ -1585,7 +1585,7 @@ async fn exec_command_terminals_outlive_their_turn() {
                 "cmd": "sleep 30",
                 "workdir": null,
                 "shell": null,
-                "tty": null,
+                "tty": false,
                 "login": null,
                 "yield_time_ms": 200,
                 "timeout_ms": null,

@@ -1175,7 +1175,7 @@ fn command(fields: Value) -> Value {
         "cmd": null,
         "workdir": null,
         "shell": null,
-        "tty": null,
+        "tty": false,
         "login": null,
         "yield_time_ms": 5000,
         "timeout_ms": null,

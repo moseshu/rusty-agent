@@ -159,7 +159,7 @@ impl TaskModel {
                         "cmd": "./check.sh",
                         "workdir": null,
                         "shell": null,
-                        "tty": null,
+                        "tty": false,
                         "login": null,
                         "yield_time_ms": 300,
                         "timeout_ms": null,

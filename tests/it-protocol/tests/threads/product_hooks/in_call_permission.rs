@@ -28,7 +28,7 @@ fn permission_hook(log: &Path, decision: Option<&str>) -> String {
 }
 
 fn exec(id: &str, command: &str, extra: Value) -> RunItem {
-    let mut arguments = json!({"cmd":command,"justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null});
+    let mut arguments = json!({"cmd":command,"justification":null,"prefix_rule":null,"sandbox_permissions":null,"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":1000,"timeout_ms":null});
     for (key, value) in extra.as_object().unwrap() {
         arguments[key] = value.clone();
     }
@@ -207,15 +207,17 @@ async fn an_undecided_permission_hook_leaves_the_sandbox_retry_to_the_client() {
 }
 
 /// The justification reaches the hook as `description` whenever it was given, an empty one
-/// included, as Codex's `PermissionRequestPayload::bash` does; a `null` one does not. A call that
-/// omits the field is refused by the local strict schema before any approval, so only `null` can
-/// stand for Codex's absent value here.
+/// included, as Codex's `PermissionRequestPayload::bash` does; an omitted or `null` one does not.
 #[tokio::test]
 async fn exec_permission_requests_carry_the_justification_as_description() {
     for (justification, expected) in [
-        (Value::Null, None),
-        (json!(""), Some("")),
-        (json!("needs write access"), Some("needs write access")),
+        (None, None),
+        (Some(Value::Null), None),
+        (Some(json!("")), Some("")),
+        (
+            Some(json!("needs write access")),
+            Some("needs write access"),
+        ),
     ] {
         let home = HooksHome::new();
         let permission = home.path("permission.jsonl");
@@ -223,8 +225,10 @@ async fn exec_permission_requests_carry_the_justification_as_description() {
         let server = home.server();
         let mut connection = server.connect(1).await;
         let thread = start_thread(&server, &mut connection).await;
-        let mut arguments = json!({"cmd":"printf 'ok\\n'","prefix_rule":null,"sandbox_permissions":"require_escalated","workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":1000,"timeout_ms":null});
-        arguments["justification"] = justification;
+        let mut arguments = json!({"cmd":"printf 'ok\\n'","prefix_rule":null,"sandbox_permissions":"require_escalated","workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":1000,"timeout_ms":null});
+        if let Some(justification) = justification {
+            arguments["justification"] = justification;
+        }
         home.script
             .push(Step::Respond(ModelResponse::new(vec![RunItem::new(
                 ItemId::new("escalated"),

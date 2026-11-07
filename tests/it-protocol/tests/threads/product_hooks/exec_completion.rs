@@ -9,7 +9,7 @@ fn exec(id: &str, command: &str, wait: u64, escalated: bool) -> RunItem {
         RunItemKind::ToolCall(ToolCall::new(
             CallId::new(id),
             "exec_command",
-            json!({"cmd":command,"justification":escalated.then_some("test approval"),"prefix_rule":null,"sandbox_permissions":escalated.then_some("require_escalated"),"workdir":null,"shell":"/bin/sh","tty":null,"login":false,"yield_time_ms":wait,"timeout_ms":null}),
+            json!({"cmd":command,"justification":escalated.then_some("test approval"),"prefix_rule":null,"sandbox_permissions":escalated.then_some("require_escalated"),"workdir":null,"shell":"/bin/sh","tty":false,"login":false,"yield_time_ms":wait,"timeout_ms":null}),
         )),
     )
 }

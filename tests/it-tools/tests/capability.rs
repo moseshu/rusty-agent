@@ -293,7 +293,7 @@ async fn test_the_shell_pair_shares_the_session_manager_it_was_built_with() {
             "cmd": "read line; printf 'reply:%s\\n' \"$line\"; sleep 30",
             "workdir": null,
             "shell": null,
-            "tty": null,
+            "tty": false,
             "login": null,
             "yield_time_ms": 100,
             "timeout_ms": null

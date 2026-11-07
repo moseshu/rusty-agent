@@ -11,17 +11,9 @@ use ra_tools::exec_command::{ExecCommandLimits, ExecCommandTool};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// Every argument the strict schema requires, so a test only writes the ones it cares about.
+/// The one argument Codex's `exec_command` requires; a test adds only the ones it cares about.
 fn arguments(overrides: Value) -> Value {
-    let mut base = json!({
-        "cmd": "true",
-        "workdir": null,
-        "shell": null,
-        "tty": null,
-        "login": null,
-        "yield_time_ms": null,
-        "timeout_ms": null
-    });
+    let mut base = json!({"cmd": "true"});
     let (Value::Object(base_map), Value::Object(overrides)) = (&mut base, overrides) else {
         panic!("both the base arguments and the overrides must be objects");
     };
@@ -71,15 +63,7 @@ fn rooted(dir: &TempDir) -> ExecCommandTool {
 #[tokio::test]
 async fn test_exec_command_schema_decode_failure_is_model_visible() {
     let tool = ExecCommandTool::new().expect("exec_command builds");
-    let arguments = json!({
-        "cmd": 3,
-        "workdir": null,
-        "shell": null,
-        "tty": null,
-        "login": null,
-        "yield_time_ms": null,
-        "timeout_ms": null
-    });
+    let arguments = json!({"cmd": 3});
     let error = tool
         .decode_input(&arguments)
         .expect_err("invalid arguments must fail before the tool body runs");
@@ -105,7 +89,8 @@ async fn test_exec_command_schema_and_identity() {
 
     tool.validate().expect("identity and schema must agree");
     assert_eq!(tool.origin().qualified_name(), "exec_command");
-    assert!(tool.schema().strict_json_schema());
+    // Codex declares `exec_command` with `strict: false`.
+    assert!(!tool.schema().strict_json_schema());
     assert_eq!(
         tool.model_definition().description(),
         Some(
@@ -114,21 +99,10 @@ async fn test_exec_command_schema_and_identity() {
     );
 
     let schema = tool.schema().input_schema();
+    // Codex declares a closed object that requires only `cmd`; its decoder still ignores
+    // arguments it does not read.
     assert_eq!(schema["additionalProperties"], json!(false));
-    // Every advertised argument is one this build reads. The approval-shaped arguments Codex
-    // carries arrive with the milestone that consumes them rather than as required nulls.
-    assert_eq!(
-        schema["required"],
-        json!([
-            "cmd",
-            "login",
-            "shell",
-            "timeout_ms",
-            "tty",
-            "workdir",
-            "yield_time_ms"
-        ])
-    );
+    assert_eq!(schema["required"], json!(["cmd"]));
 }
 
 #[tokio::test]
@@ -282,20 +256,46 @@ async fn test_exec_command_refuses_a_terminal_it_cannot_allocate() {
     assert!(!output.metadata().guidance().is_empty());
 }
 
+/// Codex's `ExecCommandArgs` ignores arguments it does not read rather than refusing the call.
+/// Without a host policy the approval arguments are among them: nothing here can honor them.
 #[tokio::test]
-async fn test_exec_command_rejects_unknown_arguments() {
+async fn test_exec_command_ignores_unknown_arguments() {
     let dir = workspace();
     let tool = rooted(&dir);
 
-    let mut args = arguments(json!({ "cmd": "ls" }));
+    let mut args = arguments(json!({ "cmd": "printf ran" }));
     args["justification"] = json!("because");
-    let output = observe(&tool, &args).await;
+    args["max_output_tokens"] = json!(5);
+    args["unrelated"] = json!({"nested": true});
+    let output = execute(&tool, &args).await.expect("the call runs");
 
     let text = output.as_text().expect("text output");
-    assert!(
-        text.contains("Invalid arguments"),
-        "unexpected sentence: {text}"
-    );
+    assert!(text.contains("ran"), "unexpected sentence: {text}");
+}
+
+/// Codex keeps its declaration and its decoder apart: the model is shown a closed object
+/// (`additionalProperties: false`), and a call that carries a field anyway still runs. Every
+/// form keeps both, so closing the advertised object does not close the decoder.
+#[tokio::test]
+async fn test_exec_command_advertises_a_closed_object_yet_ignores_unknown_arguments_in_every_form()
+{
+    let dir = workspace();
+    for tool in every_form(&dir) {
+        tool.validate().expect("identity and schema must agree");
+        let schema = tool.schema().input_schema();
+        assert!(!tool.schema().strict_json_schema());
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!(["cmd"]));
+        assert_eq!(
+            tool.model_definition().input_schema()["additionalProperties"],
+            json!(false)
+        );
+
+        let args =
+            json!({"cmd": "printf ran", "max_output_tokens": 5, "unrelated": {"nested": true}});
+        tool.decode_input(&args).expect("unknown arguments decode");
+        assert_eq!(observe(&tool, &args).await.as_text(), Some("ran"));
+    }
 }
 
 #[tokio::test]
@@ -417,7 +417,8 @@ fn permissive_policy(tool: ExecCommandTool) -> ExecCommandTool {
 
 /// Codex's `exec_permission_approvals` schema: once turned on, a tool with a policy offers
 /// `with_additional_permissions` and the permissions it asks for, with Codex's descriptions, and
-/// accepts them, whichever is installed first. Without a policy nothing is offered.
+/// accepts them, whichever is installed first. Without a policy nothing is offered; what is not
+/// offered still decodes, as Codex's arguments do, and is the policy's to refuse.
 #[tokio::test]
 async fn test_exec_command_offers_additional_permissions_when_turned_on() {
     let dir = workspace();
@@ -428,22 +429,8 @@ async fn test_exec_command_offers_additional_permissions_when_turned_on() {
     for tool in &tools {
         tool.validate().expect("identity and schema must agree");
         let schema = tool.schema().input_schema();
-        assert_eq!(
-            schema["required"],
-            json!([
-                "additional_permissions",
-                "cmd",
-                "justification",
-                "login",
-                "prefix_rule",
-                "sandbox_permissions",
-                "shell",
-                "timeout_ms",
-                "tty",
-                "workdir",
-                "yield_time_ms"
-            ])
-        );
+        assert_eq!(schema["required"], json!(["cmd"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
         let properties = &schema["properties"];
         assert_eq!(
             properties["sandbox_permissions"]["description"],
@@ -501,6 +488,9 @@ async fn test_exec_command_offers_additional_permissions_when_turned_on() {
             .get("additional_permissions")
             .is_none()
     );
+    // Not offered is not refused at decoding: Codex's `ExecCommandArgs` reads
+    // `additional_permissions` whatever is advertised, and its handler refuses them while the
+    // feature is off. Here that refusal is the host policy's, as the coding product's does.
     let off = permissive_policy(rooted(&dir));
     assert!(
         off.decode_input(&arguments(json!({
@@ -509,8 +499,8 @@ async fn test_exec_command_offers_additional_permissions_when_turned_on() {
             "prefix_rule": null,
             "additional_permissions": {"network": {"enabled": true}, "file_system": null}
         })))
-        .is_err(),
-        "a tool that does not offer them does not accept them"
+        .is_ok(),
+        "arguments the tool does not offer are left to the policy"
     );
 }
 
@@ -533,21 +523,8 @@ async fn test_exec_command_policy_resolvers_add_the_approval_arguments() {
     tool.validate().expect("identity and schema must agree");
 
     let schema = tool.schema().input_schema();
-    assert_eq!(
-        schema["required"],
-        json!([
-            "cmd",
-            "justification",
-            "login",
-            "prefix_rule",
-            "sandbox_permissions",
-            "shell",
-            "timeout_ms",
-            "tty",
-            "workdir",
-            "yield_time_ms"
-        ])
-    );
+    assert_eq!(schema["required"], json!(["cmd"]));
+    assert_eq!(schema["additionalProperties"], json!(false));
     let properties = &schema["properties"];
     assert_eq!(
         properties["justification"]["description"],
@@ -627,4 +604,70 @@ async fn test_exec_command_reports_sandbox_preparation_as_process_creation() {
     assert!(text.contains("cannot deny the network"), "{text}");
     assert!(output.metadata().guidance().is_empty(), "{text}");
     assert!(!marker.exists());
+}
+
+/// The three argument forms this tool can advertise: without a policy, with one, and with Codex's
+/// additional permissions on top. Codex decodes all of them from one `ExecCommandArgs`.
+fn every_form(dir: &TempDir) -> [ExecCommandTool; 3] {
+    [
+        rooted(dir),
+        permissive_policy(rooted(dir)),
+        permissive_policy(rooted(dir)).with_additional_permissions(),
+    ]
+}
+
+/// Codex requires only `cmd`: every other argument may be left out, and each form runs the call.
+#[tokio::test]
+async fn test_exec_command_runs_with_only_cmd_in_every_form() {
+    let dir = workspace();
+    for tool in every_form(&dir) {
+        let args = json!({"cmd": "printf ran"});
+        tool.decode_input(&args).expect("only `cmd` decodes");
+        assert_eq!(observe(&tool, &args).await.as_text(), Some("ran"));
+    }
+}
+
+/// An omitted `yield_time_ms` is the host's default, not a fixed value: the host's configured
+/// default still applies, as the omitted argument does in Codex.
+#[tokio::test]
+async fn test_exec_command_omitted_yield_uses_the_host_default() {
+    let dir = workspace();
+    let tool = rooted(&dir).with_limits(ExecCommandLimits::new().with_default_yield_time_ms(50));
+    let output = execute(&tool, &json!({"cmd": "sleep 5; echo late"}))
+        .await
+        .expect("the command starts and yields");
+    let text = output.as_text().expect("text output");
+    assert!(
+        text.contains("still running"),
+        "unexpected sentence: {text}"
+    );
+}
+
+/// What Codex refuses at decoding is still refused in every form: a missing `cmd`, a value of the
+/// wrong type, and an explicit `null` for `tty` or `yield_time_ms`, which have defaults rather
+/// than a null. Other optional arguments accept `null` as their absent value.
+#[tokio::test]
+async fn test_exec_command_refuses_what_codex_cannot_decode_in_every_form() {
+    let dir = workspace();
+    for tool in every_form(&dir) {
+        for refused in [
+            json!({}),
+            json!({"cmd": 3}),
+            json!({"cmd": "true", "timeout_ms": "soon"}),
+            json!({"cmd": "true", "tty": null}),
+            json!({"cmd": "true", "yield_time_ms": null}),
+        ] {
+            assert!(
+                tool.decode_input(&refused).is_err(),
+                "{refused} must not decode"
+            );
+        }
+        for accepted in [
+            json!({"cmd": "true", "workdir": null, "shell": null, "login": null, "timeout_ms": null}),
+            json!({"cmd": "true", "tty": false, "yield_time_ms": 10}),
+        ] {
+            tool.decode_input(&accepted)
+                .unwrap_or_else(|error| panic!("{accepted} must decode: {error}"));
+        }
+    }
 }

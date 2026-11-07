@@ -832,7 +832,7 @@ allow_upstream_proxy = false
                 "exec_command",
                 json!({"cmd": command, "justification": null, "prefix_rule": null,
                    "sandbox_permissions": null, "workdir": null, "shell": "/bin/sh",
-                   "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+                   "tty": false, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
             )),
         )])));
     home.script.answer("Network probe complete");
@@ -1042,7 +1042,7 @@ allow_local_binding = true
                    "prefix_rule": null,
                    "sandbox_permissions": escalated.then_some("require_escalated"),
                    "workdir": null, "shell": "/bin/sh",
-                   "tty": null, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+                   "tty": false, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
         )),
     )]);
     let gate = Arc::new(Notify::new());
