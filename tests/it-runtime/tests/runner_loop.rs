@@ -4438,13 +4438,19 @@ async fn run_level_model_override_applies_to_every_turn() {
     .unwrap();
 
     // It must be included on every turn, not only the first. A silently ignored run-level setting
-    // manifests as inconsistent billing and latency rather than an error.
-    assert_eq!(
-        selectors.lock().unwrap().clone(),
-        [
-            Some("run/override".to_owned()),
-            Some("run/override".to_owned())
-        ]
+    // manifests as inconsistent billing and latency rather than an error. The model is resolved
+    // once per turn and again for capability assembly and hook metadata; every one of those
+    // resolutions must carry the override.
+    let selectors = selectors.lock().unwrap().clone();
+    assert!(
+        selectors.len() >= 2,
+        "at least one resolution per turn: {selectors:?}"
+    );
+    assert!(
+        selectors
+            .iter()
+            .all(|selector| selector.as_deref() == Some("run/override")),
+        "{selectors:?}"
     );
 }
 

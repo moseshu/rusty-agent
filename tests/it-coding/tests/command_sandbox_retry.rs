@@ -467,19 +467,8 @@ fn run_request(fixture: &Fixture, responses: Vec<ModelResponse>) -> RunRequest {
 )]
 async fn a_checkpointed_retry_approval_runs_only_the_retry() {
     let mut fixture = fixture(granular(true)).await;
-    let mut arguments = fixture.arguments("");
-    for field in [
-        "workdir",
-        "shell",
-        "tty",
-        "login",
-        "timeout_ms",
-        "sandbox_permissions",
-        "justification",
-        "prefix_rule",
-    ] {
-        arguments[field] = Value::Null;
-    }
+    // Only `cmd` is required, as in Codex's `ExecCommandArgs`; omitted fields take their defaults.
+    let arguments = fixture.arguments("");
     let call = ModelResponse::new(vec![RunItem::new(
         ItemId::new("c-1"),
         RunItemKind::ToolCall(ToolCall::new(
@@ -610,19 +599,8 @@ async fn approval_retains_the_selected_sandbox() {
 )]
 async fn resumed_checkpoint_cannot_execute_again() {
     let mut fixture = fixture(granular(true)).await;
-    let mut arguments = fixture.arguments("");
-    for field in [
-        "workdir",
-        "shell",
-        "tty",
-        "login",
-        "timeout_ms",
-        "sandbox_permissions",
-        "justification",
-        "prefix_rule",
-    ] {
-        arguments[field] = Value::Null;
-    }
+    // Only `cmd` is required, as in Codex's `ExecCommandArgs`; omitted fields take their defaults.
+    let arguments = fixture.arguments("");
     let call = ModelResponse::new(vec![RunItem::new(
         ItemId::new("c-1"),
         RunItemKind::ToolCall(ToolCall::new(
@@ -683,19 +661,8 @@ async fn resumed_checkpoint_cannot_execute_again() {
 )]
 async fn retry_does_not_bypass_configured_deny() {
     let mut fixture = fixture(granular(true)).await;
-    let mut arguments = fixture.arguments("");
-    for field in [
-        "workdir",
-        "shell",
-        "tty",
-        "login",
-        "timeout_ms",
-        "sandbox_permissions",
-        "justification",
-        "prefix_rule",
-    ] {
-        arguments[field] = Value::Null;
-    }
+    // Only `cmd` is required, as in Codex's `ExecCommandArgs`; omitted fields take their defaults.
+    let arguments = fixture.arguments("");
     let call = ModelResponse::new(vec![RunItem::new(
         ItemId::new("c-1"),
         RunItemKind::ToolCall(ToolCall::new(
@@ -875,19 +842,9 @@ async fn invalid_requests_return_to_the_model_without_asking_for_approval() {
             ("tty", json!(true), "terminal"),
         ] {
             let mut fixture = fixture(AskForApproval::UnlessTrusted).await;
+            // Only `cmd` is required, as in Codex's `ExecCommandArgs`; omitted fields take their
+            // defaults.
             let mut arguments = json!({"cmd": "printf should-not-run > invalid-request.txt", "yield_time_ms": 5000});
-            for name in [
-                "workdir",
-                "shell",
-                "tty",
-                "login",
-                "timeout_ms",
-                "sandbox_permissions",
-                "justification",
-                "prefix_rule",
-            ] {
-                arguments[name] = Value::Null;
-            }
             arguments[field] = value;
             assert!(!fixture.needs_approval(&arguments).await);
             if fixed_ask {
