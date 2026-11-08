@@ -823,6 +823,120 @@ command = '''cat >> '{}'; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":
     assert!(log.exists(), "a parsable patch runs its hook");
 }
 
+/// Codex's `write_stdin` permission-request input, built from the approval the tool prepared:
+/// the terminal's session, the input, the launching call, this call, the environment, the
+/// launch directory as a file URI, no terminal, and the review's override and grants. A terminal
+/// that recorded no launching call or no absolute directory gives `null` for those keys. Asked
+/// with no approval, or with one this product cannot read, the hook is given the call's
+/// arguments.
+#[tokio::test]
+async fn write_stdin_permission_requests_describe_the_prepared_approval() {
+    let home = TempDir::new().unwrap();
+    let capture = home.path().join("hook-input.json");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PermissionRequest]]
+matcher = "write_stdin"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = """cat > {capture}; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":"PermissionRequest","decision":{{"behavior":"allow"}}}}}}'"""
+"#,
+            capture = capture.display()
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_with_queue(&runtime, &queue);
+    let origin = ToolOrigin::new("write_stdin").unwrap();
+    let call_id = CallId::new("call-input");
+    let arguments = serde_json::json!({
+        "session_id": "exec-7", "chars": "q\n", "until": "done", "match_text": null,
+        "control": null, "yield_time_ms": 1000
+    });
+    let ask = |state: Option<serde_json::Value>| {
+        let bound = &bound;
+        let origin = &origin;
+        let call_id = &call_id;
+        let arguments = &arguments;
+        let capture = &capture;
+        async move {
+            let data = ToolHookData::new(origin, call_id, arguments);
+            let data = match &state {
+                Some(state) => data.with_approval_state(state),
+                None => data,
+            };
+            let decision = bound
+                .dispatch(HookEvent::PermissionRequest(data))
+                .await
+                .unwrap();
+            assert_eq!(decision, HookDecision::Allow);
+            let input: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(capture).unwrap()).unwrap();
+            assert_eq!(input["tool_name"], "write_stdin");
+            input["tool_input"].clone()
+        }
+    };
+    let prepared = |policy_state: serde_json::Value| serde_json::json!({ "run_id": "turn-1", "call_id": "call-input", "policy_state": policy_state });
+    let workspace = home.path().canonicalize().unwrap();
+    let cwd_uri = ra_paths::PathUri::from_abs_path(
+        &ra_paths::AbsolutePathBuf::from_absolute_path_checked(&workspace).unwrap(),
+    )
+    .to_string();
+    // The grant a terminal keeps after a granted directory write, as the product writes it.
+    let grants = serde_json::json!({
+        "network": {"enabled": true},
+        "file_system": {"write": [workspace.join("allowed")]}
+    });
+
+    assert_eq!(
+        ask(Some(prepared(serde_json::json!({
+            "launch_call_id": "call-launch", "session_id": "exec-7", "cwd": workspace,
+            "input": "q\n", "reason": "Send input to an existing terminal.",
+            "sandbox_permissions": "with_additional_permissions", "additional_permissions": grants
+        }))))
+        .await,
+        serde_json::json!({
+            "session_id": "exec-7", "chars": "q\n", "parent_call_id": "call-launch",
+            "approval_id": "call-input", "environment_id": "local", "cwd": cwd_uri, "tty": false,
+            "sandbox_permissions": "with_additional_permissions", "additional_permissions": grants
+        })
+    );
+
+    // No launching call, and no directory or one that is not absolute: the keys stay, as null.
+    for cwd in [
+        serde_json::Value::Null,
+        serde_json::json!("relative/dir"),
+        serde_json::json!("~/terminal"),
+    ] {
+        assert_eq!(
+            ask(Some(prepared(serde_json::json!({
+                "launch_call_id": null, "session_id": "exec-7", "cwd": cwd, "input": "q\n",
+                "reason": "r", "sandbox_permissions": "require_escalated"
+            }))))
+            .await,
+            serde_json::json!({
+                "session_id": "exec-7", "chars": "q\n", "parent_call_id": null,
+                "approval_id": "call-input", "environment_id": "local", "cwd": null,
+                "tty": false, "sandbox_permissions": "require_escalated",
+                "additional_permissions": null
+            }),
+            "{cwd}"
+        );
+    }
+
+    // Nothing prepared, or something this product cannot read: the call's own arguments.
+    for state in [
+        None,
+        Some(serde_json::json!({"apply_patch": {"item_started": true}})),
+        Some(prepared(serde_json::json!({"unexpected": true}))),
+    ] {
+        assert_eq!(ask(state.clone()).await, arguments, "{state:?}");
+    }
+}
+
 #[tokio::test]
 async fn session_start_command_matchers_receive_all_lifecycle_sources() {
     use ra_core::hook::SessionStartSource;

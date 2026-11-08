@@ -174,18 +174,23 @@ impl<'a> ToolHookData<'a> {
     pub const fn arguments(&self) -> &'a serde_json::Value {
         self.arguments
     }
-    /// Marks a permission request the tool raised from inside its invocation, carrying the state
-    /// it kept with that request (see [`ToolApprovalRequest`](crate::tool::ToolApprovalRequest)).
+    /// Carries the state the tool kept with the approval a permission request asks about: what
+    /// [`Tool::approval_state`] prepared before the call, or
+    /// what a [`ToolApprovalRequest`](crate::tool::ToolApprovalRequest) carried from inside it.
     #[must_use]
     pub const fn with_approval_state(mut self, state: &'a serde_json::Value) -> Self {
         self.approval_state = Some(state);
         self
     }
-    /// The state a tool kept with an approval it requested from inside its invocation.
+    /// The state the tool kept with the approval a permission request asks about.
     ///
-    /// `None` for every event except a permission request raised that way; a permission request
-    /// made before the invocation starts has no tool state. The runtime passes the value through
-    /// without reading it, so its format belongs to the tool that produced it.
+    /// It means the same before the call and inside it: before the call it is what
+    /// [`Tool::approval_state`] prepared for the question,
+    /// inside it what the tool's [`ToolApprovalRequest`](crate::tool::ToolApprovalRequest)
+    /// carried. `None` for every other event, and for a permission request about which the tool
+    /// kept nothing — including a call a fixed `ask` rule puts to the hooks that the tool itself
+    /// would not have asked about. The runtime passes the value through without reading it, so
+    /// its format belongs to the tool that produced it.
     #[must_use]
     pub const fn approval_state(&self) -> Option<&'a serde_json::Value> {
         self.approval_state

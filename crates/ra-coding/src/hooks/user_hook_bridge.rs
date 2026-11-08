@@ -1378,8 +1378,18 @@ fn hook_input(call: &ToolHookData<'_>) -> Value {
     call.arguments().clone()
 }
 /// Codex's `PermissionRequestPayload` input: exec carries the model's `justification` as
-/// `description` whenever it was given, an empty one included; every other tool is unchanged.
+/// `description` whenever it was given, an empty one included; terminal input is described by the
+/// approval `write_stdin` prepared, falling back to the call's arguments when the hooks are asked
+/// with none (a fixed `ask` rule over input the policy would not have asked about) or with one this
+/// product cannot read; every other tool is unchanged.
 fn permission_input(call: &ToolHookData<'_>) -> Value {
+    if exec_kind(call) == Some(ExecKind::Stdin)
+        && let Some(input) = call.approval_state().and_then(|state| {
+            crate::thread_settings::stdin_permission_input(state, call.call_id().as_str())
+        })
+    {
+        return input;
+    }
     let mut input = hook_input(call);
     if exec_kind(call) == Some(ExecKind::Command)
         && let Some(description) = call

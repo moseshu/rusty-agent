@@ -187,6 +187,7 @@ impl Tool for PreparingTool {
 struct PermissionHook {
     decisions: Mutex<Vec<HookDecision>>,
     journal: Journal,
+    shown: Mutex<Vec<Option<Value>>>,
 }
 
 impl PermissionHook {
@@ -194,7 +195,13 @@ impl PermissionHook {
         Arc::new(Self {
             decisions: Mutex::new(decisions),
             journal: Arc::clone(journal),
+            shown: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The state each permission request carried, in order.
+    fn shown(&self) -> Vec<Option<Value>> {
+        self.shown.lock().unwrap().clone()
     }
 }
 
@@ -208,9 +215,13 @@ impl UserHook for PermissionHook {
         _context: &UserHookContext<'_>,
         event: &HookEvent<'_>,
     ) -> Result<HookDecision> {
-        if !matches!(event, HookEvent::PermissionRequest(_)) {
+        let HookEvent::PermissionRequest(call) = event else {
             return Ok(HookDecision::Continue);
-        }
+        };
+        self.shown
+            .lock()
+            .unwrap()
+            .push(call.approval_state().cloned());
         self.journal.lock().unwrap().push("hook".to_owned());
         let mut decisions = self.decisions.lock().unwrap();
         Ok(if decisions.is_empty() {
@@ -557,4 +568,51 @@ async fn every_hook_answer_of_one_call_is_recorded() {
         [ApprovalResolution::Approved, ApprovalResolution::Declined]
     );
     assert_eq!(output_text(result.new_items()), "blocked by hook");
+}
+
+/// The hooks are shown what the tool prepared for the question, before the call as inside it,
+/// whatever made the call ask; a tool that keeps nothing shows them nothing.
+#[tokio::test]
+async fn the_hooks_are_shown_the_prepared_state_before_the_call() {
+    for (source, approval, rule) in the_two_sources_of_a_question() {
+        let state = json!({"prepared": "for the hooks"});
+        let mut case = Case::new(
+            approval,
+            Prepares::State(state.clone()),
+            None,
+            vec![HookDecision::Allow],
+        );
+        if let Some(rule) = rule {
+            case = case.with_rule(rule);
+        }
+        Runner::run(case.request(vec![calls_prepared(), finishes()]))
+            .await
+            .unwrap();
+        assert_eq!(case.hook.shown(), [Some(state)], "{source}");
+    }
+
+    let case = Case::new(
+        ToolApprovalPolicy::Always,
+        Prepares::Nothing,
+        None,
+        vec![HookDecision::Allow],
+    );
+    Runner::run(case.request(vec![calls_prepared(), finishes()]))
+        .await
+        .unwrap();
+    assert_eq!(case.hook.shown(), [None]);
+
+    // The question asked from inside the call carries the state that request kept, as before.
+    let before = json!({"prepared": "before"});
+    let inside = json!({"asked": "inside"});
+    let case = Case::new(
+        ToolApprovalPolicy::Dynamic,
+        Prepares::State(before.clone()),
+        Some(inside.clone()),
+        vec![HookDecision::Allow, HookDecision::Allow],
+    );
+    Runner::run(case.request(vec![calls_prepared(), finishes()]))
+        .await
+        .unwrap();
+    assert_eq!(case.hook.shown(), [Some(before), Some(inside)]);
 }

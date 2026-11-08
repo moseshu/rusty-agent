@@ -40,6 +40,24 @@ for callers who want ambiguous context refused. A `PatchHunk` that continues the
 the one before it now serializes `continues_previous: true`; records without the field read as
 before. `RootedFileSystem::write_file_nofollow` is the new write primitive behind overwrites.
 
+### Permission hooks see the prepared approval before the call too
+
+A PermissionRequest hook asked before a call now receives the state the tool prepared for that
+question, as one asked from inside the call already did: `ToolHookData::approval_state()` returns
+what `Tool::approval_state` returned, and `None` when the tool kept nothing (for example a call a
+fixed `ask` rule puts to the hooks that the tool would not have asked about). Hooks that treated a
+before-call state as impossible should read it as the tool's own description of the question.
+
+The coding product's `write_stdin` permission request now gives hooks Codex's input:
+`{session_id, chars, parent_call_id, approval_id, environment_id, cwd, tty,
+sandbox_permissions, additional_permissions}`, with `cwd` as a `file:` URI. `session_id` is this
+build's string session ID and `tty` is always `false`; `parent_call_id` and `cwd` are `null` for a
+terminal that recorded no launching call or no absolute launch directory. The local wait
+parameters (`until`, `match_text`, `control`, `yield_time_ms`) are no longer part of the hook
+input. When the input was not reviewed into an approval — a fixed `ask` rule over input the
+review would not ask about, or another stdin policy's state — hooks receive the call's
+arguments as before.
+
 ### `apply_patch` verifies before it is asked about, and approvals are prepared before hooks
 
 A patch is now verified against the workspace before anybody is asked about it or anything is

@@ -669,3 +669,6 @@ mod exec_arguments;
 
 #[path = "product_hooks/apply_patch_hooks.rs"]
 mod apply_patch_hooks;
+
+#[path = "product_hooks/stdin_permission.rs"]
+mod stdin_permission;

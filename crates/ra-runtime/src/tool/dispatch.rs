@@ -1092,11 +1092,13 @@ async fn admit_permission(
                 }
                 Err(error) => return Err(error),
             };
-            let decision = run_user_hook(
-                request,
-                HookEvent::PermissionRequest(tool_hook_data(request)),
-            )
-            .await?;
+            // The hooks are asked about what the tool prepared, as Codex builds a permission
+            // request's payload from the approval its handler prepared; the tool reads its state.
+            let data = match &state {
+                Some(state) => tool_hook_data(request).with_approval_state(state),
+                None => tool_hook_data(request),
+            };
+            let decision = run_user_hook(request, HookEvent::PermissionRequest(data)).await?;
             record_hook_answer(request, &decision);
             match decision {
                 HookDecision::Allow => return Ok(Admission::Proceed(state)),

@@ -392,8 +392,10 @@ async fn without_a_decision_the_request_waits_for_the_host_and_is_not_asked_agai
     assert_eq!(*narration.0.lock().unwrap(), ["start", "end/ok"]);
 }
 
+/// A tool that keeps no state with the question asked before its call shows the hooks none
+/// there; the request it raises from inside the call carries the state it kept with it.
 #[tokio::test]
-async fn only_a_request_from_inside_the_invocation_carries_tool_state() {
+async fn a_tool_that_keeps_no_state_before_the_call_shows_the_hooks_none_there() {
     let retry = json!({"stage": "retry"});
     let tool = AskingTool::new(true, vec![retry.clone()]);
     let hook = PermissionHook::new([HookDecision::Allow, HookDecision::Allow]);

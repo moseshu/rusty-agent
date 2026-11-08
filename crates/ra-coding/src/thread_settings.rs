@@ -1853,6 +1853,36 @@ struct StdinApproval {
     additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
+/// Codex's `write_stdin` permission-request input (`ApprovalAction::WriteStdin`'s
+/// `permission_request_payload`), built from the approval `write_stdin` prepared for the call
+/// `approval_id`, or `None` when `state` is not such an approval.
+///
+/// This build's session IDs are strings and its terminals have no PTY, so `session_id` is a
+/// string and `tty` is `false`. A terminal that recorded no launching call or no absolute launch
+/// directory gives `null` for `parent_call_id` or `cwd`; the keys stay, as Codex always sends
+/// them.
+pub(crate) fn stdin_permission_input(state: &Value, approval_id: &str) -> Option<Value> {
+    let state = ra_tools::write_stdin::approval_policy_state(state)
+        .and_then(|state| serde_json::from_value::<StdinApproval>(state.clone()).ok())?;
+    let cwd = state
+        .cwd
+        .as_deref()
+        .filter(|cwd| cwd.is_absolute())
+        .and_then(|cwd| ra_paths::AbsolutePathBuf::from_absolute_path_checked(cwd).ok())
+        .map(|cwd| ra_paths::PathUri::from_abs_path(&cwd));
+    Some(json!({
+        "session_id": state.session_id,
+        "chars": state.input,
+        "parent_call_id": state.launch_call_id,
+        "approval_id": approval_id,
+        "environment_id": LOCAL_ENVIRONMENT_ID,
+        "cwd": cwd,
+        "tty": false,
+        "sandbox_permissions": state.sandbox_permissions,
+        "additional_permissions": state.additional_permissions,
+    }))
+}
+
 const MAX_STDIN_APPROVAL_BYTES: usize = 8_000;
 
 /// Codex's reviewed stdin action for this executor's string session IDs and pipe input.

@@ -873,3 +873,48 @@ async fn legacy_platform_commands_refuse_unenforceable_profiles_before_launch() 
         assert!(!root.join("must-not-exist").exists());
     }
 }
+
+/// What a fixed `ask` rule puts to the permission hooks for input the review would not have
+/// asked about: the tool prepares nothing for it — input under the launch sandbox, input the
+/// review refuses, and input that is not reviewed — so the hooks are given the call's arguments,
+/// and the call reviews the input again when it runs.
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "the legacy command sandbox refuses the default workspace profile"
+)]
+async fn input_the_review_would_not_ask_about_prepares_no_approval() {
+    let prepared = |fixture: &Fixture, arguments: Value| {
+        let run = fixture.run();
+        let stdin = Arc::clone(&fixture.stdin);
+        async move {
+            let call_id = CallId::new("write");
+            let context = ToolContext::new(&run, stdin.as_ref(), &call_id, &arguments);
+            stdin.approval_state(&context).await.unwrap()
+        }
+    };
+
+    let on_request = fixture(AskForApproval::OnRequest, workspace());
+    let session = on_request.open(json!({})).await;
+    for arguments in [
+        Fixture::input(&session, "hello\n"),
+        Fixture::input(&session, ""),
+        json!({"session_id": session, "chars": "", "control": "interrupt"}),
+        Fixture::input("no-such-session", "hello\n"),
+    ] {
+        assert_eq!(
+            prepared(&on_request, arguments.clone()).await,
+            None,
+            "{arguments}"
+        );
+    }
+
+    let mut never = fixture(AskForApproval::Never, workspace());
+    let session = never.open(json!({})).await;
+    never.update(&ThreadPolicyOverrides::new().with_sandbox_policy(read_only()));
+    assert_eq!(
+        prepared(&never, Fixture::input(&session, "hello\n")).await,
+        None,
+        "a refused input"
+    );
+}
