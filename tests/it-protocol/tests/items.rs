@@ -1692,62 +1692,342 @@ fn stored(output: ToolOutput) -> Value {
     serde_json::to_value(output).unwrap()
 }
 
-/// The coding host shows a patch `apply_patch` applies as the files it changes: a created file
-/// with its content, a changed one with the patch's hunks — moved, when the patch moves it — and a
-/// deleted one; in progress while it applies, then completed or failed.
+/// The coding host shows a patch `apply_patch` announces as the files it changes, as Codex's file
+/// change follows `PatchApplyBegin` and `PatchApplyEnd`: a created file with its content, a changed
+/// one with the patch's hunks — moved, when the patch moves it — and a deleted one; in progress
+/// from its begin, then as its end says. Its call alone shows nothing, and a patch whose result
+/// comes in without an end has failed.
 #[test]
 fn the_coding_hosts_patches_show_as_file_changes() {
+    use ra_core::event::{
+        FileEvent, HostEvent, HostEventBody,
+        file::{
+            FileChangeKind, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+            PatchFileChange,
+        },
+    };
+    use ra_protocol::server::ThreadToolItemEvent;
+
     let items = ra_coding::thread_items::CodingThreadToolItems::new("/work");
-    let patch = "*** Begin Patch\n\
-                 *** Add File: notes.txt\n\
-                 +first\n\
-                 +second\n\
-                 *** Update File: src/lib.rs\n\
-                 *** Move to: src/main.rs\n\
-                 @@ fn main\n\
-                 -old\n\
-                 +new\n\
-                 *** Delete File: gone.txt\n\
-                 *** End Patch";
-    let call = ToolCall::new(
-        CallId::new("call-patch"),
-        "apply_patch",
-        json!({"patch": patch}),
-    );
+    let allocator =
+        ra_core::state::RunState::start(RunId::new("run-patch")).restore_event_seq_allocator(None);
+    let event = |body: FileEvent| {
+        HostEvent::allocate(&allocator, AgentId::new("coder"), HostEventBody::File(body)).unwrap()
+    };
+    let call_id = CallId::new("call-patch");
+    let begin = event(FileEvent::PatchApplyBegin(PatchApplyBeginEvent::new(
+        call_id.clone(),
+        vec![
+            PatchFileChange::new("notes.txt", FileChangeKind::Added, "first\nsecond\n"),
+            PatchFileChange::new(
+                "src/lib.rs",
+                FileChangeKind::Moved,
+                "@@ fn main\n-old\n+new\n",
+            )
+            .with_moved_to("src/main.rs"),
+            PatchFileChange::new("gone.txt", FileChangeKind::Deleted, ""),
+        ],
+    )));
     let changes = json!([
         {"path": "notes.txt", "kind": {"type": "add"}, "diff": "first\nsecond\n"},
         {"path": "src/lib.rs", "kind": {"type": "update", "move_path": "src/main.rs"},
          "diff": "@@ fn main\n-old\n+new\n"},
         {"path": "gone.txt", "kind": {"type": "delete"}, "diff": ""},
     ]);
+    let Some(ThreadToolItemEvent::Started(started)) = items.event(&begin, &[]) else {
+        panic!("a begin starts the patch's item");
+    };
     assert_eq!(
-        serde_json::to_value(items.started(&call).unwrap()).unwrap(),
+        serde_json::to_value(&started).unwrap(),
         json!({"type": "fileChange", "id": "call-patch", "changes": changes, "status": "inProgress"})
     );
-    let applied = ToolCallOutput::new(CallId::new("call-patch"), stored(ToolOutput::text("ok")));
-    assert_eq!(
-        serde_json::to_value(items.completed(&call, &applied).unwrap()).unwrap()["status"],
-        "completed"
-    );
-    let failed = applied.clone().with_error(true);
-    assert_eq!(
-        serde_json::to_value(items.completed(&call, &failed).unwrap()).unwrap()["status"],
-        "failed"
-    );
 
-    // A patch given as a custom tool's raw input reads the same; one that cannot be read shows
-    // nothing, and neither does a tool the host does not show.
-    let custom = ToolCall::custom(CallId::new("call-patch"), "apply_patch", patch);
-    assert_eq!(items.started(&custom), items.started(&call));
-    let unreadable = ToolCall::new(
-        CallId::new("c"),
+    for (status, shown) in [
+        (PatchApplyStatus::Completed, "completed"),
+        (PatchApplyStatus::Failed, "failed"),
+        (PatchApplyStatus::Declined, "declined"),
+    ] {
+        let end = event(FileEvent::PatchApplyEnd(PatchApplyEndEvent::new(
+            call_id.clone(),
+            status,
+            "text",
+        )));
+        let Some(ThreadToolItemEvent::Completed(ended)) =
+            items.event(&end, std::slice::from_ref(&started))
+        else {
+            panic!("an end completes the patch's item");
+        };
+        let ended = serde_json::to_value(&ended).unwrap();
+        assert_eq!(ended["status"], shown);
+        assert_eq!(ended["changes"], changes);
+    }
+    let orphan = event(FileEvent::PatchApplyEnd(PatchApplyEndEvent::new(
+        CallId::new("never-began"),
+        PatchApplyStatus::Completed,
+        "",
+    )));
+    assert_eq!(items.event(&orphan, std::slice::from_ref(&started)), None);
+
+    // The call and its result alone show nothing: the patch's own boundaries do.
+    let call = ToolCall::new(
+        call_id.clone(),
         "apply_patch",
-        json!({"patch": "nonsense"}),
+        json!({"patch": "*** Begin Patch\n*** End Patch"}),
     );
-    assert_eq!(items.started(&unreadable), None);
+    let applied = ToolCallOutput::new(call_id, stored(ToolOutput::text("ok")));
+    assert_eq!(items.started(&call), None);
+    assert_eq!(items.completed(&call, &applied), None);
+
+    // A begun patch whose result came in without its end failed; a running command is left.
+    let unfinished = serde_json::to_value(items.unfinished(&started, &applied).unwrap()).unwrap();
+    assert_eq!(unfinished["status"], "failed");
+    assert_eq!(unfinished["changes"], changes);
+    let command = items
+        .started(&ToolCall::new(
+            CallId::new("c"),
+            "exec_command",
+            json!({"cmd": "sleep 5"}),
+        ))
+        .unwrap();
+    assert_eq!(items.unfinished(&command, &applied), None);
+
     let other = ToolCall::new(CallId::new("c"), "read_file", json!({"path": "a"}));
     assert_eq!(items.started(&other), None);
     assert_eq!(items.completed(&other, &applied), None);
+}
+
+/// A tool that announces a patch's boundaries in the order a case names, standing in for the patch
+/// tool so the projection can be driven through every order it has to handle.
+struct BoundaryTool {
+    origin: ToolOrigin,
+    schema: ToolSchema,
+}
+
+impl BoundaryTool {
+    fn new() -> Self {
+        Self {
+            origin: ToolOrigin::new("patcher").unwrap(),
+            schema: ToolSchema::new(
+                "patcher",
+                json!({"type": "object", "properties": {"steps": {"type": "array", "items": {"type": "string"}}}, "required": ["steps"], "additionalProperties": false}),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BoundaryTool {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+    fn schema(&self) -> &ToolSchema {
+        &self.schema
+    }
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        use ra_core::event::{
+            ApprovalEvent, ApprovalResolution, FileEvent, HostEventBody,
+            file::{
+                FileChangeKind, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+                PatchFileChange,
+            },
+        };
+        let emitter = context
+            .event_emitter()
+            .expect("the thread records host events");
+        let call_id = context.call_id().clone();
+        for step in context.arguments()["steps"].as_array().unwrap() {
+            let body =
+                match step.as_str().unwrap() {
+                    "begin" => {
+                        HostEventBody::File(FileEvent::PatchApplyBegin(PatchApplyBeginEvent::new(
+                            call_id.clone(),
+                            vec![PatchFileChange::new("a.txt", FileChangeKind::Added, "a\n")],
+                        )))
+                    }
+                    "completed" => HostEventBody::File(FileEvent::PatchApplyEnd(
+                        PatchApplyEndEvent::new(call_id.clone(), PatchApplyStatus::Completed, "ok"),
+                    )),
+                    "failed" => HostEventBody::File(FileEvent::PatchApplyEnd(
+                        PatchApplyEndEvent::new(call_id.clone(), PatchApplyStatus::Failed, "no"),
+                    )),
+                    "declined" => HostEventBody::Approval(ApprovalEvent::resolved(
+                        call_id.clone(),
+                        ApprovalResolution::Declined,
+                    )),
+                    "unanswered" => HostEventBody::Approval(ApprovalEvent::resolved(
+                        call_id.clone(),
+                        ApprovalResolution::Failed,
+                    )),
+                    "cancelled" => HostEventBody::Approval(ApprovalEvent::resolved(
+                        call_id.clone(),
+                        ApprovalResolution::Cancelled,
+                    )),
+                    other => panic!("unknown step {other}"),
+                };
+            emitter.emit(body).unwrap();
+        }
+        Ok(ToolOutput::text("result"))
+    }
+}
+
+/// A patch's item follows its boundaries, live and read back alike: it starts once at its begin,
+/// ends once — at its end, at a refused answer, or, failing both, failed at the call's result — and
+/// nothing after its end changes it.
+#[tokio::test]
+async fn a_patch_item_ends_exactly_once_whatever_order_its_boundaries_arrive_in() {
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("ended", &["begin", "completed"], "completed"),
+        ("unended", &["begin"], "failed"),
+        ("refused", &["begin", "declined"], "declined"),
+        ("unanswered", &["begin", "unanswered"], "declined"),
+        ("cancelled", &["begin", "cancelled"], "declined"),
+        ("ended-twice", &["begin", "failed", "completed"], "failed"),
+        (
+            "refused-then-ended",
+            &["begin", "declined", "completed"],
+            "declined",
+        ),
+    ];
+    let server = Server::start(Some(Arc::new(
+        ra_coding::thread_items::CodingThreadToolItems::new("/work"),
+    )));
+    let mut connection = server.connect(1).await;
+    let script = Arc::new(Script::default());
+    script.push(Step::Respond(ModelResponse::new(
+        cases
+            .iter()
+            .map(|(id, steps, _)| {
+                RunItem::new(
+                    ItemId::new(*id),
+                    RunItemKind::ToolCall(ToolCall::new(
+                        CallId::new(*id),
+                        "patcher",
+                        json!({ "steps": steps }),
+                    )),
+                )
+            })
+            .collect(),
+    )));
+    script.push(Step::Respond(final_message("answer", "Done")));
+    let recorder = server.create_thread().await;
+    let agent = AgentSpec::builder()
+        .id(AgentId::new("lead"))
+        .name("Lead")
+        .instructions("lead")
+        .tools(vec![Arc::new(BoundaryTool::new()) as Arc<dyn Tool>])
+        .build()
+        .unwrap();
+    let thread = AgentThread::builder(
+        SessionId::new(THREAD),
+        AgentBinding::direct(agent),
+        Arc::new(Resolver(Arc::clone(&script))) as Arc<dyn ModelResolver>,
+    )
+    .with_rollout_recorder(recorder)
+    .build();
+    server.load_thread(thread, &[&connection]).await;
+
+    server.turn_start(&mut connection, "patch").await;
+    let notifications = connection.turn_notifications().await;
+
+    for (id, _, status) in cases {
+        let changes: Vec<_> = notifications
+            .iter()
+            .filter(|(method, item)| {
+                method != "turn/completed" && item["type"] == "fileChange" && item["id"] == *id
+            })
+            .map(|(method, item)| (method.as_str(), item["status"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            changes,
+            [("item/started", "inProgress"), ("item/completed", *status)],
+            "{id}"
+        );
+    }
+
+    let page = server
+        .turns_list(
+            &mut connection,
+            ThreadTurnsListParams::new(THREAD).with_items_view(TurnItemsView::Full),
+        )
+        .await;
+    let read: Vec<_> = page.data()[0]
+        .items()
+        .iter()
+        .filter_map(|item| match serde_json::to_value(item).unwrap() {
+            item if item["type"] == "fileChange" => Some((
+                item["id"].as_str().unwrap().to_owned(),
+                item["status"].as_str().unwrap().to_owned(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(id, _, status)| ((*id).to_owned(), (*status).to_owned()))
+        .collect();
+    assert_eq!(read, expected, "read back as they ended live");
+}
+
+/// A patch that began in a turn interrupted before its call's result leaves its item in progress,
+/// as Codex leaves an interrupted turn's items, read back as it was left.
+#[tokio::test]
+async fn an_interrupted_patch_is_left_in_progress() {
+    use ra_core::event::{
+        FileEvent, HostEvent, HostEventBody,
+        file::{FileChangeKind, PatchApplyBeginEvent, PatchFileChange},
+    };
+    let server = Server::start(Some(Arc::new(
+        ra_coding::thread_items::CodingThreadToolItems::new("/work"),
+    )));
+    let mut connection = server.connect(1).await;
+    let recorder = server.create_thread().await;
+    let allocator =
+        ra_core::state::RunState::start(RunId::new("run-1")).restore_event_seq_allocator(None);
+    record(
+        &recorder,
+        [
+            RolloutItem::RunStarted(RolloutRunStarted::new(
+                RunId::new("run-1"),
+                AgentId::new("lead"),
+            )),
+            RolloutItem::Item(RunItem::new(
+                ItemId::new("patch"),
+                RunItemKind::ToolCall(ToolCall::new(
+                    CallId::new("patch"),
+                    "apply_patch",
+                    json!({"patch": "*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch\n"}),
+                )),
+            )),
+            RolloutItem::Event(
+                HostEvent::allocate(
+                    &allocator,
+                    AgentId::new("lead"),
+                    HostEventBody::File(FileEvent::PatchApplyBegin(PatchApplyBeginEvent::new(
+                        CallId::new("patch"),
+                        vec![PatchFileChange::new("a.txt", FileChangeKind::Added, "a\n")],
+                    ))),
+                )
+                .unwrap(),
+            ),
+            run_ended("run-1", RolloutRunEnd::Interrupted),
+        ],
+    )
+    .await;
+
+    let page = server
+        .turns_list(
+            &mut connection,
+            ThreadTurnsListParams::new(THREAD).with_items_view(TurnItemsView::Full),
+        )
+        .await;
+    let patch = page.data()[0]
+        .items()
+        .iter()
+        .map(|item| serde_json::to_value(item).unwrap())
+        .find(|item| item["type"] == "fileChange")
+        .expect("the patch's item");
+    assert_eq!(patch["status"], "inProgress");
 }
 
 /// A command runs in the directory its call names, under the workspace root; a call that failed

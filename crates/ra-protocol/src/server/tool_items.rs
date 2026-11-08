@@ -10,7 +10,10 @@
 //! A call's item starts when the call is recorded, before its tool runs. Where the tool's runtime
 //! reports its own boundaries — a command's start and exit, as host events naming the call — the
 //! host may let them drive the item instead, as Codex's tools drive theirs: a command then ends
-//! when it exits, however long after its call returned, in the turn it began in. The host's answer
+//! when it exits, however long after its call returned, in the turn it began in. An item a
+//! runtime began and has not ended by the time the call's result comes in is the host's to end
+//! from that result ([`ThreadToolItems::unfinished`]), and an item that has ended is not changed by
+//! a later event for its call. The host's answer
 //! to a call's approval is such an event too
 //! ([`ApprovalEvent`](ra_core::event::ApprovalEvent)): a call that was not approved ends as its
 //! answer says, which is how Codex's tools report a declined call, rather than by the refusal the
@@ -60,6 +63,18 @@ pub trait ThreadToolItems: Debug + Send + Sync {
     /// history is read back. Once it gives an item for a call, the call's result no longer
     /// completes or replaces that item.
     fn event(&self, _event: &HostEvent, _items: &[ThreadItem]) -> Option<ThreadToolItemEvent> {
+        None
+    }
+
+    /// The item an event-driven `item` ends as when its call's result comes in while the item is
+    /// still in progress — or `None` to leave it in progress. Asked live and again when the
+    /// history is read back, once per result.
+    ///
+    /// A runtime that ends its own items still fails in ways it never reports: a call that times
+    /// out, or that is refused after its item began but before it ran. The result is then the
+    /// last word on the call. An item whose runtime outlives the call, such as a command left
+    /// running, is the one to leave in progress.
+    fn unfinished(&self, _item: &ThreadItem, _output: &ToolCallOutput) -> Option<ThreadItem> {
         None
     }
 }

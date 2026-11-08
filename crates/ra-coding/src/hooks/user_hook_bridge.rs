@@ -715,7 +715,10 @@ impl ProductHookRuntime {
                 HookDecision::Continue
             }
             HookEvent::PreToolUse(call) => {
-                if exec_kind(&call) == Some(ExecKind::Stdin) {
+                // A patch that cannot be parsed fails before any hook, as Codex resolves a patch's
+                // environment, and parses it, before its pre-tool hooks: the call then fails at
+                // decoding with `apply_patch verification failed`.
+                if exec_kind(&call) == Some(ExecKind::Stdin) || is_unparsable_patch(&call) {
                     return HookDecision::Continue;
                 }
                 let tool = HookToolName::for_call(&call);
@@ -1344,6 +1347,22 @@ impl ContextDelivery {
         self.pending.clear();
         self.pending_warnings.clear();
     }
+}
+
+/// Whether `call` is an `apply_patch` call whose patch text cannot be read or parsed.
+fn is_unparsable_patch(call: &ToolHookData<'_>) -> bool {
+    // An MCP tool that happens to be named `apply_patch` is not the patch tool.
+    if call.tool().and_then(crate::mcp::hook_tool_name).is_some()
+        || call.origin().namespace().is_some()
+        || call.origin().name() != "apply_patch"
+    {
+        return false;
+    }
+    let patch = match call.arguments() {
+        Value::String(patch) => Some(patch.as_str()),
+        arguments => arguments.get("patch").and_then(Value::as_str),
+    };
+    patch.is_none_or(|patch| ra_patch::parse_patch(patch).is_err())
 }
 
 fn hook_input(call: &ToolHookData<'_>) -> Value {

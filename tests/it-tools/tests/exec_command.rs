@@ -671,3 +671,68 @@ async fn test_exec_command_refuses_what_codex_cannot_decode_in_every_form() {
         }
     }
 }
+
+/// Approval preparation renders a policy refusal but preserves host failures as run errors.
+#[tokio::test]
+async fn approval_preparation_distinguishes_refusals_from_host_failures() {
+    use std::sync::Arc;
+
+    use ra_core::error::{Error, Result, ToolErrorKind};
+    use ra_tools::exec_command::{ExecCommandAttempt, ExecCommandPolicy, rejection};
+
+    struct Policy {
+        refuses: bool,
+    }
+
+    impl ExecCommandPolicy for Policy {
+        fn needs_approval(&self, _context: &ToolContext<'_>) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn approval_state(&self, _context: &ToolContext<'_>) -> Result<Option<Value>> {
+            Err(if self.refuses {
+                rejection("policy refused")
+            } else {
+                Error::caller("host failed")
+            })
+        }
+
+        fn attempt(&self, _context: &ToolContext<'_>) -> Result<ExecCommandAttempt> {
+            panic!("approval preparation must not execute a command")
+        }
+    }
+
+    for refuses in [false, true] {
+        let tool = ExecCommandTool::new()
+            .unwrap()
+            .with_command_policy(Arc::new(Policy { refuses }));
+        let run = run();
+        let call_id = CallId::new("prepare");
+        let arguments = json!({"cmd": "true"});
+        let context = ToolContext::new(&run, &tool, &call_id, &arguments);
+        let error = tool.approval_state(&context).await.unwrap_err();
+        if refuses {
+            assert!(matches!(
+                error,
+                Error::Tool {
+                    kind: ToolErrorKind::InvalidInput,
+                    ..
+                }
+            ));
+            let output = tool
+                .handle_failure(&context, &error)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(output.as_text(), Some("policy refused"));
+        } else {
+            assert_eq!(error.to_string(), Error::caller("host failed").to_string());
+            assert!(
+                tool.handle_failure(&context, &error)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}

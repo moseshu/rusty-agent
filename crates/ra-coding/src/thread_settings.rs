@@ -2228,7 +2228,8 @@ fn command_permissions(
 }
 
 /// Whether a patch asks before it is applied: Codex's patch safety check, and its approval cache
-/// when it would ask.
+/// when it would ask. A patch the policy refuses is refused with the reason the model reads, as
+/// Codex answers a rejected patch with `patch rejected: …`.
 pub(crate) fn patch_approval(context: &ToolContext<'_>) -> Result<bool> {
     let Some(settings) = context.run().app_context::<CodingThreadSettings>() else {
         return Ok(true);
@@ -2247,7 +2248,7 @@ fn patch_asks(settings: &CodingThreadSettings) -> Result<bool> {
             | AskForApproval::Granular {
                 sandbox_approval: false,
                 ..
-            } => Err(Error::caller(
+            } => Err(ra_tools::exec_command::rejection(
                 "apply_patch is denied by the read-only sandbox policy",
             )),
             _ => Ok(true),
@@ -2266,7 +2267,7 @@ fn patch_asks(settings: &CodingThreadSettings) -> Result<bool> {
             | AskForApproval::Granular {
                 sandbox_approval: false,
                 ..
-            } => Err(Error::caller(
+            } => Err(ra_tools::exec_command::rejection(
                 "patch rejected: the patch executor cannot enforce the selected sandbox",
             )),
             _ => Ok(true),

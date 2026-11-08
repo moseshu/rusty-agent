@@ -536,11 +536,20 @@ pub type EnvironmentResolver = dyn Fn(&ToolContext<'_>) -> Result<ExecEnvironmen
 /// Host approval callback evaluated for each command.
 pub type ApprovalResolver = dyn Fn(&ToolContext<'_>) -> Result<bool> + Send + Sync;
 
-/// The error an [`ExecCommandPolicy`] returns to refuse a command: the model reads `reason`
-/// verbatim as the command's result, as Codex returns a rejected command's reason.
+/// The error an [`ExecCommandPolicy`] or an [`ApprovalResolver`] returns to refuse a call: the
+/// model reads `reason` verbatim as the call's result, as Codex returns a rejected command's reason
+/// and a rejected patch's.
 #[must_use]
 pub fn rejection(reason: impl Into<String>) -> Error {
     ExecCommandFailure::Rejected(reason.into()).into_error()
+}
+
+/// The reason in a refusal made with [`rejection`], or `None` for any other error.
+pub(crate) fn rejection_reason(error: &Error) -> Option<&str> {
+    match ExecCommandFailure::of(error)? {
+        ExecCommandFailure::Rejected(reason) => Some(reason),
+        _ => None,
+    }
 }
 
 /// Codex's message for a command a network review denied, when finishing its approval left no
@@ -609,7 +618,8 @@ pub trait ExecCommandPolicy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// An error fails the run.
+    /// A [`rejection`] ends the call with its model-visible reason before anybody is asked.
+    /// Other errors keep their classification and follow [`Tool::approval_state`]'s handling.
     fn approval_state(&self, _context: &ToolContext<'_>) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
@@ -1471,13 +1481,21 @@ impl Tool for ExecCommandTool {
         let Some(policy_state) = self
             .policy
             .as_ref()
-            .map_or(Ok(None), |policy| policy.approval_state(context))?
+            .map_or(Ok(None), |policy| policy.approval_state(context))
+            .map_err(|error| match rejection_reason(&error) {
+                // The permission stage shapes invalid input before asking. Keep the typed
+                // refusal so the normal failure handler renders its reason verbatim.
+                Some(reason) => ExecCommandFailure::Rejected(reason.to_owned())
+                    .into_error_of_kind(ToolErrorKind::InvalidInput),
+                None => error,
+            })?
         else {
             return Ok(None);
         };
-        let input = self
-            .policy_input(context.arguments())
-            .map_err(|error| rejection(format!("invalid arguments: {error}")))?;
+        let input = self.policy_input(context.arguments()).map_err(|error| {
+            ExecCommandFailure::Rejected(format!("invalid arguments: {error}"))
+                .into_error_of_kind(ToolErrorKind::InvalidInput)
+        })?;
         let request = self
             .request(input)
             .map_err(ExecCommandFailure::into_error)?;
@@ -1697,7 +1715,12 @@ impl ExecCommandFailure {
     }
 
     fn into_error(self) -> Error {
-        Error::tool(self.kind(), TOOL_NAME, self.to_string()).with_source(self)
+        let kind = self.kind();
+        self.into_error_of_kind(kind)
+    }
+
+    fn into_error_of_kind(self, kind: ToolErrorKind) -> Error {
+        Error::tool(kind, TOOL_NAME, self.to_string()).with_source(self)
     }
 
     fn of(error: &Error) -> Option<&Self> {

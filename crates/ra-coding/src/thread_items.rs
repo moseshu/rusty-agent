@@ -12,21 +12,31 @@
 //! Codex parses command lines into reads, listings and searches; this adapter retains one
 //! unparsed command.
 //!
+//! A patch's item is driven by the patch tool's begin and end events, as Codex's file change is
+//! by `PatchApplyBegin` and `PatchApplyEnd`: a patch that fails verification, or that its policy
+//! refuses, never begins and shows no item, and one that begins shows it before it is asked
+//! about. A patch whose call ends in a way the tool does not report — a timeout, or a refusal
+//! after it began and before it ran — fails with the call's result.
+//!
 //! - A patch's changes are the files its text names. A created file's diff is its content, and a
 //!   changed file's is the patch's own hunks rather than a unified diff against the file; a deleted
-//!   file's content is not known, and its diff is empty.
-//! - A call that failed is a failed item. A call whose approval was not given ends as the answer
-//!   the thread recorded says, as Codex's handlers end it, rather than by the refusal the model is
-//!   given.
+//!   file's content is not read, and its diff is empty.
+//! - A call whose approval was not given ends as the answer the thread recorded says, as Codex's
+//!   handlers end it, rather than by the refusal the model is given.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ra_core::{
-    event::{ApprovalEvent, ApprovalResolution, HostEvent, HostEventBody, exec::ExecEvent},
+    event::{
+        ApprovalEvent, ApprovalResolution, FileEvent, HostEvent, HostEventBody,
+        exec::ExecEvent,
+        file::{
+            FileChangeKind, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus as Ended,
+        },
+    },
     item::{ToolCall, ToolCallOutput},
     tool::ToolOutput,
 };
-use ra_patch::{PatchAction, PatchHunk, parse_patch};
 use ra_protocol::server::{
     ThreadToolItemEvent, ThreadToolItems,
     protocol::{
@@ -37,7 +47,6 @@ use ra_protocol::server::{
 use serde_json::Value;
 
 const EXEC_COMMAND: &str = "exec_command";
-const APPLY_PATCH: &str = "apply_patch";
 
 /// The items the coding host's tools show, for the commands it runs in `workspace_root`.
 #[derive(Debug, Clone)]
@@ -105,7 +114,6 @@ impl ThreadToolItems for CodingThreadToolItems {
     fn started(&self, call: &ToolCall) -> Option<ThreadItem> {
         match call.name() {
             EXEC_COMMAND => self.command_started(call),
-            APPLY_PATCH => patch_item(call, PatchApplyStatus::InProgress),
             _ => None,
         }
     }
@@ -113,6 +121,17 @@ impl ThreadToolItems for CodingThreadToolItems {
     fn event(&self, event: &HostEvent, items: &[ThreadItem]) -> Option<ThreadToolItemEvent> {
         if let HostEventBody::Approval(approval) = event.body() {
             return refused_item(approval, items).map(ThreadToolItemEvent::Completed);
+        }
+        if let HostEventBody::File(event) = event.body() {
+            return match event {
+                FileEvent::PatchApplyBegin(begin) => {
+                    Some(ThreadToolItemEvent::Started(patch_began(begin)))
+                }
+                FileEvent::PatchApplyEnd(end) => {
+                    patch_ended(end, items).map(ThreadToolItemEvent::Completed)
+                }
+                _ => None,
+            };
         }
         let HostEventBody::Exec(event) = event.body() else {
             return None;
@@ -178,16 +197,21 @@ impl ThreadToolItems for CodingThreadToolItems {
                     }
                 )
             }),
-            APPLY_PATCH => patch_item(
-                call,
-                if output.is_error() {
-                    PatchApplyStatus::Failed
-                } else {
-                    PatchApplyStatus::Completed
-                },
-            ),
             _ => None,
         }
+    }
+
+    /// A patch that began and whose call's result came in without its end: the call failed in a
+    /// way the tool did not report. A command left running stays in progress.
+    fn unfinished(&self, item: &ThreadItem, _output: &ToolCallOutput) -> Option<ThreadItem> {
+        let ThreadItem::FileChange { .. } = item else {
+            return None;
+        };
+        let mut item = item.clone();
+        if let ThreadItem::FileChange { status, .. } = &mut item {
+            *status = PatchApplyStatus::Failed;
+        }
+        Some(item)
     }
 }
 
@@ -308,96 +332,40 @@ fn running_session(headline: &str) -> Option<&str> {
         .then_some(session_id)
 }
 
-/// The patch `call` applies, as a file change in `status`, or `None` if its text cannot be read.
-fn patch_item(call: &ToolCall, status: PatchApplyStatus) -> Option<ThreadItem> {
-    let patch = match call.arguments() {
-        Value::String(patch) => patch.as_str(),
-        arguments => arguments.get("patch")?.as_str()?,
-    };
-    let plan = parse_patch(patch).ok()?;
-    let mut changes: Vec<FileUpdateChange> = Vec::new();
-    for action in plan.actions() {
-        match action {
-            PatchAction::AddFile { path, content } => {
-                changes.push(FileUpdateChange::new(
-                    display(path),
-                    PatchChangeKind::Add,
-                    content.clone(),
-                ));
-            }
-            PatchAction::DeleteFile { path } => {
-                changes.push(FileUpdateChange::new(
-                    display(path),
-                    PatchChangeKind::Delete,
-                    "",
-                ));
-            }
-            PatchAction::UpdateFile { path, hunks } => {
-                changes.push(FileUpdateChange::new(
-                    display(path),
-                    PatchChangeKind::update(None),
-                    hunks_diff(hunks),
-                ));
-            }
-            PatchAction::MoveFile { from, to } => {
-                // The parser gives a moved file's changes first and its move after them.
-                let from = display(from);
-                let diff = match changes.last() {
-                    Some(last)
-                        if last.path() == from
-                            && matches!(last.kind(), PatchChangeKind::Update { .. }) =>
-                    {
-                        changes
-                            .pop()
-                            .map(|last| last.diff().to_owned())
-                            .unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                changes.push(FileUpdateChange::new(
-                    from,
-                    PatchChangeKind::update(Some(to.clone())),
-                    diff,
-                ));
-            }
-            _ => {}
-        }
-    }
-    Some(ThreadItem::file_change(
-        call.call_id().as_str(),
+/// A patch's item as its begin announces it: Codex's `PatchApplyBegin` turned into a file change.
+fn patch_began(begin: &PatchApplyBeginEvent) -> ThreadItem {
+    let changes = begin
+        .changes()
+        .iter()
+        .map(|change| {
+            let kind = match change.change() {
+                FileChangeKind::Added => PatchChangeKind::Add,
+                FileChangeKind::Deleted => PatchChangeKind::Delete,
+                _ => PatchChangeKind::update(change.moved_to().map(PathBuf::from)),
+            };
+            FileUpdateChange::new(change.path(), kind, change.diff())
+        })
+        .collect();
+    ThreadItem::file_change(
+        begin.call_id().as_str(),
         changes,
-        status,
-    ))
+        PatchApplyStatus::InProgress,
+    )
 }
 
-fn display(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
-/// A changed file's hunks as the patch gives them: context lines, then the lines it removes and
-/// the lines it adds, each under the anchor it is found by.
-fn hunks_diff(hunks: &[PatchHunk]) -> String {
-    let mut diff = String::new();
-    for hunk in hunks {
-        let anchors = hunk.context_anchors().join(" ");
-        diff.push_str("@@");
-        if !anchors.is_empty() {
-            diff.push(' ');
-            diff.push_str(&anchors);
-        }
-        diff.push('\n');
-        let lines = hunk
-            .context_before()
-            .iter()
-            .map(|line| (' ', line))
-            .chain(hunk.removed_lines().iter().map(|line| ('-', line)))
-            .chain(hunk.added_lines().iter().map(|line| ('+', line)))
-            .chain(hunk.context_after().iter().map(|line| (' ', line)));
-        for (prefix, line) in lines {
-            diff.push(prefix);
-            diff.push_str(line);
-            diff.push('\n');
-        }
-    }
-    diff
+/// The item a patch's end leaves: the begun item, in the status it ended with.
+fn patch_ended(end: &PatchApplyEndEvent, items: &[ThreadItem]) -> Option<ThreadItem> {
+    let mut item = items
+        .iter()
+        .find(|item| item.id() == end.call_id().as_str())?
+        .clone();
+    let ThreadItem::FileChange { status, .. } = &mut item else {
+        return None;
+    };
+    *status = match end.status() {
+        Ended::Completed => PatchApplyStatus::Completed,
+        Ended::Declined => PatchApplyStatus::Declined,
+        _ => PatchApplyStatus::Failed,
+    };
+    Some(item)
 }

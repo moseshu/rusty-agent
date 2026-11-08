@@ -289,13 +289,21 @@ pub trait Tool: std::any::Any + Send + Sync + 'static {
         }
     }
 
-    /// State to keep with the approval this call is about to wait for, handed back through
-    /// [`ToolContext::resume_state`] when the approved call is dispatched again.
+    /// State to keep with the approval this call is about to be asked about, handed back through
+    /// [`ToolContext::resume_state`] when the approved call runs.
     ///
-    /// The runtime asks only when the call needs approval, right after [`Tool::needs_approval`]
-    /// said so. A tool keeps here what it decided while asking, so the approved call runs as it
+    /// The runtime calls this once for each question it is about to put, whatever decided that the
+    /// call asks — [`Tool::needs_approval`], a fixed `ask` rule, or an `Always` policy — and before
+    /// the permission hooks are asked, so the state reaches the call whether a hook or the host
+    /// answers. A tool keeps here what it decided while asking, so the approved call runs as it
     /// was decided even when the approval is answered in another process. The default keeps
     /// nothing.
+    ///
+    /// This is also where a tool prepares what the question is about, as Codex's handlers verify a
+    /// call and announce its item before their orchestrator asks: it may check the call against
+    /// the workspace and emit host events here. An error of kind
+    /// [`ToolErrorKind::InvalidInput`](crate::error::ToolErrorKind::InvalidInput) ends the call as
+    /// its failure, through the tool's failure handling, and nobody is asked.
     async fn approval_state(
         &self,
         _context: &ToolContext<'_>,

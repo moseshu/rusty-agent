@@ -30,15 +30,20 @@ fn tool(workspace: &TempDir) -> ApplyPatchTool {
     ApplyPatchTool::new(Arc::new(filesystem)).expect("tool")
 }
 
+/// The text the model reads for a call: its result, or the failure the tool renders.
 async fn call(tool: &ApplyPatchTool, call_id: &str, arguments: &serde_json::Value) -> String {
     let run = run();
     let call_id = CallId::new(call_id);
-    tool.call(ToolContext::new(&run, tool, &call_id, arguments))
-        .await
-        .expect("tool result")
-        .as_text()
-        .expect("text")
-        .to_owned()
+    let context = || ToolContext::new(&run, tool, &call_id, arguments);
+    let output = match tool.call(context()).await {
+        Ok(output) => output,
+        Err(error) => tool
+            .handle_failure(&context(), &error)
+            .await
+            .expect("failure handling")
+            .unwrap_or_else(|| panic!("the tool renders its own failure: {error}")),
+    };
+    output.as_text().expect("text").to_owned()
 }
 
 #[tokio::test]
@@ -62,8 +67,11 @@ async fn applies_multiple_actions_and_reports_the_committed_delta() {
     assert!(output.contains("2 path(s)"));
 }
 
+/// A later operation that cannot apply to the workspace as it is fails the whole patch at
+/// verification, before the earlier ones are written, as Codex's handler verifies every operation
+/// first.
 #[tokio::test]
-async fn keeps_already_committed_changes_when_a_later_action_fails() {
+async fn a_later_delete_of_a_missing_file_fails_verification_before_any_write() {
     let workspace = TempDir::new().expect("workspace");
     std::fs::write(workspace.path().join("source.txt"), "old\n").expect("source");
     let tool = tool(&workspace);
@@ -72,10 +80,13 @@ async fn keeps_already_committed_changes_when_a_later_action_fails() {
     let output = call(&tool, "call-patch-partial", &arguments).await;
 
     assert_eq!(
-        std::fs::read_to_string(workspace.path().join("source.txt")).expect("updated"),
-        "new\n"
+        std::fs::read_to_string(workspace.path().join("source.txt")).expect("unchanged"),
+        "old\n"
     );
-    assert!(output.contains("stopped after changing 1 path(s)"));
+    assert!(
+        output.starts_with("apply_patch verification failed: Failed to read missing.txt"),
+        "{output}"
+    );
 }
 
 #[tokio::test]
@@ -159,14 +170,22 @@ async fn records_each_committed_change_including_a_partial_application() {
         .with_event_seq_allocator(state.restore_event_seq_allocator(None));
     let call_id = CallId::new("call-patch-1");
 
-    // The third action cannot apply: there is no such file to delete. The first two already have.
+    // The third action verifies but cannot be written: its parent is a regular file. The first two
+    // already have been.
+    std::fs::write(workspace.path().join("blocker"), "file\n").expect("blocker");
     let arguments = json!({
-        "patch": "*** Begin Patch\n*** Update File: source.txt\n@@\n-old\n+new\n*** Add File: added.txt\n+created\n*** Delete File: missing.txt\n*** End Patch\n"
+        "patch": "*** Begin Patch\n*** Update File: source.txt\n@@\n-old\n+new\n*** Add File: added.txt\n+created\n*** Add File: blocker/new.txt\n+blocked\n*** End Patch\n"
     });
-    let text = tool
-        .call(ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services))
+    let context = || ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services);
+    let error = tool
+        .call(context())
         .await
-        .expect("tool result")
+        .expect_err("a patch that stopped part way is a failure");
+    let text = tool
+        .handle_failure(&context(), &error)
+        .await
+        .expect("failure handling")
+        .expect("rendered")
         .as_text()
         .expect("text")
         .to_owned();

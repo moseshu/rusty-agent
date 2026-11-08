@@ -21,6 +21,16 @@
 //! these are emitted from; the second keeps a log that hosts persist from becoming a second copy of
 //! the workspace, and keeps file contents out of a channel whose retention nobody has reasoned
 //! about.
+//!
+//! # Patch boundaries
+//!
+//! [`PatchApplyBeginEvent`] and [`PatchApplyEndEvent`] are Codex's `PatchApplyBegin` and
+//! `PatchApplyEnd`: a patch tool announces the changes it is about to make once the patch has been
+//! verified and before it asks for approval or writes, and reports how the call ended. A host shows
+//! a patch as one item between the two, as Codex's file-change item is. The changes a begin event
+//! carries are the patch's own text — a created file's content, an updated file's hunks — which the
+//! call's arguments already hold; a deleted file's content is never read into them, so the limit
+//! above still stands.
 
 use std::borrow::Cow;
 
@@ -46,6 +56,10 @@ pub enum FileEvent {
     Read(FileReadEvent),
     /// A file was created, modified, deleted, or moved.
     Changed(FileChangedEvent),
+    /// A verified patch is about to be applied.
+    PatchApplyBegin(PatchApplyBeginEvent),
+    /// A patch whose begin was announced has ended.
+    PatchApplyEnd(PatchApplyEndEvent),
     /// Forward-compatible unknown file event kind.
     Unknown(serde_json::Value),
 }
@@ -60,11 +74,15 @@ impl Serialize for FileEvent {
         enum Known<'a> {
             Read(&'a FileReadEvent),
             Changed(&'a FileChangedEvent),
+            PatchApplyBegin(&'a PatchApplyBeginEvent),
+            PatchApplyEnd(&'a PatchApplyEndEvent),
         }
 
         match self {
             Self::Read(event) => Known::Read(event).serialize(serializer),
             Self::Changed(event) => Known::Changed(event).serialize(serializer),
+            Self::PatchApplyBegin(event) => Known::PatchApplyBegin(event).serialize(serializer),
+            Self::PatchApplyEnd(event) => Known::PatchApplyEnd(event).serialize(serializer),
             Self::Unknown(value) => value.serialize(serializer),
         }
     }
@@ -86,6 +104,16 @@ impl<'de> Deserialize<'de> for FileEvent {
             Some(serde_json::Value::String(ref name)) if name == "changed" => {
                 serde_json::from_value(val)
                     .map(Self::Changed)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(serde_json::Value::String(ref name)) if name == "patch_apply_begin" => {
+                serde_json::from_value(val)
+                    .map(Self::PatchApplyBegin)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(serde_json::Value::String(ref name)) if name == "patch_apply_end" => {
+                serde_json::from_value(val)
+                    .map(Self::PatchApplyEnd)
                     .map_err(serde::de::Error::custom)
             }
             other => {
@@ -359,6 +387,182 @@ impl FileChangedEvent {
     #[must_use]
     pub const fn lines_removed(&self) -> u64 {
         self.lines_removed
+    }
+
+    /// Unknown fields preserved while reading a newer record.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// One file a patch is about to change, as its begin event announces it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchFileChange {
+    path: String,
+    change: FileChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
+    #[serde(default)]
+    diff: String,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl PatchFileChange {
+    /// A change to `path`, described by `diff` as the patch gives it.
+    #[must_use]
+    pub fn new(path: impl Into<String>, change: FileChangeKind, diff: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            change,
+            moved_to: None,
+            diff: diff.into(),
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// Records where the file is moved to.
+    #[must_use]
+    pub fn with_moved_to(mut self, path: impl Into<String>) -> Self {
+        self.moved_to = Some(path.into());
+        self
+    }
+
+    /// The path the patch names.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// What the patch does to the file.
+    #[must_use]
+    pub const fn change(&self) -> &FileChangeKind {
+        &self.change
+    }
+
+    /// Where a moved file is going.
+    #[must_use]
+    pub fn moved_to(&self) -> Option<&str> {
+        self.moved_to.as_deref()
+    }
+
+    /// The change as the patch's own text gives it: a created file's content, an updated file's
+    /// hunks, and nothing for a deleted file.
+    #[must_use]
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+
+    /// Unknown fields preserved while reading a newer record.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// Emitted once per call, when a verified patch is about to be asked about or applied: Codex's
+/// `PatchApplyBegin`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchApplyBeginEvent {
+    #[serde(default = "default_schema_version")]
+    schema_version: SchemaVersion,
+    call_id: CallId,
+    changes: Vec<PatchFileChange>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl PatchApplyBeginEvent {
+    /// The patch of `call_id` is about to make `changes`.
+    #[must_use]
+    pub fn new(call_id: CallId, changes: Vec<PatchFileChange>) -> Self {
+        Self {
+            schema_version: FILE_EVENT_SCHEMA_VERSION,
+            call_id,
+            changes,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// The tool call this patch belongs to.
+    #[must_use]
+    pub const fn call_id(&self) -> &CallId {
+        &self.call_id
+    }
+
+    /// The files the patch changes, in the patch's order.
+    #[must_use]
+    pub fn changes(&self) -> &[PatchFileChange] {
+        &self.changes
+    }
+
+    /// Unknown fields preserved while reading a newer record.
+    #[must_use]
+    pub const fn unknown(&self) -> &Unknown {
+        &self.unknown
+    }
+}
+
+/// How a patch whose begin was announced ended: Codex's `PatchApplyStatus`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchApplyStatus {
+    /// Every change was applied.
+    Completed,
+    /// The patch could not be applied, or was applied only in part.
+    Failed,
+    /// The patch was refused.
+    Declined,
+}
+
+/// Emitted when a patch whose begin was announced ends, however it ended: Codex's
+/// `PatchApplyEnd`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchApplyEndEvent {
+    #[serde(default = "default_schema_version")]
+    schema_version: SchemaVersion,
+    call_id: CallId,
+    status: PatchApplyStatus,
+    #[serde(default)]
+    output: String,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl PatchApplyEndEvent {
+    /// The patch of `call_id` ended as `status`, and the model was given `output`.
+    #[must_use]
+    pub fn new(call_id: CallId, status: PatchApplyStatus, output: impl Into<String>) -> Self {
+        Self {
+            schema_version: FILE_EVENT_SCHEMA_VERSION,
+            call_id,
+            status,
+            output: output.into(),
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// The tool call this patch belongs to.
+    #[must_use]
+    pub const fn call_id(&self) -> &CallId {
+        &self.call_id
+    }
+
+    /// How the patch ended.
+    #[must_use]
+    pub const fn status(&self) -> PatchApplyStatus {
+        self.status
+    }
+
+    /// The text the model was given for the call.
+    #[must_use]
+    pub fn output(&self) -> &str {
+        &self.output
     }
 
     /// Unknown fields preserved while reading a newer record.

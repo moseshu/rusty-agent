@@ -517,6 +517,23 @@ fn build_with_session_source(
     requester_thread: Option<&str>,
     source: Option<ra_protocol::server::SessionSource>,
 ) -> (Server, Option<ThreadRequester>) {
+    build_server(options, requester_thread, source, None)
+}
+
+/// Builds a server from `options` whose threads show their tools' calls as `tool_items` says.
+fn build_showing_items(
+    options: Options,
+    tool_items: Arc<dyn ra_protocol::server::ThreadToolItems>,
+) -> Server {
+    build_server(options, None, None, Some(tool_items)).0
+}
+
+fn build_server(
+    options: Options,
+    requester_thread: Option<&str>,
+    source: Option<ra_protocol::server::SessionSource>,
+    tool_items: Option<Arc<dyn ra_protocol::server::ThreadToolItems>>,
+) -> (Server, Option<ThreadRequester>) {
     let store = options
         .store
         .clone()
@@ -533,6 +550,9 @@ fn build_with_session_source(
     }
     if let Some(delay) = options.unload_delay {
         server = server.with_thread_unload_delay(delay);
+    }
+    if let Some(tool_items) = tool_items {
+        server = server.with_thread_tool_items(tool_items);
     }
     let requester =
         requester_thread.map(|thread| ThreadRequester::new(&server, &[], SessionId::new(thread)));

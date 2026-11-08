@@ -291,3 +291,39 @@ async fn a_hook_granted_retry_is_not_remembered_for_the_session() {
         2
     );
 }
+
+/// An escalation a hook approves runs at once outside the sandbox, asked about once and before
+/// the call, with no retry put to the hook or the client. The approval's prepared state reaching
+/// the call is covered by the runtime's own tests; this case pins the product behaviour around it.
+#[tokio::test]
+async fn an_escalation_a_hook_approves_runs_as_approved() {
+    let home = HooksHome::new();
+    let permission = home.path("permission.jsonl");
+    write_granular(&home, &permission_hook(&permission, Some(ALLOW)));
+    let server = home.server();
+    let mut connection = server.connect(1).await;
+    let thread = start_thread(&server, &mut connection).await;
+    home.script.push(Step::Respond(ModelResponse::new(vec![exec(
+        "escalated",
+        WRITES,
+        json!({"sandbox_permissions": "require_escalated", "justification": "needs to write"}),
+    )])));
+    home.script.answer("completed");
+    server.run_turn(&mut connection, &thread, "write").await;
+    let messages = connection.drain().await;
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message["method"] == "item/commandExecution/requestApproval"),
+        "the client was not asked"
+    );
+    let run_ids = permission_run_ids(&messages);
+    assert_eq!(run_ids.len(), 1, "asked once, before the call: {run_ids:?}");
+    assert!(!run_ids[0].ends_with(":retry"), "{run_ids:?}");
+    assert!(
+        home.workspace.path().join("denied.txt").exists(),
+        "{}",
+        model_output(&home.script, "escalated")
+    );
+}

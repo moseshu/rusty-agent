@@ -449,7 +449,9 @@ impl ThreadHistoryBuilder {
         item: &RunItem,
         tool_items: Option<&dyn ThreadToolItems>,
     ) -> Vec<ItemChange> {
-        let changes = self.projector.project(item, tool_items);
+        let unfinished = self.unfinished_runtime_item(turn_id, item, tool_items);
+        let mut changes = self.projector.project(item, tool_items);
+        changes.extend(unfinished.map(ItemChange::Completed));
         if changes.is_empty() {
             return changes;
         }
@@ -473,6 +475,31 @@ impl ThreadHistoryBuilder {
         changes
     }
 
+    /// The item an event-driven call's result ends, when the runtime began the item and has not
+    /// ended it: the result is then the last word on the call.
+    fn unfinished_runtime_item(
+        &mut self,
+        turn_id: Option<&str>,
+        item: &RunItem,
+        tool_items: Option<&dyn ThreadToolItems>,
+    ) -> Option<ThreadItem> {
+        let RunItemKind::ToolCallOutput(output) = item.kind() else {
+            return None;
+        };
+        let call_id = output.call_id().as_str();
+        if !self.projector.runtime_items.contains(call_id) {
+            return None;
+        }
+        let tool_items = tool_items?;
+        let turn = self.turn_for(turn_id)?;
+        let running = turn
+            .items
+            .iter()
+            .find(|existing| existing.id() == call_id)
+            .filter(|existing| is_in_progress(existing))?;
+        tool_items.unfinished(running, output)
+    }
+
     /// Projects runtime events into their original turn, including late command exits. The calls
     /// of the client's own tools are the server's to show (see [`super::dynamic_tool_calls`]); the
     /// host's tools show the rest.
@@ -493,10 +520,16 @@ impl ThreadHistoryBuilder {
         else {
             return Vec::new();
         };
-        let existed = turn
+        let existing = turn
             .items
             .iter()
-            .any(|item| item.id() == change.item().id());
+            .find(|item| item.id() == change.item().id());
+        let existed = existing.is_some();
+        // An item that has ended stays as it ended: a late event for its call — an end after the
+        // call's result already ended it, or a second answer to its approval — changes nothing.
+        if existing.is_some_and(has_ended) && matches!(change, ItemChange::Completed(_)) {
+            return Vec::new();
+        }
         turn.upsert(change.item().clone());
         self.projector
             .runtime_items
@@ -508,11 +541,12 @@ impl ThreadHistoryBuilder {
         }
     }
 
-    /// Forgets the finished turns except those with an item still in progress — a command left
-    /// running — whose runtime can still report its end into them.
+    /// Forgets the finished turns except those with a command still running, whose runtime can
+    /// still report its end into them. A file change left in progress by an interrupted turn does
+    /// not keep its turn: nothing will end it, as Codex leaves such an item as it was.
     pub(crate) fn retain_background_turns(&mut self) {
         self.turns
-            .retain(|turn| turn.items.iter().any(is_in_progress));
+            .retain(|turn| turn.items.iter().any(is_running_command));
     }
 
     /// The turn `turn_id` failed with `error`, and will end next: Codex's `handle_error`.
@@ -690,6 +724,28 @@ impl ThreadHistoryBuilder {
             self.turns.push(turn);
         }
     }
+}
+
+/// Whether `item` is a command or a file change that has ended, whatever its status.
+const fn has_ended(item: &ThreadItem) -> bool {
+    match item {
+        ThreadItem::CommandExecution { status, .. } => {
+            !matches!(status, CommandExecutionStatus::InProgress)
+        }
+        ThreadItem::FileChange { status, .. } => !matches!(status, PatchApplyStatus::InProgress),
+        _ => false,
+    }
+}
+
+/// Whether `item` is a command still running.
+const fn is_running_command(item: &ThreadItem) -> bool {
+    matches!(
+        item,
+        ThreadItem::CommandExecution {
+            status: CommandExecutionStatus::InProgress,
+            ..
+        }
+    )
 }
 
 /// Whether `item` is still running.

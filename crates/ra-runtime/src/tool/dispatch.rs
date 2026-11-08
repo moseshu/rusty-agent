@@ -47,6 +47,7 @@ use ra_core::{
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
+    event::{ApprovalEvent, ApprovalResolution, HostEventBody},
     guardrail::{
         ToolGuardrailVerdict, ToolInputGuardrail, ToolInputGuardrailData, ToolInputGuardrailResult,
         ToolOutputGuardrail, ToolOutputGuardrailData, ToolOutputGuardrailResult,
@@ -664,8 +665,8 @@ async fn run_chain(
             ),
             Some(PermissionDecision::Deny)
         );
-    if (!continuation || continuation_denied)
-        && let Some(answer) = admit_permission(
+    let permitted = if !continuation || continuation_denied {
+        admit_permission(
             request,
             &options,
             &name,
@@ -674,16 +675,25 @@ async fn run_chain(
             records,
         )
         .await?
-    {
-        if continuation_denied {
-            let outcome = Err(Error::tool(
-                ToolErrorKind::PermissionDenied,
-                &name,
-                "continuation denied by current policy",
-            ));
-            announce_invocation_end(request, &outcome).await?;
+    } else {
+        Admission::Proceed(None)
+    };
+    match permitted {
+        // A permission hook approved the question the tool prepared, so the call runs with the
+        // state the tool kept for it, as an approval the host answered resumes with it.
+        Admission::Proceed(Some(state)) => request.resume = Some(ToolResume::before_call(state)),
+        Admission::Proceed(None) => {}
+        Admission::Answered(answer) => {
+            if continuation_denied {
+                let outcome = Err(Error::tool(
+                    ToolErrorKind::PermissionDenied,
+                    &name,
+                    "continuation denied by current policy",
+                ));
+                announce_invocation_end(request, &outcome).await?;
+            }
+            return Ok(answer);
         }
-        return Ok(answer);
     }
 
     // 4. Input guardrail, on the arguments the tool is about to be handed. A refusal here means the
@@ -810,6 +820,7 @@ async fn run_chain(
             HookEvent::PermissionRequest(tool_hook_data(request).with_approval_state(&state)),
         )
         .await?;
+        record_hook_answer(request, &decision);
         match decision {
             HookDecision::Allow => {
                 // A call cancelled while its hooks decided is not invoked again.
@@ -996,6 +1007,15 @@ async fn run_user_hook(
         .await
 }
 
+/// What the permission stage lets a call do.
+enum Admission {
+    /// The call may proceed, carrying the state its tool kept with a question a permission hook
+    /// approved, if there was one.
+    Proceed(Option<Value>),
+    /// The chain answers in place of the call.
+    Answered(ToolDispatch),
+}
+
 /// Runs the permission stage, returning the answer the chain gives instead of running the tool.
 ///
 /// `None` means the call may proceed. A fixed rule or mode decision is resolved without entering
@@ -1007,11 +1027,11 @@ async fn admit_permission(
     input_guardrails: &[Arc<dyn ToolInputGuardrail>],
     output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
     records: &mut ToolGuardrailRecords,
-) -> Result<Option<ToolDispatch>> {
+) -> Result<Admission> {
     let tool = &request.tool;
     let permission = resolve_permission(tool, options, request).await?;
     match permission {
-        PermissionDecision::Allow => Ok(None),
+        PermissionDecision::Allow => Ok(Admission::Proceed(None)),
         PermissionDecision::Deny => {
             let error = Error::tool(
                 ToolErrorKind::PermissionDenied,
@@ -1030,12 +1050,11 @@ async fn admit_permission(
                     serde_json::Value::String(message.to_owned()),
                 )
                 .with_error(true);
-                return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-                    output,
-                    error.code(),
-                ))));
+                return Ok(Admission::Answered(ToolDispatch::Refused(
+                    ToolRefusal::new(output, error.code()),
+                )));
             }
-            Ok(Some(refused(&request.call_id, name, &error)))
+            Ok(Admission::Answered(refused(&request.call_id, name, &error)))
         }
         PermissionDecision::Ask => {
             // The optional pre-approval pass. It exists so nobody is asked to approve a call that
@@ -1046,26 +1065,12 @@ async fn admit_permission(
                 && let Some(refusal) =
                     check_input_guardrails(request, input_guardrails, records).await?
             {
-                return Ok(Some(refusal));
+                return Ok(Admission::Answered(refusal));
             }
-            match run_user_hook(
-                request,
-                HookEvent::PermissionRequest(tool_hook_data(request)),
-            )
-            .await?
-            {
-                HookDecision::Allow => return Ok(None),
-                HookDecision::Deny { message } => {
-                    return Ok(Some(ToolDispatch::Refused(ToolRefusal::new(
-                        pre_invocation_rejection(request, message)?,
-                        PERMISSION_REQUEST_HOOK_CODE,
-                    ))));
-                }
-                _ => {}
-            }
-            let mut approval = request.approval();
-            // What the tool decided while asking stays with the question, so the approved call
-            // runs as it was decided wherever the answer is given.
+            // The tool prepares the question before anybody answers it, as Codex's handlers do
+            // before their orchestrator asks the hooks or the reviewer: what it decided while
+            // asking stays with the question, so the approved call runs as it was decided whoever
+            // answers and wherever. A call the tool finds it cannot run ends here, unasked.
             let state = request
                 .cancel
                 .run(tool.approval_state(&request.context()))
@@ -1083,18 +1088,62 @@ async fn admit_permission(
                         records,
                     )
                     .await
-                    .map(Some);
+                    .map(Admission::Answered);
                 }
                 Err(error) => return Err(error),
             };
+            let decision = run_user_hook(
+                request,
+                HookEvent::PermissionRequest(tool_hook_data(request)),
+            )
+            .await?;
+            record_hook_answer(request, &decision);
+            match decision {
+                HookDecision::Allow => return Ok(Admission::Proceed(state)),
+                HookDecision::Deny { message } => {
+                    return Ok(Admission::Answered(ToolDispatch::Refused(
+                        ToolRefusal::new(
+                            pre_invocation_rejection(request, message)?,
+                            PERMISSION_REQUEST_HOOK_CODE,
+                        ),
+                    )));
+                }
+                _ => {}
+            }
+            let mut approval = request.approval();
             if let Some(state) = state {
                 approval = approval.with_resume(ToolResume::before_call(state));
             }
-            Ok(Some(ToolDispatch::AwaitingApproval(approval)))
+            Ok(Admission::Answered(ToolDispatch::AwaitingApproval(
+                approval,
+            )))
         }
         _ => Err(Error::caller(format!(
             "tool `{name}` has an unsupported permission decision `{permission:?}`"
         ))),
+    }
+}
+
+/// Records a permission hook's answer to an approval as the approval's resolution, as Codex
+/// resolves an approval a hook decided: an approval the hooks leave undecided is answered, and
+/// recorded, by whoever the host asks instead. Each question is recorded on its own, so a call
+/// asked more than once records every answer.
+fn record_hook_answer(request: &ToolDispatchRequest, decision: &HookDecision) {
+    let resolution = match decision {
+        HookDecision::Allow => ApprovalResolution::Approved,
+        HookDecision::Deny { .. } => ApprovalResolution::Declined,
+        _ => return,
+    };
+    let Some(emitter) = request.context().event_emitter() else {
+        return;
+    };
+    let event = ApprovalEvent::resolved(request.call_id.clone(), resolution);
+    if let Err(error) = emitter.emit(HostEventBody::Approval(event)) {
+        tracing::warn!(
+            call_id = %request.call_id,
+            %error,
+            "a permission hook's answer could not be recorded on the host event channel"
+        );
     }
 }
 

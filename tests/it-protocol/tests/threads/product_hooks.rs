@@ -73,6 +73,19 @@ impl HooksHome {
     /// A server whose threads the coding factory builds from this home, unloaded as soon as the
     /// last connection lets go of them.
     fn server(&self) -> Server {
+        build(self.options(), None).0
+    }
+
+    /// Like [`Self::server`], with the coding host's tool calls shown as items.
+    fn server_showing_items(&self) -> Server {
+        let root = self.workspace.path().canonicalize().unwrap();
+        build_showing_items(
+            self.options(),
+            Arc::new(ra_coding::thread_items::CodingThreadToolItems::new(root)),
+        )
+    }
+
+    fn options(&self) -> Options {
         let root = self.workspace.path().canonicalize().unwrap();
         let host = CodingHost::open(&root).unwrap();
         let settings = CodingThreadSettingsAdapter::new(
@@ -86,15 +99,11 @@ impl HooksHome {
         let factory =
             CodingThreadFactory::new(host, Arc::new(Resolver(Arc::clone(&self.script))), settings)
                 .with_product_config(self.config_builder());
-        build(
-            Options {
-                store: Some(Arc::clone(&self.store)),
-                factory: Some(Arc::new(factory)),
-                unload_delay: Some(Duration::ZERO),
-            },
-            None,
-        )
-        .0
+        Options {
+            store: Some(Arc::clone(&self.store)),
+            factory: Some(Arc::new(factory)),
+            unload_delay: Some(Duration::ZERO),
+        }
     }
 }
 
@@ -657,3 +666,6 @@ mod in_call_permission;
 
 #[path = "product_hooks/exec_arguments.rs"]
 mod exec_arguments;
+
+#[path = "product_hooks/apply_patch_hooks.rs"]
+mod apply_patch_hooks;

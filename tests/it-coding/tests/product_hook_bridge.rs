@@ -183,7 +183,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
     assert_eq!(event.run.event_name, HookEventName::PreToolUse);
 
     let patch = ToolOrigin::new("apply_patch").unwrap();
-    let arguments = serde_json::json!({"patch":"original patch"});
+    let arguments = serde_json::json!({"patch": ORIGINAL_PATCH});
     let decision = bound
         .dispatch(HookEvent::PreToolUse(ToolHookData::new(
             &patch, &call_id, &arguments,
@@ -749,11 +749,11 @@ command = '''printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","p
     let id = CallId::new("patch");
     for (arguments, expected) in [
         (
-            serde_json::json!({"patch":"original patch"}),
+            serde_json::json!({"patch": ORIGINAL_PATCH}),
             serde_json::json!({"patch":"replacement patch"}),
         ),
         (
-            serde_json::json!("original patch"),
+            serde_json::json!(ORIGINAL_PATCH),
             serde_json::json!("replacement patch"),
         ),
     ] {
@@ -765,6 +765,62 @@ command = '''printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","p
             .unwrap();
         assert_eq!(decision, HookDecision::UpdateInput { input: expected });
     }
+}
+
+const ORIGINAL_PATCH: &str = "*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch\n";
+
+/// A patch that cannot be parsed runs no PreToolUse hook, as Codex parses a patch while resolving
+/// its environment, before its hooks; the call then fails at decoding.
+#[tokio::test]
+async fn an_unparsable_patch_runs_no_pre_tool_use_hook() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("pre.log");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PreToolUse]]
+matcher = "^apply_patch$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '''cat >> '{}'; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"no"}}}}' '''
+"#,
+            log.display()
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_with_queue(&runtime, &queue);
+    let origin = ToolOrigin::new("apply_patch").unwrap();
+    let id = CallId::new("patch");
+    for arguments in [
+        serde_json::json!({"patch":"not a patch"}),
+        serde_json::json!("not a patch"),
+        serde_json::json!({"text": ORIGINAL_PATCH}),
+    ] {
+        let decision = bound
+            .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+                &origin, &id, &arguments,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(decision, HookDecision::Continue, "{arguments}");
+    }
+    assert!(!log.exists(), "no hook ran");
+
+    let arguments = serde_json::json!({"patch": ORIGINAL_PATCH});
+    let decision = bound
+        .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+            &origin, &id, &arguments,
+        )))
+        .await
+        .unwrap();
+    assert!(
+        matches!(decision, HookDecision::Deny { .. }),
+        "{decision:?}"
+    );
+    assert!(log.exists(), "a parsable patch runs its hook");
 }
 
 #[tokio::test]

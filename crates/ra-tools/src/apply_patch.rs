@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! The V4A patch-application tool.
 //!
 //! Editing a file through a diff is not a coding concern: a research agent revising a report and an
@@ -19,28 +20,53 @@
 //! outside the granted paths that share a hard link or are named by a link. An overwritten file
 //! keeps its permissions, while ownership, extended attributes and hard-link relationships are not
 //! copied. Write paths cannot traverse symbolic-link directories.
+//!
+//! # Verification, approval, and the patch's item
+//!
+//! As Codex's handler does, a patch is verified against the workspace before anybody is asked
+//! about it and before anything is written: a patch that cannot be parsed fails at decoding, before
+//! any hook, and one whose files do not check out fails with `apply_patch verification failed`
+//! without an approval being requested. Whether a patch asks stays with the permission stage, so
+//! fixed rules and product presets keep deciding it; the tool prepares the question in
+//! [`Tool::approval_state`], which verifies the patch and announces it with a
+//! [`PatchApplyBeginEvent`] before the hooks or the host are asked. A call that needs no approval
+//! verifies and announces itself. A host policy installed with
+//! [`ApplyPatchTool::with_approval_resolver`] is consulted again for a refusal once the patch has
+//! been verified, so a patch that is both broken and refused is reported as broken, as Codex
+//! reports it. Every announced patch ends with one [`PatchApplyEndEvent`]; a refusal the host or a
+//! hook gives is recorded by the runtime as the approval's answer instead.
+//!
+//! Every failure is returned as an error and rendered by [`Tool::handle_failure`], so a failed
+//! call is not reported to post-tool hooks as a result.
 
-use std::{fmt, io::Read as _, path::Path, sync::Arc};
+use std::{collections::HashSet, fmt, io::Read as _, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use ra_core::{
-    error::Result,
+    error::{Error, Result, ToolErrorKind},
     event::{
         FileEvent,
-        file::{FileChangeKind, FileChangedEvent},
+        file::{
+            FileChangeKind, FileChangedEvent, PatchApplyBeginEvent, PatchApplyEndEvent,
+            PatchApplyStatus, PatchFileChange,
+        },
     },
     tool::{
-        ResourceClaim, Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext, ToolInput as _,
-        ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
+        DecodedToolInput, ResourceClaim, Tool, ToolApprovalPolicy, ToolConcurrency, ToolContext,
+        ToolFailureHandling, ToolInput as _, ToolOptions, ToolOrigin, ToolOutput, ToolSchema,
     },
 };
 use ra_exec::fs::{RootedFileSystem, Workspace};
 use ra_macros::ToolInput;
 use ra_patch::{
-    CommittedPatchDelta, PatchAction, PatchConflict, PatchHunk, apply_chunks, parse_patch,
+    CommittedPatchDelta, PatchAction, PatchConflict, PatchHunk, PatchPlan, apply_chunks,
+    parse_patch,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
+
+use crate::exec_command::rejection_reason;
 
 const TOOL_NAME: &str = "apply_patch";
 
@@ -100,7 +126,13 @@ impl ApplyPatchTool {
         )
     }
 
-    /// Installs a host policy callback. It also validates the policy immediately before writing.
+    /// Installs a host policy callback.
+    ///
+    /// The callback says whether a patch asks before it is applied, and refuses one by returning a
+    /// [`rejection`](crate::exec_command::rejection). A refusal is not given while the permission
+    /// stage decides whether to ask: it is given once the patch has been verified, when the
+    /// callback is consulted again immediately before the question is put or the patch is
+    /// written. Its `Ok` answer is not consulted then, so a call a fixed rule allows is not asked.
     #[must_use]
     pub fn with_approval_resolver(
         mut self,
@@ -127,6 +159,13 @@ fn base_options() -> ToolOptions {
     ToolOptions::new()
         .with_approval(ToolApprovalPolicy::Always)
         .with_action_classes([crate::action_classes::EDIT])
+        .with_failure_handling(ToolFailureHandling::Custom)
+}
+
+/// The state an approval this tool asked for carries: the patch was verified and its begin was
+/// announced before the question was put, so the approved call does not announce it again.
+fn approval_state_value() -> Value {
+    serde_json::json!({ "apply_patch": { "item_started": true } })
 }
 
 #[async_trait]
@@ -138,58 +177,80 @@ impl Tool for ApplyPatchTool {
         &self.schema
     }
 
+    fn decode_input(&self, arguments: &Value) -> Result<Option<DecodedToolInput>> {
+        // Parsing only: the patch is read against the workspace later, where reading may block.
+        patch_plan(arguments).map_err(ApplyPatchFailure::into_error)?;
+        Ok(None)
+    }
+
     async fn needs_approval(&self, context: &ToolContext<'_>) -> Result<bool> {
-        self.approval_resolver
-            .as_ref()
-            .map_or(Ok(true), |resolve| resolve(context))
+        let Some(resolve) = &self.approval_resolver else {
+            return Ok(true);
+        };
+        match resolve(context) {
+            // A refusal is given after verification, by the call itself; asking about a patch that
+            // is going to be refused would put the question before the answer.
+            Err(error) if rejection_reason(&error).is_some() => Ok(false),
+            answer => answer,
+        }
+    }
+
+    async fn approval_state(&self, context: &ToolContext<'_>) -> Result<Option<Value>> {
+        let checked = self.check(context)?.map_err(|failure| {
+            // Asked before the call runs, a failure ends the call without a question. The runtime
+            // shapes only invalid input there; the text the model reads is the failure's own.
+            failure.into_error_of_kind(ToolErrorKind::InvalidInput)
+        })?;
+        announce_begin(context, checked.changes);
+        Ok(Some(approval_state_value()))
     }
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
-        if let Some(resolve) = &self.approval_resolver {
-            resolve(&context)?;
+        let begun = resumed_after_begin(&context)?;
+        // An announced patch ends with an end event however the call ends, and one that was never
+        // announced has no item to end.
+        let end = |status, failure: ApplyPatchFailure| {
+            if begun {
+                announce_end(&context, status, &failure.to_string());
+            }
+            Err(failure.into_error())
+        };
+        let checked = match self.check(&context)? {
+            Ok(checked) => checked,
+            Err(failure @ ApplyPatchFailure::Rejected(_)) => {
+                return end(PatchApplyStatus::Declined, failure);
+            }
+            Err(failure) => return end(PatchApplyStatus::Failed, failure),
+        };
+        if !begun {
+            announce_begin(&context, checked.changes);
         }
-        let patch = match context.arguments() {
-            // The current provider-neutral call item carries JSON. Accepting a bare JSON string
-            // keeps this handler compatible with the custom/freeform wire item once that item is
-            // introduced, while the object form remains available to existing function-only
-            // adapters.
-            serde_json::Value::String(patch) => patch.clone(),
-            arguments => {
-                serde_json::from_value::<ApplyPatchInput>(arguments.clone())
-                    .map_err(|error| {
-                        ra_core::error::Error::caller(format!(
-                            "invalid apply_patch arguments: {error}"
-                        ))
-                    })?
-                    .patch
-            }
-        };
-        let plan = match parse_patch(&patch) {
-            Ok(plan) => plan,
-            Err(error) => return Ok(ToolOutput::text(format!("Patch was not applied: {error}."))),
-        };
-        let operations = match operations(plan.actions()) {
-            Ok(operations) => operations,
-            Err(error) => {
-                return Ok(ToolOutput::text(render_stop(
-                    &CommittedPatchDelta::empty(),
-                    &error,
-                )));
-            }
-        };
+        let operations = operations(checked.plan.actions())
+            .map_err(|failure| ApplyPatchFailure::Verification(failure.to_string()).into_error())?;
         let mut committed = CommittedPatchDelta::empty();
         for operation in &operations {
             match self.apply_operation(&context, operation, &committed) {
                 Ok(delta) => committed = delta,
                 Err(stop) => {
-                    return Ok(ToolOutput::text(render_stop(
-                        &stop.committed,
-                        &stop.failure,
-                    )));
+                    let failure =
+                        ApplyPatchFailure::Application(render_stop(&stop.committed, &stop.failure));
+                    announce_end(&context, PatchApplyStatus::Failed, &failure.to_string());
+                    return Err(failure.into_error());
                 }
             }
         }
-        Ok(ToolOutput::text(render_success(&committed)))
+        let text = render_success(&committed);
+        announce_end(&context, PatchApplyStatus::Completed, &text);
+        Ok(ToolOutput::text(text))
+    }
+
+    async fn handle_failure(
+        &self,
+        _context: &ToolContext<'_>,
+        error: &Error,
+    ) -> Result<Option<ToolOutput>> {
+        // Matched on the typed cause the error carries, never on its message.
+        Ok(ApplyPatchFailure::of(error).map(|failure| ToolOutput::text(failure.to_string())))
     }
 
     fn options(&self) -> ToolOptions {
@@ -197,7 +258,106 @@ impl Tool for ApplyPatchTool {
     }
 }
 
+/// A patch that parsed, verified against the workspace, and was not refused.
+struct Checked {
+    plan: PatchPlan,
+    changes: Vec<PatchFileChange>,
+}
+
 impl ApplyPatchTool {
+    /// Parses and verifies the call's patch, then asks the host policy whether it refuses it.
+    ///
+    /// Verification comes first, as Codex verifies a patch before its safety check. The outer
+    /// error is a policy that failed rather than refused; it is not the patch's failure.
+    fn check(
+        &self,
+        context: &ToolContext<'_>,
+    ) -> Result<std::result::Result<Checked, ApplyPatchFailure>> {
+        let checked = match self.verified(context.arguments()) {
+            Ok(checked) => checked,
+            Err(failure) => return Ok(Err(failure)),
+        };
+        let Some(resolve) = &self.approval_resolver else {
+            return Ok(Ok(checked));
+        };
+        match resolve(context) {
+            Ok(_) => Ok(Ok(checked)),
+            Err(error) => match rejection_reason(&error) {
+                Some(reason) => Ok(Err(ApplyPatchFailure::Rejected(reason.to_owned()))),
+                None => Err(error),
+            },
+        }
+    }
+
+    fn verified(&self, arguments: &Value) -> std::result::Result<Checked, ApplyPatchFailure> {
+        let plan = patch_plan(arguments)?;
+        let changes = {
+            let operations = operations(plan.actions())
+                .map_err(|failure| ApplyPatchFailure::Verification(failure.to_string()))?;
+            self.verify(&operations)
+                .map_err(ApplyPatchFailure::Verification)?
+        };
+        Ok(Checked { plan, changes })
+    }
+
+    /// Codex's `verify_apply_patch_args`: each operation checked against the workspace as it is
+    /// now, on its own, with nothing written. Returns the changes the patch's begin announces.
+    fn verify(
+        &self,
+        operations: &[Operation<'_>],
+    ) -> std::result::Result<Vec<PatchFileChange>, String> {
+        let mut targeted = HashSet::new();
+        let mut changes = Vec::with_capacity(operations.len());
+        for operation in operations {
+            let path = operation.path();
+            // Keyed as Codex keys a patch's changes, by the path each resolves to: `./a` and `a`
+            // name one file.
+            let resolved: std::path::PathBuf = path
+                .components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .collect();
+            if !targeted.insert(resolved) {
+                return Err(format!("multiple operations target {}", path.display()));
+            }
+            let read = |path: &Path| {
+                self.read_text(path)
+                    .map_err(|failure| format!("Failed to read {}: {failure}", path.display()))
+            };
+            changes.push(match *operation {
+                Operation::Add { path, content } => {
+                    PatchFileChange::new(display(path), FileChangeKind::Added, content)
+                }
+                Operation::Delete { path } => {
+                    read(path)?;
+                    PatchFileChange::new(display(path), FileChangeKind::Deleted, "")
+                }
+                Operation::Update {
+                    path,
+                    hunks,
+                    move_to,
+                } => {
+                    let original = read(path)?;
+                    apply_chunks(path, &original, hunks)
+                        .map_err(|conflict| PatchToolFailure::Conflict(conflict).to_string())?;
+                    match move_to {
+                        Some(destination) => PatchFileChange::new(
+                            display(path),
+                            FileChangeKind::Moved,
+                            hunks_diff(hunks),
+                        )
+                        .with_moved_to(display(destination)),
+                        None => PatchFileChange::new(
+                            display(path),
+                            FileChangeKind::Updated,
+                            hunks_diff(hunks),
+                        ),
+                    }
+                }
+            });
+        }
+        Ok(changes)
+    }
+
     /// Commits one operation in Codex's order, recording each change as it lands.
     ///
     /// An update that moves its file writes the destination first and removes the source only
@@ -310,6 +470,92 @@ impl ApplyPatchTool {
     }
 }
 
+/// The patch text of a call's arguments, parsed.
+///
+/// The provider-neutral call item carries JSON. A bare JSON string is accepted so this handler
+/// stays compatible with the custom/freeform wire item once that item is introduced, while the
+/// object form remains available to function-only adapters.
+fn patch_plan(arguments: &Value) -> std::result::Result<PatchPlan, ApplyPatchFailure> {
+    let patch = match arguments {
+        Value::String(patch) => patch.clone(),
+        arguments => {
+            serde_json::from_value::<ApplyPatchInput>(arguments.clone())
+                .map_err(|error| {
+                    ApplyPatchFailure::Verification(format!("invalid arguments: {error}"))
+                })?
+                .patch
+        }
+    };
+    parse_patch(&patch).map_err(|error| ApplyPatchFailure::Verification(error.to_string()))
+}
+
+/// Whether this call resumes an approval this tool asked for, whose begin it already announced.
+fn resumed_after_begin(context: &ToolContext<'_>) -> Result<bool> {
+    match context.resume_state() {
+        None => Ok(false),
+        Some(state) if *state == approval_state_value() => Ok(true),
+        Some(_) => Err(ApplyPatchFailure::ApprovalState.into_error()),
+    }
+}
+
+/// Announces a verified patch before it is asked about or applied: Codex's `emitter.begin`.
+fn announce_begin(context: &ToolContext<'_>, changes: Vec<PatchFileChange>) {
+    let event = PatchApplyBeginEvent::new(context.call_id().clone(), changes);
+    emit_patch_event(context, FileEvent::PatchApplyBegin(event));
+}
+
+/// Ends an announced patch: Codex's `emitter.finish`.
+fn announce_end(context: &ToolContext<'_>, status: PatchApplyStatus, output: &str) {
+    let event = PatchApplyEndEvent::new(context.call_id().clone(), status, output);
+    emit_patch_event(context, FileEvent::PatchApplyEnd(event));
+}
+
+/// A host without an event channel has no item to show, as with committed changes.
+fn emit_patch_event(context: &ToolContext<'_>, event: FileEvent) {
+    let Some(emitter) = context.event_emitter() else {
+        return;
+    };
+    if let Err(error) = emitter.emit_file(event) {
+        tracing::warn!(
+            call_id = %context.call_id(),
+            %error,
+            "a patch boundary could not be recorded on the host event channel"
+        );
+    }
+}
+
+fn display(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// A changed file's hunks as the patch gives them: context lines, then the lines it removes and
+/// the lines it adds, each under the anchor it is found by.
+fn hunks_diff(hunks: &[PatchHunk]) -> String {
+    let mut diff = String::new();
+    for hunk in hunks {
+        let anchors = hunk.context_anchors().join(" ");
+        diff.push_str("@@");
+        if !anchors.is_empty() {
+            diff.push(' ');
+            diff.push_str(&anchors);
+        }
+        diff.push('\n');
+        let lines = hunk
+            .context_before()
+            .iter()
+            .map(|line| (' ', line))
+            .chain(hunk.removed_lines().iter().map(|line| ('-', line)))
+            .chain(hunk.added_lines().iter().map(|line| ('+', line)))
+            .chain(hunk.context_after().iter().map(|line| (' ', line)));
+        for (prefix, line) in lines {
+            diff.push(prefix);
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+    diff
+}
+
 /// Counts logical lines using the applier's LF, CRLF, and lone-CR terminators.
 fn count_file_lines(content: &str) -> usize {
     let bytes = content.as_bytes();
@@ -373,6 +619,15 @@ enum Operation<'a> {
         hunks: &'a [PatchHunk],
         move_to: Option<&'a Path>,
     },
+}
+
+impl Operation<'_> {
+    /// The path the operation is keyed by: its source, as Codex keys a patch's changes.
+    const fn path(&self) -> &Path {
+        match *self {
+            Self::Add { path, .. } | Self::Delete { path } | Self::Update { path, .. } => path,
+        }
+    }
 }
 
 /// The plan's actions as Codex's operations.
@@ -508,3 +763,56 @@ impl fmt::Display for PatchToolFailure {
         }
     }
 }
+
+/// Why a patch call ended without its patch applied in full, carried as the error's typed source
+/// so [`Tool::handle_failure`] renders it without reading prose back.
+#[derive(Debug)]
+enum ApplyPatchFailure {
+    /// The arguments, the patch text, or the patch against the workspace did not check out.
+    Verification(String),
+    /// The host's patch policy refused the patch; the text is its reason, read verbatim.
+    Rejected(String),
+    /// Application stopped; the text reports what was written before it did.
+    Application(String),
+    /// The approval this call resumes from is not one this tool asked for.
+    ApprovalState,
+}
+
+impl ApplyPatchFailure {
+    const fn kind(&self) -> ToolErrorKind {
+        match self {
+            Self::Verification(_) | Self::ApprovalState => ToolErrorKind::InvalidInput,
+            Self::Rejected(_) => ToolErrorKind::PermissionDenied,
+            Self::Application(_) => ToolErrorKind::ExecutionFailed,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        let kind = self.kind();
+        self.into_error_of_kind(kind)
+    }
+
+    fn into_error_of_kind(self, kind: ToolErrorKind) -> Error {
+        Error::tool(kind, TOOL_NAME, self.to_string()).with_source(self)
+    }
+
+    fn of(error: &Error) -> Option<&Self> {
+        std::error::Error::source(error).and_then(<dyn std::error::Error + 'static>::downcast_ref)
+    }
+}
+
+impl fmt::Display for ApplyPatchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verification(diagnosis) => {
+                write!(formatter, "apply_patch verification failed: {diagnosis}")
+            }
+            Self::Rejected(text) | Self::Application(text) => formatter.write_str(text),
+            Self::ApprovalState => {
+                formatter.write_str("apply_patch cannot resume an approval it did not ask for")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyPatchFailure {}

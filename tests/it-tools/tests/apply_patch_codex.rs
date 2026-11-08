@@ -49,13 +49,17 @@ async fn apply(root: &Path, patch: &str) -> Applied {
         .with_event_seq_allocator(state.restore_event_seq_allocator(None));
     let call_id = CallId::new("call-codex-patch");
     let arguments = json!(patch);
-    let text = tool
-        .call(ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services))
-        .await
-        .expect("tool result")
-        .as_text()
-        .expect("text")
-        .to_owned();
+    let context = || ToolContext::new(&run, &tool, &call_id, &arguments).with_services(&services);
+    // A failed call is an error the tool renders itself, as the runtime shapes it for the model.
+    let output = match tool.call(context()).await {
+        Ok(output) => output,
+        Err(error) => tool
+            .handle_failure(&context(), &error)
+            .await
+            .expect("failure handling")
+            .unwrap_or_else(|| panic!("the tool renders its own failure: {error}")),
+    };
+    let text = output.as_text().expect("text").to_owned();
     let changes = sink
         .events()
         .iter()
@@ -119,6 +123,14 @@ fn copy_dir(from: &Path, to: &Path) {
 /// parser is not part of this port; each is listed with what differs.
 const PARSER_DIFFERENCES: &[(&str, &str)] = &[];
 
+/// Scenarios Codex runs through its standalone `apply_patch` binary, which applies a patch without
+/// verifying it first, and that its tool handler would refuse at verification. The tool follows
+/// the handler, so each of these must fail verification and leave the workspace as it was given.
+const VERIFIED_BEFORE_APPLYING: &[(&str, &str)] = &[(
+    "015_failure_after_partial_success_leaves_changes",
+    "the patch deletes a file that does not exist, which `verify_apply_patch_args` refuses",
+)];
+
 /// Every scenario, run as Codex runs it: copy `input/`, apply `patch.txt`, compare with
 /// `expected/` byte for byte, whatever the call reported.
 #[tokio::test]
@@ -145,7 +157,21 @@ async fn codex_apply_patch_scenarios() {
             copy_dir(&input, workspace.path());
         }
         let text = std::fs::read_to_string(scenario.join("patch.txt")).expect("patch");
+        let before = snapshot(workspace.path());
         let applied = apply(workspace.path(), &text).await;
+        if VERIFIED_BEFORE_APPLYING
+            .iter()
+            .any(|(verified, _)| *verified == name)
+        {
+            assert!(
+                applied.text.starts_with("apply_patch verification failed:"),
+                "{name}: {}",
+                applied.text
+            );
+            assert_eq!(snapshot(workspace.path()), before, "{name} writes nothing");
+            assert!(applied.changes.is_empty(), "{name} records nothing");
+            continue;
+        }
         if snapshot(workspace.path()) != snapshot(&scenario.join("expected")) {
             failures.push(format!("{name}: {}", applied.text));
         }

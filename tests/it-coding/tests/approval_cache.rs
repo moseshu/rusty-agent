@@ -534,3 +534,93 @@ async fn a_session_approval_answered_through_the_runner_spans_turns() {
     let log = std::fs::read_to_string(fixture.dir.path().join("ran.log")).unwrap();
     assert_eq!(log.lines().count(), 2);
 }
+
+/// A fixed ask still prepares the command first: an argument refusal reaches the model before
+/// a permission hook or the host can be asked, as Codex rejects it before execution.
+#[tokio::test]
+async fn an_exec_refusal_before_a_fixed_ask_is_model_visible() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ra_core::{
+        hook::{HookDecision, HookEvent, HookEventName, UserHook, UserHookContext},
+        permission::{PermissionDecision, PermissionRule},
+    };
+    use ra_runtime::hook::UserHookRegistration;
+
+    struct Hooks {
+        calls: AtomicUsize,
+        decision: HookDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl UserHook for Hooks {
+        fn name(&self) -> &str {
+            "permission-and-post"
+        }
+
+        async fn call(
+            &self,
+            _context: &UserHookContext<'_>,
+            _event: &HookEvent<'_>,
+        ) -> Result<HookDecision> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.decision.clone())
+        }
+    }
+
+    for fixed_ask in [false, true] {
+        for decision in [
+            HookDecision::Allow,
+            HookDecision::Deny {
+                message: "hook refused".to_owned(),
+            },
+            HookDecision::Continue,
+        ] {
+            let mut fixture = fixture(AskForApproval::OnRequest).await;
+            let hooks = Arc::new(Hooks {
+                calls: AtomicUsize::new(0),
+                decision,
+            });
+            if fixed_ask {
+                fixture.config = fixture
+                    .config
+                    .with_permission_rules([
+                        PermissionRule::new(PermissionDecision::Ask).with_tool_name("exec_command")
+                    ]);
+            }
+            for event in [HookEventName::PermissionRequest, HookEventName::PostToolUse] {
+                fixture.config = fixture.config.with_user_hook(UserHookRegistration::new(
+                    event,
+                    Arc::clone(&hooks) as Arc<dyn UserHook>,
+                ));
+            }
+            let arguments = json!({
+                "cmd": "echo ran > unexpected.txt",
+                "justification": "test"
+            });
+            let result = Runner::run(run_request(
+                &fixture,
+                "refused",
+                vec![tool_call("refused-exec", &arguments), done()],
+            ))
+            .await
+            .expect("an invalid command is a tool result, not a run failure");
+            assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
+            let output = result
+                .new_items()
+                .iter()
+                .find_map(|item| match item.kind() {
+                    RunItemKind::ToolCallOutput(output) => Some(output),
+                    _ => None,
+                })
+                .expect("the rejected command has an output");
+            let stored = ToolOutput::from_stored(output.output()).unwrap().unwrap();
+            assert_eq!(
+                stored.as_text().unwrap(),
+                "`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: \"require_escalated\"` for unsandboxed execution, or omit `justification`."
+            );
+            assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
+            assert!(!fixture.dir.path().join("unexpected.txt").exists());
+        }
+    }
+}

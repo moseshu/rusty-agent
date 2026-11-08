@@ -40,6 +40,60 @@ for callers who want ambiguous context refused. A `PatchHunk` that continues the
 the one before it now serializes `continues_previous: true`; records without the field read as
 before. `RootedFileSystem::write_file_nofollow` is the new write primitive behind overwrites.
 
+### `apply_patch` verifies before it is asked about, and approvals are prepared before hooks
+
+A patch is now verified against the workspace before anybody is asked about it or anything is
+written, as Codex's patch handler does, and its file-change item follows the tool's own begin and
+end events.
+
+- **Verification first.** A patch that cannot be parsed fails at decoding, before any hook; one
+  whose files do not check out (a missing file to update or delete, context that is not found, two
+  operations on one path) fails with `apply_patch verification failed: …` without asking and
+  without writing anything. A later operation that cannot apply no longer leaves earlier ones
+  written: the whole patch fails at verification.
+- **Failures are errors.** `ApplyPatchTool::call` returns `Err` for every failure — verification,
+  a policy refusal, and a patch that stopped part way — and `Tool::handle_failure` renders the text
+  the model reads (the tool now selects `ToolFailureHandling::Custom`). Hosts calling the tool
+  directly receive the error instead of an `Ok` text; post-tool hooks no longer see failed patches
+  as results.
+- **Policy refusals reach the model.** An approval resolver installed with
+  `with_approval_resolver` refuses a patch by returning `ra_tools::exec_command::rejection(reason)`;
+  the reason is the model's text, given once the patch has been verified. `needs_approval` answers
+  `false` for such a refusal instead of propagating it. Any other resolver error is still the
+  host's error. The coding product's patch policy now refuses this way, so `apply_patch is denied
+  by the read-only sandbox policy` and `patch rejected: …` are model-visible results rather than
+  run failures.
+- **Without a resolver** the tool still always asks, and an invalid patch is now reported without
+  an approval interruption.
+- **Events.** `FileEvent` has two new variants, `PatchApplyBegin(PatchApplyBeginEvent)` and
+  `PatchApplyEnd(PatchApplyEndEvent)` (with `PatchFileChange` and `PatchApplyStatus`), Codex's
+  `PatchApplyBegin`/`PatchApplyEnd`. A begin is emitted once per call, after verification and
+  before the question or the write; an end follows every announced patch. A match on `FileEvent`
+  needs an arm for them (the enum was already `#[non_exhaustive]`).
+- **Approval preparation.** For every call the permission stage asks about — a tool's own
+  `needs_approval`, a fixed `ask` rule, or an `Always` policy — the runtime now calls
+  `Tool::approval_state` before the PermissionRequest hooks, and a hook's approval hands that state
+  to the call (`ToolResume::before_call`) as a host approval does. An `InvalidInput` error from
+  `approval_state` ends the call as its failure without asking anybody. For `exec_command` this
+  means a hook-approved command runs as approved: an escalation applies at once and a sandbox
+  retry is not asked about again, as in Codex.
+  A typed `exec_command::rejection(...)` from command-policy approval preparation is rendered
+  as the command's failure before any permission hook or host is asked, including under a fixed
+  `ask` rule. Its reason is preserved verbatim. At this boundary the tool classifies that refusal
+  as `InvalidInput` to use the runtime's existing pre-approval failure handling; invocation-time
+  refusals remain `PermissionDenied`, and other policy errors keep their classification.
+- **Hook answers are recorded.** A PermissionRequest hook that allows or denies now records an
+  `ApprovalEvent` (`Approved` / `Declined`) for the call, once per question, as the host's answer
+  is recorded. A command a hook refuses therefore ends `declined` rather than `failed`.
+- **Items.** `ThreadToolItems` has a new defaulted method, `unfinished`, which ends an
+  event-driven item still in progress when its call's result arrives. An item that has ended is no
+  longer changed by a later event for its call. A file change left in progress by an interrupted
+  turn no longer keeps that turn in memory. The coding host's file-change items are now driven by
+  the patch events: a patch that fails verification or is refused by its policy shows no item, and
+  one that is asked about shows its item before the question.
+- **Hooks.** The coding product does not run PreToolUse for an `apply_patch` call whose patch
+  cannot be parsed.
+
 ### macOS command sandboxing through canonical permission profiles
 
 On macOS, coding shell commands — including background terminals, their stdin, approved
