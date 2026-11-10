@@ -257,10 +257,15 @@ pub(super) fn allocate_thread_updated_at(
 /// two processes opening a new database do not both create it.
 fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: usize = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
+    // SQLite stores `user_version` as a 32-bit integer, so a negative value is read as an error
+    // rather than as an older schema.
+    let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    for (next_version, migration) in (1_u32..).zip(MIGRATIONS) {
+        if next_version <= version {
+            continue;
+        }
         transaction.execute_batch(migration)?;
-        transaction.pragma_update(None, "user_version", index + 1)?;
+        transaction.pragma_update(None, "user_version", next_version)?;
     }
     transaction.commit()
 }

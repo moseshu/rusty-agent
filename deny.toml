@@ -25,7 +25,11 @@ yanked = "deny"
 # 与 Codex 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 的 codex-rs/deny.toml 同样逐条忽略：DNSSEC 特性未开启，
 # 0118 没有修复版，0119 的修复在 0.26.1 而 rama 尚未跟进。2026-10-30 由维护者明确接受；rama 升级到
 # hickory 0.26.1 或 hickory-net 后撤销。
+# 同一 rama 0.3.0-alpha.4 的 rama-core 依赖 tokio-graceful 0.2.2，后者只在 `cfg(loom)` 下依赖
+# loom 0.7.2 -> pin-utils 0.1.1；常规构建从不编译它。这是「不再维护」告警，没有修复版。
+# 2026-11-10 由维护者明确接受本条精确例外；rama 升级去掉 tokio-graceful/loom 后撤销。
 ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "Maintainer explicitly accepted this exact exception on 2026-11-10. pin-utils 0.1.1 is unmaintained with no safe upgrade; it is reached only through rama-core 0.3.0-alpha.4 -> tokio-graceful 0.2.2 -> loom 0.7.2, a cfg(loom)-only dependency never compiled in normal builds; remove when rama drops tokio-graceful/loom" },
     { id = "RUSTSEC-2026-0118", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; DNSSEC features are not enabled; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2026-0119", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; no fixed rama release is available yet; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2024-0449", reason = "Maintainer explicitly accepted this exact exception on 2026-10-23. Ported Codex skill parser uses serde_yaml 0.9.34 -> unsafe-libyaml 0.2.11; upstream Codex has this same unmaintained advisory exception, with no patched release; remove when the port migrates off this parser" },

@@ -31,7 +31,7 @@ tokio-util.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"], optional = true }
 rustls = { workspace = true, features = ["aws_lc_rs"], optional = true }
 sse-stream = { version = "0.2.6", optional = true }
-rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "server", "transport-async-rw"] }
 sha1 = "0.10.6"
 base64.workspace = true
 url = "2"

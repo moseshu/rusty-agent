@@ -495,6 +495,10 @@ fn create_staging_file_with(
             use cap_std::fs::OpenOptionsExt as _;
             options.mode(if default_permissions { 0o666 } else { 0o600 });
         }
+        // Other platforms have no creation mode to choose; a new file there already gets the
+        // platform's default access, so the choice has nothing to select.
+        #[cfg(not(unix))]
+        let _ = default_permissions;
         match parent.open_with(&name, &options) {
             Ok(file) => return Ok((file, name)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

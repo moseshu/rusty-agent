@@ -14,6 +14,6 @@ path = "src/lib.rs"
 ra-core = { path = "../../crates/ra-core" }
 ra-session = { path = "../../crates/ra-session" }
 # 与 ra-session 用同一版本：测试要绕开会话、直接改库来制造坏行与失败的写入。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = "1"

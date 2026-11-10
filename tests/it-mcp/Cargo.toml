@@ -9,7 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server", "transport-io"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-streamable-http-server", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
 serde_json = "1"
 
