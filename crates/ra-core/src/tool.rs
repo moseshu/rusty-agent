@@ -199,8 +199,9 @@ pub trait Tool: std::any::Any + Send + Sync + 'static {
     /// A tool that returns one has its parsed model arguments schema-validated and decoded before
     /// [`Tool::call`] runs. The resulting value is available through
     /// [`ToolContext::decoded_input`]. Implementations that override [`Tool::decode_input`] must
-    /// use this same decoder; function decorators retain callable defaults separately from their
-    /// strict advertised schema. The runtime calls `decode_input`, not this method, directly.
+    /// use this same decoder. Calls are checked against the input type's own defaults and
+    /// unknown-field policy, not its strict advertised schema, as Python's `function_schema`
+    /// does. The runtime calls `decode_input`, not this method, directly.
     /// Tools without a Rust input type, such as a remote MCP proxy, keep receiving the
     /// parsed JSON value unchanged.
     fn func_schema(&self) -> Option<&FuncSchema> {

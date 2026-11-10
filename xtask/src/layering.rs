@@ -230,9 +230,22 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // `ra-patch` is the same shape as `ra-exec` and `ra-mcp` here: a service crate holding the work
     // that one tool entry point binds to. It arrived when `apply_patch` moved in, which is also
     // when the reusable-piece test stopped having an exception.
+    //
+    // `ra-filesystem` and `ra-paths` are service crates `ra-exec` already depends on. `exec_command`
+    // decodes `additional_permissions` with Codex's `AdditionalPermissionProfile`, which
+    // `ra-filesystem` ports, under the path base `ra-paths` provides, so a malformed request is
+    // refused before any host policy runs, as Codex refuses it while parsing `ExecCommandArgs`.
     (
         "ra-tools",
-        &["ra-core", "ra-exec", "ra-mcp", "ra-macros", "ra-patch"],
+        &[
+            "ra-core",
+            "ra-exec",
+            "ra-mcp",
+            "ra-macros",
+            "ra-patch",
+            "ra-filesystem",
+            "ra-paths",
+        ],
     ),
     // `ra-patch` parses and applies a text format and needs nothing from the framework to do it.
     // What it does need is `ra-core::compat`: a `PatchPlan` and a `CommittedPatchDelta` are records

@@ -7,6 +7,37 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Typed tool inputs accept what their type defaults, whatever strictness advertises
+
+`FuncSchema::for_input`, and with it `ToolInput::func_schema` and every tool built on a
+`#[derive(ToolInput)]` type, now checks a call against the type's own derived schema rather than
+the strict schema it advertises. What it advertises is still `ToolInput::tool_schema`, including a
+declaration the type supplies itself. This is the split Python's `function_schema` makes, and the one
+`#[tool]` functions already had: strictness shapes what the model is shown, and the input type
+decides what a call may send.
+
+- **Omitted fields.** A call may leave out a field Serde defaults (`Option<T>`, `#[serde(default)]`)
+  even though strict advertising lists every property as required. Such calls were refused with
+  ``required argument `$.<field>` is missing``; they now decode to the default. Built-in tools
+  with optional arguments, such as `read_file`, `grep` and `glob`, are affected. **A tool that
+  relied on strictness to require an `Option` field** must make the field non-optional or check
+  it in the tool.
+- **Unknown arguments.** They are refused only when the type uses `#[serde(deny_unknown_fields)]`,
+  as every strictly advertised built-in input does; otherwise they are ignored, as Serde ignores
+  them. Nested types keep their own policy. Previously strict advertising refused them at every
+  level.
+- **Opaque fields.** A `serde_json::Value` field, which schemars describes as JSON Schema's
+  `true`, accepts any value; the argument check used to fail on such a node.
+- **Unchanged.** The advertised schema, its hash and `TOOL_SCHEMA_REVISION`; fields Serde requires
+  stay required, and a present value is still checked against its type.
+- **`exec_command` with policy resolvers** decodes every call with Codex's full argument set,
+  whichever form it advertises. It checks `additional_permissions` as Codex parses it, accepting
+  the canonical `file_system.entries` form as well as the advertised `read`/`write` one and
+  refusing anything else before a host policy runs; the value reaches the policy as sent. With additional permissions off, `sandbox_permissions:
+  "with_additional_permissions"` or `additional_permissions` in either form is no longer an
+  argument error; it reaches the policy, which refuses it as Codex does. With them on, the
+  canonical form is no longer refused before the policy reads it.
+
 ### Tool arguments that are not JSON are answered instead of failing the response
 
 A function call whose argument text is not JSON no longer fails the model response that carried

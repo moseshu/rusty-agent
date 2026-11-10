@@ -102,16 +102,33 @@ async fn undecodable_arguments_are_refused_in_the_default_product() {
     }
 }
 
-/// With the feature off, `additional_permissions` decodes as Codex's arguments do, and the policy
-/// refuses it with Codex's words instead of running the command. Codex reads the permissions as a
-/// sandbox override (`apply_granted_turn_permissions`), so under `never` its approval-policy
-/// refusal comes first; under `on-request` the disabled feature is named.
+/// With the feature off, `additional_permissions` (in its advertised legacy form or Codex's
+/// canonical `entries` form) and the `with_additional_permissions` value the tool does not advertise
+/// all decode as Codex's arguments do, and the policy refuses them with
+/// Codex's words instead of running the command. Codex reads either as a sandbox override
+/// (`apply_granted_turn_permissions`), so under `never` its approval-policy refusal comes first;
+/// under `on-request` the disabled feature is named.
 #[tokio::test]
 async fn additional_permissions_are_refused_with_codex_words_while_the_feature_is_off() {
-    let arguments = json!({
-        "cmd": "printf ran",
-        "additional_permissions": {"network": {"enabled": true}}
-    });
+    for arguments in [
+        json!({
+            "cmd": "printf ran",
+            "additional_permissions": {"network": {"enabled": true}}
+        }),
+        json!({"cmd": "printf ran", "sandbox_permissions": "with_additional_permissions"}),
+        // Codex's canonical form, which the tool does not advertise but the policy reads.
+        json!({
+            "cmd": "printf ran",
+            "additional_permissions": {"file_system": {"entries": [
+                {"path": {"type": "path", "path": "/tmp/allowed"}, "access": "read"}
+            ]}}
+        }),
+    ] {
+        refused_with_codex_words(&arguments).await;
+    }
+}
+
+async fn refused_with_codex_words(arguments: &Value) {
     for (approval, message) in [
         (
             "never",
@@ -122,8 +139,12 @@ async fn additional_permissions_are_refused_with_codex_words_while_the_feature_i
             "additional permissions are disabled; enable `features.exec_permission_approvals` before using `with_additional_permissions`",
         ),
     ] {
-        let (text, _) = run_exec_with_approval(approval, "", arguments.clone()).await;
-        assert!(text.contains(message), "{approval}: {text}");
-        assert!(!text.contains("\"ran\""), "{approval}: {text}");
+        let (text, schema) = run_exec_with_approval(approval, "", arguments.clone()).await;
+        assert!(text.contains(message), "{approval} {arguments}: {text}");
+        assert!(!text.contains("\"ran\""), "{approval} {arguments}: {text}");
+        assert!(
+            !schema.to_string().contains("with_additional_permissions"),
+            "the feature is off, so the value is not advertised: {schema}"
+        );
     }
 }

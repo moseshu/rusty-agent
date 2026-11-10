@@ -1,4 +1,4 @@
-use core_contract::tool::{FuncSchema, ToolInput};
+use core_contract::tool::{FuncSchema, ToolInput, ToolSchema};
 use ra_macros::ToolInput;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -204,16 +204,81 @@ fn test_tool_input_07() {
         }
     );
     assert!(schema.decode_arguments(r#"{"query":3}"#).is_err());
-    assert!(schema
-        .decode_arguments(
-            r#"{"query":"rust","filters":{"include_archived":null,"labels":[]}}"#,
-        )
-        .is_err());
-    assert!(schema
-        .decode_arguments(
-            r#"{"query":"rust","limit":null,"filters":{"include_archived":null,"labels":[],"unknown":true}}"#,
-        )
-        .is_err());
+    assert!(schema.decode_arguments(r#"{"query":"rust"}"#).is_err());
+}
+
+#[derive(Debug, PartialEq, Deserialize, JsonSchema, ToolInput)]
+#[serde(deny_unknown_fields)]
+struct ClosedInput {
+    query: String,
+    limit: Option<u32>,
+    #[serde(default)]
+    exact: bool,
+}
+
+/// Strictness shapes what the model is shown, not what a call may send, as Python's
+/// `function_schema` validates with the callable's model rather than the strict schema
+/// (`test_function_with_field_optional_with_default`): a call may omit what Serde defaults, and
+/// unknown arguments follow each type's own Serde policy.
+#[test]
+fn a_strict_input_decodes_what_serde_defaults_and_keeps_its_unknown_field_policy() {
+    let schema = SearchInput::func_schema("catalog_search").unwrap();
+    assert_eq!(
+        schema.tool_schema().input_schema()["required"],
+        json!(["filters", "limit", "query"])
+    );
+    let decoded = schema
+        .decode_arguments(r#"{"query":"rust","filters":{"labels":[],"unknown":true}}"#)
+        .unwrap()
+        .downcast::<SearchInput>()
+        .unwrap();
+    assert_eq!(
+        decoded,
+        SearchInput {
+            query: "rust".to_owned(),
+            limit: None,
+            filters: SearchFilters {
+                include_archived: None,
+                labels: Vec::new(),
+            },
+        }
+    );
+    // What Serde requires stays required.
+    let missing = schema
+        .decode_value_diagnostic(json!({"query": "rust", "filters": {}}))
+        .unwrap_err();
+    assert_eq!(
+        missing.to_string(),
+        "required argument `$.filters.labels` is missing"
+    );
+
+    let closed = ClosedInput::func_schema("closed").unwrap();
+    assert_eq!(
+        closed.tool_schema().input_schema()["required"],
+        json!(["exact", "limit", "query"])
+    );
+    assert_eq!(
+        closed
+            .decode_value(json!({"query": "rust"}))
+            .unwrap()
+            .downcast::<ClosedInput>()
+            .unwrap(),
+        ClosedInput {
+            query: "rust".to_owned(),
+            limit: None,
+            exact: false,
+        }
+    );
+    let unknown = closed
+        .decode_value_diagnostic(json!({"query": "rust", "other": 1}))
+        .unwrap_err();
+    assert_eq!(unknown.to_string(), "unknown argument `$.other`");
+    // A present value is still checked against its type.
+    assert!(
+        closed
+            .decode_value(json!({"query": "rust", "exact": null}))
+            .is_err()
+    );
 }
 
 #[test]
@@ -297,4 +362,89 @@ fn contains_null(schema: &Value) -> bool {
         Value::Array(values) => values.iter().any(contains_null),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
+}
+
+/// An input type that supplies its own declaration rather than the derived one.
+#[derive(Debug, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DeclaredInput {
+    query: String,
+    limit: Option<u32>,
+}
+
+impl ToolInput for DeclaredInput {
+    fn tool_schema(name: impl Into<String>) -> core_contract::error::Result<ToolSchema> {
+        Ok(ToolSchema::loose(
+            name,
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        )?
+        .with_description("Declared by the type."))
+    }
+}
+
+/// `for_input` advertises the type's own declaration unchanged and still checks calls against the
+/// type's derived schema.
+#[test]
+fn for_input_advertises_the_declaration_a_type_supplies() {
+    let declared = DeclaredInput::tool_schema("declared").unwrap();
+    let schema = FuncSchema::for_input::<DeclaredInput>("declared").unwrap();
+    assert_eq!(schema.tool_schema(), &declared);
+    assert!(!schema.tool_schema().strict_json_schema());
+    assert_eq!(
+        schema.tool_schema().description(),
+        Some("Declared by the type.")
+    );
+    assert_eq!(
+        schema.tool_schema().input_schema_hash(),
+        declared.input_schema_hash()
+    );
+    assert_eq!(
+        schema
+            .decode_value(json!({"query": "rust"}))
+            .unwrap()
+            .downcast::<DeclaredInput>()
+            .unwrap(),
+        DeclaredInput {
+            query: "rust".to_owned(),
+            limit: None,
+        }
+    );
+    let unknown = schema
+        .decode_value_diagnostic(json!({"query": "rust", "other": 1}))
+        .unwrap_err();
+    assert_eq!(unknown.to_string(), "unknown argument `$.other`");
+}
+
+// Loose, because strict normalization refuses a schema node that is not an object.
+#[derive(Debug, PartialEq, Deserialize, JsonSchema, ToolInput)]
+#[tool_input(strict = false)]
+#[serde(deny_unknown_fields)]
+struct OpaqueInput {
+    name: String,
+    payload: Option<Value>,
+}
+
+/// A `serde_json::Value` field derives JSON Schema's `true`: any value passes the shape check and
+/// is left to whoever reads it.
+#[test]
+fn an_opaque_json_field_accepts_any_value() {
+    let schema = OpaqueInput::func_schema("opaque").unwrap();
+    for payload in [
+        json!({"entries": [1, "two"]}),
+        json!([1]),
+        json!("text"),
+        json!(null),
+    ] {
+        let decoded = schema
+            .decode_value(json!({"name": "n", "payload": payload.clone()}))
+            .unwrap_or_else(|error| panic!("{payload}: {error}"))
+            .downcast::<OpaqueInput>()
+            .unwrap();
+        assert_eq!(decoded.payload, (!payload.is_null()).then_some(payload));
+    }
+    assert!(schema.decode_value(json!({"payload": 1})).is_err());
 }

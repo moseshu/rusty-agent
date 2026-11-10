@@ -20,12 +20,12 @@
 //! arrive, so it is refused with a sentence instead. The approval-shaped arguments Codex carries
 //! (`sandbox_permissions`, `justification`, `prefix_rule`) are advertised only once policy resolvers
 //! are installed, for the same reason: the host's policy is what reads them, so a tool without one
-//! neither advertises nor accepts them. Their descriptions are Codex's. Codex's
-//! `with_additional_permissions` value and its `additional_permissions` argument are advertised
-//! only when the host also turns them on with [`ExecCommandTool::with_additional_permissions`], as
-//! Codex offers them only behind its `exec_permission_approvals` feature. A call is decoded against
-//! what the tool advertises, so with them off it cannot send them, where Codex, whose schema is not
-//! strict, still reads them.
+//! neither advertises nor reads them, and ignores them as it ignores any argument it does not read.
+//! Their descriptions are Codex's. Codex's `with_additional_permissions` value and its
+//! `additional_permissions` argument are advertised only when the host also turns them on with
+//! [`ExecCommandTool::with_additional_permissions`], as Codex offers them only behind its
+//! `exec_permission_approvals` feature. With them off, a call that sends them anyway is still
+//! decoded as Codex decodes it, and the host's policy refuses it in Codex's words.
 //!
 //! Output ceilings are host configuration rather than an argument, on the same grounds `read_file`
 //! states: the model cannot know the context budget it is spending against, so an argument asking
@@ -72,7 +72,7 @@ const TOOL_NAME: &str = "exec_command";
 
 /// Declares an argument form of `exec_command`: the arguments every form takes, then `extra`.
 macro_rules! exec_command_input {
-    ($name:ident { $($extra:tt)* }) => {
+    ($(#[$attribute:meta])* $name:ident { $($extra:tt)* }) => {
         // The doc comment below is the model-facing description. Measurements show that the
         // tools doing the work carry short descriptions and the dangerous ones carry contracts;
         // this is both, so the description says what the tool returns and the argument
@@ -85,6 +85,7 @@ macro_rules! exec_command_input {
         // object, as Codex's declaration does; see `ExecSchema`.
         #[derive(Debug, Clone, Deserialize, JsonSchema, ToolInput)]
         #[tool_input(strict = false)]
+        $(#[$attribute])*
         /// Runs a command in a shell. Returns its output, or a `session_id` when the command is still
         /// running after the yield timeout.
         struct $name {
@@ -127,9 +128,8 @@ where
 ///
 /// Codex keeps two contracts apart here. Its declaration closes the argument object
 /// (`additionalProperties: false`), so the model is told not to invent fields, while
-/// `ExecCommandArgs` ignores any field it does not read. [`FuncSchema::for_input`] validates a
-/// call against the schema it advertises, so the closed object is advertised separately and the
-/// decoder keeps the open one.
+/// `ExecCommandArgs` ignores any field it does not read. The input types do not deny unknown
+/// fields, so [`FuncSchema::for_input`] decodes them open; this closes the advertised object.
 #[derive(Clone)]
 struct ExecSchema {
     decoder: FuncSchema,
@@ -138,8 +138,16 @@ struct ExecSchema {
 
 impl ExecSchema {
     fn for_input<T: ra_core::tool::ToolInput>() -> Result<Self> {
-        let decoder = FuncSchema::for_input::<T>(TOOL_NAME)?;
-        let open = decoder.tool_schema();
+        Self::advertising::<T, T>()
+    }
+
+    /// Advertises form `A` and decodes calls as form `D`.
+    ///
+    /// Codex decodes every call with the whole of `ExecCommandArgs`, whatever its declaration
+    /// offers, and leaves refusing a value it does not offer to the handler, in its own words.
+    fn advertising<A: ra_core::tool::ToolInput, D: ra_core::tool::ToolInput>() -> Result<Self> {
+        let decoder = FuncSchema::for_input::<D>(TOOL_NAME)?;
+        let open = A::tool_schema(TOOL_NAME)?;
         let mut input_schema = open.input_schema().clone();
         input_schema
             .as_object_mut()
@@ -162,8 +170,9 @@ impl ExecSchema {
 exec_command_input!(ExecCommandInput {});
 
 // The approval arguments are read from the call's arguments by the host's policy resolvers, not by
-// this tool, which only advertises and accepts them.
-exec_command_input!(PolicyExecCommandInput {
+// this tool, which only advertises and accepts them. This form is only advertised: calls decode as
+// `PolicyCallInput`, so a value the host has not turned on reaches its policy.
+exec_command_input!(#[allow(dead_code)] PolicyExecCommandInput {
     /// Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for
     /// unsandboxed execution.
     #[allow(dead_code)]
@@ -178,8 +187,9 @@ exec_command_input!(PolicyExecCommandInput {
 });
 
 // Codex's approval arguments with its `with_additional_permissions` value and the permissions it
-// asks for, which the host's policy reads from the call's arguments.
-exec_command_input!(PermissionsExecCommandInput {
+// asks for, which the host's policy reads from the call's arguments. This form is only advertised
+// as well; calls decode as `PolicyCallInput`.
+exec_command_input!(#[allow(dead_code)] PermissionsExecCommandInput {
     /// Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions`
     /// with `additional_permissions`, or `require_escalated` for unsandboxed execution.
     #[allow(dead_code)]
@@ -198,22 +208,55 @@ exec_command_input!(PermissionsExecCommandInput {
     additional_permissions: Option<serde_json::Value>,
 });
 
-impl From<PermissionsExecCommandInput> for ExecCommandInput {
-    fn from(input: PermissionsExecCommandInput) -> Self {
-        Self {
-            cmd: input.cmd,
-            workdir: input.workdir,
-            shell: input.shell,
-            tty: input.tty,
-            login: input.login,
-            yield_time_ms: input.yield_time_ms,
-            timeout_ms: input.timeout_ms,
-        }
-    }
+// What a call decodes as once policy resolvers are installed, whichever form is advertised: Codex's
+// whole `ExecCommandArgs`. `additional_permissions` is checked as Codex parses it, by decoding
+// Codex's `AdditionalPermissionProfile`, which reads the canonical form (`file_system.entries`) as
+// well as the legacy `read`/`write` one the forms above advertise. Checking it against that
+// advertised shape instead would refuse a call Codex accepts; not checking it would let a host
+// policy that never reads it run a command whose request Codex refuses. It is kept as JSON because
+// the host's policy reads it from the call's arguments.
+exec_command_input!(PolicyCallInput {
+    #[allow(dead_code)]
+    sandbox_permissions: Option<AdditionalSandboxPermissionsArgument>,
+    #[allow(dead_code)]
+    justification: Option<String>,
+    #[allow(dead_code)]
+    prefix_rule: Option<Vec<String>>,
+    #[allow(dead_code)]
+    #[serde(default, deserialize_with = "codex_permission_profile")]
+    additional_permissions: Option<serde_json::Value>,
+});
+
+/// Reads `additional_permissions` as Codex's `ExecCommandArgs` does, refusing what its
+/// `AdditionalPermissionProfile` cannot decode, and keeps the value as sent.
+///
+/// Codex reads relative paths in the request against the directory the command runs in, which is
+/// not known while arguments are decoded. Whether a path is relative does not change whether the
+/// request decodes, and the host's policy decodes it again against that directory, so a base is
+/// set here only when the caller has not set one.
+fn codex_permission_profile<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let has_base = ra_paths::AbsolutePathBufGuard::deserialization_base(Path::new("relative"))
+        .is_ok_and(|base| base.is_some());
+    let base = std::env::temp_dir();
+    let _guard =
+        (!has_base && base.is_absolute()).then(|| ra_paths::AbsolutePathBufGuard::new(&base));
+    serde_json::from_value::<ra_filesystem::models::AdditionalPermissionProfile>(value.clone())
+        .map_err(D::Error::custom)?;
+    Ok(Some(value))
 }
 
-impl From<PolicyExecCommandInput> for ExecCommandInput {
-    fn from(input: PolicyExecCommandInput) -> Self {
+impl From<PolicyCallInput> for ExecCommandInput {
+    fn from(input: PolicyCallInput) -> Self {
         Self {
             cmd: input.cmd,
             workdir: input.workdir,
@@ -892,8 +935,11 @@ impl ExecCommandTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ExecSchema::for_input::<ExecCommandInput>()?,
-            policy_schema: ExecSchema::for_input::<PolicyExecCommandInput>()?,
-            permissions_schema: ExecSchema::for_input::<PermissionsExecCommandInput>()?,
+            policy_schema: ExecSchema::advertising::<PolicyExecCommandInput, PolicyCallInput>()?,
+            permissions_schema: ExecSchema::advertising::<
+                PermissionsExecCommandInput,
+                PolicyCallInput,
+            >()?,
             additional_permissions: false,
             options: base_options(),
             process_manager: Arc::new(ProcessManager::default()),
@@ -928,8 +974,11 @@ impl ExecCommandTool {
         Ok(Self {
             origin: ToolOrigin::new(TOOL_NAME)?,
             schema: ExecSchema::for_input::<ExecCommandInput>()?,
-            policy_schema: ExecSchema::for_input::<PolicyExecCommandInput>()?,
-            permissions_schema: ExecSchema::for_input::<PermissionsExecCommandInput>()?,
+            policy_schema: ExecSchema::advertising::<PolicyExecCommandInput, PolicyCallInput>()?,
+            permissions_schema: ExecSchema::advertising::<
+                PermissionsExecCommandInput,
+                PolicyCallInput,
+            >()?,
             additional_permissions: false,
             options: base_options()
                 .with_resource_claim(ResourceClaim::exclusive(workspace.resource_id().clone())),
@@ -1064,18 +1113,12 @@ impl ExecCommandTool {
         )
     }
 
-    /// A call's arguments in the form the installed policy accepts.
+    /// A call's arguments as the installed policy's forms decode them: all of Codex's, whichever
+    /// form is advertised.
     fn policy_input(
-        &self,
         arguments: &serde_json::Value,
     ) -> std::result::Result<ExecCommandInput, serde_json::Error> {
-        if self.additional_permissions {
-            serde_json::from_value::<PermissionsExecCommandInput>(arguments.clone())
-                .map(ExecCommandInput::from)
-        } else {
-            serde_json::from_value::<PolicyExecCommandInput>(arguments.clone())
-                .map(ExecCommandInput::from)
-        }
+        serde_json::from_value::<PolicyCallInput>(arguments.clone()).map(ExecCommandInput::from)
     }
 
     /// Turns decoded arguments into the request `ra-exec` runs.
@@ -1147,11 +1190,8 @@ impl ExecCommandTool {
         let request = if let Some(resume) = resume {
             resume.request.clone()
         } else {
-            let input = if self.policy.is_some() && self.additional_permissions {
-                self.take_input::<PermissionsExecCommandInput>(context)?
-                    .into()
-            } else if self.policy.is_some() {
-                self.take_input::<PolicyExecCommandInput>(context)?.into()
+            let input = if self.policy.is_some() {
+                self.take_input::<PolicyCallInput>(context)?.into()
             } else {
                 self.take_input::<ExecCommandInput>(context)?
             };
@@ -1464,7 +1504,7 @@ impl Tool for ExecCommandTool {
         // Invalid requests are handled by the invocation's normal failure renderer, so the model
         // can correct them without asking the host to approve a command that cannot start.
         let input = if self.policy.is_some() {
-            self.policy_input(context.arguments())
+            Self::policy_input(context.arguments())
         } else {
             serde_json::from_value::<ExecCommandInput>(context.arguments().clone())
         };
@@ -1492,7 +1532,7 @@ impl Tool for ExecCommandTool {
         else {
             return Ok(None);
         };
-        let input = self.policy_input(context.arguments()).map_err(|error| {
+        let input = Self::policy_input(context.arguments()).map_err(|error| {
             ExecCommandFailure::Rejected(format!("invalid arguments: {error}"))
                 .into_error_of_kind(ToolErrorKind::InvalidInput)
         })?;

@@ -553,6 +553,18 @@ async fn test_exec_command_policy_resolvers_add_the_approval_arguments() {
     }));
     tool.decode_input(&args)
         .expect("the approval arguments decode");
+    // Codex decodes its whole `ExecCommandArgs` whatever it offers, and its handler refuses what
+    // the feature does not allow; what Codex cannot decode is refused here as well.
+    tool.decode_input(&json!({
+        "cmd": "printf ok",
+        "sandbox_permissions": "with_additional_permissions",
+        "additional_permissions": {"network": {"enabled": true}}
+    }))
+    .expect("a value the tool does not offer is left to the policy");
+    assert!(
+        tool.decode_input(&json!({"cmd": "printf ok", "sandbox_permissions": "unknown"}))
+            .is_err()
+    );
     let run = run();
     let call_id = CallId::new("call-exec-1");
     assert!(
@@ -667,6 +679,96 @@ async fn test_exec_command_refuses_what_codex_cannot_decode_in_every_form() {
             json!({"cmd": "true", "tty": false, "yield_time_ms": 10}),
         ] {
             tool.decode_input(&accepted)
+                .unwrap_or_else(|error| panic!("{accepted} must decode: {error}"));
+        }
+    }
+}
+
+/// Codex decodes `additional_permissions` in its canonical form as well as the legacy one the tool
+/// advertises, and the host's policy reads both; the tool leaves that to the policy in either
+/// policy form, so a canonical request is not refused as an argument error before it is read.
+#[tokio::test]
+async fn test_exec_command_leaves_additional_permissions_to_the_policy_in_either_policy_form() {
+    let dir = workspace();
+    let canonical = json!({
+        "cmd": "printf ok",
+        "sandbox_permissions": "with_additional_permissions",
+        "additional_permissions": {"file_system": {"entries": [
+            {"path": {"type": "path", "path": "/tmp/allowed"}, "access": "read"}
+        ]}}
+    });
+    for tool in [
+        permissive_policy(rooted(&dir)),
+        permissive_policy(rooted(&dir)).with_additional_permissions(),
+    ] {
+        tool.decode_input(&canonical)
+            .unwrap_or_else(|error| panic!("the canonical form must reach the policy: {error}"));
+        // The advertised declaration keeps the legacy shape the forms have always shown.
+        let schema = tool.schema().input_schema().to_string();
+        assert!(!schema.contains("entries"), "{schema}");
+    }
+    let schema = permissive_policy(rooted(&dir))
+        .with_additional_permissions()
+        .schema()
+        .input_schema()
+        .clone();
+    assert_eq!(
+        schema["definitions"]["FileSystemPermissionsArgument"]["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["read".to_owned(), "write".to_owned()])
+    );
+}
+
+/// A host policy need not read `additional_permissions`, so the tool refuses one Codex's
+/// `ExecCommandArgs` cannot parse before any policy runs, in either policy form, while both of
+/// Codex's forms and relative paths, which Codex reads against the command's directory, decode.
+#[tokio::test]
+async fn test_exec_command_refuses_malformed_additional_permissions_before_the_policy() {
+    let dir = workspace();
+    let marker = dir.path().join("ran");
+    for tool in [
+        permissive_policy(rooted(&dir)),
+        permissive_policy(rooted(&dir)).with_additional_permissions(),
+    ] {
+        for malformed in [
+            json!("invalid"),
+            json!(["read"]),
+            json!({"file_system": {"entries": "all"}}),
+            json!({"file_system": {"read": ["/tmp"], "entries": []}}),
+            json!({"file_system": {"read": "/tmp"}}),
+            json!({"network": {"enabled": "yes"}}),
+        ] {
+            let arguments = json!({
+                "cmd": format!("touch '{}'", marker.display()),
+                "additional_permissions": malformed,
+            });
+            let error = tool
+                .decode_input(&arguments)
+                .expect_err("Codex refuses this request while parsing its arguments");
+            assert!(
+                error.to_string().contains("Invalid arguments"),
+                "{malformed}: {error}"
+            );
+            // A call that reaches the tool without the runtime's decoding is refused the same way.
+            let text = observe(&tool, &arguments).await;
+            assert!(
+                text.as_text()
+                    .is_some_and(|text| text.starts_with("Invalid arguments")),
+                "{malformed}: {text:?}"
+            );
+            assert!(!marker.exists(), "{malformed} ran the command");
+        }
+        for accepted in [
+            json!(null),
+            json!({}),
+            json!({"network": {"enabled": true}}),
+            json!({"file_system": {"read": ["/tmp/allowed"], "write": ["relative/dir"]}}),
+            json!({"file_system": {"entries": [
+                {"path": {"type": "path", "path": "relative/file"}, "access": "write"}
+            ]}}),
+        ] {
+            tool.decode_input(&json!({"cmd": "true", "additional_permissions": accepted}))
                 .unwrap_or_else(|error| panic!("{accepted} must decode: {error}"));
         }
     }

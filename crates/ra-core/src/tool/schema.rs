@@ -45,27 +45,7 @@ pub trait ToolInput: ToolInputRequirements {
     where
         Self: Sized,
     {
-        let root = schemars::schema_for!(Self);
-        let mut input_schema = serde_json::to_value(root).map_err(|error| {
-            Error::config("failed to serialize derived tool schema").with_source(error)
-        })?;
-        if let Some(root) = input_schema.as_object_mut() {
-            // These belong to the function envelope, not the parameter schema. Keeping them here
-            // duplicates the derive docs on every request and wastes the schema token budget.
-            root.remove("$schema");
-            root.remove("title");
-            root.remove("description");
-        }
-        let mut schema = if Self::STRICT_JSON_SCHEMA {
-            ensure_strict_json_schema(&mut input_schema, TOOL_INPUT_SCHEMA_LABEL)?;
-            ToolSchema::new(name, input_schema)?
-        } else {
-            ToolSchema::loose(name, input_schema)?
-        };
-        if let Some(description) = Self::DESCRIPTION {
-            schema = schema.with_description(description);
-        }
-        Ok(schema)
+        advertised_schema::<Self>(name, derived_argument_schema::<Self>()?)
     }
 
     /// Builds a schema tied to a decoder for this exact type.
@@ -75,6 +55,42 @@ pub trait ToolInput: ToolInputRequirements {
     {
         FuncSchema::for_input::<Self>(name)
     }
+}
+
+/// The argument schema schemars derives for `T`, without the envelope keys.
+///
+/// This is the type's own contract: it lists as required only what Serde requires, and it closes
+/// the object only when the type denies unknown fields. Strict normalization works on a copy.
+fn derived_argument_schema<T: ToolInput>() -> Result<Value> {
+    let root = schemars::schema_for!(T);
+    let mut input_schema = serde_json::to_value(root).map_err(|error| {
+        Error::config("failed to serialize derived tool schema").with_source(error)
+    })?;
+    if let Some(root) = input_schema.as_object_mut() {
+        // These belong to the function envelope, not the parameter schema. Keeping them here
+        // duplicates the derive docs on every request and wastes the schema token budget.
+        root.remove("$schema");
+        root.remove("title");
+        root.remove("description");
+    }
+    Ok(input_schema)
+}
+
+/// The model-facing schema of `T`, strictly normalized when `T` asks for it.
+fn advertised_schema<T: ToolInput>(
+    name: impl Into<String>,
+    mut input_schema: Value,
+) -> Result<ToolSchema> {
+    let mut schema = if T::STRICT_JSON_SCHEMA {
+        ensure_strict_json_schema(&mut input_schema, TOOL_INPUT_SCHEMA_LABEL)?;
+        ToolSchema::new(name, input_schema)?
+    } else {
+        ToolSchema::loose(name, input_schema)?
+    };
+    if let Some(description) = T::DESCRIPTION {
+        schema = schema.with_description(description);
+    }
+    Ok(schema)
 }
 
 /// Stable schema half of an executable tool.
@@ -498,21 +514,24 @@ pub struct FuncSchema {
     inject_tool_context: bool,
     return_type_name: Option<&'static str>,
     decoder: ArgumentDecoder,
-    argument_schema: Option<Value>,
+    /// What a call is checked against: the input type's own schema, not the advertised one.
+    argument_schema: Value,
 }
 
 impl FuncSchema {
     /// Builds schema and decoder from the same concrete [`ToolInput`] type.
+    ///
+    /// The model is shown [`ToolInput::tool_schema`], including any declaration a type supplies
+    /// itself. As with Python's `function_schema` and the sandbox tools' Pydantic argument models,
+    /// strictness shapes only that declaration: a call is checked against the type's own derived
+    /// schema, so it may omit what Serde defaults (an `Option` or a `#[serde(default)]` field)
+    /// even though strict advertising lists every property as required, and unknown arguments are
+    /// refused only when the type denies them.
     pub fn for_input<T: ToolInput>(name: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            schema_version: FUNC_SCHEMA_VERSION,
-            tool_schema: T::tool_schema(name)?,
-            input_type_name: core::any::type_name::<T>(),
-            inject_tool_context: false,
-            return_type_name: None,
-            decoder: decode_arguments::<T>,
-            argument_schema: None,
-        })
+        Ok(Self::with_schemas::<T>(
+            T::tool_schema(name)?,
+            derived_argument_schema::<T>()?,
+        ))
     }
 
     /// Builds a function decorator's schema and decoder from one input type.
@@ -520,41 +539,32 @@ impl FuncSchema {
     /// Like Python's `function_schema`, strictness constrains the advertised schema while runtime
     /// validation follows the callable's defaults and extra-field policy. `required` distinguishes
     /// a nullable parameter from one with an explicit default, which Serde and schemars otherwise
-    /// conflate for `Option<T>`. Ordinary [`Self::for_input`] retains schema-bound validation.
+    /// conflate for `Option<T>`; [`Self::for_input`] keeps their conflation, as Serde decodes it.
     #[doc(hidden)]
     pub fn for_function_input<T: ToolInput>(
         name: impl Into<String>,
         required: &[&str],
     ) -> Result<Self> {
-        let mut arguments = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
-            Error::config("failed to serialize function argument schema").with_source(error)
-        })?;
-        let root = arguments
+        let mut arguments = derived_argument_schema::<T>()?;
+        arguments
             .as_object_mut()
-            .ok_or_else(|| Error::config("function arguments must have an object schema"))?;
-        root.remove("$schema");
-        root.remove("title");
-        root.remove("description");
-        root.insert("required".to_owned(), serde_json::json!(required));
-        let mut advertised = arguments.clone();
-        let mut tool_schema = if T::STRICT_JSON_SCHEMA {
-            ensure_strict_json_schema(&mut advertised, TOOL_INPUT_SCHEMA_LABEL)?;
-            ToolSchema::new(name, advertised)?
-        } else {
-            ToolSchema::loose(name, advertised)?
-        };
-        if let Some(description) = T::DESCRIPTION {
-            tool_schema = tool_schema.with_description(description);
-        }
-        Ok(Self {
+            .ok_or_else(|| Error::config("function arguments must have an object schema"))?
+            .insert("required".to_owned(), serde_json::json!(required));
+        let tool_schema = advertised_schema::<T>(name, arguments.clone())?;
+        Ok(Self::with_schemas::<T>(tool_schema, arguments))
+    }
+
+    /// Advertises `tool_schema` and validates calls against `arguments` before decoding `T`.
+    fn with_schemas<T: ToolInput>(tool_schema: ToolSchema, arguments: Value) -> Self {
+        Self {
             schema_version: FUNC_SCHEMA_VERSION,
             tool_schema,
             input_type_name: core::any::type_name::<T>(),
             inject_tool_context: false,
             return_type_name: None,
             decoder: decode_arguments::<T>,
-            argument_schema: Some(arguments),
-        })
+            argument_schema: arguments,
+        }
     }
 
     /// Records whether the eventual callable receives runtime `ToolContext` separately.
@@ -614,12 +624,7 @@ impl FuncSchema {
         &self,
         value: Value,
     ) -> std::result::Result<DecodedToolInput, ToolArgumentDecodeError> {
-        validate_argument_shape(
-            &value,
-            self.argument_schema
-                .as_ref()
-                .unwrap_or_else(|| self.tool_schema.input_schema()),
-        )?;
+        validate_argument_shape(&value, &self.argument_schema)?;
         (self.decoder)(value)
     }
 
@@ -705,6 +710,17 @@ fn validate_schema_node(
     root: &Value,
     path: &str,
 ) -> core::result::Result<(), ArgumentShapeViolation> {
+    // JSON Schema's boolean schemas: schemars derives `true` for a `serde_json::Value` field, which
+    // accepts anything and leaves the value to whoever reads it; `false` accepts nothing.
+    match schema {
+        Value::Bool(true) => return Ok(()),
+        Value::Bool(false) => {
+            return Err(ArgumentShapeViolation::NoMatchingVariant {
+                path: path.to_owned(),
+            });
+        }
+        _ => {}
+    }
     let object = schema
         .as_object()
         .ok_or_else(|| ArgumentShapeViolation::InvalidSchema {
