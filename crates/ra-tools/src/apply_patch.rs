@@ -373,10 +373,12 @@ impl ApplyPatchTool {
         context: &ToolContext<'_>,
         operation: &Operation<'_>,
         committed: &CommittedPatchDelta,
-    ) -> std::result::Result<CommittedPatchDelta, Stop> {
-        let stop = |failure| Stop {
-            committed: committed.clone(),
-            failure,
+    ) -> std::result::Result<CommittedPatchDelta, Box<Stop>> {
+        let stop = |failure| {
+            Box::new(Stop {
+                committed: committed.clone(),
+                failure,
+            })
         };
         match *operation {
             Operation::Add { path, content } => {
@@ -438,13 +440,13 @@ impl ApplyPatchTool {
                     // that remains unchanged.
                     let written = count_file_lines(update.content());
                     record_change(context, destination, kind, None, written, 0);
-                    return Err(Stop {
+                    return Err(Box::new(Stop {
                         committed: append_delta(committed, destination, written, 0),
                         failure: PatchToolFailure::Message(format!(
                             "failed to remove the original `{}`: {error}",
                             path.display()
                         )),
-                    });
+                    }));
                 }
                 record_change(
                     context,
@@ -675,6 +677,9 @@ fn operations(
 }
 
 /// Where application stopped: what was committed before it, and why.
+///
+/// Results carry it boxed: it holds paths whose size grows on Windows, and it is built only when
+/// application stops, so the successful path should not pay for its size.
 struct Stop {
     committed: CommittedPatchDelta,
     failure: PatchToolFailure,
