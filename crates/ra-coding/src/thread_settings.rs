@@ -668,7 +668,14 @@ impl CodingThreadSettingsAdapter {
         );
         Ok(Self {
             initial: CodingThreadSettings {
-                environments: vec![serde_json::from_value(json!({"environmentId": "local", "cwd": cwd, "runtimeWorkspaceRoots": null})).map_err(|error| Error::config(error.to_string()))?],
+                // The default selection: the local environment at this cwd. Built directly rather
+                // than through JSON, which cannot carry a cwd that is not UTF-8; only the
+                // environment id of this entry is read, never its cwd text.
+                environments: vec![ra_protocol::server::protocol::TurnEnvironmentParams {
+                    environment_id: "local".to_owned(),
+                    cwd: ra_paths::LegacyAppPathString::from_path(&cwd),
+                    runtime_workspace_roots: None,
+                }],
                 selected_capability_roots: Vec::new(),
                 executor_environments: None,
                 cwd,

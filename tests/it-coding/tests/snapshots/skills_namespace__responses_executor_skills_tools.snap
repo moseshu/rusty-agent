@@ -96,10 +96,7 @@ expression: "body[\"tools\"]"
         },
         "tty": {
           "description": "Request a terminal. Not available; leave unset or false.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "workdir": {
           "description": "Working directory for the command. A relative path resolves against the workspace root.",
@@ -114,27 +111,15 @@ expression: "body[\"tools\"]"
           "minimum": {
             "$serde_json::private::Number": "0.0"
           },
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         }
       },
       "required": [
-        "cmd",
-        "justification",
-        "login",
-        "prefix_rule",
-        "sandbox_permissions",
-        "shell",
-        "timeout_ms",
-        "tty",
-        "workdir",
-        "yield_time_ms"
+        "cmd"
       ],
       "type": "object"
     },
-    "strict": true,
+    "strict": false,
     "type": "function"
   },
   {
