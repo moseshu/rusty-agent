@@ -662,10 +662,14 @@ impl Tool for ReadFileTool {
         // Under `Custom`, returning `None` means the failure propagates and the turn stops, so a
         // gap here would turn a mistyped argument — the most correctable mistake a model makes —
         // into a stopped run.
-        Ok(ReadFileFailure::of(error).map(|failure| {
-            ToolOutput::text(failure.to_string())
-                .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step()))
-        }))
+        let unparsed = crate::argument_error::unparsed_arguments_error(error)
+            .map(ReadFileFailure::BadArguments);
+        Ok(ReadFileFailure::of(error)
+            .or(unparsed.as_ref())
+            .map(|failure| {
+                ToolOutput::text(failure.to_string())
+                    .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step()))
+            }))
     }
 }
 

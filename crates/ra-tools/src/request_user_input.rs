@@ -250,14 +250,20 @@ impl RequestUserInputTool {
         self
     }
 
-    async fn ask(&self, context: &ToolContext<'_>) -> std::result::Result<ToolOutput, String> {
+    /// The refusals Codex's handler gives before it reads the arguments: a non-root thread, then
+    /// a mode that does not offer the tool.
+    fn refusal_before_arguments(&self, context: &ToolContext<'_>) -> Option<String> {
         if context.run().parent_run_id().is_some() {
-            return Err("request_user_input can only be used by the root thread".to_owned());
+            return Some("request_user_input can only be used by the root thread".to_owned());
+        }
+        request_user_input_unavailable_message(self.mode, &self.available_modes)
+    }
+
+    async fn ask(&self, context: &ToolContext<'_>) -> std::result::Result<ToolOutput, String> {
+        if let Some(refusal) = self.refusal_before_arguments(context) {
+            return Err(refusal);
         }
         let mode = self.mode;
-        if let Some(message) = request_user_input_unavailable_message(mode, &self.available_modes) {
-            return Err(message);
-        }
         let args: RequestUserInputToolArgs = serde_json::from_value(context.arguments().clone())
             .map_err(|error| format!("failed to parse function arguments: {error}"))?;
         let questions = normalize_request_user_input_tool_args(args)?;
@@ -320,15 +326,22 @@ impl Tool for RequestUserInputTool {
 
     async fn handle_failure(
         &self,
-        _context: &ToolContext<'_>,
+        context: &ToolContext<'_>,
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
         // Control signals stop or close out the run rather than becoming an observation.
         if error.is_control_signal() {
             return Ok(None);
         }
+        // A call whose arguments were not JSON never reached the tool. Codex's handler still
+        // refuses a non-root thread and an unavailable mode first, then answers as below.
         Ok(std::error::Error::source(error)
             .and_then(<dyn std::error::Error + 'static>::downcast_ref::<RequestUserInputFailure>)
-            .map(|failure| ToolOutput::text(failure.0.clone())))
+            .map(|failure| ToolOutput::text(failure.0.clone()))
+            .or_else(|| {
+                crate::argument_error::unparsed_arguments_reply(error).map(|reply| {
+                    ToolOutput::text(self.refusal_before_arguments(context).unwrap_or(reply))
+                })
+            }))
     }
 }

@@ -23,11 +23,30 @@ pub struct HandoffCall {
     arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
+    // The provider's argument text when it is not JSON, as on `ToolCall`; `arguments` is then
+    // `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unparsed_arguments: Option<Box<str>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
 
 impl HandoffCall {
+    /// Records that the model's argument text for this handoff was not JSON, and sets its
+    /// [`arguments`](Self::arguments) to `null`.
+    #[must_use]
+    pub fn with_unparsed_arguments(mut self, text: impl Into<String>) -> Self {
+        self.arguments = Value::Null;
+        self.unparsed_arguments = Some(text.into().into_boxed_str());
+        self
+    }
+
+    /// The model's argument text, when it was not JSON.
+    #[must_use]
+    pub fn unparsed_arguments(&self) -> Option<&str> {
+        self.unparsed_arguments.as_deref()
+    }
+
     /// Creates a handoff call.
     #[must_use]
     pub fn new(call_id: CallId, target_agent: AgentId, arguments: Value) -> Self {
@@ -37,6 +56,7 @@ impl HandoffCall {
             target_agent,
             arguments,
             tool_name: None,
+            unparsed_arguments: None,
             unknown: Unknown::new(),
         }
     }
@@ -70,6 +90,30 @@ impl HandoffCall {
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         &self.arguments
+    }
+
+    /// The form this call takes when a pending handoff stores it, if that differs from the call.
+    ///
+    /// A call whose arguments were not JSON is stored with its text as a string argument, while
+    /// its record in the run history keeps `null`. A build that does not know unparsed arguments
+    /// sees the two disagree and refuses to load the pending handoff, rather than handing its
+    /// handler `null` and transferring control.
+    pub(crate) fn pending_record(&self) -> Option<Self> {
+        let text = self.unparsed_arguments.as_deref()?;
+        Some(Self {
+            arguments: Value::String(text.to_owned()),
+            ..self.clone()
+        })
+    }
+
+    /// Reverses [`pending_record`](Self::pending_record) for a call read from a pending handoff.
+    pub(crate) fn restore_pending_record(&mut self) {
+        if let (Some(text), Value::String(stored)) =
+            (self.unparsed_arguments.as_deref(), &self.arguments)
+            && stored.as_str() == text
+        {
+            self.arguments = Value::Null;
+        }
     }
 
     /// Tool name the model called, when the producing adapter recorded it.

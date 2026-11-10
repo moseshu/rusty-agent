@@ -57,9 +57,9 @@ use ra_core::{
     permission::PermissionDecision,
     state::{NestedRunRef, RunState},
     tool::{
-        FunctionToolCustomDataContext, Tool, ToolApprovalPolicy, ToolApprovalRequest, ToolCaller,
-        ToolConcurrency, ToolContext, ToolFailureHandling, ToolOptions, ToolOutput, ToolServices,
-        ToolTimeoutBehavior, ToolTimeoutError,
+        FunctionToolCustomDataContext, Tool, ToolApprovalPolicy, ToolApprovalRequest,
+        ToolArgumentDecodeError, ToolCaller, ToolConcurrency, ToolContext, ToolFailureHandling,
+        ToolOptions, ToolOutput, ToolServices, ToolTimeoutBehavior, ToolTimeoutError,
     },
 };
 use serde_json::{Value, json};
@@ -327,9 +327,23 @@ pub struct ToolDispatchRequest {
     nested_resume: Option<Arc<RunState>>,
     resume: Option<ToolResume>,
     output_committer: Option<Arc<Mutex<Option<ToolDispatchOutcome>>>>,
+    unparsed_arguments: Option<Box<str>>,
 }
 
 impl ToolDispatchRequest {
+    /// Dispatches a call whose argument text was not JSON.
+    ///
+    /// Its hooks and input guardrails are shown the text as a JSON string, marked as such, as the
+    /// reference shows them such text; the tool itself is never handed it. A `PreToolUse` rewrite
+    /// replaces it with the rewritten arguments.
+    pub(crate) fn with_unparsed_arguments(mut self, text: Option<&str>) -> Self {
+        if let Some(text) = text {
+            self.arguments = Value::String(text.to_owned());
+            self.unparsed_arguments = Some(text.into());
+        }
+        self
+    }
+
     pub(crate) fn with_output_committer(
         mut self,
         committer: Arc<Mutex<Option<ToolDispatchOutcome>>>,
@@ -372,6 +386,7 @@ impl ToolDispatchRequest {
             nested_resume: None,
             resume: None,
             output_committer: None,
+            unparsed_arguments: None,
         }
     }
 
@@ -460,6 +475,11 @@ impl ToolDispatchRequest {
             tool.model_definition().name(),
             self.arguments.clone(),
         );
+        // A call whose text was not JSON is recorded with `null` arguments and its text kept
+        // apart, as the call itself is, so the approved call resumes as that call.
+        if let Some(text) = &self.unparsed_arguments {
+            approval = approval.with_unparsed_arguments(text.as_ref());
+        }
         if let Some(namespace) = tool.origin().namespace() {
             approval = approval.with_namespace(namespace.as_str());
         }
@@ -508,13 +528,18 @@ impl ToolDispatchRequest {
     /// Built from the same fields [`Self::context`] is: a check deciding over a different view of
     /// the call than the tool receives would be deciding about something adjacent to what happens.
     fn guardrail_input_data(&self) -> ToolInputGuardrailData<'_> {
-        ToolInputGuardrailData::new(
+        let data = ToolInputGuardrailData::new(
             &self.run,
             self.tool.origin(),
             &self.call_id,
             &self.arguments,
         )
-        .with_services(&self.services)
+        .with_services(&self.services);
+        if self.unparsed_arguments.is_some() {
+            data.with_unparsed_arguments()
+        } else {
+            data
+        }
     }
 }
 
@@ -597,10 +622,24 @@ async fn run_chain(
     let output_guardrails = request.guardrails.resolve_output(&options, tool.origin())?;
 
     // A resumed approval carries the effective arguments. Pre-tool hooks ran before that
-    // approval was issued, as they do before the upstream handler waits for authorization.
-    if !request.is_continuation()
-        && !request.approval_granted
-        && !matches!(
+    // approval was issued, as they do before the upstream handler waits for authorization. A call
+    // a fixed decision denies skips them; for a call reported before any approval that is only a
+    // real denial, not a question that prompts being off would have refused.
+    let denied_before_hooks = if request.unparsed_arguments.is_some()
+        && request
+            .permission
+            .reports_unparsed_arguments_before_approval()
+    {
+        matches!(
+            request.permission.decision_without_asking(
+                options.action_classes(),
+                tool.origin(),
+                request.run.agent_id()
+            ),
+            PermissionDecision::Deny
+        )
+    } else {
+        matches!(
             request.permission.fixed_decision(
                 options.action_classes(),
                 tool.origin(),
@@ -608,9 +647,15 @@ async fn run_chain(
             ),
             Some(PermissionDecision::Deny)
         )
-    {
+    };
+    if !request.is_continuation() && !request.approval_granted && !denied_before_hooks {
         match run_user_hook(request, HookEvent::PreToolUse(tool_hook_data(request))).await? {
-            HookDecision::UpdateInput { input } => request.arguments = input,
+            // A rewrite is JSON, so a call whose text was not JSON runs as the rewrite says, as
+            // the reference rebuilds the invocation from rewritten hook input.
+            HookDecision::UpdateInput { input } => {
+                request.arguments = input;
+                request.unparsed_arguments = None;
+            }
             HookDecision::Deny { message } => {
                 return Ok(ToolDispatch::Refused(ToolRefusal::new(
                     pre_invocation_rejection(request, message)?,
@@ -625,7 +670,14 @@ async fn run_chain(
     // implementation receives the checked value from its context instead of each implementation
     // independently reinterpreting provider JSON. Untyped and remote tools retain the parsed
     // JSON-only contract.
-    let decoded_input = match tool.decode_input(&request.arguments) {
+    //
+    // A call whose text was not JSON has nothing to decode: it is reported as a failure once it is
+    // admitted, below, as the reference parses arguments only when the tool is invoked.
+    let decoded_input = match if request.unparsed_arguments.is_some() {
+        Ok(None)
+    } else {
+        tool.decode_input(&request.arguments)
+    } {
         Ok(decoded) => decoded,
         Err(error) => {
             return shape_failure(
@@ -703,6 +755,67 @@ async fn run_chain(
         && let Some(refusal) = check_input_guardrails(request, &input_guardrails, records).await?
     {
         return Ok(refusal);
+    }
+
+    // A call whose text was not JSON, admitted and allowed by its input guardrails, ends here as
+    // the tool's failure to read its arguments: the tool is never handed the text.
+    if let Some(text) = request.unparsed_arguments.as_deref() {
+        let message = serde_json::from_str::<Value>(text)
+            .err()
+            .map_or_else(String::new, |error| error.to_string());
+        let diagnostic = ToolArgumentDecodeError::InvalidJson { message };
+        let failure = || {
+            Error::tool(ToolErrorKind::InvalidInput, &name, diagnostic.to_string())
+                .with_source(diagnostic.clone())
+        };
+        // The reference parses arguments inside the invocation, so this failure is an invocation
+        // that started and failed: its lifecycle starts once the input guardrails allow the call
+        // and ends with the error, before the failure policy shapes or raises it, as every other
+        // failed invocation is narrated here. Like any invocation it starts only once the
+        // concurrency gate admits it, so an exclusive tool still running is not overlapped by
+        // another's start. It declares no resources: the tool cannot read its arguments, so its
+        // dynamic claims are not asked for.
+        let permits = if let Some(gate) = admission {
+            let permits = gate
+                .acquire_permits(&request.cancel, options.concurrency(), &[])
+                .await?;
+            tracing::Span::current().record(
+                ra_core::trace::field::TOOL_ADMISSION_WAIT_MS,
+                duration_ms(admission_started.elapsed()),
+            );
+            request.cancel.ensure_not_cancelled()?;
+            Some(permits)
+        } else {
+            None
+        };
+        lifecycle_dispatch::tool_start(
+            &request.lifecycle,
+            &lifecycle_call(request),
+            &request.cancel,
+        )
+        .await?;
+        drop(permits);
+        announce_invocation_end(request, &Err(failure())).await?;
+        let failed = shape_failure(
+            tool,
+            request,
+            &options,
+            &name,
+            failure(),
+            &output_guardrails,
+            records,
+        )
+        .await?;
+        // The output is a failure whichever way it was rendered, as the reference answers such a
+        // call with `success: false`. A tool's own text is already marked where it is finished
+        // (`finish_output`), before it is committed; this covers the paths that commit nothing.
+        return Ok(match failed {
+            ToolDispatch::Observed(mut observation) => {
+                observation.output = observation.output.with_error(true);
+                ToolDispatch::Observed(observation)
+            }
+            other => other,
+        });
     }
 
     // Stages 5 to 7 repeat only when the tool asks for approval from inside its invocation and a
@@ -951,8 +1064,13 @@ async fn run_chain(
 }
 
 fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
-    ToolHookData::new(request.tool.origin(), &request.call_id, &request.arguments)
-        .with_tool(request.tool.as_ref())
+    let data = ToolHookData::new(request.tool.origin(), &request.call_id, &request.arguments)
+        .with_tool(request.tool.as_ref());
+    if request.unparsed_arguments.is_some() {
+        data.with_unparsed_arguments()
+    } else {
+        data
+    }
 }
 
 /// The view of one call the lifecycle narration is built from.
@@ -965,13 +1083,18 @@ fn tool_hook_data(request: &ToolDispatchRequest) -> ToolHookData<'_> {
 /// everything it might refuse the call over, while narration is handed what happened. A shared view
 /// would make the next field added for one of them appear in the other.
 fn lifecycle_call(request: &ToolDispatchRequest) -> ToolStartInput<'_> {
-    ToolStartInput::new(
+    let call = ToolStartInput::new(
         &request.run,
         request.tool.origin(),
         &request.call_id,
         &request.arguments,
     )
-    .with_services(&request.services)
+    .with_services(&request.services);
+    if request.unparsed_arguments.is_some() {
+        call.with_unparsed_arguments()
+    } else {
+        call
+    }
 }
 
 /// Tells the lifecycle narration how the invocation it announced settled.
@@ -1071,10 +1194,16 @@ async fn admit_permission(
             // before their orchestrator asks the hooks or the reviewer: what it decided while
             // asking stays with the question, so the approved call runs as it was decided whoever
             // answers and wherever. A call the tool finds it cannot run ends here, unasked.
-            let state = request
-                .cancel
-                .run(tool.approval_state(&request.context()))
-                .await?;
+            //
+            // A call whose text was not JSON is asked about as it is: the tool cannot read it.
+            let state = if request.unparsed_arguments.is_some() {
+                Ok(None)
+            } else {
+                request
+                    .cancel
+                    .run(tool.approval_state(&request.context()))
+                    .await?
+            };
             let state = match state {
                 Ok(state) => state,
                 Err(error) if is_invalid_input(&error) => {
@@ -1165,6 +1294,20 @@ async fn resolve_permission(
     request: &ToolDispatchRequest,
 ) -> Result<PermissionDecision> {
     let origin = tool.origin();
+    // A product that reports calls whose text was not JSON before any approval asks nobody about
+    // them: a class restriction or a `deny` rule still refuses, and every question is skipped,
+    // including one that prompts being off would have turned into a refusal.
+    if request.unparsed_arguments.is_some()
+        && request
+            .permission
+            .reports_unparsed_arguments_before_approval()
+    {
+        return Ok(request.permission.decision_without_asking(
+            options.action_classes(),
+            origin,
+            request.run.agent_id(),
+        ));
+    }
     if let Some(decision) =
         request
             .permission
@@ -1177,6 +1320,21 @@ async fn resolve_permission(
     }
     if request.approval_granted {
         return Ok(PermissionDecision::Allow);
+    }
+
+    // A call whose text was not JSON cannot be judged by the tool's dynamic check, which reads
+    // arguments; the reference fails closed and asks. Everything else in the chain still applies.
+    if request.unparsed_arguments.is_some() {
+        let fallback = match options.approval() {
+            ToolApprovalPolicy::Never => PermissionDecision::Allow,
+            _ => PermissionDecision::Ask,
+        };
+        return Ok(request.permission.evaluate(
+            options.action_classes(),
+            origin,
+            request.run.agent_id(),
+            fallback,
+        ));
     }
 
     let fallback = if needs_approval(tool, options, request).await? {
@@ -1412,10 +1570,15 @@ async fn finish_output(
             "a completed tool output must be an observation",
         ));
     };
+    // A call whose arguments were not JSON never runs, so any failure finished here is its answer,
+    // and it is a failure however the tool worded it, as the reference answers such a call with
+    // `success: false`. Marked before the output is committed or handed to the extractor, so the
+    // copy a resumed run reads carries the same flag as the answer this call returns.
     if matches!(
         failure_code,
         Some("tool.timeout" | TOOL_OUTPUT_GUARDRAIL_CODE | "hook.post_tool_use")
-    ) {
+    ) || (failure_code.is_some() && request.unparsed_arguments.is_some())
+    {
         observation.output = observation.output.with_error(true);
     }
     let mut context = FunctionToolCustomDataContext::new(

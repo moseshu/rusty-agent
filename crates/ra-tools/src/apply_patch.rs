@@ -250,7 +250,11 @@ impl Tool for ApplyPatchTool {
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
         // Matched on the typed cause the error carries, never on its message.
-        Ok(ApplyPatchFailure::of(error).map(|failure| ToolOutput::text(failure.to_string())))
+        let unparsed = crate::argument_error::unparsed_arguments_error(error)
+            .map(|error| ApplyPatchFailure::Verification(format!("invalid arguments: {error}")));
+        Ok(ApplyPatchFailure::of(error)
+            .or(unparsed.as_ref())
+            .map(|failure| ToolOutput::text(failure.to_string())))
     }
 
     fn options(&self) -> ToolOptions {

@@ -21,7 +21,7 @@ use ra_core::{
     tool::{ToolLookupKey, ToolNamespace, ToolOrigin},
     usage::{RequestUsage, Usage},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn record_call(state: &mut RunState, agent: &AgentId, identity: &ToolUse, call: &str) {
     let attempt = ToolUseAttempt::new(identity.clone(), CallId::new(call), &json!({"path":"a"}));
@@ -820,6 +820,201 @@ fn test_run_state_carries_the_model_input_projection_a_transfer_installed() {
     let (base, carried) = resumed.model_input_base().unwrap();
     assert_eq!(base, opening);
     assert_eq!(carried.len(), 3);
+}
+
+/// An approval of a call whose arguments were not JSON keeps its routing key apart from
+/// `lookup_key`, so a build that does not know unparsed arguments refuses to approve it instead of
+/// running the tool with `null` arguments.
+#[test]
+fn approval_of_unparsed_call_withholds_its_routing_key_from_older_readers() {
+    let origin = ToolOrigin::new("raw_tool").unwrap();
+    let call = || ToolApproval::new(CallId::new("raw"), "raw_tool", json!({"stale": true}));
+    let unparsed_first = call()
+        .with_unparsed_arguments("{bad")
+        .with_tool_origin(&origin);
+    let origin_first = call()
+        .with_tool_origin(&origin)
+        .with_unparsed_arguments("{bad");
+    assert_eq!(unparsed_first, origin_first);
+    assert_eq!(unparsed_first.arguments(), &json!(null));
+    assert_eq!(unparsed_first.unparsed_arguments(), Some("{bad"));
+    assert_eq!(unparsed_first.lookup_key(), Some(origin.lookup_key()));
+
+    let wire = serde_json::to_value(&unparsed_first).unwrap();
+    assert!(wire.get("lookup_key").is_none(), "{wire}");
+    assert!(wire.get("unparsed_call_lookup_key").is_some(), "{wire}");
+    let restored: ToolApproval = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, unparsed_first);
+    assert_eq!(restored.lookup_key(), Some(origin.lookup_key()));
+
+    let parsed = serde_json::to_value(call().with_tool_origin(&origin)).unwrap();
+    assert!(parsed.get("lookup_key").is_some(), "{parsed}");
+    assert!(parsed.get("unparsed_call_lookup_key").is_none(), "{parsed}");
+
+    // This build approves the stored checkpoint; without the separate field, which is all an
+    // older reader sees, the approval has no routing identity and is refused.
+    let item = RunItem::new(
+        ItemId::new("approval-raw"),
+        RunItemKind::ToolApproval(unparsed_first),
+    )
+    .with_provenance(ItemProvenance::new(AgentId::new("coder")));
+    let mut state = RunState::start(RunId::new("run-approval-unparsed"));
+    state
+        .begin_segment(AgentId::new("coder"), Vec::new())
+        .unwrap();
+    state.record_generated_items([item.clone()]);
+    state
+        .set_pending_interruptions(std::slice::from_ref(&item))
+        .unwrap();
+    let stored = serde_json::to_value(&state).unwrap();
+
+    let mut restored: RunState = serde_json::from_value(stored.clone()).unwrap();
+    let pending = restored.generated_items()[0].clone();
+    restored.approve(&pending, false).unwrap();
+
+    let mut older_view = stored;
+    older_view["generated_items"][0]["kind"]["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unparsed_call_lookup_key");
+    let mut older_view: RunState = serde_json::from_value(older_view).unwrap();
+    let pending = older_view.generated_items()[0].clone();
+    let error = older_view.approve(&pending, false).unwrap_err();
+    assert!(error.to_string().contains("routing identity"), "{error}");
+}
+
+/// A pending handoff stores a call whose arguments were not JSON with its text as the argument,
+/// while the history keeps `null`, so a build that compares only argument values refuses to load
+/// it instead of handing the handler `null`.
+#[test]
+fn pending_handoff_with_unparsed_arguments_is_stored_apart_from_its_history_record() {
+    use ra_core::{
+        item::{HandoffCall, ToolCall},
+        state::PendingHandoff,
+    };
+    let history = RunItem::new(
+        ItemId::new("handoff-item"),
+        RunItemKind::ToolCall(ToolCall::unparsed(
+            CallId::new("handoff"),
+            "transfer_to_target",
+            "{bad",
+        )),
+    );
+    let call = HandoffCall::new(
+        CallId::new("handoff"),
+        AgentId::new("target"),
+        json!({"stale": true}),
+    )
+    .with_tool_name("transfer_to_target")
+    .with_unparsed_arguments("{bad");
+    assert_eq!(call.arguments(), &json!(null));
+    let pending = RunItem::new(ItemId::new("handoff-item"), RunItemKind::HandoffCall(call));
+    let mut state = RunState::start(RunId::new("pending-unparsed"));
+    state
+        .begin_segment(AgentId::new("source"), Vec::new())
+        .unwrap();
+    state.record_generated_items([history]);
+    state
+        .set_pending_handoff(Some(
+            PendingHandoff::new(
+                vec![pending.clone()],
+                Vec::new(),
+                Vec::new(),
+                ItemId::new("handoff-item"),
+            )
+            .with_declarations(vec![0]),
+        ))
+        .unwrap();
+
+    let stored = serde_json::to_value(&state).unwrap();
+    let stored_call = &stored["pending_handoff"]["calls"][0]["kind"]["data"];
+    let history_call = &stored["generated_items"][0]["kind"]["data"];
+    assert_eq!(stored_call["arguments"], json!("{bad"));
+    assert_eq!(stored_call["unparsed_arguments"], json!("{bad"));
+    assert_eq!(history_call["arguments"], json!(null));
+    assert_eq!(history_call["unparsed_arguments"], json!("{bad"));
+
+    let restored: RunState = serde_json::from_value(stored.clone()).unwrap();
+    let restored_pending = restored.pending_handoff().unwrap();
+    assert_eq!(restored_pending.calls(), [pending]);
+    restored_pending
+        .input_data(restored.generated_items())
+        .unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), stored);
+
+    // Without the text, which is all an older reader sees, the stored call and its history record
+    // disagree and the checkpoint is refused.
+    let mut older_view = stored.clone();
+    older_view["pending_handoff"]["calls"][0]["kind"]["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unparsed_arguments");
+    older_view["generated_items"][0]["kind"]["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unparsed_arguments");
+    assert!(serde_json::from_value::<RunState>(older_view).is_err());
+
+    // A stored argument that is not the call's own text is not read back as `null`.
+    let mut altered = stored;
+    altered["pending_handoff"]["calls"][0]["kind"]["data"]["arguments"] = json!("{worse");
+    assert!(serde_json::from_value::<RunState>(altered).is_err());
+}
+
+/// A pending handoff whose call and history record disagree about unparsed text is refused, in
+/// both directions: a real `null` in one and argument text that was not JSON in the other.
+#[test]
+fn pending_handoffs_refuse_a_swap_between_null_and_unparsed_text() {
+    use ra_core::{
+        item::{HandoffCall, ToolCall},
+        state::PendingHandoff,
+    };
+    let pending_of = |unparsed: bool| {
+        let call = HandoffCall::new(CallId::new("handoff"), AgentId::new("target"), Value::Null)
+            .with_tool_name("transfer_to_target");
+        let call = if unparsed {
+            call.with_unparsed_arguments("{bad")
+        } else {
+            call
+        };
+        PendingHandoff::new(
+            vec![RunItem::new(
+                ItemId::new("handoff-item"),
+                RunItemKind::HandoffCall(call),
+            )],
+            Vec::new(),
+            Vec::new(),
+            ItemId::new("handoff-item"),
+        )
+        .with_declarations(vec![0])
+    };
+    let history_of = |unparsed: bool| {
+        let call = if unparsed {
+            ToolCall::unparsed(CallId::new("handoff"), "transfer_to_target", "{bad")
+        } else {
+            ToolCall::new(CallId::new("handoff"), "transfer_to_target", Value::Null)
+        };
+        RunItem::new(ItemId::new("handoff-item"), RunItemKind::ToolCall(call))
+    };
+    for (history_unparsed, pending_unparsed, accepted) in [
+        (true, true, true),
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let mut state = RunState::start(RunId::new("pending-swap"));
+        state
+            .begin_segment(AgentId::new("source"), Vec::new())
+            .unwrap();
+        state.record_generated_items([history_of(history_unparsed)]);
+        assert_eq!(
+            state
+                .set_pending_handoff(Some(pending_of(pending_unparsed)))
+                .is_ok(),
+            accepted,
+            "history unparsed {history_unparsed}, pending unparsed {pending_unparsed}"
+        );
+    }
 }
 
 #[test]
@@ -2171,7 +2366,7 @@ fn current_schema_preserves_ownerless_rules_instead_of_applying_legacy_migration
     assert_eq!(state.permission_rules().len(), 1);
     assert_eq!(
         RUN_STATE_SCHEMA_VERSION,
-        ra_core::compat::SchemaVersion::new(19)
+        ra_core::compat::SchemaVersion::new(20)
     );
     assert_eq!(state.schema_version(), RUN_STATE_SCHEMA_VERSION);
 }

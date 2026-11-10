@@ -4,6 +4,8 @@
 mod approval_ownership;
 #[path = "agent_handoff/structured_output.rs"]
 mod structured_output;
+#[path = "agent_handoff/unparsed_arguments.rs"]
+mod unparsed_arguments;
 
 use std::sync::{
     Arc, Mutex,

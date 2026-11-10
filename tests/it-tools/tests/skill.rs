@@ -340,3 +340,49 @@ async fn omitted_skills_can_be_discovered_and_loaded() {
     let end = observe(&tool, &json!({"skill": null, "offset": 999})).await;
     assert_eq!(body(&end), "No more installed skills.");
 }
+
+/// Arguments that were not JSON are reported as this tool's own argument error.
+#[tokio::test]
+async fn test_skill_reports_arguments_that_are_not_json_as_bad_arguments() {
+    // The error the runtime hands the tool when the provider's argument text was not JSON: the
+    // decode error is its source, and the call never reached the tool.
+    let diagnostic = ra_core::tool::ToolArgumentDecodeError::InvalidJson {
+        message: serde_json::from_str::<serde_json::Value>("{bad")
+            .unwrap_err()
+            .to_string(),
+    };
+    let error = ra_core::error::Error::tool(
+        ra_core::error::ToolErrorKind::InvalidInput,
+        "skill",
+        diagnostic.to_string(),
+    )
+    .with_source(diagnostic);
+    let tool = SkillTool::new(Arc::new(StubCatalog::refusing(|skill| {
+        SkillCatalogError::NotFound { skill }
+    })))
+    .unwrap();
+    let agent = ra_core::agent::AgentSpec::builder()
+        .id(ra_core::item::AgentId::new("unparsed"))
+        .name("Unparsed")
+        .build()
+        .unwrap();
+    let run = ra_core::context::RunContext::new(ra_core::state::RunId::new("run-unparsed"), &agent);
+    let call_id = ra_core::item::CallId::new("call-unparsed");
+    let arguments = serde_json::Value::Null;
+    let output = ra_core::tool::Tool::handle_failure(
+        &tool,
+        &ra_core::tool::ToolContext::new(&run, &tool, &call_id, &arguments),
+        &error,
+    )
+    .await
+    .unwrap()
+    .expect("the tool renders the decode error itself");
+    assert_eq!(
+        output.as_text().unwrap(),
+        "Invalid arguments: arguments are not valid JSON: key must be a string at line 1 column 2."
+    );
+    assert_eq!(
+        output.metadata().guidance().join(" "),
+        "Send `skill` to load an identifier, or null with `offset` to list skills."
+    );
+}

@@ -110,7 +110,7 @@ impl PendingSessionWrite {
 }
 
 /// Current [`RunState`] schema version.
-pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(19);
+pub const RUN_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(20);
 
 /// Human-readable summaries of every run-state wire version this build understands.
 ///
@@ -219,9 +219,17 @@ pub const RUN_STATE_SCHEMA_VERSION_SUMMARIES: &[(SchemaVersion, &str)] = &[
          Older runtimes cannot preserve a background wakeup when resumed tools conclude the run.",
     ),
     (
-        RUN_STATE_SCHEMA_VERSION,
+        SchemaVersion::new(19),
         "Persisted the actual sampled input for stop hooks across approval recovery, including an \
          empty projection. Older runtimes reconstruct history and can expose projected-out input.",
+    ),
+    (
+        RUN_STATE_SCHEMA_VERSION,
+        "Persisted the text of tool and handoff arguments that were not JSON, with `null` \
+         arguments. An approval of such a call keeps its routing key under a separate field, and a \
+         pending handoff stores such a call with its text as the argument. An older runtime \
+         refuses to approve or resume such an approval and refuses to load a checkpoint with such \
+         a pending handoff, rather than calling the tool or handler with `null` arguments.",
     ),
 ];
 
@@ -670,6 +678,7 @@ pub struct HandoffProjection {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingHandoff {
+    #[serde(with = "pending_handoff_calls")]
     calls: Vec<RunItem>,
     #[serde(default)]
     declarations: Vec<usize>,
@@ -798,11 +807,13 @@ impl PendingHandoff {
                             stored.call_id() == handoff.call_id()
                                 && Some(stored.name()) == handoff.tool_name()
                                 && stored.arguments() == handoff.arguments()
+                                && stored.unparsed_arguments() == handoff.unparsed_arguments()
                         }
                         RunItemKind::HandoffCall(stored) => {
                             stored.call_id() == handoff.call_id()
                                 && stored.target_agent() == handoff.target_agent()
                                 && stored.arguments() == handoff.arguments()
+                                && stored.unparsed_arguments() == handoff.unparsed_arguments()
                         }
                         _ => false,
                     }
@@ -811,6 +822,52 @@ impl PendingHandoff {
             }
         }
         Ok(start)
+    }
+}
+
+/// Stores pending handoff calls whose arguments were not JSON in the form
+/// [`HandoffCall::pending_record`](crate::item::HandoffCall) describes, and reads them back.
+mod pending_handoff_calls {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::item::{RunItem, RunItemKind};
+
+    struct Stored<'a>(&'a RunItem);
+
+    impl Serialize for Stored<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let pending = match self.0.kind() {
+                RunItemKind::HandoffCall(call) => call.pending_record(),
+                _ => None,
+            };
+            match pending {
+                Some(call) => {
+                    let mut item = self.0.clone();
+                    *item.kind_mut() = RunItemKind::HandoffCall(call);
+                    item.serialize(serializer)
+                }
+                None => self.0.serialize(serializer),
+            }
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        calls: &[RunItem],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(calls.iter().map(Stored))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<RunItem>, D::Error> {
+        let mut calls = Vec::<RunItem>::deserialize(deserializer)?;
+        for call in &mut calls {
+            if let RunItemKind::HandoffCall(handoff) = call.kind_mut() {
+                handoff.restore_pending_record();
+            }
+        }
+        Ok(calls)
     }
 }
 

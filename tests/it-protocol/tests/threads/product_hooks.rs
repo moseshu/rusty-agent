@@ -672,3 +672,6 @@ mod apply_patch_hooks;
 
 #[path = "product_hooks/stdin_permission.rs"]
 mod stdin_permission;
+
+#[path = "product_hooks/unparsed_arguments.rs"]
+mod unparsed_arguments;

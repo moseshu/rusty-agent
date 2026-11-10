@@ -709,8 +709,13 @@ impl Tool for CollaborationTool {
         if error.is_control_signal() {
             return Ok(None);
         }
+        // A call whose arguments were not JSON never reached the tool; Codex's collaboration
+        // handlers parse before anything else and answer it as below.
         Ok(std::error::Error::source(error)
             .and_then(<dyn std::error::Error + 'static>::downcast_ref::<CollaborationFailure>)
-            .map(|failure| ToolOutput::text(failure.0.clone())))
+            .map(|failure| ToolOutput::text(failure.0.clone()))
+            .or_else(|| {
+                crate::argument_error::unparsed_arguments_reply(error).map(ToolOutput::text)
+            }))
     }
 }

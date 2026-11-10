@@ -467,7 +467,11 @@ impl Tool for WriteStdinTool {
         _context: &ToolContext<'_>,
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
-        Ok(WriteStdinFailure::of(error).map(|failure| ToolOutput::text(failure.to_string())))
+        let unparsed = crate::argument_error::unparsed_arguments_error(error)
+            .map(WriteStdinFailure::BadArguments);
+        Ok(WriteStdinFailure::of(error)
+            .or(unparsed.as_ref())
+            .map(|failure| ToolOutput::text(failure.to_string())))
     }
 }
 

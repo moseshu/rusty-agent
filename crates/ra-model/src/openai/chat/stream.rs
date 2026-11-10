@@ -1382,7 +1382,7 @@ impl StreamDriver {
             arguments,
             &self.handoffs,
             &self.custom_tools,
-        )?;
+        );
         self.emit_item(kind, output_index, payload);
         Ok(())
     }

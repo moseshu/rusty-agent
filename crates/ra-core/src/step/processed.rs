@@ -365,7 +365,12 @@ impl ProcessedResponse {
     pub fn attempts(&self) -> Vec<ToolUseAttempt> {
         self.ordered_actions(false)
             .into_iter()
-            .map(|action| ToolUseAttempt::new(action.identity, action.call_id, &action.arguments))
+            .map(|action| match action.unparsed_arguments {
+                // Text that was not JSON is its own attempt: neither a `null` call nor a call
+                // with any parsed value repeats it.
+                Some(text) => ToolUseAttempt::unparsed(action.identity, action.call_id, text),
+                None => ToolUseAttempt::new(action.identity, action.call_id, &action.arguments),
+            })
             .collect()
     }
 
@@ -397,6 +402,7 @@ impl ProcessedResponse {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
                     arguments: Cow::Borrowed(action.call.arguments()),
+                    unparsed_arguments: action.call.unparsed_arguments(),
                 },
             );
         }
@@ -407,6 +413,7 @@ impl ProcessedResponse {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
                     arguments: Cow::Borrowed(action.call.arguments()),
+                    unparsed_arguments: action.call.unparsed_arguments(),
                 },
             );
         }
@@ -420,6 +427,7 @@ impl ProcessedResponse {
                     // call alike, and the identity beside it says which of the three this is.
                     call_id: CallId::new(action.request_id()),
                     arguments: Cow::Borrowed(action.request.arguments()),
+                    unparsed_arguments: None,
                 },
             );
         }
@@ -430,6 +438,7 @@ impl ProcessedResponse {
                     identity: action.identity(),
                     call_id: action.call_id().clone(),
                     arguments: Cow::Borrowed(action.call.arguments()),
+                    unparsed_arguments: action.call.unparsed_arguments(),
                 },
             );
         }
@@ -443,6 +452,7 @@ impl ProcessedResponse {
                             identity: ToolUse::Hosted(call.name().to_owned()),
                             call_id: CallId::new(item.id().as_str()),
                             arguments: Cow::Borrowed(call.raw().payload()),
+                            unparsed_arguments: None,
                         });
                     }
                     RunItemKind::ToolSearchCall(raw) | RunItemKind::ToolSearchOutput(raw)
@@ -452,6 +462,7 @@ impl ProcessedResponse {
                             identity: ToolUse::Hosted("tool_search".to_owned()),
                             call_id: CallId::new(item.id().as_str()),
                             arguments: Cow::Borrowed(raw.payload()),
+                            unparsed_arguments: None,
                         });
                     }
                     _ => {}
@@ -464,6 +475,7 @@ impl ProcessedResponse {
                         },
                         call_id: CallId::new(call.id()),
                         arguments: Cow::Owned(Value::String(call.arguments().to_owned())),
+                        unparsed_arguments: None,
                     });
                 }
                 by_item.remove(item.id())
@@ -477,6 +489,8 @@ struct OrderedAction<'a> {
     identity: ToolUse,
     call_id: CallId,
     arguments: Cow<'a, Value>,
+    // The call's argument text when it was not JSON; `arguments` is then `null`.
+    unparsed_arguments: Option<&'a str>,
 }
 
 impl fmt::Debug for ProcessedResponse {
@@ -601,12 +615,20 @@ impl ProcessedResponseBuilder {
         }
         let target_agent = target.id().clone();
         let call = match item.kind() {
-            RunItemKind::ToolCall(call) => HandoffCall::new(
-                call.call_id().clone(),
-                target_agent,
-                call.arguments().clone(),
-            )
-            .with_tool_name(call.name()),
+            RunItemKind::ToolCall(call) => {
+                let handoff = HandoffCall::new(
+                    call.call_id().clone(),
+                    target_agent,
+                    call.arguments().clone(),
+                )
+                .with_tool_name(call.name());
+                // Carried over so a handoff resumed after this turn's approvals still knows its
+                // arguments were not JSON.
+                match call.unparsed_arguments() {
+                    Some(text) => handoff.with_unparsed_arguments(text),
+                    None => handoff,
+                }
+            }
             RunItemKind::HandoffCall(call) => {
                 if call.target_agent() != &target_agent {
                     return Err(Error::caller(format!(

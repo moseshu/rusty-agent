@@ -151,6 +151,7 @@ pub struct PermissionEngine {
     policy: Option<ActionClassPolicy>,
     rules: Arc<[PermissionRule]>,
     answered_from: Option<usize>,
+    unparsed_arguments_reported_before_approval: bool,
 }
 
 /// What a call the host rejected returns to the model when the host gave no text of its own.
@@ -191,6 +192,26 @@ impl PermissionEngine {
         self.rules = all.into();
         self.answered_from = Some(self.answered_from.unwrap_or(start));
         self
+    }
+
+    /// Reports a call whose argument text was not JSON without asking anyone about it.
+    ///
+    /// By default such a call keeps the framework's approval semantics, as the reference does: a
+    /// tool that would ask is asked about without consulting its dynamic approval check, which
+    /// cannot read the arguments, and the failure is reported only once the call is admitted.
+    /// Turned on, nothing is asked — fixed denials still refuse the call — and the failure is
+    /// reported at once, as Codex's handlers answer arguments they cannot parse before any
+    /// approval. A product selects this; it is not the framework default.
+    #[must_use]
+    pub const fn with_unparsed_arguments_reported_before_approval(mut self, enabled: bool) -> Self {
+        self.unparsed_arguments_reported_before_approval = enabled;
+        self
+    }
+
+    /// Whether a call whose argument text was not JSON is reported without asking anyone.
+    #[must_use]
+    pub const fn reports_unparsed_arguments_before_approval(&self) -> bool {
+        self.unparsed_arguments_reported_before_approval
     }
 
     /// Installed action-class policy, if any.
@@ -260,6 +281,37 @@ impl PermissionEngine {
             return Some(PermissionDecision::Allow);
         }
         None
+    }
+
+    /// Resolves a call nobody is asked about: every question is skipped, every denial stands.
+    ///
+    /// Used for a call whose argument text was not JSON when the product reports such calls
+    /// before any approval. A class restriction and a matching `deny` rule still refuse it; an
+    /// `ask` rule, the tool's own wish to ask, and prompts being off do not, because the call is
+    /// about to be answered with its argument error rather than run. The rule is read before
+    /// prompts-off turns `ask` into `deny`, which is the difference from
+    /// [`Self::fixed_decision`]: after that normalization a skipped question and a real denial
+    /// can no longer be told apart.
+    pub(crate) fn decision_without_asking(
+        &self,
+        classes: &[ActionClass],
+        origin: &ToolOrigin,
+        agent_id: &AgentId,
+    ) -> PermissionDecision {
+        let restricted = self
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.permits_classes(classes));
+        if restricted
+            || matches!(
+                self.matching_rule(origin, agent_id),
+                Some(PermissionDecision::Deny)
+            )
+        {
+            PermissionDecision::Deny
+        } else {
+            PermissionDecision::Allow
+        }
     }
 
     /// Rejection text from a matching sticky deny rule, if that rule decides this call.

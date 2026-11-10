@@ -72,11 +72,35 @@ pub struct ToolCall {
     namespace: Option<String>,
     #[serde(default, skip_serializing_if = "ToolCallKind::is_function")]
     kind: ToolCallKind,
+    // The provider's argument text when it is not JSON; `arguments` is then `null`. Kept apart so
+    // a build that does not know this field reads the call as one with `null` arguments rather
+    // than taking the text for a valid string argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unparsed_arguments: Option<Box<str>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
 
 impl ToolCall {
+    /// Creates a function call whose arguments the provider gave as text that is not JSON.
+    ///
+    /// Its [`arguments`](Self::arguments) are `null`; the text is
+    /// [`unparsed_arguments`](Self::unparsed_arguments). The call is reported to the model as a
+    /// failure when it runs, as the reference reports arguments it cannot parse, rather than
+    /// failing the response that carried it.
+    #[must_use]
+    pub fn unparsed(call_id: CallId, name: impl Into<String>, text: impl Into<String>) -> Self {
+        let mut call = Self::new(call_id, name, Value::Null);
+        call.unparsed_arguments = Some(text.into().into_boxed_str());
+        call
+    }
+
+    /// The provider's argument text, when it was not JSON.
+    #[must_use]
+    pub fn unparsed_arguments(&self) -> Option<&str> {
+        self.unparsed_arguments.as_deref()
+    }
+
     /// Creates a call to a custom tool, whose arguments are its raw input as a JSON string.
     #[must_use]
     pub fn custom(call_id: CallId, name: impl Into<String>, input: impl Into<String>) -> Self {
@@ -93,6 +117,7 @@ impl ToolCall {
             arguments,
             namespace: None,
             kind: ToolCallKind::Function,
+            unparsed_arguments: None,
             unknown: Unknown::new(),
         }
     }
@@ -141,7 +166,8 @@ impl ToolCall {
         self.namespace.as_deref()
     }
 
-    /// Parsed argument JSON.
+    /// Parsed argument JSON; `null` for a call whose arguments were not JSON (see
+    /// [`unparsed_arguments`](Self::unparsed_arguments)).
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         &self.arguments
@@ -349,6 +375,16 @@ pub struct ToolApproval {
     // Boxed for the reason `lookup_key` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume: Option<Box<ToolResume>>,
+    // The call's argument text when it was not JSON, as on `ToolCall`; `arguments` is then `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unparsed_arguments: Option<Box<str>>,
+    // The routing key of an approval whose call's arguments were not JSON, held here instead of in
+    // `lookup_key`. A build that does not know unparsed arguments refuses to approve or resume an
+    // approval without `lookup_key`, so it stops rather than running the call with `null`
+    // arguments; it keeps this field as unknown and writes it back unchanged. At most one of the
+    // two is set, chosen by whether `unparsed_arguments` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unparsed_call_lookup_key: Option<Box<ToolLookupKey>>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -362,10 +398,15 @@ impl std::fmt::Debug for ToolApproval {
             .field("tool_name", &self.tool_name)
             .field("arguments", &self.arguments)
             .field("namespace", &self.namespace)
-            .field("lookup_key", &self.lookup_key)
+            .field("lookup_key", &self.lookup_key())
             .field("has_recipient_binding", &self.recipient_binding.is_some())
             .field("kind", &self.kind)
             .field("resume", &self.resume)
+            .field("unparsed_arguments", &self.unparsed_arguments)
+            .field(
+                "routing_key_withheld_from_older_builds",
+                &self.unparsed_call_lookup_key.is_some(),
+            )
             .field("unknown", &self.unknown)
             .finish()
     }
@@ -385,8 +426,28 @@ impl ToolApproval {
             recipient_binding: None,
             kind: ToolCallKind::Function,
             resume: None,
+            unparsed_arguments: None,
+            unparsed_call_lookup_key: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records that the call asked about had argument text that was not JSON, and sets its
+    /// [`arguments`](Self::arguments) to `null`, so the approved call resumes as that call.
+    #[must_use]
+    pub fn with_unparsed_arguments(mut self, text: impl Into<String>) -> Self {
+        self.arguments = Value::Null;
+        self.unparsed_arguments = Some(text.into().into_boxed_str());
+        if let Some(key) = self.lookup_key.take() {
+            self.unparsed_call_lookup_key = Some(key);
+        }
+        self
+    }
+
+    /// The asked-about call's argument text, when it was not JSON.
+    #[must_use]
+    pub fn unparsed_arguments(&self) -> Option<&str> {
+        self.unparsed_arguments.as_deref()
     }
 
     /// Keeps the tool's state with this approval, to hand back when the approved call resumes.
@@ -433,7 +494,12 @@ impl ToolApproval {
     /// wrong, and checking one against the other proves nothing a reader would not already know.
     #[must_use]
     pub fn with_tool_origin(mut self, origin: &ToolOrigin) -> Self {
-        self.lookup_key = Some(Box::new(origin.lookup_key().clone()));
+        let key = Some(Box::new(origin.lookup_key().clone()));
+        if self.unparsed_arguments.is_some() {
+            self.unparsed_call_lookup_key = key;
+        } else {
+            self.lookup_key = key;
+        }
         self
     }
     /// Retains the selected adapter recipient independently of its allocated model name.
@@ -481,7 +547,9 @@ impl ToolApproval {
     /// Exact routing key needed to rebuild the pending action after a restart.
     #[must_use]
     pub fn lookup_key(&self) -> Option<&ToolLookupKey> {
-        self.lookup_key.as_deref()
+        self.lookup_key
+            .as_deref()
+            .or(self.unparsed_call_lookup_key.as_deref())
     }
 
     /// Unknown fields retained during deserialization.

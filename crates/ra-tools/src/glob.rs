@@ -239,7 +239,9 @@ impl Tool for GlobTool {
         _context: &ToolContext<'_>,
         error: &Error,
     ) -> Result<Option<ToolOutput>> {
-        Ok(GlobFailure::of(error).map(|failure| {
+        let unparsed =
+            crate::argument_error::unparsed_arguments_error(error).map(GlobFailure::BadArguments);
+        Ok(GlobFailure::of(error).or(unparsed.as_ref()).map(|failure| {
             ToolOutput::text(failure.to_string())
                 .with_metadata(ObservationMetadata::new().with_guidance(failure.guidance()))
         }))

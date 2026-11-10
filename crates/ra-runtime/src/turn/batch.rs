@@ -544,6 +544,9 @@ pub(crate) struct StreamedFunctionDispatches {
 struct StreamedFunctionCall {
     tool: ToolOrigin,
     arguments: Value,
+    // Compared with the settled call too: `{bad` that was not JSON and the JSON string `"{bad"`,
+    // or `null` and text that was not JSON, are different calls with equal parsed values.
+    unparsed_arguments: Option<String>,
     task_id: Id,
 }
 
@@ -639,7 +642,8 @@ impl StreamedFunctionDispatches {
         .with_services(self.services.clone())
         .with_tool_guardrails(self.guardrails.clone())
         .with_user_hooks(self.user_hooks.clone())
-        .with_lifecycle_hooks(self.lifecycle.clone());
+        .with_lifecycle_hooks(self.lifecycle.clone())
+        .with_unparsed_arguments(action.call().unparsed_arguments());
         let tool = action.tool().origin().clone();
         let function_span = function_span(&tool, &call_id);
         let task_id = spawn_dispatch_task(
@@ -660,6 +664,7 @@ impl StreamedFunctionDispatches {
             StreamedFunctionCall {
                 tool,
                 arguments: action.call().arguments().clone(),
+                unparsed_arguments: action.call().unparsed_arguments().map(str::to_owned),
                 task_id,
             },
         );
@@ -796,6 +801,7 @@ fn spawn_function_dispatches(
         {
             if started.tool != *action.tool().origin()
                 || started.arguments != *action.call().arguments()
+                || started.unparsed_arguments.as_deref() != action.call().unparsed_arguments()
             {
                 preflight_failure = Some(Error::provider(
                     ra_core::error::ProviderErrorKind::Behavior,
@@ -836,7 +842,8 @@ fn spawn_function_dispatches(
         .with_services(request.services.clone())
         .with_tool_guardrails(request.guardrails.clone())
         .with_user_hooks(request.user_hooks.clone())
-        .with_lifecycle_hooks(request.lifecycle.clone());
+        .with_lifecycle_hooks(request.lifecycle.clone())
+        .with_unparsed_arguments(action.call().unparsed_arguments());
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let call_id = action.call_id().clone();
@@ -1460,11 +1467,7 @@ async fn execute_handoffs(
     }
     request
         .cancel
-        .run(
-            handoff
-                .spec()
-                .invoke(&request.run, handoff.call().arguments()),
-        )
+        .run(handoff.spec().invoke_call(&request.run, handoff.call()))
         .await??;
     request.cancel.ensure_not_cancelled()?;
     let target = handoff.target();

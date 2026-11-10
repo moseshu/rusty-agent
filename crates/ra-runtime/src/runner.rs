@@ -733,6 +733,15 @@ impl RunConfig {
         self
     }
 
+    /// Reports a tool call whose argument text was not JSON without asking anyone about it (see
+    /// [`PermissionEngine::with_unparsed_arguments_reported_before_approval`]). Off by default.
+    pub fn with_unparsed_arguments_reported_before_approval(mut self, enabled: bool) -> Self {
+        self.permission = self
+            .permission
+            .with_unparsed_arguments_reported_before_approval(enabled);
+        self
+    }
+
     /// Replaces the ordered permission-rule exceptions for this run.
     pub fn with_permission_rules(
         mut self,
@@ -4056,6 +4065,7 @@ async fn run_approved_call(
             kind: approval.kind(),
             call_id: approval.call_id(),
             arguments: approval.arguments(),
+            unparsed_arguments: approval.unparsed_arguments(),
             nested: None,
             resume: approval.resume().cloned(),
         },
@@ -4097,6 +4107,8 @@ async fn continue_paused_run(
             kind: ra_core::item::ToolCallKind::Function,
             call_id: &call_id,
             arguments: &arguments,
+            // A call whose text was not JSON never reaches its tool, so it never pauses one.
+            unparsed_arguments: None,
             nested: Some(checkpoint),
             resume: None,
         },
@@ -4112,6 +4124,8 @@ struct ResumedCall<'a> {
     kind: ra_core::item::ToolCallKind,
     call_id: &'a CallId,
     arguments: &'a serde_json::Value,
+    /// The call's argument text when it was not JSON, as the approval kept it.
+    unparsed_arguments: Option<&'a str>,
     /// The paused nested run the call continues; `None` for a call the host approved.
     nested: Option<RunState>,
     /// The state the tool kept with the approval the host answered.
@@ -4172,6 +4186,7 @@ async fn execute_resumed_call(
         kind,
         call_id,
         arguments,
+        unparsed_arguments,
         nested,
         resume,
     } = call;
@@ -4213,7 +4228,8 @@ async fn execute_resumed_call(
     .with_services(context.services.clone())
     .with_tool_guardrails(context.tool_guardrails.clone())
     .with_user_hooks(context.config.user_hooks().clone())
-    .with_lifecycle_hooks(lifecycle.clone());
+    .with_lifecycle_hooks(lifecycle.clone())
+    .with_unparsed_arguments(unparsed_arguments);
     let request = match (nested, resume) {
         (Some(checkpoint), _) => request.with_nested_resume(checkpoint),
         (None, Some(resume)) => request.with_approval_granted().with_resume(resume),

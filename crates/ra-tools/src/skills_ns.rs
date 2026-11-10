@@ -410,6 +410,11 @@ impl Tool for SkillTool {
             .and_then(|source| source.downcast_ref::<FunctionCallError>());
         Ok(match failure {
             Some(FunctionCallError::RespondToModel(message)) => Some(ToolOutput::text(message)),
+            // A call whose arguments were not JSON never reached the tool; Codex's skills tools
+            // answer it with the parser's diagnostic alone, as `parse_args` does.
+            None => {
+                crate::argument_error::unparsed_arguments_diagnostic(error).map(ToolOutput::text)
+            }
             _ => None,
         })
     }

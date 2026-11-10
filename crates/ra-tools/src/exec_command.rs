@@ -1565,15 +1565,19 @@ impl Tool for ExecCommandTool {
         // Matched on the typed cause carried in the error's source, never on its message. Reading
         // the sentence back out of prose is the de-lexicalization rule this project bans, and it
         // also produced the doubled text a message-sniffing version emitted.
-        Ok(ExecCommandFailure::of(error).map(|failure| {
-            let output = ToolOutput::text(failure.to_string());
-            match failure.next_step() {
-                Some(next_step) => {
-                    output.with_metadata(ObservationMetadata::new().with_guidance(next_step))
+        let unparsed = crate::argument_error::unparsed_arguments_error(error)
+            .map(ExecCommandFailure::BadArguments);
+        Ok(ExecCommandFailure::of(error)
+            .or(unparsed.as_ref())
+            .map(|failure| {
+                let output = ToolOutput::text(failure.to_string());
+                match failure.next_step() {
+                    Some(next_step) => {
+                        output.with_metadata(ObservationMetadata::new().with_guidance(next_step))
+                    }
+                    None => output,
                 }
-                None => output,
-            }
-        }))
+            }))
     }
 }
 

@@ -543,6 +543,7 @@ pub struct ToolStartInput<'a> {
     origin: &'a ToolOrigin,
     call_id: &'a CallId,
     arguments: &'a Value,
+    unparsed_arguments: bool,
 }
 
 impl<'a> ToolStartInput<'a> {
@@ -559,6 +560,7 @@ impl<'a> ToolStartInput<'a> {
             origin,
             call_id,
             arguments,
+            unparsed_arguments: false,
         }
     }
 
@@ -566,6 +568,21 @@ impl<'a> ToolStartInput<'a> {
     pub const fn with_services(mut self, services: &'a ToolServices) -> Self {
         self.services = services;
         self
+    }
+
+    /// Marks a call whose argument text was not JSON: [`arguments`](Self::arguments) is then that
+    /// text as a JSON string, as the reference's tool context carries the raw argument text.
+    pub const fn with_unparsed_arguments(mut self) -> Self {
+        self.unparsed_arguments = true;
+        self
+    }
+
+    /// Whether [`arguments`](Self::arguments) is argument text that was not JSON, rather than a
+    /// parsed value (which may itself be a JSON string). Such a call starts and then ends with
+    /// the error of reading its arguments; the tool itself is not run.
+    #[must_use]
+    pub const fn has_unparsed_arguments(&self) -> bool {
+        self.unparsed_arguments
     }
 
     /// The run this call is part of.

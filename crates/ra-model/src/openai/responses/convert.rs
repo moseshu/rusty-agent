@@ -424,15 +424,13 @@ pub(crate) fn convert_function_call(
     let call_id = CallId::new(required_str(item, "call_id", "function_call")?);
     let name = required_str(item, "name", "function_call")?;
     let arguments_text = required_str(item, "arguments", "function_call")?;
-    let arguments: Value = if arguments_text.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(arguments_text).map_err(|error| {
-            behavior_error(format!(
-                "OpenAI function `{name}` returned invalid JSON arguments"
-            ))
-            .with_source(error)
-        })?
+    let arguments = crate::openai::function_arguments(arguments_text);
+    // Text that is not JSON travels as the call's own record of it, with `null` arguments.
+    let unparsed = arguments.is_none().then_some(arguments_text);
+    let arguments = arguments.unwrap_or(Value::Null);
+    let tool_call = |arguments: Value| match unparsed {
+        Some(text) => ToolCall::unparsed(call_id.clone(), name, text),
+        None => ToolCall::new(call_id.clone(), name, arguments),
     };
     // The reference's `get_tool_call_namespace`: a call of a namespace's function names it, and an
     // empty one names none.
@@ -442,19 +440,19 @@ pub(crate) fn convert_function_call(
         .filter(|namespace| !namespace.is_empty());
     if let Some(namespace) = namespace {
         return Ok(RunItemKind::ToolCall(
-            ToolCall::new(call_id, name, arguments).with_namespace(namespace),
+            tool_call(arguments).with_namespace(namespace),
         ));
     }
 
     if let Some(handoff) = handoffs.iter().find(|handoff| handoff.name() == name) {
-        Ok(RunItemKind::HandoffCall(
-            HandoffCall::new(call_id, handoff.target_agent().clone(), arguments)
-                .with_tool_name(name),
-        ))
+        let call = HandoffCall::new(call_id.clone(), handoff.target_agent().clone(), arguments)
+            .with_tool_name(name);
+        Ok(RunItemKind::HandoffCall(match unparsed {
+            Some(text) => call.with_unparsed_arguments(text),
+            None => call,
+        }))
     } else {
-        Ok(RunItemKind::ToolCall(ToolCall::new(
-            call_id, name, arguments,
-        )))
+        Ok(RunItemKind::ToolCall(tool_call(arguments)))
     }
 }
 

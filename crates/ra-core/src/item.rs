@@ -501,6 +501,10 @@ impl RunItem {
         &self.kind
     }
 
+    pub(crate) const fn kind_mut(&mut self) -> &mut RunItemKind {
+        &mut self.kind
+    }
+
     /// Sets the output phase on an assistant message while preserving this record's envelope.
     ///
     /// Other record kinds, and messages from user or system roles, are left untouched. Turn

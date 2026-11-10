@@ -310,6 +310,7 @@ pub struct ToolInputGuardrailData<'a> {
     call_id: &'a CallId,
     arguments: &'a Value,
     services: &'a ToolServices,
+    unparsed_arguments: bool,
 }
 
 impl<'a> ToolInputGuardrailData<'a> {
@@ -326,7 +327,23 @@ impl<'a> ToolInputGuardrailData<'a> {
             call_id,
             arguments,
             services: ToolServices::none(),
+            unparsed_arguments: false,
         }
+    }
+
+    /// Marks a call whose argument text was not JSON: [`arguments`](Self::arguments) is then that
+    /// text as a JSON string, as the reference hands such text to its input guardrails.
+    pub const fn with_unparsed_arguments(mut self) -> Self {
+        self.unparsed_arguments = true;
+        self
+    }
+
+    /// Whether [`arguments`](Self::arguments) is argument text that was not JSON, rather than a
+    /// parsed value (which may itself be a JSON string). Such a call is reported as a failure
+    /// once its input guardrails allow it.
+    #[must_use]
+    pub const fn has_unparsed_arguments(&self) -> bool {
+        self.unparsed_arguments
     }
 
     /// Installs the framework ports this call may reach.

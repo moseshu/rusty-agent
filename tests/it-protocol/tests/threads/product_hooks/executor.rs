@@ -1617,3 +1617,6 @@ mod mcp_payload;
 
 #[path = "mcp_permission.rs"]
 mod mcp_permission;
+
+#[path = "mcp_unparsed.rs"]
+mod mcp_unparsed;

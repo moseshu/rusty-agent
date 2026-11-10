@@ -366,9 +366,7 @@ pub(crate) async fn lower_input_item(
                 "type": "function_call",
                 "call_id": call.call_id().as_str(),
                 "name": name,
-                "arguments": serde_json::to_string(call.arguments()).map_err(|error| {
-                    behavior_error("handoff arguments could not be serialized").with_source(error)
-                })?
+                "arguments": replayed_arguments(call.arguments(), call.unparsed_arguments())?
             }))
         }
         ModelInputItem::HandoffOutput(output) => Ok(json!({
@@ -427,15 +425,24 @@ fn lower_hosted_record(raw: &ra_core::item::RawProviderItem) -> Value {
     payload
 }
 
+/// A function call's wire `arguments` string: argument text that was not JSON is handed back as the
+/// model wrote it.
+fn replayed_arguments(arguments: &Value, unparsed: Option<&str>) -> Result<String> {
+    match unparsed {
+        Some(text) => Ok(text.to_owned()),
+        None => serde_json::to_string(arguments).map_err(|error| {
+            behavior_error("tool-call arguments could not be serialized").with_source(error)
+        }),
+    }
+}
+
 /// A function call, handed back as the model made it, namespace and all.
 fn lower_function_call(call: &ra_core::item::ToolCall) -> Result<Value> {
     let mut lowered = json!({
         "type": "function_call",
         "call_id": call.call_id().as_str(),
         "name": call.name(),
-        "arguments": serde_json::to_string(call.arguments()).map_err(|error| {
-            behavior_error("tool-call arguments could not be serialized").with_source(error)
-        })?
+        "arguments": replayed_arguments(call.arguments(), call.unparsed_arguments())?
     });
     if let Some(namespace) = call.namespace() {
         lowered["namespace"] = Value::String(namespace.to_owned());

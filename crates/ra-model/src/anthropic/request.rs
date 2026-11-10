@@ -182,12 +182,14 @@ async fn lower_messages(
             }
             ModelInputItem::ToolCall(call) => {
                 pending_tool_results.insert(call.call_id().clone());
-                accumulator.push(ASSISTANT_ROLE, vec![json!({"type":"tool_use", "id":call.call_id().as_str(), "name":call.name(), "input":call.arguments()})]);
+                let input = tool_use_input(call.arguments(), call.unparsed_arguments());
+                accumulator.push(ASSISTANT_ROLE, vec![json!({"type":"tool_use", "id":call.call_id().as_str(), "name":call.name(), "input":input})]);
             }
             ModelInputItem::HandoffCall(call) => {
                 pending_tool_results.insert(call.call_id().clone());
                 let name = handoff_name(call, request)?;
-                accumulator.push(ASSISTANT_ROLE, vec![json!({"type":"tool_use", "id":call.call_id().as_str(), "name":name, "input":call.arguments()})]);
+                let input = tool_use_input(call.arguments(), call.unparsed_arguments());
+                accumulator.push(ASSISTANT_ROLE, vec![json!({"type":"tool_use", "id":call.call_id().as_str(), "name":name, "input":input})]);
             }
             ModelInputItem::ToolCallOutput(output) => {
                 remove_pending_tool_result(&mut pending_tool_results, output.call_id())?;
@@ -672,4 +674,14 @@ fn insert_number(body: &mut Map<String, Value>, name: &str, value: Option<f64>) 
     if let Some(number) = value.and_then(serde_json::Number::from_f64) {
         body.insert(name.to_owned(), Value::Number(number));
     }
+}
+
+/// A replayed call's `tool_use.input`, which must be an object: a call whose argument text was not
+/// JSON — made against another provider — is replayed as `{}`, its failure already recorded in the
+/// paired result.
+fn tool_use_input(arguments: &Value, unparsed: Option<&str>) -> Value {
+    if unparsed.is_some() {
+        return json!({});
+    }
+    arguments.clone()
 }

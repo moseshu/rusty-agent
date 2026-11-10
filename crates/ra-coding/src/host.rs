@@ -625,8 +625,13 @@ impl CodingHost {
     /// it as a loose processor would leave that family absent from the installed set — so a later
     /// capability that declares a dependency on it would be refused beside the very thing that
     /// satisfies it.
+    ///
+    /// A tool call whose argument text is not JSON is answered with the tool's own argument error
+    /// without asking for approval, as Codex's handlers parse their arguments before any approval.
+    /// This is a product choice: the framework default asks first, as the reference SDK does.
     pub fn build_run_config(&self) -> RunConfig {
         RunConfig::new()
+            .with_unparsed_arguments_reported_before_approval(true)
             .with_max_turns(None)
             .with_max_function_tool_concurrency(8)
             .with_context_filter(Arc::new(ToolOutputReferenceTrimmer::default()))

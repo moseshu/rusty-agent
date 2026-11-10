@@ -1730,3 +1730,143 @@ async fn dynamic_exec_named_tool_keeps_ordinary_hook_name_and_input() {
     }
     assert_eq!(payloads[1]["tool_response"], "dynamic output");
 }
+
+/// An ordinary function a host registered under the name `apply_patch`.
+struct PlainApplyPatch {
+    origin: ToolOrigin,
+    schema: ra_core::tool::ToolSchema,
+}
+
+#[async_trait::async_trait]
+impl ra_core::tool::Tool for PlainApplyPatch {
+    fn origin(&self) -> &ToolOrigin {
+        &self.origin
+    }
+    fn schema(&self) -> &ra_core::tool::ToolSchema {
+        &self.schema
+    }
+    async fn call(
+        &self,
+        _: ra_core::tool::ToolContext<'_>,
+    ) -> ra_core::error::Result<ra_core::tool::ToolOutput> {
+        Ok(ra_core::tool::ToolOutput::text("ran"))
+    }
+}
+
+/// Codex chooses the hook payload by the handler a call selected, so a host's ordinary function
+/// named `apply_patch` is hooked as an ordinary function: its PreToolUse receives argument text
+/// that was not JSON as a string, under its own name without the patch tool's `Write` and `Edit`
+/// aliases, and a rewrite reaches it as given. The patch tool itself keeps its patch identity.
+#[tokio::test]
+async fn a_function_named_apply_patch_is_hooked_as_the_function_it_is() {
+    let home = TempDir::new().unwrap();
+    let named = home.path().join("named.log");
+    let write = home.path().join("write.log");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PreToolUse]]
+matcher = "^apply_patch$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '''cat >> '{}'; echo >> '{}'; printf '%s' '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{{"message":"rewritten"}}}}}}' '''
+[[hooks.PreToolUse]]
+matcher = "^Write$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '''cat >> '{}'; echo >> '{}' '''
+"#,
+            named.display(),
+            named.display(),
+            write.display(),
+            write.display()
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_with_queue(&runtime, &queue);
+    let plain = PlainApplyPatch {
+        origin: ToolOrigin::new("apply_patch").unwrap(),
+        schema: ra_core::tool::ToolSchema::new(
+            "apply_patch",
+            serde_json::json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
+        )
+        .unwrap(),
+    };
+    let id = CallId::new("plain");
+
+    let text = serde_json::json!("{bad");
+    let decision = bound
+        .dispatch(HookEvent::PreToolUse(
+            ToolHookData::new(ra_core::tool::Tool::origin(&plain), &id, &text)
+                .with_unparsed_arguments()
+                .with_tool(&plain),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        HookDecision::UpdateInput {
+            input: serde_json::json!({"message":"rewritten"})
+        }
+    );
+    let parsed = serde_json::json!({"message":"original"});
+    let decision = bound
+        .dispatch(HookEvent::PreToolUse(
+            ToolHookData::new(ra_core::tool::Tool::origin(&plain), &id, &parsed).with_tool(&plain),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        HookDecision::UpdateInput {
+            input: serde_json::json!({"message":"rewritten"})
+        }
+    );
+    let inputs = logged(&named);
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["tool_name"], "apply_patch");
+    assert_eq!(inputs[0]["tool_input"], text);
+    assert_eq!(inputs[1]["tool_input"], parsed);
+    assert!(
+        logged(&write).is_empty(),
+        "the patch tool's alias is not this function's"
+    );
+
+    // The patch tool under the same name: its input is the patch command, its aliases match,
+    // and argument text that was not JSON runs no hook.
+    let workspace = TempDir::new().unwrap();
+    let patch_tool = ra_tools::apply_patch::ApplyPatchTool::new(Arc::new(
+        ra_exec::fs::RootedFileSystem::open(workspace.path()).unwrap(),
+    ))
+    .unwrap();
+    let patch = serde_json::json!({"patch": ORIGINAL_PATCH});
+    bound
+        .dispatch(HookEvent::PreToolUse(
+            ToolHookData::new(ra_core::tool::Tool::origin(&patch_tool), &id, &patch)
+                .with_tool(&patch_tool),
+        ))
+        .await
+        .unwrap();
+    let inputs = logged(&named);
+    assert_eq!(inputs.len(), 3);
+    assert_eq!(
+        inputs[2]["tool_input"],
+        serde_json::json!({"command": ORIGINAL_PATCH})
+    );
+    assert_eq!(logged(&write).len(), 1);
+    let unparsed = serde_json::json!(ORIGINAL_PATCH);
+    let decision = bound
+        .dispatch(HookEvent::PreToolUse(
+            ToolHookData::new(ra_core::tool::Tool::origin(&patch_tool), &id, &unparsed)
+                .with_unparsed_arguments()
+                .with_tool(&patch_tool),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(decision, HookDecision::Continue);
+    assert_eq!(logged(&named).len(), 3);
+    assert_eq!(logged(&write).len(), 1);
+}

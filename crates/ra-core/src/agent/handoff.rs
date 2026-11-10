@@ -34,7 +34,7 @@ use super::{AgentSpec, validate_required_text};
 use crate::{
     context::RunContext,
     error::{Error, ProviderErrorKind, Result},
-    item::{AgentId, CallId, ModelInputItem, RunItem},
+    item::{AgentId, CallId, HandoffCall, ModelInputItem, RunItem},
     model::ModelHandoffDefinition,
     tool::{ToolInput, ToolSchema, schema::ToolInputRequirements},
 };
@@ -156,6 +156,16 @@ where
 pub trait HandoffInvocationHandler: Send + Sync + 'static {
     /// Validates the payload and runs the callback, propagating failures to the run.
     async fn on_handoff(&self, context: &RunContext, arguments: &Value) -> Result<()>;
+
+    /// Whether the handler reads the model's payload.
+    ///
+    /// A handoff whose argument text was not JSON is refused before a handler that reads its
+    /// payload runs, as the reference refuses typed input it cannot parse; one whose handler does
+    /// not read the payload proceeds, as the reference ignores input it does not ask for. Defaults
+    /// to `true`, so a handler is never handed a payload it might take for valid.
+    fn consumes_arguments(&self) -> bool {
+        true
+    }
 }
 
 struct HandoffInvocationFn<F>(F);
@@ -168,6 +178,10 @@ where
 {
     async fn on_handoff(&self, context: &RunContext, _arguments: &Value) -> Result<()> {
         (self.0)(context).await
+    }
+
+    fn consumes_arguments(&self) -> bool {
+        false
     }
 }
 
@@ -334,6 +348,27 @@ impl HandoffSpec {
             Some(handler) => handler.on_handoff(context, arguments).await,
             None => Ok(()),
         }
+    }
+
+    /// Runs the callback for `call`.
+    ///
+    /// A call whose argument text was not JSON is refused before a handler that reads the payload
+    /// runs, as the reference refuses typed handoff input it cannot parse. A handler that does not
+    /// read the payload still runs, as the reference calls a callback without input whatever the
+    /// input was. Any other call is [`invoke`](Self::invoke)d with its arguments.
+    pub async fn invoke_call(&self, context: &RunContext, call: &HandoffCall) -> Result<()> {
+        if call.unparsed_arguments().is_some()
+            && self
+                .invocation
+                .as_ref()
+                .is_some_and(|handler| handler.consumes_arguments())
+        {
+            return Err(Error::provider(
+                ProviderErrorKind::Behavior,
+                "invalid handoff input: the arguments are not valid JSON",
+            ));
+        }
+        self.invoke(context, call.arguments()).await
     }
 
     /// Sets the model-input history projection for the receiving agent.

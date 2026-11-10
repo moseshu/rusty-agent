@@ -376,3 +376,49 @@ fn a_provider_compaction_is_kept_opaque_from_record_to_model_input() {
         "provider_compaction"
     );
 }
+
+/// Argument text that was not JSON is kept apart from `arguments`, which stay `null`. A record
+/// written before the field existed reads as a parsed call, and a record carrying it round-trips.
+#[test]
+fn unparsed_argument_text_is_kept_apart_and_older_records_read_as_parsed() {
+    let call = ToolCall::unparsed(CallId::new("call-1"), "echo", "{bad");
+    let wire = serde_json::to_value(&call).unwrap();
+    assert_eq!(wire["arguments"], Value::Null);
+    assert_eq!(wire["unparsed_arguments"], json!("{bad"));
+    let restored: ToolCall = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored, call);
+    assert_eq!(restored.unparsed_arguments(), Some("{bad"));
+
+    let mut older = wire;
+    older.as_object_mut().unwrap().remove("unparsed_arguments");
+    let older: ToolCall = serde_json::from_value(older).unwrap();
+    assert_eq!(older.arguments(), &Value::Null);
+    assert_eq!(older.unparsed_arguments(), None);
+    let parsed = ToolCall::new(CallId::new("call-2"), "echo", json!({"a": 1}));
+    assert!(
+        serde_json::to_value(&parsed)
+            .unwrap()
+            .get("unparsed_arguments")
+            .is_none()
+    );
+
+    let handoff = HandoffCall::new(CallId::new("call-3"), AgentId::new("reviewer"), json!({}))
+        .with_tool_name("transfer_to_reviewer")
+        .with_unparsed_arguments("{bad");
+    assert_eq!(handoff.arguments(), &Value::Null);
+    let wire = serde_json::to_value(&handoff).unwrap();
+    assert_eq!(wire["unparsed_arguments"], json!("{bad"));
+    assert_eq!(
+        serde_json::from_value::<HandoffCall>(wire).unwrap(),
+        handoff
+    );
+
+    let approval =
+        ToolApproval::new(CallId::new("call-4"), "echo", json!({})).with_unparsed_arguments("{bad");
+    assert_eq!(approval.arguments(), &Value::Null);
+    let wire = serde_json::to_value(&approval).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ToolApproval>(wire).unwrap(),
+        approval
+    );
+}

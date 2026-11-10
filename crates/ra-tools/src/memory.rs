@@ -327,7 +327,9 @@ fn failure_output(error: &Error) -> Option<ToolOutput> {
     if error.is_control_signal() {
         return None;
     }
-    if let Some(failure) = MemoryToolFailure::of(error) {
+    let unparsed =
+        crate::argument_error::unparsed_arguments_error(error).map(MemoryToolFailure::BadArguments);
+    if let Some(failure) = MemoryToolFailure::of(error).or(unparsed.as_ref()) {
         return Some(
             ToolOutput::text(failure.to_string())
                 .with_metadata(ObservationMetadata::new().with_guidance(failure.next_step())),

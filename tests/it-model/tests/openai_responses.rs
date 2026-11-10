@@ -656,8 +656,11 @@ async fn http_errors_map_to_provider_recoverability() {
     assert_eq!(error.recoverability(), Recoverability::Retryable);
 }
 
+/// Argument text that is not JSON does not fail the response: the call keeps the text, with
+/// `null` arguments, and is answered as a failure when it runs, as the reference parses arguments
+/// only when it invokes the tool.
 #[tokio::test]
-async fn invalid_function_arguments_are_model_behavior_errors() {
+async fn invalid_function_arguments_are_kept_on_the_call() {
     let server = MockServer::start().await;
     let model = mounted_model(
         &server,
@@ -672,12 +675,15 @@ async fn invalid_function_arguments_are_model_behavior_errors() {
         })),
     )
     .await;
-    let error = model
+    let response = model
         .get_response(ModelRequest::new(vec![], resolved(ModelSettings::new())))
         .await
-        .expect_err("invalid model arguments should fail conversion");
-    assert_eq!(error.code(), "provider.behavior");
-    assert_eq!(error.recoverability(), Recoverability::RetryableWithChange);
+        .expect("argument text that is not JSON does not fail the response");
+    let RunItemKind::ToolCall(call) = response.output()[0].kind() else {
+        panic!("expected a tool call");
+    };
+    assert_eq!(call.arguments(), &Value::Null);
+    assert_eq!(call.unparsed_arguments(), Some("{not-json"));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -118,6 +118,7 @@ pub struct ToolHookData<'a> {
     arguments: &'a serde_json::Value,
     tool: Option<&'a dyn Tool>,
     approval_state: Option<&'a serde_json::Value>,
+    unparsed_arguments: bool,
 }
 
 impl std::fmt::Debug for ToolHookData<'_> {
@@ -128,6 +129,7 @@ impl std::fmt::Debug for ToolHookData<'_> {
             .field("arguments", self.arguments)
             .field("tool", &self.tool.map(Tool::origin))
             .field("approval_state", &self.approval_state.is_some())
+            .field("unparsed_arguments", &self.unparsed_arguments)
             .finish()
     }
 }
@@ -146,7 +148,21 @@ impl<'a> ToolHookData<'a> {
             arguments,
             tool: None,
             approval_state: None,
+            unparsed_arguments: false,
         }
+    }
+    /// Marks a call whose argument text was not JSON: [`arguments`](Self::arguments) is then that
+    /// text as a JSON string, as the reference gives such a call's input to its hooks.
+    #[must_use]
+    pub const fn with_unparsed_arguments(mut self) -> Self {
+        self.unparsed_arguments = true;
+        self
+    }
+    /// Whether [`arguments`](Self::arguments) is argument text that was not JSON, rather than a
+    /// parsed value (which may itself be a JSON string).
+    #[must_use]
+    pub const fn has_unparsed_arguments(&self) -> bool {
+        self.unparsed_arguments
     }
     /// Borrows the actual selected executable, retaining its adapter-owned identity.
     #[must_use]

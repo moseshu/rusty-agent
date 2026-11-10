@@ -101,6 +101,19 @@ impl ArgumentFingerprint {
         Self(format!("{digest:x}"))
     }
 
+    /// Computes the digest of argument text that was not JSON.
+    ///
+    /// Kept apart from every parsed value's digest: such a call is recorded with `null` arguments,
+    /// and a model that then sends a real `null`, or the same characters as a JSON string, has
+    /// changed its call rather than repeated it. The same text sent again is a repeat. The prefix
+    /// cannot begin any canonical JSON text, so the two digests never coincide.
+    pub(crate) fn compute_unparsed(text: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"unparsed-arguments\0");
+        hasher.update(text.as_bytes());
+        Self(format!("{:x}", hasher.finalize()))
+    }
+
     /// Lowercase hexadecimal representation.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -157,6 +170,15 @@ impl ToolUseAttempt {
             identity,
             call_id,
             fingerprint: ArgumentFingerprint::compute(arguments),
+        }
+    }
+
+    /// Records one invoked identity whose argument text was not JSON.
+    pub(crate) fn unparsed(identity: ToolUse, call_id: CallId, text: &str) -> Self {
+        Self {
+            identity,
+            call_id,
+            fingerprint: ArgumentFingerprint::compute_unparsed(text),
         }
     }
 

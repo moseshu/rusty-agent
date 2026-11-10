@@ -304,6 +304,15 @@ impl Case {
     }
 
     fn request(&self, script: Vec<ModelResponse>) -> RunRequest {
+        self.request_with(script, |config| config)
+    }
+
+    /// Like [`Self::request`], with `extend` adding to the run's configuration.
+    fn request_with(
+        &self,
+        script: Vec<ModelResponse>,
+        extend: impl FnOnce(RunConfig) -> RunConfig,
+    ) -> RunRequest {
         let agent = AgentSpec::builder()
             .id(AgentId::new("coder"))
             .name("Coder")
@@ -321,7 +330,7 @@ impl Case {
         .with_services(
             ToolServices::new().with_event_sink(Arc::clone(&self.sink) as Arc<dyn HostEventSink>),
         )
-        .with_config(
+        .with_config(extend(
             RunConfig::new()
                 .with_permission_rules(self.rules.clone())
                 .with_lifecycle_hook(Arc::clone(&self.narration) as Arc<dyn LifecycleHook>)
@@ -329,7 +338,7 @@ impl Case {
                     HookEventName::PermissionRequest,
                     Arc::clone(&self.hook) as Arc<dyn UserHook>,
                 )),
-        )
+        ))
     }
 
     fn journal(&self) -> Vec<String> {
@@ -615,4 +624,143 @@ async fn the_hooks_are_shown_the_prepared_state_before_the_call() {
         .await
         .unwrap();
     assert_eq!(case.hook.shown(), [Some(before), Some(inside)]);
+}
+
+/// Records each PreToolUse it sees: the arguments and whether they were text that was not JSON.
+#[derive(Default)]
+struct PreRecorder(Mutex<Vec<(Value, bool)>>);
+
+#[async_trait]
+impl UserHook for PreRecorder {
+    fn name(&self) -> &str {
+        "pre"
+    }
+    async fn call(
+        &self,
+        _context: &UserHookContext<'_>,
+        event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        if let HookEvent::PreToolUse(call) = event {
+            self.0
+                .lock()
+                .unwrap()
+                .push((call.arguments().clone(), call.has_unparsed_arguments()));
+        }
+        Ok(HookDecision::Continue)
+    }
+}
+
+fn calls_prepared_unparsed() -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new("c-1"),
+        RunItemKind::ToolCall(ToolCall::unparsed(
+            CallId::new("call-1"),
+            "prepared",
+            "{bad",
+        )),
+    )])
+}
+
+/// Runs one unparsed call of `case`, with the product's choice to report such a call before any
+/// approval set to `reported_first`, and returns the outcome, the call's answer and what PreToolUse
+/// saw.
+async fn run_unparsed(
+    case: &Case,
+    reported_first: bool,
+) -> (RunOutcome, Vec<RunItem>, Vec<(Value, bool)>) {
+    let pre = Arc::new(PreRecorder::default());
+    let request = case.request_with(vec![calls_prepared_unparsed(), finishes()], |config| {
+        config
+            .with_unparsed_arguments_reported_before_approval(reported_first)
+            .with_user_hook(UserHookRegistration::new(
+                HookEventName::PreToolUse,
+                Arc::clone(&pre) as Arc<dyn UserHook>,
+            ))
+    });
+    let result = Runner::run(request).await.unwrap();
+    let seen = pre.0.lock().unwrap().clone();
+    (result.outcome().clone(), result.new_items().to_vec(), seen)
+}
+
+/// With the product's choice on, a call whose text was not JSON is asked about by nobody, whatever
+/// would otherwise have asked: PreToolUse sees the text, the tool's failure handler answers, and the
+/// answer is an error. The tool's dynamic answer, its prepared state and its body never run.
+#[tokio::test]
+async fn reported_first_unparsed_calls_ask_nobody_and_answer_with_the_tool_failure() {
+    let mut sources: Vec<(&str, ToolApprovalPolicy, Option<PermissionRule>)> =
+        the_two_sources_of_a_question().into();
+    sources.push((
+        "a fixed allow rule",
+        ToolApprovalPolicy::Always,
+        Some(PermissionRule::new(PermissionDecision::Allow).with_tool_name("prepared")),
+    ));
+    sources.push(("an always-asking tool", ToolApprovalPolicy::Always, None));
+    for (source, approval, rule) in sources {
+        let mut case = Case::new(
+            approval,
+            Prepares::State(json!({"kept": true})),
+            None,
+            Vec::new(),
+        );
+        if let Some(rule) = rule {
+            case = case.with_rule(rule);
+        }
+        let (outcome, items, pre) = run_unparsed(&case, true).await;
+        assert!(
+            matches!(outcome, RunOutcome::Completed { .. }),
+            "{source}: {outcome:?}"
+        );
+        assert!(case.journal().is_empty(), "{source}: {:?}", case.journal());
+        assert!(case.tool.invocations().is_empty(), "{source}");
+        assert!(case.resolutions().is_empty(), "{source}");
+        assert_eq!(pre, [(json!("{bad"), true)], "{source}");
+        assert!(output_text(&items).starts_with("failed: "), "{source}");
+        assert!(
+            items.iter().any(|item| matches!(
+                item.kind(),
+                RunItemKind::ToolCallOutput(output) if output.is_error()
+            )),
+            "{source}"
+        );
+    }
+}
+
+/// The choice only skips asking: a fixed deny rule still refuses the call before PreToolUse, and
+/// neither the input guardrails nor the tool's failure handler see it.
+#[tokio::test]
+async fn reported_first_unparsed_calls_are_still_refused_by_a_fixed_deny() {
+    let case = Case::new(
+        ToolApprovalPolicy::Always,
+        Prepares::Nothing,
+        None,
+        Vec::new(),
+    )
+    .with_rule(PermissionRule::new(PermissionDecision::Deny).with_tool_name("prepared"));
+    let (outcome, items, pre) = run_unparsed(&case, true).await;
+    assert!(
+        matches!(outcome, RunOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert!(pre.is_empty(), "{pre:?}");
+    assert!(case.journal().is_empty(), "{:?}", case.journal());
+    assert!(!output_text(&items).starts_with("failed: "));
+}
+
+/// Without the choice, the framework asks about such a call as the reference does, without
+/// running the tool's dynamic answer.
+#[tokio::test]
+async fn unparsed_calls_wait_for_approval_without_the_choice() {
+    let case = Case::new(
+        ToolApprovalPolicy::Always,
+        Prepares::Nothing,
+        None,
+        Vec::new(),
+    );
+    let (outcome, _, pre) = run_unparsed(&case, false).await;
+    assert!(
+        matches!(outcome, RunOutcome::Interrupted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(pre, [(json!("{bad"), true)]);
+    assert_eq!(case.journal(), ["hook"]);
 }

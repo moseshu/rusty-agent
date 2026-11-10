@@ -57,6 +57,7 @@
 pub mod action_classes;
 pub mod agent_ns;
 pub mod apply_patch;
+mod argument_error;
 pub mod capability;
 pub mod exec_command;
 pub mod glob;

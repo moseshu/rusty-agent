@@ -384,3 +384,46 @@ async fn search_truncation_counts_rendered_bytes() {
     assert_eq!(cut.original_bytes(), (first.len() + second.len()) as u64);
     assert_eq!(cut.retained_bytes(), first.len() as u64);
 }
+
+/// Arguments that were not JSON are reported as this tool's own argument error.
+#[tokio::test]
+async fn test_web_entries_report_arguments_that_are_not_json_as_bad_arguments() {
+    // The error the runtime hands the tool when the provider's argument text was not JSON: the
+    // decode error is its source, and the call never reached the tool.
+    let diagnostic = ra_core::tool::ToolArgumentDecodeError::InvalidJson {
+        message: serde_json::from_str::<serde_json::Value>("{bad")
+            .unwrap_err()
+            .to_string(),
+    };
+    let error = ra_core::error::Error::tool(
+        ra_core::error::ToolErrorKind::InvalidInput,
+        "web_search",
+        diagnostic.to_string(),
+    )
+    .with_source(diagnostic);
+    let tool = search(Arc::new(StubBackend::returning(Vec::new())));
+    let agent = ra_core::agent::AgentSpec::builder()
+        .id(ra_core::item::AgentId::new("unparsed"))
+        .name("Unparsed")
+        .build()
+        .unwrap();
+    let run = ra_core::context::RunContext::new(ra_core::state::RunId::new("run-unparsed"), &agent);
+    let call_id = ra_core::item::CallId::new("call-unparsed");
+    let arguments = serde_json::Value::Null;
+    let output = ra_core::tool::Tool::handle_failure(
+        &tool,
+        &ra_core::tool::ToolContext::new(&run, &tool, &call_id, &arguments),
+        &error,
+    )
+    .await
+    .unwrap()
+    .expect("the tool renders the decode error itself");
+    assert_eq!(
+        output.as_text().unwrap(),
+        "Invalid arguments: arguments are not valid JSON: key must be a string at line 1 column 2."
+    );
+    assert_eq!(
+        output.metadata().guidance().join(" "),
+        "Send the arguments the schema names, and nothing else."
+    );
+}

@@ -433,14 +433,18 @@ impl Tool for ViewImageTool {
         if error.is_control_signal() {
             return Ok(None);
         }
-        Ok(ViewImageFailure::of(error).map(|failure| {
-            let output = ToolOutput::text(failure.to_string());
-            match failure.next_step() {
-                Some(guidance) => {
-                    output.with_metadata(ObservationMetadata::new().with_guidance(guidance))
+        let unparsed = crate::argument_error::unparsed_arguments_error(error)
+            .map(ViewImageFailure::BadArguments);
+        Ok(ViewImageFailure::of(error)
+            .or(unparsed.as_ref())
+            .map(|failure| {
+                let output = ToolOutput::text(failure.to_string());
+                match failure.next_step() {
+                    Some(guidance) => {
+                        output.with_metadata(ObservationMetadata::new().with_guidance(guidance))
+                    }
+                    None => output,
                 }
-                None => output,
-            }
-        }))
+            }))
     }
 }

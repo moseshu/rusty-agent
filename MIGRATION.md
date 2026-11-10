@@ -7,6 +7,117 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Tool arguments that are not JSON are answered instead of failing the response
+
+A function call whose argument text is not JSON no longer fails the model response that carried
+it. As the reference SDK parses arguments only when it invokes the tool, the call is recorded
+with its text and answered as a failure when it runs; the run continues.
+
+- **Recorded calls.** The OpenAI Responses and Chat Completions adapters, buffered and streamed,
+  turn such text into `ToolCall::unparsed(call_id, name, text)`: `arguments()` is `null` and the
+  new `unparsed_arguments()` returns the text. A handoff called this way becomes a `HandoffCall`
+  with `with_unparsed_arguments(text)`. Blank text still reads as `{}` and `"null"` as `null`;
+  only text that does not parse is affected. **A host that reads `ToolCall::arguments()`
+  directly must check `unparsed_arguments()`**: a `null` there may be text that was not JSON.
+- **Replay.** Both OpenAI adapters send the text back exactly as the model wrote it. Anthropic,
+  whose `tool_use.input` must be an object, receives `{}` for such a call; its paired
+  `tool_result` carries `is_error: true`.
+- **Dispatch, by default.** The call keeps the framework's approval semantics. PreToolUse runs and
+  sees the text as a JSON string, with `ToolHookData::has_unparsed_arguments()` set. A tool that
+  would ask (`Always`, `Dynamic`, or a fixed `ask` rule) is asked about without calling its
+  `needs_approval` or `approval_state`, which cannot read the text; the PermissionRequest hook sees
+  the text and the mark. A fixed `deny` still refuses first, and with prompts off a question is
+  still a refusal. Once admitted, the input guardrails run on the text
+  (`ToolInputGuardrailData::has_unparsed_arguments()`), and a guardrail refusal is the answer.
+  Otherwise the tool's failure policy answers with an `InvalidInput` error whose source is
+  `ToolArgumentDecodeError::InvalidJson`: `ModelVisible` gives the generic failure object,
+  `Custom` calls the tool's `handle_failure`, and `Propagate` fails the run. A rejected approval
+  is answered by the rejection alone. The tool's `decode_input` and `call` never run, and
+  PostToolUse does not fire.
+- **Lifecycle.** As the reference parses arguments inside the invocation, an admitted call is
+  narrated as an invocation that started and failed: `on_tool_start` fires once the input
+  guardrails allow it, with `ToolStartInput::has_unparsed_arguments()` set, and `on_tool_end`
+  follows with the `tool.invalid_input` error before the failure policy answers or raises, as for
+  any other failed invocation in this framework.
+- **Repeat detection.** The repeat breaker fingerprints such text apart from every parsed value:
+  a model that corrects the text into a real `null`, or into the same characters as a JSON
+  string, has changed its call; the same text sent again is a repeat.
+- **Every answer is an error.** The output of such a call is marked `is_error: true` however it
+  was worded, including a tool's own `handle_failure` text, and the mark is set before the output
+  is committed, so a run resumed after a failing custom-data extractor sees the same flag.
+- **Rewrites.** A PreToolUse hook that rewrites the input into JSON sends the call down the
+  ordinary path with the rewritten arguments; an approval asked after the rewrite holds only the
+  rewritten value.
+- **Approvals across a checkpoint.** A `ToolApproval` for such a call keeps the text
+  (`ToolApproval::with_unparsed_arguments`, `unparsed_arguments()`), so the approved call resumes
+  as the call that was asked about.
+- **Handoffs.** `HandoffInvocationHandler` has a new defaulted method, `consumes_arguments`
+  (`true` by default). The runtime now invokes handoffs through the new
+  `HandoffSpec::invoke_call(context, call)`. For a handoff whose text was not JSON, a handler that
+  reads its payload — a typed `with_input_type` handler, or a custom handler that keeps the
+  default — is not called and the run fails with `provider.behavior` (`invalid handoff input`),
+  as the reference raises `ModelBehaviorError`. A handoff without a handler transfers as usual,
+  and a `with_on_handoff_fn` callback runs and the handoff transfers. A custom handler that
+  ignores its payload should return `false` from `consumes_arguments` to keep transferring.
+- **Streaming.** A call started early from the stream and the terminal response must also agree
+  on the unparsed text: swapping such text for the equal JSON string, or for `null`, fails the
+  turn with `provider.behavior` like any other changed streamed call.
+- **Tools.** The `ra-tools` entries with their own argument-error wording report such a call in
+  that wording: `exec_command`, `write_stdin`, `grep`, `glob`, `read_file`, `view_image`, the
+  `memory` and `web` entries and `skill` give `Invalid arguments: arguments are not valid JSON:
+  … .` with their usual guidance, and `apply_patch` gives `apply_patch verification failed:
+  invalid arguments: arguments are not valid JSON: …`. The tools ported from Codex handlers give
+  Codex's text: the collaboration tools, the MCP resource tools, `request_permissions`,
+  `update_plan` and `request_user_input` give `failed to parse function arguments: …`, after
+  `update_plan`'s Plan-mode refusal and `request_user_input`'s root-thread and mode refusals as in
+  Codex; the skills namespace tools give the parser's diagnostic alone.
+- **Not yet for Anthropic streams.** A streamed Anthropic tool input whose joined
+  `input_json_delta` fragments are not JSON still fails its response with `provider.behavior`
+  (`Anthropic streamed tool input is not valid JSON`), so such a run still fails under Anthropic.
+
+#### Coding product: reported before any approval
+
+The coding host turns on the new `RunConfig::with_unparsed_arguments_reported_before_approval`
+(also on `PermissionEngine`, read with `reports_unparsed_arguments_before_approval`), as Codex's
+handlers answer arguments they cannot parse before any approval. Such a call is then asked about
+by nobody — no PermissionRequest hook, no client approval request — while a `deny` rule or an
+action-class restriction still refuses it before PreToolUse. A question that prompts being off
+would have turned into a refusal (an `ask` rule, or a tool that asks) is skipped like any other,
+so the call is answered with its argument error rather than `tool.permission_denied`. This is a product choice; the option is off by default and SDK hosts
+keep the framework semantics above.
+
+Product hooks follow Codex's payloads. An ordinary function tool or MCP tool's PreToolUse receives
+the text as a string as its `tool_input`, and a rewrite into an object reaches the tool or MCP
+server as given. `exec_command` and `apply_patch` run no PreToolUse for such a call, even when
+the text reads as a patch. The hook bridge now recognises the patch tool by the selected tool
+rather than by its name, so a host function or dynamic tool that happens to be named
+`apply_patch` is hooked as the ordinary function it is: its own name without the `Write`/`Edit`
+aliases, its arguments as input, and rewrites handed back unchanged.
+
+#### Checkpoints and older builds
+
+`RUN_STATE_SCHEMA_VERSION` is now 20. Tool calls, handoff calls and approvals persist the text in
+a new `unparsed_arguments` field; records without it read as before, and a build that does not
+know it keeps it and writes it back unchanged. History that holds such calls stays readable and
+writable by 0.3.0, though 0.3.0 replays the call with `"null"` (Responses) or `"{}"` (Chat)
+arguments.
+
+A checkpoint still **waiting** on such a call is written so that 0.3.0 refuses it before calling
+anything, rather than handing the tool or handoff handler `null`:
+
+- An approval of such a call keeps its routing key in `unparsed_call_lookup_key` instead of
+  `lookup_key`. 0.3.0 refuses to approve it, or to resume one approved by a newer build, because
+  it lacks a routing identity. 0.3.0 can still reject it; the rejection runs no tool, but that
+  call's result is then missing from the tool results `tool_use_behavior` sees.
+- A pending handoff stores such a call with its text as the argument while the history keeps
+  `null`, so 0.3.0 refuses to load the checkpoint (`pending handoff call has no stored record`),
+  history included.
+
+These guards are needed because a `RunState` from a newer schema is still read rather than
+refused: unlike the reference SDK, which rejects a newer or unsupported schema version outright,
+this crate keeps unknown fields and continues. Let this build finish the turn that holds such a
+call before handing its checkpoint to an older one.
+
 ### `apply_patch` applies and writes as Codex does
 
 `ra_tools::apply_patch::ApplyPatchTool` now applies updates with Codex's matching and commits

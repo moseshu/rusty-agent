@@ -444,6 +444,11 @@ fn failure(tool: &str, method: &str, error: &Error) -> Option<ToolOutput> {
     if error.is_control_signal() {
         return None;
     }
+    // A call whose arguments were not JSON never reached the tool; Codex's resource handlers parse
+    // before anything else and answer it as below.
+    if let Some(reply) = crate::argument_error::unparsed_arguments_reply(error) {
+        return Some(ToolOutput::text(reply));
+    }
     let message = match error {
         Error::Tool {
             tool: source,

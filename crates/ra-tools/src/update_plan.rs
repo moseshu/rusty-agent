@@ -24,6 +24,9 @@ use serde_json::json;
 use crate::request_user_input::ModeKind;
 
 const TOOL_NAME: &str = "update_plan";
+/// Codex's refusal in Plan mode, given before the arguments are read.
+const PLAN_MODE_REFUSAL: &str =
+    "update_plan is a TODO/checklist tool and is not allowed in Plan mode";
 const DESCRIPTION: &str = "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n";
 
 /// Codex's `StepStatus`.
@@ -247,7 +250,7 @@ impl Tool for UpdatePlanTool {
             return Err(Error::tool(
                 ToolErrorKind::InvalidInput,
                 TOOL_NAME,
-                "update_plan is a TODO/checklist tool and is not allowed in Plan mode",
+                PLAN_MODE_REFUSAL,
             ));
         }
         let input: UpdatePlanInput =
@@ -269,6 +272,15 @@ impl Tool for UpdatePlanTool {
     ) -> Result<Option<ToolOutput>> {
         if error.is_control_signal() {
             return Ok(None);
+        }
+        // A call whose arguments were not JSON never reached the tool. Codex's handler refuses
+        // the tool in Plan mode before it reads the arguments, then answers as below.
+        if let Some(reply) = crate::argument_error::unparsed_arguments_reply(error) {
+            return Ok(Some(ToolOutput::text(if self.mode == ModeKind::Plan {
+                PLAN_MODE_REFUSAL.to_owned()
+            } else {
+                reply
+            })));
         }
         Ok(match error {
             Error::Tool { tool, message, .. } if tool == TOOL_NAME => {

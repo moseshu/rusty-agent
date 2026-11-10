@@ -5641,3 +5641,174 @@ async fn a_zero_turn_run_can_be_closed_by_an_explicit_handler_without_sampling()
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert!(result.new_items().is_empty());
 }
+
+/// A call whose argument text was not JSON reaches a tool with custom failure handling only as
+/// the framework's decode error; the tool reports it in its own words, the observation is marked
+/// as an error, and the run continues.
+#[tokio::test]
+async fn unparsed_arguments_are_reported_in_the_tool_own_words_and_the_run_continues() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tool: Arc<dyn Tool> =
+        Arc::new(ra_tools::read_file::ReadFileTool::rooted(workspace.path()).unwrap());
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![item(
+            "unparsed-call",
+            RunItemKind::ToolCall(ToolCall::unparsed(
+                CallId::new("call-1"),
+                "read_file",
+                "{bad",
+            )),
+        )]),
+        ModelResponse::new(vec![message("done", "done")]),
+    ]);
+    let result = Runner::run(request(vec![tool], &model, &CancelScope::root()))
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_text(), "done");
+    let output = result
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-1" => {
+                Some(output)
+            }
+            _ => None,
+        })
+        .expect("the call is answered");
+    assert!(output.is_error());
+    let text = serde_json::to_string(output.output()).unwrap();
+    assert!(
+        text.contains(
+            "Invalid arguments: arguments are not valid JSON: key must be a string at line 1 \
+             column 2."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Send `path`, and `offset` and `limit` only for text."),
+        "{text}"
+    );
+}
+
+/// A tool that words its own failures and whose custom-data extractor always fails.
+struct FailingExtractorTool {
+    inner: ScriptedTool,
+    extractions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for FailingExtractorTool {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_failure_handling(ra_core::tool::ToolFailureHandling::Custom)
+    }
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.inner.call(context).await
+    }
+    async fn handle_failure(&self, _: &ToolContext<'_>, _: &Error) -> Result<Option<ToolOutput>> {
+        Ok(Some(ToolOutput::text("the arguments could not be read")))
+    }
+    async fn extract_custom_data(
+        &self,
+        _: &mut ra_core::tool::FunctionToolCustomDataContext<'_>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        self.extractions.fetch_add(1, Ordering::SeqCst);
+        Err(Error::caller("extractor failed"))
+    }
+}
+
+/// The answer to a call whose arguments were not JSON is committed before the extractor runs; when
+/// the extractor then fails, the checkpoint keeps that answer marked as an error, as the answer
+/// the call would have returned is.
+#[tokio::test]
+async fn unparsed_arguments_answer_is_checkpointed_as_an_error_when_extraction_fails() {
+    let extractions = Arc::new(AtomicUsize::new(0));
+    let inner = ScriptedTool::new("worded");
+    let calls = Arc::clone(&inner.calls);
+    let tool: Arc<dyn Tool> = Arc::new(FailingExtractorTool {
+        inner,
+        extractions: Arc::clone(&extractions),
+    });
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![item(
+        "unparsed-call",
+        RunItemKind::ToolCall(ToolCall::unparsed(CallId::new("call-1"), "worded", "{bad")),
+    )])]);
+    let failed = Runner::run(request(vec![tool], &model, &CancelScope::root()))
+        .await
+        .unwrap_err();
+    assert!(failed.to_string().contains("extractor failed"), "{failed}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(extractions.load(Ordering::SeqCst), 1);
+
+    let state: RunState =
+        serde_json::from_value(serde_json::to_value(failed.run_state().unwrap()).unwrap()).unwrap();
+    let answer = state
+        .generated_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-1" => {
+                Some(output)
+            }
+            _ => None,
+        })
+        .expect("the committed answer is checkpointed");
+    assert!(answer.is_error());
+    assert!(
+        serde_json::to_string(answer.output())
+            .unwrap()
+            .contains("the arguments could not be read")
+    );
+}
+
+/// A streamed call and its terminal record must agree on unparsed text as well as on the parsed
+/// value: `{bad` that was not JSON and the JSON string `"{bad"`, or `null` and text that was not
+/// JSON, are different calls with equal or similar parsed values, and either swap fails the turn.
+#[tokio::test]
+async fn a_terminal_response_that_swaps_unparsed_text_for_a_value_fails_the_turn() {
+    let unparsed = || {
+        item(
+            "c-1",
+            RunItemKind::ToolCall(ToolCall::unparsed(
+                CallId::new("call-1"),
+                "write_file",
+                "{bad",
+            )),
+        )
+    };
+    let string = || tool_call_with_arguments("c-1", "call-1", "write_file", json!("{bad"));
+    let null = || tool_call_with_arguments("c-1", "call-1", "write_file", Value::Null);
+    for (label, narrated, terminal) in [
+        ("text, then the string", unparsed(), string()),
+        ("the string, then text", string(), unparsed()),
+        ("text, then null", unparsed(), null()),
+        ("null, then text", null(), unparsed()),
+    ] {
+        let tool = Arc::new(ScriptedTool::new("write_file"));
+        let model = StreamingModel::new(vec![narrated_tool_call_turn(
+            narrated,
+            ModelResponse::new(vec![terminal]),
+        )]);
+        let error = Runner::run(RunRequest::new(
+            agent(vec![tool as Arc<dyn Tool>]),
+            Arc::new(SingleModelResolver {
+                model: Arc::clone(&model) as Arc<dyn Model>,
+            }),
+            RunId::new("run-loop"),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("改文件"))],
+        ))
+        .await
+        .expect_err(label);
+        assert_eq!(error.code(), "provider.behavior", "{label}: {error}");
+        assert!(
+            error.to_string().contains("changed streamed function call"),
+            "{label}: {error}"
+        );
+    }
+}

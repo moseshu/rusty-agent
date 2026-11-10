@@ -97,14 +97,22 @@ async fn lower_item(
                 ));
             }
             let arguments = crate::custom_tools::function_arguments(call)?;
-            accumulator.push_tool_call(call.call_id(), call.name(), &arguments)
+            accumulator.push_tool_call(call.call_id(), call.name(), &arguments, None)
         }
-        ModelInputItem::ToolCall(call) => {
-            accumulator.push_tool_call(call.call_id(), call.name(), call.arguments())
-        }
+        ModelInputItem::ToolCall(call) => accumulator.push_tool_call(
+            call.call_id(),
+            call.name(),
+            call.arguments(),
+            call.unparsed_arguments(),
+        ),
         ModelInputItem::HandoffCall(call) => {
             let name = handoff_tool_name(call, request)?;
-            accumulator.push_tool_call(call.call_id(), &name, call.arguments())
+            accumulator.push_tool_call(
+                call.call_id(),
+                &name,
+                call.arguments(),
+                call.unparsed_arguments(),
+            )
         }
         ModelInputItem::ToolCallOutput(output) => {
             let content = lower_tool_output(output.output(), codec).await?;
@@ -543,10 +551,19 @@ impl MessageAccumulator {
         self.push_message(Value::Object(message));
     }
 
-    fn push_tool_call(&mut self, call_id: &CallId, name: &str, arguments: &Value) -> Result<()> {
+    fn push_tool_call(
+        &mut self,
+        call_id: &CallId,
+        name: &str,
+        arguments: &Value,
+        unparsed: Option<&str>,
+    ) -> Result<()> {
         // The wire field is a JSON *string*, and an absent argument object is `{}` rather than
-        // `null`: a model asked to re-read its own call sees the empty object it produced.
-        let arguments = if arguments.is_null() {
+        // `null`: a model asked to re-read its own call sees the empty object it produced. Text
+        // that was not JSON is handed back as the model wrote it.
+        let arguments = if let Some(text) = unparsed {
+            text.to_owned()
+        } else if arguments.is_null() {
             "{}".to_owned()
         } else {
             serde_json::to_string(arguments).map_err(|error| {
@@ -830,14 +847,13 @@ fn lift_tool_call(
         .pointer("/function/arguments")
         .and_then(Value::as_str)
         .unwrap_or("{}");
-    tool_call_item(
+    Ok(Some(tool_call_item(
         CallId::new(call_id),
         name,
         arguments,
         handoffs,
         custom_tools,
-    )
-    .map(Some)
+    )))
 }
 
 /// Turns a wire tool call into the item kind it denotes, resolving handoffs by advertised name.
@@ -852,34 +868,32 @@ pub(crate) fn tool_call_item(
     arguments: &str,
     handoffs: &[ModelHandoffDefinition],
     custom_tools: &BTreeSet<String>,
-) -> Result<RunItemKind> {
-    let arguments = if arguments.trim().is_empty() {
-        Value::Object(Map::new())
-    } else {
-        serde_json::from_str(arguments).map_err(|error| {
-            behavior_error(format!(
-                "OpenAI function `{name}` returned invalid JSON arguments"
-            ))
-            .with_source(error)
-        })?
-    };
+) -> RunItemKind {
+    let text = arguments;
+    let parsed = crate::openai::function_arguments(text);
+    // Text that is not JSON travels as the call's own record of it, with `null` arguments.
+    let unparsed = parsed.is_none().then_some(text);
+    let arguments = parsed.unwrap_or(Value::Null);
     if custom_tools.contains(name)
         && let Some(input) = arguments
             .get(crate::custom_tools::FUNCTION_INPUT)
             .and_then(Value::as_str)
     {
-        return Ok(RunItemKind::ToolCall(ToolCall::custom(
-            call_id, name, input,
-        )));
+        return RunItemKind::ToolCall(ToolCall::custom(call_id, name, input));
     }
     match handoffs.iter().find(|handoff| handoff.name() == name) {
-        Some(handoff) => Ok(RunItemKind::HandoffCall(
-            HandoffCall::new(call_id, handoff.target_agent().clone(), arguments)
-                .with_tool_name(name),
-        )),
-        None => Ok(RunItemKind::ToolCall(ToolCall::new(
-            call_id, name, arguments,
-        ))),
+        Some(handoff) => {
+            let call = HandoffCall::new(call_id, handoff.target_agent().clone(), arguments)
+                .with_tool_name(name);
+            RunItemKind::HandoffCall(match unparsed {
+                Some(text) => call.with_unparsed_arguments(text),
+                None => call,
+            })
+        }
+        None => RunItemKind::ToolCall(match unparsed {
+            Some(text) => ToolCall::unparsed(call_id, name, text),
+            None => ToolCall::new(call_id, name, arguments),
+        }),
     }
 }
 

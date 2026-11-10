@@ -717,8 +717,14 @@ impl ProductHookRuntime {
             HookEvent::PreToolUse(call) => {
                 // A patch that cannot be parsed fails before any hook, as Codex resolves a patch's
                 // environment, and parses it, before its pre-tool hooks: the call then fails at
-                // decoding with `apply_patch verification failed`.
-                if exec_kind(&call) == Some(ExecKind::Stdin) || is_unparsable_patch(&call) {
+                // decoding with `apply_patch verification failed`. A command whose argument text
+                // is not JSON has no hook input either, as Codex's exec handler builds its payload
+                // only from arguments it could parse.
+                if exec_kind(&call) == Some(ExecKind::Stdin)
+                    || is_unparsable_patch(&call)
+                    || (exec_kind(&call) == Some(ExecKind::Command)
+                        && call.has_unparsed_arguments())
+                {
                     return HookDecision::Continue;
                 }
                 let tool = HookToolName::for_call(&call);
@@ -1221,6 +1227,19 @@ fn exec_kind(call: &ToolHookData<'_>) -> Option<ExecKind> {
     None
 }
 
+/// Whether `call` selected the patch tool, as Codex chooses the hook payload by the selected
+/// handler. A host may register an ordinary function, or an MCP tool, under the same name; those
+/// are hooked as the functions they are. Without the selected executable, only a bare
+/// `apply_patch` name can mean the patch tool.
+fn is_patch_tool(call: &ToolHookData<'_>) -> bool {
+    if let Some(tool) = call.tool() {
+        return (tool as &dyn std::any::Any)
+            .downcast_ref::<ra_tools::apply_patch::ApplyPatchTool>()
+            .is_some();
+    }
+    call.origin().namespace().is_none() && call.origin().name() == "apply_patch"
+}
+
 /// The source's hook-facing tool identity: the serialized name and extra matcher inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HookToolName {
@@ -1244,6 +1263,13 @@ impl HookToolName {
                 matcher_aliases: Vec::new(),
             };
         }
+        // `Write` and `Edit` select the same handlers for edit-oriented hook configurations.
+        if is_patch_tool(call) {
+            return Self {
+                name: "apply_patch".to_owned(),
+                matcher_aliases: vec!["Write".to_owned(), "Edit".to_owned()],
+            };
+        }
         let origin = call.origin();
         match origin.name() {
             // Shell-like tools keep the historical hook name.
@@ -1255,11 +1281,6 @@ impl HookToolName {
                     matcher_aliases: Vec::new(),
                 }
             }
-            // `Write` and `Edit` select the same handlers for edit-oriented hook configurations.
-            "apply_patch" if origin.namespace().is_none() => Self {
-                name: "apply_patch".to_owned(),
-                matcher_aliases: vec!["Write".to_owned(), "Edit".to_owned()],
-            },
             "spawn_agent" if origin.namespace().is_none() => Self {
                 name: "spawn_agent".to_owned(),
                 matcher_aliases: vec!["Agent".to_owned()],
@@ -1351,12 +1372,14 @@ impl ContextDelivery {
 
 /// Whether `call` is an `apply_patch` call whose patch text cannot be read or parsed.
 fn is_unparsable_patch(call: &ToolHookData<'_>) -> bool {
-    // An MCP tool that happens to be named `apply_patch` is not the patch tool.
-    if call.tool().and_then(crate::mcp::hook_tool_name).is_some()
-        || call.origin().namespace().is_some()
-        || call.origin().name() != "apply_patch"
-    {
+    // Another tool that happens to be named `apply_patch` is not the patch tool.
+    if !is_patch_tool(call) {
         return false;
+    }
+    // Argument text that was not JSON is never a patch, even when it reads as one: Codex gives its
+    // hooks a patch only from freeform input, and such a call is a function call.
+    if call.has_unparsed_arguments() {
+        return true;
     }
     let patch = match call.arguments() {
         Value::String(patch) => Some(patch.as_str()),
@@ -1372,7 +1395,7 @@ fn hook_input(call: &ToolHookData<'_>) -> Value {
     if exec_kind(call) == Some(ExecKind::Command) {
         return serde_json::json!({"command": call.arguments().get("cmd").cloned().unwrap_or(Value::Null)});
     }
-    if call.origin().namespace().is_none() && call.origin().name() == "apply_patch" {
+    if is_patch_tool(call) {
         return serde_json::json!({"command": call.arguments().as_str().map(str::to_owned).or_else(|| call.arguments().get("patch").and_then(Value::as_str).map(str::to_owned))});
     }
     call.arguments().clone()
@@ -1423,14 +1446,13 @@ fn native_input(call: &ToolHookData<'_>, input: Value) -> std::result::Result<Va
     if call.tool().and_then(crate::mcp::hook_tool_name).is_some() {
         return Ok(input);
     }
-    if call.origin().namespace().is_none()
-        && (exec_kind(call) == Some(ExecKind::Command) || call.origin().name() == "apply_patch")
-    {
+    let patch = is_patch_tool(call);
+    if patch || exec_kind(call) == Some(ExecKind::Command) {
         let command = input
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| "hook input rewrite requires a string command".to_owned())?;
-        if call.origin().name() == "apply_patch" {
+        if patch {
             return match call.arguments() {
                 Value::String(_) => Ok(Value::String(command.to_owned())),
                 Value::Object(_) => {
