@@ -676,11 +676,14 @@ fn insert_number(body: &mut Map<String, Value>, name: &str, value: Option<f64>) 
     }
 }
 
-/// A replayed call's `tool_use.input`, which must be an object: a call whose argument text was not
-/// JSON — made against another provider — is replayed as `{}`, its failure already recorded in the
-/// paired result.
+/// A replayed call's `tool_use.input`, which must be an object.
+///
+/// A call whose argument text was not JSON, or whose arguments are JSON but not an object (`null`,
+/// an array, a string — from a streamed input or another provider), is sent as `{}`. Only the
+/// request changes: the call in history keeps its own arguments, and its failure is already
+/// recorded in the paired result.
 fn tool_use_input(arguments: &Value, unparsed: Option<&str>) -> Value {
-    if unparsed.is_some() {
+    if unparsed.is_some() || !arguments.is_object() {
         return json!({});
     }
     arguments.clone()

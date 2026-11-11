@@ -52,7 +52,9 @@ with its text and answered as a failure when it runs; the run continues.
   directly must check `unparsed_arguments()`**: a `null` there may be text that was not JSON.
 - **Replay.** Both OpenAI adapters send the text back exactly as the model wrote it. Anthropic,
   whose `tool_use.input` must be an object, receives `{}` for such a call; its paired
-  `tool_result` carries `is_error: true`.
+  `tool_result` carries `is_error: true`. Anthropic also receives `{}` for a tool or handoff call
+  whose arguments are JSON but not an object (`null`, an array, a string, a number), which were
+  sent as they were and refused by the API; the call in history keeps its arguments.
 - **Dispatch, by default.** The call keeps the framework's approval semantics. PreToolUse runs and
   sees the text as a JSON string, with `ToolHookData::has_unparsed_arguments()` set. A tool that
   would ask (`Always`, `Dynamic`, or a fixed `ask` rule) is asked about without calling its

@@ -408,6 +408,84 @@ async fn anthropic_replay_sends_an_empty_input_beside_the_error_result() {
     }
 }
 
+/// Arguments that are JSON but not an object — `null`, an array, a string, a number, from a
+/// streamed input or another provider — are sent to Anthropic as `{}`, since `tool_use.input` must
+/// be an object; an object is sent as it is. Only the request changes, for a tool call and for a
+/// handoff call alike, and the tool call's paired result keeps its error flag.
+#[tokio::test]
+async fn anthropic_replay_sends_non_object_arguments_as_an_empty_input() {
+    for handoff in [false, true] {
+        for (arguments, expected) in [
+            (Value::Null, json!({})),
+            (json!([1]), json!({})),
+            (json!("s"), json!({})),
+            (json!(3), json!({})),
+            (json!({"path": "a.txt"}), json!({"path": "a.txt"})),
+        ] {
+            let label = format!("handoff={handoff} arguments={arguments}");
+            let (call, output) = if handoff {
+                (
+                    ModelInputItem::HandoffCall(
+                        HandoffCall::new(
+                            CallId::new("call-1"),
+                            AgentId::new("reviewer"),
+                            arguments.clone(),
+                        )
+                        .with_tool_name("transfer_to_reviewer"),
+                    ),
+                    ModelInputItem::HandoffOutput(HandoffOutput::new(
+                        CallId::new("call-1"),
+                        AgentId::new("worker"),
+                        AgentId::new("reviewer"),
+                    )),
+                )
+            } else {
+                (
+                    ModelInputItem::ToolCall(ToolCall::new(
+                        CallId::new("call-1"),
+                        "echo",
+                        arguments.clone(),
+                    )),
+                    ModelInputItem::ToolCallOutput(
+                        ToolCallOutput::new(CallId::new("call-1"), json!("failed"))
+                            .with_error(true),
+                    ),
+                )
+            };
+            let server = MockServer::start().await;
+            let model = anthropic(&server).await;
+            model
+                .get_response(with_handoff(request(vec![
+                    ModelInputItem::Message(Message::user("call it")),
+                    call,
+                    output,
+                ])))
+                .await
+                .unwrap();
+            let body = sent_body(&server).await;
+            let blocks: Vec<&Value> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .collect();
+            let tool_use = blocks
+                .iter()
+                .find(|block| block["type"] == "tool_use")
+                .unwrap();
+            assert_eq!(tool_use["input"], expected, "{label}");
+            if !handoff {
+                let result = blocks
+                    .iter()
+                    .find(|block| block["type"] == "tool_result")
+                    .unwrap();
+                assert_eq!(result["is_error"], json!(true), "{label}");
+            }
+        }
+    }
+}
+
 struct Echo {
     origin: ToolOrigin,
     schema: ToolSchema,
