@@ -112,6 +112,7 @@ pub use self::plugin_management::{
 };
 pub use self::plugins::{PluginAuthPolicy, PluginInstallPolicy, Product};
 pub use self::streaming::*;
+pub use self::thread::{ThreadCompactStartParams, ThreadCompactStartResponse};
 pub(crate) use self::thread_lifecycle::ThreadPolicyFields;
 pub use self::thread_management::*;
 pub use self::{
@@ -522,6 +523,15 @@ pub enum ClientRequest {
         /// The thread and the page.
         params: ThreadItemsListParams,
     },
+    /// Starts a standalone compaction turn.
+    #[serde(rename = "thread/compact/start")]
+    ThreadCompactStart {
+        /// Request ID.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Thread to compact.
+        params: ThreadCompactStartParams,
+    },
     /// Stops every command a thread's tools left running. Experimental, as in Codex.
     #[serde(rename = "thread/backgroundTerminals/clean")]
     ThreadBackgroundTerminalsClean {
@@ -645,6 +655,7 @@ impl ClientRequest {
             | Self::ThreadUnsubscribe { request_id, .. }
             | Self::ThreadTurnsList { request_id, .. }
             | Self::ThreadItemsList { request_id, .. }
+            | Self::ThreadCompactStart { request_id, .. }
             | Self::ThreadBackgroundTerminalsClean { request_id, .. }
             | Self::ThreadBackgroundTerminalsList { request_id, .. }
             | Self::ThreadBackgroundTerminalsTerminate { request_id, .. }
@@ -697,6 +708,7 @@ impl ClientRequest {
             Self::ThreadUnsubscribe { .. } => "thread/unsubscribe",
             Self::ThreadTurnsList { .. } => "thread/turns/list",
             Self::ThreadItemsList { .. } => "thread/items/list",
+            Self::ThreadCompactStart { .. } => "thread/compact/start",
             Self::ThreadBackgroundTerminalsClean { .. } => "thread/backgroundTerminals/clean",
             Self::ThreadBackgroundTerminalsList { .. } => "thread/backgroundTerminals/list",
             Self::ThreadBackgroundTerminalsTerminate { .. } => {
@@ -749,6 +761,7 @@ impl ClientRequest {
             | Self::ThreadUnsubscribe { .. }
             | Self::ThreadTurnsList { .. }
             | Self::ThreadItemsList { .. }
+            | Self::ThreadCompactStart { .. }
             | Self::TurnInterrupt { .. } => None,
             Self::ThreadMetadataUpdate { params, .. } => params.experimental_reason(),
             Self::ThreadList { params, .. } => params.experimental_reason(),
@@ -834,6 +847,7 @@ impl ClientRequest {
             Self::ThreadRead { params, .. } => Some(params.thread_id()),
             Self::ThreadReadStateUpdate { params, .. } => Some(params.thread_id.as_str()),
             Self::ThreadUnsubscribe { params, .. } => Some(params.thread_id()),
+            Self::ThreadCompactStart { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsClean { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsList { params, .. } => Some(params.thread_id()),
             Self::ThreadBackgroundTerminalsTerminate { params, .. } => Some(params.thread_id()),

@@ -411,7 +411,9 @@ impl MessageProcessor {
             | ClientRequest::TurnSettingsUpdate { .. } => {
                 (Some(self.turn_admission.admit()?), false)
             }
-            ClientRequest::TurnStart { .. } | ClientRequest::TurnSteer { .. } => {
+            ClientRequest::TurnStart { .. }
+            | ClientRequest::TurnSteer { .. }
+            | ClientRequest::ThreadCompactStart { .. } => {
                 (Some(self.turn_admission.admit()?), true)
             }
             _ => (None, false),
@@ -639,6 +641,10 @@ impl MessageProcessor {
             }
             ClientRequest::ThreadItemsList { params, .. } => {
                 let result = ThreadRequestProcessor::thread_items_list(&params);
+                self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::ThreadCompactStart { params, .. } => {
+                let result = self.thread_processor.thread_compact_start(&params).await;
                 self.finish_turn_method(request_id, result).await;
             }
             ClientRequest::ThreadBackgroundTerminalsClean { params, .. } => {

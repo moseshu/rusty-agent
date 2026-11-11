@@ -18,7 +18,7 @@ use ra_core::{
     item::{AgentId, ItemId, Message, ModelInputItem, OutputPhase, RunItem, RunItemKind},
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRecorder, RolloutRunStarted},
+        rollout::{RolloutCompacted, RolloutItem, RolloutRecorder, RolloutRunStarted},
     },
     state::RunId,
 };
@@ -85,6 +85,7 @@ async fn writes_that_fail_on_an_open_file_are_retried_once_each() {
     }
     a_record_that_did_not_land_is_kept_for_the_reopened_file().await;
     a_run_start_that_landed_although_its_write_failed_is_recorded_once().await;
+    a_failed_compaction_is_not_written_by_a_later_flush().await;
 }
 
 /// As Codex's writer state keeps the unwritten suffix, a record whose write failed stays queued
@@ -162,4 +163,24 @@ async fn a_run_start_that_landed_although_its_write_failed_is_recorded_once() {
             said("a-1", "answer 1").to_model_input().unwrap()
         ]
     );
+}
+
+async fn a_failed_compaction_is_not_written_by_a_later_flush() {
+    let path = temp_rollout("failed_compaction");
+    let (recorder, _) = recorder_with_a_record(&path).await;
+    let replacement = RolloutCompacted::new(
+        RunId::new("compaction"),
+        ItemId::new("compact"),
+        vec![user("replacement")],
+    );
+
+    set_file_size_limit(file_len(&path));
+    let failed = recorder.commit_compaction(replacement).await;
+    set_file_size_limit(libc::RLIM_INFINITY);
+    assert!(failed.is_err());
+    recorder.flush().await.unwrap();
+
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    let history = reconstruct_history(&records).unwrap().into_history();
+    assert_eq!(history, [said("a-0", "earlier").to_model_input().unwrap()]);
 }

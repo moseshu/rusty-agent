@@ -344,6 +344,7 @@ impl ThreadHistoryBuilder {
     /// Tracks an incomplete display item without completing it or adding a rollout record.
     pub(crate) fn item_started(&mut self, turn_id: &str, item: &RunItem) -> Vec<ItemChange> {
         let projected = match item.kind() {
+            RunItemKind::Compaction(_) => Some(ThreadItem::context_compaction(item.id().as_str())),
             RunItemKind::Message(message) if message.role() == MessageRole::Assistant => {
                 Some(ThreadItem::agent_message(
                     item.id().as_str(),
@@ -611,6 +612,11 @@ impl ThreadHistoryBuilder {
                     self.current_turn = Some(PendingTurn::new(format!("rollout-{index}")));
                 }
                 self.item(None, &item, tool_items);
+            }
+            RolloutPayload::Compacted(compacted) => {
+                if let Some(turn) = self.turn_for(Some(compacted.run_id().as_str())) {
+                    turn.upsert(ThreadItem::context_compaction(compacted.item_id().as_str()));
+                }
             }
             RolloutPayload::RunEnded(ended) => self.run_ended(&ended, at_ms),
             RolloutPayload::Event(event) => {

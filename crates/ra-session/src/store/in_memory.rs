@@ -11,7 +11,9 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore},
+        rollout::{
+            RolloutCompacted, RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore,
+        },
     },
 };
 
@@ -294,6 +296,14 @@ impl RolloutRecorder for InMemoryRecorder {
         if let Err(error) = self.append(item) {
             state.failed.get_or_insert(error);
         }
+    }
+
+    async fn commit_compaction(&self, compacted: RolloutCompacted) -> Result<()> {
+        let mut state = self.state();
+        if let Some(error) = state.failed.take() {
+            return Err(error);
+        }
+        self.append(RolloutItem::Compacted(compacted))
     }
 
     async fn flush(&self) -> Result<()> {

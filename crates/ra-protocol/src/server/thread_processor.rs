@@ -43,7 +43,8 @@ use super::{
         SortDirection, Thread, ThreadBackgroundTerminal, ThreadBackgroundTerminalsCleanParams,
         ThreadBackgroundTerminalsCleanResponse, ThreadBackgroundTerminalsListParams,
         ThreadBackgroundTerminalsListResponse, ThreadBackgroundTerminalsTerminateParams,
-        ThreadBackgroundTerminalsTerminateResponse, ThreadItemsListCursor, ThreadItemsListParams,
+        ThreadBackgroundTerminalsTerminateResponse, ThreadCompactStartParams,
+        ThreadCompactStartResponse, ThreadItemsListCursor, ThreadItemsListParams,
         ThreadResumeInitialTurnsPageParams, ThreadStatus, ThreadTurnsListParams,
         ThreadTurnsListResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
         ThreadUnsubscribeStatus, Turn, TurnItemsView, TurnStatus, TurnsPage,
@@ -226,6 +227,22 @@ impl ThreadRequestProcessor {
         Err(JsonRpcErrorObject::invalid_request(format!(
             "thread {session_id} is not materialized yet; thread/turns/list is unavailable before first user message"
         )))
+    }
+
+    /// `thread/compact/start`: submits a standalone compaction turn.
+    pub(crate) async fn thread_compact_start(
+        &self,
+        params: &ThreadCompactStartParams,
+    ) -> TurnMethodResult {
+        let thread = self.load_thread(params.thread_id())?;
+        let _settings_guard = thread.settings_lock.lock().await;
+        if let Some(product) = &thread.product {
+            product.activate_turn().await;
+        }
+        thread.compact().map_err(|error| {
+            JsonRpcErrorObject::internal_error(format!("failed to start compaction: {error}"))
+        })?;
+        response(ThreadCompactStartResponse::default())
     }
 
     /// `thread/backgroundTerminals/clean`: Codex's `thread_background_terminals_clean`.

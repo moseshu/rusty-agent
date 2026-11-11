@@ -12,16 +12,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use ra_core::hook::CompactTrigger;
 use ra_core::{
+    agent::control::InterAgentMessageKind,
     capability::{
         Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest,
         ContextProcessorResult, ContextSummarizer, ContextSummaryRequest,
     },
     error::{Error, Result},
     item::{
-        ArchiveRef, CallId, Compaction, ItemId, MessageRole, ModelInputItem, ModelResponse,
-        RunItem, RunItemKind,
+        ArchiveRef, CallId, Compaction, ContentBlock, ItemId, Message, MessageRole, ModelInputItem,
+        ModelResponse, RunItem, RunItemKind,
     },
     model::ModelOutputSchema,
+    sandbox::token_truncation::{TruncationPolicy, approx_token_count, truncate_text},
+    session::contextual::is_contextual_user_message,
 };
 use serde_json::{Value, json};
 
@@ -497,6 +500,9 @@ impl ContextProcessor for CompactionCapability {
         request: ContextProcessorRequest,
         summarizer: &dyn ContextSummarizer,
     ) -> Result<ContextProcessorResult> {
+        if request.force_compaction() {
+            return Self::compact_thread(request, summarizer).await;
+        }
         let Some(limits) = self.limits_for_model(request.model_name())? else {
             tracing::debug!(
                 model = request.model_name().unwrap_or("<unresolved>"),
@@ -565,6 +571,29 @@ impl ContextProcessor for CompactionCapability {
 }
 
 impl CompactionCapability {
+    async fn compact_thread(
+        request: ContextProcessorRequest,
+        summarizer: &dyn ContextSummarizer,
+    ) -> Result<ContextProcessorResult> {
+        let response = summarizer
+            .summarize(
+                ContextSummaryRequest::new(request.input().to_vec(), summary_instruction(&[]))
+                    .with_output_schema(summary_output_schema()),
+            )
+            .await?;
+        let summary = parse_summary(response.text(), Vec::new())?;
+        let compaction = Compaction::new(summary.render(), Vec::new());
+        let record = RunItem::new(
+            request.record_id().clone(),
+            RunItemKind::Compaction(compaction),
+        );
+        let mut history = retained_thread_messages(request.history());
+        history.extend(record.to_model_input());
+        Ok(ContextProcessorResult::new(history)
+            .with_generated_items(vec![record])
+            .with_model_responses(vec![response.response().clone()]))
+    }
+
     /// Asks for a summary and projects the history around it.
     ///
     /// `None` means the summary could not be obtained or understood. Compaction then declines
@@ -644,14 +673,71 @@ fn compacted_history_view(history: &[RunItem]) -> Vec<ModelInputItem> {
         .collect()
 }
 
+/// Retains the newest actual user messages within Codex's compaction budget.
+fn retained_thread_messages(history: &[RunItem]) -> Vec<ModelInputItem> {
+    const USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+    let mut remaining = USER_MESSAGE_MAX_TOKENS;
+    let mut retained = Vec::new();
+    for item in history.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let RunItemKind::Message(message) = item.kind() else {
+            continue;
+        };
+        if message.role() != MessageRole::User
+            || is_contextual_user_message(message)
+            || InterAgentMessageKind::of(message).is_some()
+        {
+            continue;
+        }
+        let text = message.text_content();
+        let tokens = approx_token_count(&text);
+        let retained_message = if tokens > remaining {
+            Message::user(truncate_text(
+                &text,
+                TruncationPolicy::tokens(i64::try_from(remaining).unwrap_or(i64::MAX)),
+            ))
+        } else if message
+            .content()
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text(_)))
+        {
+            message.clone()
+        } else {
+            let text_parts: Vec<_> = message
+                .content()
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Text(_)))
+                .cloned()
+                .collect();
+            if text_parts.is_empty() {
+                Message::user("")
+            } else {
+                Message::new(MessageRole::User, text_parts)
+            }
+        };
+        retained.push(ModelInputItem::Message(retained_message));
+        remaining = remaining.saturating_sub(tokens);
+    }
+    retained.reverse();
+    retained
+}
+
 fn summary_instruction(reasons: &[CompactionReason]) -> String {
     let reasons = reasons
         .iter()
         .map(|reason| reason.label())
         .collect::<Vec<_>>()
         .join(", ");
+    let reason = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" The context reached these limits: {reasons}.")
+    };
     format!(
-        "Summarize the conversation context for continued work. The context reached these limits: {reasons}. Return only one JSON object with these required non-empty string fields: primary_request_and_intent, key_technical_concepts, files_and_code_sections, errors_and_fixes, problem_solving, pending_tasks, current_work, optional_next_step. Do not include user_messages: the runtime preserves those verbatim."
+        "Summarize the conversation context for continued work.{reason} Return only one JSON object with these required non-empty string fields: primary_request_and_intent, key_technical_concepts, files_and_code_sections, errors_and_fixes, problem_solving, pending_tasks, current_work, optional_next_step. Do not include user_messages: the runtime preserves those verbatim."
     )
 }
 

@@ -662,7 +662,7 @@ impl fmt::Debug for SandboxBinding {
 /// enclosing capability, which is why this is a separate contract rather than a method there.
 #[async_trait]
 pub trait ContextProcessor: Send + Sync {
-    /// Transforms the context before the ordinary model request is sent.
+    /// Transforms context before a model request or for a standalone compaction.
     async fn process_context(
         &self,
         request: ContextProcessorRequest,
@@ -670,7 +670,7 @@ pub trait ContextProcessor: Send + Sync {
     ) -> Result<ContextProcessorResult>;
 }
 
-/// Facts a context processor needs for one pending model request.
+/// Facts a context processor needs for one processing pass.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct ContextProcessorRequest {
@@ -683,6 +683,7 @@ pub struct ContextProcessorRequest {
     suffix: Vec<ModelInputItem>,
     input: Vec<ModelInputItem>,
     user_hooks: Option<Arc<dyn UserHookDispatcher>>,
+    force_compaction: bool,
 }
 
 impl fmt::Debug for ContextProcessorRequest {
@@ -696,6 +697,7 @@ impl fmt::Debug for ContextProcessorRequest {
             .field("history", &self.history)
             .field("suffix", &self.suffix)
             .field("input", &self.input)
+            .field("force_compaction", &self.force_compaction)
             .field("user_hooks", &self.user_hooks.is_some())
             .finish()
     }
@@ -725,7 +727,21 @@ impl ContextProcessorRequest {
             suffix,
             input,
             user_hooks: None,
+            force_compaction: false,
         }
+    }
+
+    /// Requests compaction regardless of automatic trigger thresholds.
+    #[must_use]
+    pub const fn with_force_compaction(mut self, force: bool) -> Self {
+        self.force_compaction = force;
+        self
+    }
+
+    /// Whether compaction should proceed without checking the automatic threshold.
+    #[must_use]
+    pub const fn force_compaction(&self) -> bool {
+        self.force_compaction
     }
 
     /// Attaches the runner's existing host hook dispatcher without a dependency on its runtime.

@@ -101,6 +101,7 @@ use tracing::{Instrument, info_span, warn};
 mod entry;
 mod grouping;
 mod live_settings;
+pub(crate) mod manual_compaction;
 mod output;
 mod pending_input;
 mod prompt_cache_key;
@@ -6139,6 +6140,7 @@ async fn process_context_processors(
             run_cancel: context.cancel.clone(),
             turn_scope: turn_scope.clone(),
             stopped_after_compaction: std::sync::atomic::AtomicBool::new(false),
+            session_start_on_stop: Some(ra_core::hook::SessionStartSource::Compact),
         })
     });
 
@@ -6309,6 +6311,7 @@ struct CompactionHookDispatcher {
     /// The scope the hooks are bound to, which every stop cancels.
     turn_scope: CancelScope,
     stopped_after_compaction: std::sync::atomic::AtomicBool,
+    session_start_on_stop: Option<ra_core::hook::SessionStartSource>,
 }
 
 impl CompactionHookDispatcher {
@@ -6357,7 +6360,7 @@ impl ra_core::hook::UserHookDispatcher for CompactionHookDispatcher {
                     // this answers normally; context processing ends the run once it is recorded.
                     // As in Codex, the context re-established after compaction waits for the next
                     // turn.
-                    self.stop(Some(ra_core::hook::SessionStartSource::Compact));
+                    self.stop(self.session_start_on_stop);
                     self.stopped_after_compaction
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -6499,6 +6502,7 @@ struct RunnerContextSummarizer<'a> {
     model: &'a Arc<dyn Model>,
     template: &'a ModelRequest,
     cancel: &'a CancelScope,
+    record_usage: Option<(&'a dyn RolloutRecorder, &'a RunId)>,
 }
 
 impl<'a> RunnerContextSummarizer<'a> {
@@ -6507,6 +6511,7 @@ impl<'a> RunnerContextSummarizer<'a> {
             model: prepared.model(),
             template: prepared.request(),
             cancel,
+            record_usage: None,
         }
     }
 }
@@ -6539,6 +6544,14 @@ impl ContextSummarizer for RunnerContextSummarizer<'_> {
             .cancel
             .run(self.model.get_response(model_request))
             .await??;
+        if let Some((recorder, run_id)) = self.record_usage
+            && response.usage().requests() > 0
+        {
+            recorder.record(RolloutItem::ModelUsage(RolloutModelUsage::new(
+                run_id.clone(),
+                response.usage().clone(),
+            )));
+        }
         let text = response
             .output()
             .iter()

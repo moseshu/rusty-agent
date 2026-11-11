@@ -678,3 +678,6 @@ mod unparsed_arguments;
 
 #[path = "product_hooks/payload_acceptance.rs"]
 mod payload_acceptance;
+
+#[path = "product_hooks/manual_compaction.rs"]
+mod manual_compaction;

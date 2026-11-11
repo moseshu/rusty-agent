@@ -26,8 +26,9 @@ use ra_core::{
     session::SessionId,
 };
 use ra_runtime::thread::{
-    AgentThread, AgentThreadBuilder, NotSubmittedReason, SteerSubmission, ThreadSettingsOverrides,
-    TurnInputRequest, TurnInputSubmission, TurnSettingsUpdateOutcome, TurnStartOptions,
+    AgentThread, AgentThreadBuilder, NonSteerableTurnKind, NotSubmittedReason, SteerSubmission,
+    ThreadSettingsOverrides, TurnInputRequest, TurnInputSubmission, TurnSettingsUpdateOutcome,
+    TurnStartOptions,
 };
 use serde_json::Value;
 
@@ -186,6 +187,22 @@ impl TurnRequestProcessor {
             } => Err(JsonRpcErrorObject::internal_error(format!(
                 "failed to steer turn: {AGENT_LOOP_DIED}"
             ))),
+            SteerSubmission::NotSubmitted {
+                reason:
+                    NotSubmittedReason::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Compact,
+                    },
+            } => {
+                let message = "cannot steer a compact turn";
+                Err(
+                    JsonRpcErrorObject::invalid_request(message).with_data(serde_json::json!({
+                        "message": message,
+                        "codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}},
+                        "additionalDetails": null,
+                        "misalignment": null,
+                    })),
+                )
+            }
             SteerSubmission::NotSubmitted { reason } => {
                 Err(JsonRpcErrorObject::invalid_request(match reason {
                     NotSubmittedReason::ExpectedTurnMismatch { expected, actual } => {

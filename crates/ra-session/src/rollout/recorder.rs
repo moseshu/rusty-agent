@@ -33,7 +33,7 @@ use ra_core::{
     event::{EventTimestamp, FileEvent, HostEventBody, exec::ExecEvent},
     session::{
         SessionId,
-        rollout::{PersistContext, RolloutItem, RolloutRecorder},
+        rollout::{PersistContext, RolloutCompacted, RolloutItem, RolloutRecorder},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -85,6 +85,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem) -> bool {
 
 enum Command {
     Record(Box<RolloutPayload>),
+    CommitCompaction(RolloutCompacted, oneshot::Sender<Result<()>>),
     Flush(oneshot::Sender<Result<()>>),
     Persist(oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<Result<()>>),
@@ -231,6 +232,14 @@ impl RolloutRecorder for RolloutFileRecorder {
         }
     }
 
+    async fn commit_compaction(&self, compacted: RolloutCompacted) -> Result<()> {
+        let (done, written) = oneshot::channel();
+        self.commands
+            .send(Command::CommitCompaction(compacted, done))
+            .map_err(|_| stopped())?;
+        written.await.map_err(|_| stopped())?
+    }
+
     async fn flush(&self) -> Result<()> {
         let (done, written) = oneshot::channel();
         if self.commands.send(Command::Flush(done)).is_err() {
@@ -295,6 +304,36 @@ struct WriterState {
 }
 
 impl WriterState {
+    async fn commit_compaction(&mut self, compacted: RolloutCompacted) -> Result<()> {
+        self.write_with_recovery(false).await?;
+        self.pending.push_back(RolloutPayload::Compacted(compacted));
+        match self.write_with_recovery(false).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Reopen once more to check whether the last append landed. A failed
+                // replacement is removed from the queue before any later barrier can retry it.
+                if self.unconfirmed.is_some()
+                    && let Some(ownership) = &self.ownership
+                    && let Ok(writer) = RolloutWriter::open_with_ownership(
+                        self.path.clone(),
+                        self.session_id.clone(),
+                        Arc::clone(ownership),
+                    )
+                    .await
+                {
+                    let settled = self.settle_unconfirmed(&writer).await.is_ok();
+                    self.writer = Some(writer);
+                    if settled && self.pending.is_empty() {
+                        return Ok(());
+                    }
+                }
+                self.pending.pop_front();
+                self.unconfirmed = None;
+                Err(error)
+            }
+        }
+    }
+
     /// Writes what is queued, as [`Self::write_with_recovery`] does, unless the file has not been
     /// created and nothing is queued: as Codex's flush and shutdown leave a deferred rollout
     /// unmaterialized, a barrier with nothing to write does not create the file.
@@ -449,6 +488,10 @@ async fn write_all(mut state: WriterState, mut commands: mpsc::UnboundedReceiver
                 // As Codex writes each batch as it arrives; a failure leaves it queued for the next
                 // barrier and is reported by the next flush that cannot recover it.
                 let _ = state.write_with_recovery(false).await;
+            }
+            Command::CommitCompaction(compacted, done) => {
+                let result = state.commit_compaction(compacted).await;
+                let _ = done.send(result);
             }
             Command::Flush(done) => {
                 let _ = done.send(state.write_pending(true).await);

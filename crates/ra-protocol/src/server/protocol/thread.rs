@@ -88,6 +88,35 @@ impl ThreadClosedNotification {
     }
 }
 
+/// The parameters of `thread/compact/start`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCompactStartParams {
+    thread_id: String,
+}
+
+impl ThreadCompactStartParams {
+    /// Requests compaction for a loaded thread.
+    #[must_use]
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+        }
+    }
+
+    /// The thread whose history should be compacted.
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+}
+
+/// The acknowledgement of `thread/compact/start`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadCompactStartResponse {}
+
 /// The parameters of `thread/backgroundTerminals/clean`: Codex's
 /// `ThreadBackgroundTerminalsCleanParams`.
 #[non_exhaustive]

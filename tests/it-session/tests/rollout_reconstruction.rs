@@ -14,7 +14,7 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutModelUsage, RolloutRunEnd, RolloutRunEnded, RolloutRunStarted,
+            RolloutCompacted, RolloutModelUsage, RolloutRunEnd, RolloutRunEnded, RolloutRunStarted,
             RolloutTurnContext,
         },
     },
@@ -23,7 +23,8 @@ use ra_core::{
 };
 use ra_session::{
     RolloutPayload, RolloutReader, RolloutRecord, RolloutSessionMeta, RolloutWriter,
-    reconstruct_history, truncate_rollout_after_run, truncate_rollout_before_run,
+    reconstruct_history, truncate_rollout_after_run, truncate_rollout_before_nth_user_message,
+    truncate_rollout_before_run,
 };
 use serde_json::json;
 
@@ -339,6 +340,48 @@ fn a_compaction_that_replaces_an_earlier_one_drops_it_too() {
         said("m-3", "three"),
     ]));
     assert_eq!(history(&rollout.records()), expected);
+}
+
+#[test]
+fn standalone_compaction_replays_replacement_verbatim_and_respects_fork_boundaries() {
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["old user"])
+        .push(said("answer", "old reply"));
+    rollout
+        .start("two", &["long user"])
+        .push(said("answer", "second reply"));
+    rollout.start("compact", &[]);
+    let replacement = vec![user("truncated user"), user("summary")];
+    rollout.push(RolloutPayload::Compacted(RolloutCompacted::new(
+        RunId::new("compact"),
+        ItemId::new("compact-item"),
+        replacement.clone(),
+    )));
+    rollout.push(RolloutRunEnded::new(
+        RunId::new("compact"),
+        RolloutRunEnd::Cancelled,
+    ));
+    rollout.start("next", &["new user"]);
+
+    let before = truncate_rollout_before_run(rollout.0.clone(), &RunId::new("compact")).unwrap();
+    assert_eq!(
+        history(&before),
+        [
+            user("old user"),
+            said("answer", "old reply").to_model_input().unwrap(),
+            user("long user"),
+            said("answer", "second reply").to_model_input().unwrap(),
+        ]
+    );
+    let after = truncate_rollout_after_run(rollout.0.clone(), &RunId::new("compact")).unwrap();
+    assert_eq!(history(&after), replacement);
+    let before_new_user = truncate_rollout_before_nth_user_message(rollout.0.clone(), 2).unwrap();
+    assert_eq!(history(&before_new_user), replacement);
+    assert_eq!(
+        history(&rollout.0),
+        [replacement, vec![user("new user")]].concat()
+    );
 }
 
 #[test]

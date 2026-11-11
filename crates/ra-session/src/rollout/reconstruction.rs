@@ -26,7 +26,8 @@
 //! # Compaction
 //!
 //! Codex bounds replay at the newest compaction and takes its replacement history as the base. A
-//! compaction here does not carry a replacement; it says what it replaces:
+//! standalone thread compaction carries its complete replacement history. Later records build
+//! on it. Run-local and provider compaction records keep their existing semantics:
 //!
 //! - A [`Compaction`](ra_core::item::Compaction) names the records it stands for, which are records
 //!   of the run that wrote it. They drop out of the history, as they drop out of the model-visible
@@ -194,6 +195,19 @@ pub fn reconstruct_history(records: &[RolloutRecord]) -> Result<RolloutReconstru
                     recorded: Recorded::Input(item),
                 }));
                 last_run = Some(ReconstructedRun::started(&started));
+            }
+            RolloutPayload::Compacted(compacted) => {
+                entries.clear();
+                positions.clear();
+                entries.extend(
+                    compacted
+                        .into_replacement_history()
+                        .into_iter()
+                        .map(|item| Entry {
+                            run: None,
+                            recorded: Recorded::Input(item),
+                        }),
+                );
             }
             RolloutPayload::Item(item) => {
                 let key = (current.clone(), item.id().clone());

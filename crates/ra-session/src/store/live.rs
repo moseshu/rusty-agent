@@ -30,7 +30,7 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         SessionId,
-        rollout::{PersistContext, RolloutItem, RolloutRecorder},
+        rollout::{PersistContext, RolloutCompacted, RolloutItem, RolloutRecorder},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -165,6 +165,10 @@ impl RolloutRecorder for LiveThreadRecorder {
             // reports that.
             let _ = self.commands.send(Command::Commit);
         }
+    }
+
+    async fn commit_compaction(&self, compacted: RolloutCompacted) -> Result<()> {
+        self.inner.commit_compaction(compacted).await
     }
 
     async fn flush(&self) -> Result<()> {

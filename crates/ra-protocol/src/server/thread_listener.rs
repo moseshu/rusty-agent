@@ -538,16 +538,18 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
 
     let context = context.clone();
     tokio::spawn(async move {
-        if tokio::time::timeout(THREAD_SHUTDOWN_TIMEOUT, loaded.shutdown())
-            .await
-            .is_err()
-        {
+        let shutdown = tokio::time::timeout(THREAD_SHUTDOWN_TIMEOUT, async {
+            loaded.shutdown().await;
+            loaded.close_rollout().await
+        })
+        .await;
+        if !matches!(shutdown, Ok(Ok(()))) {
             context
                 .pending_thread_unloads
                 .lock()
                 .await
                 .remove(&thread_id);
-            tracing::warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
+            tracing::warn!(%thread_id, ?shutdown, "thread shutdown failed; leaving thread loaded");
             return;
         }
         // Another thread may have been loaded under the same id meanwhile; only the one that
@@ -562,17 +564,17 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
             return;
         }
         context.thread_watch.remove_thread(&thread_id).await;
+        context
+            .pending_thread_unloads
+            .lock()
+            .await
+            .remove(&thread_id);
         broadcast(
             &context.outgoing,
             THREAD_CLOSED_METHOD,
             ThreadClosedNotification::new(thread_id.as_str()),
         )
         .await;
-        context
-            .pending_thread_unloads
-            .lock()
-            .await
-            .remove(&thread_id);
     });
 }
 

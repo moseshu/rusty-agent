@@ -80,12 +80,13 @@
 //! - Product policy lowering: sandbox and approval policies, permission profiles and reviewer
 //!   routing belong to the host adapter. Working directory and collaboration-mode changes are
 //!   not implemented by this thread.
-//! - Review and compaction turns, which cannot be steered in Codex, and additional context: this
-//!   thread runs only regular turns on user input.
+//! - Review turns and additional context. Compaction runs as a standalone turn and rejects
+//!   steering, as in Codex.
 //! - Server draining, the admission of turns Codex refuses while its host shuts down, and the
 //!   automatic, trigger and continuation starts that only its own background work issues.
 
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -100,8 +101,8 @@ use ra_core::{
         InterruptedTurnHistoryMarker, SessionId,
         interrupt::is_interrupt,
         rollout::{
-            PersistContext, RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded,
-            RolloutRunStarted,
+            PersistContext, RolloutCompacted, RolloutItem, RolloutRecorder, RolloutRunEnd,
+            RolloutRunEnded, RolloutRunStarted,
         },
     },
     state::{EventSeqAllocator, RunId, RunState},
@@ -127,6 +128,8 @@ use crate::{
 pub enum TurnAbortReason {
     /// The host interrupted it.
     Interrupted,
+    /// A new turn replaced the running turn.
+    Replaced,
 }
 
 /// Something that happened to one of the thread's turns: the turn events of Codex's `EventMsg`.
@@ -299,12 +302,25 @@ pub enum NotSubmittedReason {
     },
     /// Steering named an output schema other than the one the running turn uses.
     ActiveTurnOutputSchemaMismatch,
+    /// The active task does not accept user input.
+    ActiveTurnNotSteerable {
+        /// The kind of task that refused input.
+        turn_kind: NonSteerableTurnKind,
+    },
     /// Steering was given no input.
     EmptyInput,
     /// The thread has been shut down and takes no more input. Codex's thread refuses it by having
     /// no session loop left to submit to (`CodexErr::InternalAgentDied`); this thread has no loop of
     /// its own, so it says why.
     ShutDown,
+}
+
+/// A standalone turn kind that does not accept user input.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonSteerableTurnKind {
+    /// A turn that compacts thread history.
+    Compact,
 }
 
 /// What the thread did with input given to [`AgentThread::start_or_steer_turn`]: Codex's
@@ -711,8 +727,9 @@ impl AgentThreadBuilder {
                     history: self.history,
                     config,
                     active_turn: None,
+                    pending_compactions: VecDeque::new(),
                     shut_down: false,
-                    pending_session_start: Some(self.session_start_source),
+                    pending_session_starts: VecDeque::from([self.session_start_source]),
                     session_ended: false,
                     pending_context: Vec::new(),
                 }),
@@ -781,16 +798,24 @@ struct ThreadState {
     /// The configuration the next turn starts with, the thread's settings among it.
     config: RunConfig,
     active_turn: Option<ActiveTurn>,
+    /// Compaction turns accepted while another turn is settling.
+    pending_compactions: VecDeque<QueuedCompaction>,
     /// Set by [`AgentThread::shutdown`]: no input is taken any more.
     shut_down: bool,
-    pending_session_start: Option<ra_core::hook::SessionStartSource>,
+    pending_session_starts: VecDeque<ra_core::hook::SessionStartSource>,
     session_ended: bool,
     /// Context injected while the running turn ends, which joins the history once it has ended.
     pending_context: Vec<Message>,
 }
 
+struct QueuedCompaction {
+    turn_id: String,
+    config: RunConfig,
+}
+
 /// The running turn: Codex's `ActiveTurn`.
 struct ActiveTurn {
+    compact: bool,
     turn_id: String,
     pending: PendingInput,
     /// Where context injected into the running turn goes: its run reads it at the next model call.
@@ -799,8 +824,8 @@ struct ActiveTurn {
     cancel: CancelScope,
     /// The schema the turn's final answer is constrained to, which input steering it must match.
     final_output_json_schema: Option<Value>,
-    /// Set by an interrupt, so the turn ends aborted however its run comes back.
-    interrupted: bool,
+    /// The reason the turn ends aborted, independent of its run result.
+    abort_reason: Option<TurnAbortReason>,
     /// The run ended and its history is being persisted before its terminal event.
     ending: bool,
     /// The checkpoint of a run waiting for approval, and where to send it once answered.
@@ -879,7 +904,7 @@ impl AgentThread {
         if messages.is_empty() {
             return;
         }
-        let messages = {
+        {
             let mut state = self.inner.lock();
             if let Some(turn) = &state.active_turn {
                 if let Err(unread) = turn.context.push(messages) {
@@ -890,9 +915,9 @@ impl AgentThread {
             state
                 .history
                 .extend(messages.iter().cloned().map(ModelInputItem::Message));
-            messages
-        };
-        record_injected_context(&self.inner, messages).await;
+            queue_injected_context(&self.inner, messages);
+        }
+        persist_injected_context(&self.inner).await;
     }
 
     /// A handle to this thread that does not keep it alive.
@@ -1024,8 +1049,16 @@ impl AgentThread {
                         reason: NotSubmittedReason::ShutDown,
                     };
                 }
+                if state.compaction_is_scheduled() {
+                    return TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::ActiveTurnNotSteerable {
+                            turn_kind: NonSteerableTurnKind::Compact,
+                        },
+                    };
+                }
                 let Some(active) = &state.active_turn else {
-                    let turn_id = self.start_turn(&mut state, &request);
+                    let turn_id = uuid::Uuid::now_v7().to_string();
+                    self.start_turn(&mut state, &request, turn_id.clone(), None);
                     return TurnInputSubmission::Started { turn_id };
                 };
                 let Some(message) = request.message() else {
@@ -1055,6 +1088,29 @@ impl AgentThread {
         }
     }
 
+    /// Submits a standalone compaction and returns its turn ID without waiting for teardown.
+    ///
+    /// An active turn is replaced. Compaction starts on its settled history and reports its
+    /// result through turn events. Must be called within a Tokio runtime.
+    pub fn compact(&self) -> ra_core::error::Result<String> {
+        let mut state = self.inner.lock();
+        if state.shut_down {
+            return Err(ra_core::error::Error::caller("the thread has shut down"));
+        }
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let config = state.config.clone();
+        state.pending_compactions.push_back(QueuedCompaction {
+            turn_id: turn_id.clone(),
+            config,
+        });
+        if state.active_turn.is_some() {
+            state.replace_active_turn();
+        } else {
+            self.start_pending_compaction(&mut state);
+        }
+        Ok(turn_id)
+    }
+
     /// Steers the running turn with `request` if it is `expected_turn_id`: Codex's `steer_turn`.
     #[must_use]
     pub fn steer_turn(
@@ -1078,6 +1134,13 @@ impl AgentThread {
                 reason: NotSubmittedReason::ExpectedTurnMismatch {
                     expected: expected_turn_id.to_owned(),
                     actual: active.turn_id.clone(),
+                },
+            };
+        }
+        if state.compaction_is_scheduled() {
+            return SteerSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::Compact,
                 },
             };
         }
@@ -1113,10 +1176,10 @@ impl AgentThread {
         let Some(active) = state.active_turn.as_mut() else {
             return false;
         };
-        if active.ending {
+        if active.ending || active.abort_reason.is_some() {
             return false;
         }
-        active.interrupted = true;
+        active.abort_reason = Some(TurnAbortReason::Interrupted);
         active.cancel.cancel(CancelReason::UserInterrupt);
         true
     }
@@ -1301,11 +1364,12 @@ impl AgentThread {
             let ended = {
                 let mut state = self.inner.lock();
                 state.shut_down = true;
+                state.pending_compactions.clear();
                 let Some(active) = state.active_turn.as_mut() else {
                     break;
                 };
-                if !active.ending && !active.interrupted {
-                    active.interrupted = true;
+                if !active.ending && active.abort_reason.is_none() {
+                    active.abort_reason = Some(TurnAbortReason::Interrupted);
                     active.cancel.cancel(CancelReason::UserInterrupt);
                 }
                 // Registered before the lock is let go, so the end cannot slip past unseen.
@@ -1415,30 +1479,56 @@ impl AgentThread {
         self.inner.receiver.lock().await.recv().await
     }
 
+    fn start_pending_compaction(&self, state: &mut ThreadState) {
+        if let Some(compaction) = state.pending_compactions.pop_front() {
+            self.start_turn(
+                state,
+                &TurnInputRequest::new(Vec::new()),
+                compaction.turn_id,
+                Some(compaction.config),
+            );
+            if !state.pending_compactions.is_empty() {
+                state.replace_active_turn();
+            }
+        }
+    }
+
     /// Starts a turn on `request`, under the lock, so its start is reported before anything a
     /// later caller does with the thread.
-    fn start_turn(&self, state: &mut ThreadState, request: &TurnInputRequest) -> String {
+    fn start_turn(
+        &self,
+        state: &mut ThreadState,
+        request: &TurnInputRequest,
+        turn_id: String,
+        compaction_config: Option<RunConfig>,
+    ) {
+        let compact = compaction_config.is_some();
         request.thread_settings.apply(&mut state.config);
         if !request.thread_settings.is_empty() {
             self.inner.emit(ThreadEvent::ThreadSettingsApplied);
         }
-        let turn_id = uuid::Uuid::now_v7().to_string();
         let cancel = CancelScope::root().child(ScopeKind::Run);
         let pending = PendingInput::new();
+        if compact {
+            let _ = pending.close();
+        }
         let context = ra_core::hook::HookContextQueue::default();
-        let settings = LiveRunSettings::new(state.config.clone());
+        // Later settings updates apply to later submissions, as in the session operation queue.
+        let config = compaction_config.unwrap_or_else(|| state.config.clone());
+        let settings = LiveRunSettings::new(config.clone());
         let final_output_json_schema = request.start.final_output_json_schema.clone();
         let output_schema = final_output_json_schema.clone().map(|schema| {
             OutputSchema::json_schema(TURN_OUTPUT_SCHEMA_NAME, schema).with_strict(true)
         });
         state.active_turn = Some(ActiveTurn {
+            compact,
             turn_id: turn_id.clone(),
             pending: pending.clone(),
             context: context.clone(),
             settings: settings.clone(),
             cancel: cancel.clone(),
             final_output_json_schema,
-            interrupted: false,
+            abort_reason: None,
             ending: false,
             paused: None,
         });
@@ -1458,10 +1548,11 @@ impl AgentThread {
             });
         }
         let turn = StartedTurn {
-            turn_id: turn_id.clone(),
+            compact,
+            turn_id,
             history: state.history.clone(),
             input,
-            config: state.config.clone(),
+            config,
             output_schema,
             pending,
             context,
@@ -1472,7 +1563,23 @@ impl AgentThread {
             Arc::clone(&self.inner),
             turn,
         ))));
-        turn_id
+    }
+}
+
+impl ThreadState {
+    fn compaction_is_scheduled(&self) -> bool {
+        !self.pending_compactions.is_empty()
+            || self.active_turn.as_ref().is_some_and(|turn| turn.compact)
+    }
+
+    fn replace_active_turn(&mut self) {
+        if let Some(turn) = self.active_turn.as_mut()
+            && !turn.ending
+            && turn.abort_reason.is_none()
+        {
+            turn.abort_reason = Some(TurnAbortReason::Replaced);
+            turn.cancel.cancel(CancelReason::Superseded);
+        }
     }
 }
 
@@ -1500,6 +1607,16 @@ pub(crate) struct TurnAbort {
 }
 
 impl TurnAbort {
+    pub(crate) fn install_compaction(&self, history: &[ModelInputItem]) {
+        if let Some(inner) = self.thread.upgrade() {
+            let mut state = inner.lock();
+            state.history = history.to_vec();
+            state
+                .pending_session_starts
+                .push_back(ra_core::hook::SessionStartSource::Compact);
+        }
+    }
+
     /// Aborts the turn as [`AgentThread::interrupt`] does, cancelling it with `reason`, and when
     /// `then_session_start` is given, has the next turn start by re-establishing context from that
     /// source. Does nothing once the thread runs another turn or this one is ending; a turn the
@@ -1520,12 +1637,12 @@ impl TurnAbort {
         else {
             return false;
         };
-        if !active.interrupted {
-            active.interrupted = true;
+        if active.abort_reason.is_none() {
+            active.abort_reason = Some(TurnAbortReason::Interrupted);
             active.cancel.cancel(reason);
         }
         if let Some(source) = then_session_start {
-            state.pending_session_start = Some(source);
+            state.pending_session_starts.push_back(source);
         }
         true
     }
@@ -1533,6 +1650,7 @@ impl TurnAbort {
 
 /// What a turn runs on, fixed when it starts.
 struct StartedTurn {
+    compact: bool,
     turn_id: String,
     history: Vec<ModelInputItem>,
     input: Option<Message>,
@@ -1559,7 +1677,7 @@ enum TurnEnd {
 /// Observes the same records used for replay, including calls recorded before execution.
 /// The runner's terminal record waits until the thread has saved unconsumed steering input.
 /// A weak reference lets background execution report its exit without keeping a thread alive.
-struct ThreadRecorder {
+pub(crate) struct ThreadRecorder {
     thread: Weak<ThreadInner>,
     turn_id: String,
     store: Option<Arc<dyn RolloutRecorder>>,
@@ -1567,6 +1685,25 @@ struct ThreadRecorder {
 }
 
 impl ThreadRecorder {
+    pub(crate) async fn commit_compaction(
+        &self,
+        compacted: RolloutCompacted,
+    ) -> ra_core::error::Result<()> {
+        if let Some(store) = &self.store {
+            store.commit_compaction(compacted).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compaction_completed(&self, item: RunItem) {
+        if let Some(thread) = self.thread.upgrade() {
+            thread.emit(ThreadEvent::Item {
+                turn_id: self.turn_id.clone(),
+                item,
+            });
+        }
+    }
+
     async fn finish(&self) {
         let ending = self
             .ending
@@ -1692,6 +1829,7 @@ impl RolloutRecorder for ThreadRecorder {
 async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let started = Instant::now();
     let StartedTurn {
+        compact,
         turn_id,
         history,
         input,
@@ -1714,10 +1852,14 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         store: inner.rollout.clone(),
         ending: Mutex::new(None),
     });
-    let (run_input, stopped, hook_context) = prepare_host_input(
-        &inner, &recorder, &config, &cancel, context, run_input, submitted,
-    )
-    .await;
+    let (run_input, stopped, hook_context) = if compact {
+        (run_input, false, context)
+    } else {
+        prepare_host_input(
+            &inner, &recorder, &config, &cancel, context, run_input, submitted,
+        )
+        .await
+    };
     let (end, history) = if stopped {
         recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
             RunId::new(&turn_id),
@@ -1747,6 +1889,8 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
             },
             run_input,
         )
+    } else if compact {
+        run_compaction_turn(&inner, &recorder, &config, &cancel, hook_context, run_input).await
     } else {
         run_to_end(
             &inner,
@@ -1769,20 +1913,22 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
 
     // Close the queue and freeze the terminal decision under the thread lock. Persistence may
     // await without letting a late interrupt reinterpret which inputs the history keeps.
-    let interrupted = {
+    let abort_reason = {
         let mut state = inner.lock();
         let Some(active) = state.active_turn.as_mut() else {
             tracing::error!(%turn_id, "a running turn lost its active state");
             return;
         };
-        let interrupted = active.interrupted;
+        let reason = active.abort_reason;
         active.ending = true;
-        interrupted
+        reason
     };
     // Codex runs Interrupt hooks for an interrupted turn whichever stage it reached: during the
     // prompt's own hooks, while the model or a tool ran, or while it waited for approval. The
     // runner leaves this to the thread for the runs it owns, so they run once.
-    if interrupted && interrupt_hooks.has_event(ra_core::hook::HookEventName::Interrupt) {
+    if abort_reason == Some(TurnAbortReason::Interrupted)
+        && interrupt_hooks.has_event(ra_core::hook::HookEventName::Interrupt)
+    {
         let run = thread_hook_context(&inner, RunId::new(&turn_id), &interrupt_config);
         crate::runner::InterruptNotice::for_turn(
             interrupt_hooks,
@@ -1794,7 +1940,7 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         .await;
     }
     let mut history = history;
-    if !interrupted && !leftover.is_empty() {
+    if abort_reason.is_none() && !leftover.is_empty() {
         for message in leftover {
             let item = RunItem::new(
                 ItemId::new(uuid::Uuid::now_v7().to_string()),
@@ -1815,17 +1961,19 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
     let ended_context = {
         let mut state = inner.lock();
         state.history = history;
-        // Context injected while the turn ended joins the history now that it has; it is recorded
-        // below, outside the lock.
+        // Queue this context before exposing the idle state so a new turn cannot record a
+        // history replacement ahead of it.
         let ended_context = std::mem::take(&mut state.pending_context);
         state
             .history
             .extend(ended_context.iter().cloned().map(ModelInputItem::Message));
+        let has_ended_context = !ended_context.is_empty();
+        queue_injected_context(&inner, ended_context);
         state.active_turn = None;
-        if interrupted {
+        if let Some(reason) = abort_reason {
             inner.emit(ThreadEvent::TurnAborted {
                 turn_id,
-                reason: TurnAbortReason::Interrupted,
+                reason,
                 completed_at,
                 duration_ms,
             });
@@ -1850,35 +1998,99 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
                 duration_ms,
             });
         }
-        ended_context
+        AgentThread {
+            inner: Arc::clone(&inner),
+        }
+        .start_pending_compaction(&mut state);
+        has_ended_context
     };
-    record_injected_context(&inner, ended_context).await;
+    if ended_context {
+        persist_injected_context(&inner).await;
+    }
     inner.turn_ended.notify_waiters();
 }
 
-/// Records context injected outside a turn in the thread's rollout and persists it: Codex's
-/// `record_conversation_items` for `inject_no_new_turn` with no running work.
-async fn record_injected_context(inner: &ThreadInner, messages: Vec<Message>) {
+/// Queues context injected outside a turn: Codex's `record_conversation_items`.
+fn queue_injected_context(inner: &ThreadInner, messages: Vec<Message>) {
     let Some(rollout) = &inner.rollout else {
         return;
     };
-    if messages.is_empty() {
-        return;
-    }
     for message in messages {
         rollout.record(RolloutItem::Item(RunItem::new(
             ItemId::new(uuid::Uuid::now_v7().to_string()),
             RunItemKind::Message(message),
         )));
     }
-    if let Err(error) = rollout.persist(PersistContext::Standard).await {
+}
+
+async fn persist_injected_context(inner: &ThreadInner) {
+    if let Some(rollout) = &inner.rollout
+        && let Err(error) = rollout.persist(PersistContext::Standard).await
+    {
         tracing::warn!(%error, "context injected without a turn could not be persisted");
     }
 }
 
-/// Runs a turn's run to its end — across any number of pauses for approval — and returns how it
-/// ended and the thread's history after it. A spawned agent's runs are driven the same way (see
-/// [`crate::agent::control`]).
+async fn run_compaction_turn(
+    inner: &Arc<ThreadInner>,
+    recorder: &Arc<ThreadRecorder>,
+    config: &RunConfig,
+    cancel: &CancelScope,
+    hook_context: ra_core::hook::HookContextQueue,
+    mut history: Vec<ModelInputItem>,
+) -> (TurnEnd, Vec<ModelInputItem>) {
+    let run_id = RunId::new(&recorder.turn_id);
+    recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+        run_id.clone(),
+        inner.agent.public_id().clone(),
+    )));
+    let owner = Arc::new(TurnAbort {
+        thread: Arc::downgrade(inner),
+        turn_id: recorder.turn_id.clone(),
+    });
+    let services = inner
+        .services
+        .clone()
+        .with_hook_context(hook_context.clone());
+    let result = crate::runner::manual_compaction::ManualCompaction {
+        agent: &inner.agent,
+        models: inner.model_resolver.as_ref(),
+        config,
+        services: &services,
+        cancel,
+        recorder,
+        owner,
+        run_id: run_id.clone(),
+    }
+    .run(&mut history)
+    .await;
+    record_context_history(
+        inner,
+        recorder,
+        &mut history,
+        Vec::new(),
+        hook_context.close_entries(),
+    );
+    let (end, record) = match result {
+        Ok(()) => (
+            TurnEnd::Completed(None),
+            RolloutRunEnded::new(run_id, RolloutRunEnd::Completed),
+        ),
+        Err(error) if error.is_cancelled() => (
+            TurnEnd::Cancelled,
+            RolloutRunEnded::new(run_id, RolloutRunEnd::Cancelled),
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            let record =
+                RolloutRunEnded::new(run_id, RolloutRunEnd::Failed).with_error(message.clone());
+            (TurnEnd::Failed(message), record)
+        }
+    };
+    recorder.record(RolloutItem::RunEnded(record));
+    (end, history)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2135,12 +2347,12 @@ async fn prepare_host_input(
     for message in queue.take_warnings() {
         inner.emit(ThreadEvent::Warning { message });
     }
-    let source = {
-        let mut state = inner.lock();
-        state.pending_session_start.take()
-    };
     let result: ra_core::error::Result<bool> = async {
-        if let Some(source) = source {
+        loop {
+            let source = inner.lock().pending_session_starts.pop_front();
+            let Some(source) = source else {
+                break;
+            };
             let decision = hooks
                 .dispatch(HookEvent::SessionStart {
                     session_id: &inner.thread_id,

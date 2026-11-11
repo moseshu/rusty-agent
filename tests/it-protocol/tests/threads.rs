@@ -118,7 +118,17 @@ const PATIENCE: Duration = Duration::from_secs(10);
 enum Step {
     Respond(ModelResponse),
     After(Arc<Notify>, ModelResponse),
+    AwaitCancellation(CancellationGate),
     Fail,
+}
+
+/// Holds a cancelled model call in teardown until the test lets it settle.
+struct CancellationGate(std::sync::mpsc::Receiver<()>);
+
+impl Drop for CancellationGate {
+    fn drop(&mut self) {
+        let _ = self.0.recv_timeout(PATIENCE * 2);
+    }
 }
 
 #[derive(Default)]
@@ -191,6 +201,10 @@ impl Model for ScriptedModel {
             Some(Step::After(gate, response)) => {
                 gate.notified().await;
                 Ok(response)
+            }
+            Some(Step::AwaitCancellation(gate)) => {
+                let _gate = gate;
+                std::future::pending().await
             }
             Some(Step::Fail) => Err(Error::caller("the model failed")),
             None => Err(Error::caller("the model ran out of responses")),

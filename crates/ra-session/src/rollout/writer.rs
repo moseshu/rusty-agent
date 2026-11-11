@@ -17,7 +17,8 @@ use ra_core::{
     session::{
         SessionId,
         rollout::{
-            RolloutItem, RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn, RolloutTraceRecord,
+            RolloutCompacted, RolloutItem, RolloutRunEnded, RolloutRunStarted, RolloutThreadSpawn,
+            RolloutTraceRecord,
         },
     },
     state::RunId,
@@ -621,6 +622,8 @@ pub enum RolloutPayload {
     Event(HostEvent),
     /// Authoritative conversation item.
     Item(RunItem),
+    /// Committed replacement of model-visible thread history.
+    Compacted(RolloutCompacted),
     /// Unprunable model usage record.
     ModelUsage(RolloutModelUsage),
     /// Child agent execution anchor on the root timeline.
@@ -702,6 +705,7 @@ impl From<RolloutItem> for RolloutPayload {
             RolloutItem::RunStarted(started) => Self::RunStarted(started),
             RolloutItem::TurnContext(context) => Self::TurnContext(context),
             RolloutItem::Item(item) => Self::Item(item),
+            RolloutItem::Compacted(compacted) => Self::Compacted(compacted),
             RolloutItem::Event(event) => Self::Event(event),
             RolloutItem::ModelUsage(usage) => Self::ModelUsage(usage),
             RolloutItem::RunEnded(ended) => Self::RunEnded(ended),
@@ -736,6 +740,10 @@ impl RolloutRecord {
     /// # Errors
     ///
     /// Returns [`Error`] if the payload cannot be serialized into the envelope.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep rollout wire names and their serialization together."
+    )]
     pub fn new(timeline_seq: u64, at: EventTimestamp, payload: RolloutPayload) -> Result<Self> {
         let (type_name, payload_val) = match payload {
             RolloutPayload::Trace(trace) => (
@@ -779,6 +787,16 @@ impl RolloutRecord {
                         SessionErrorKind::Corrupted,
                         format!("failed to serialize item: {e}"),
                     )
+                })?,
+            ),
+            RolloutPayload::Compacted(compacted) => (
+                "compacted".to_owned(),
+                serde_json::to_value(compacted).map_err(|error| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        "failed to serialize compaction",
+                    )
+                    .with_source(error)
                 })?,
             ),
             RolloutPayload::ModelUsage(usage) => (
@@ -926,6 +944,12 @@ impl RolloutRecord {
                         format!("corrupted item payload: {e}"),
                     )
                     .with_source(e)
+                }),
+            "compacted" => serde_json::from_value::<RolloutCompacted>(self.payload.clone())
+                .map(RolloutPayload::Compacted)
+                .map_err(|error| {
+                    Error::session(SessionErrorKind::Corrupted, "corrupted compaction payload")
+                        .with_source(error)
                 }),
             "model_usage" => serde_json::from_value::<RolloutModelUsage>(self.payload.clone())
                 .map(RolloutPayload::ModelUsage)

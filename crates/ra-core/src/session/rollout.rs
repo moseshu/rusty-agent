@@ -33,7 +33,7 @@ use crate::{
     error::Result,
     event::HostEvent,
     finish::FinishReason,
-    item::{AgentId, ModelInputItem, RunItem},
+    item::{AgentId, ItemId, ModelInputItem, RunItem},
     state::RunId,
     usage::Usage,
 };
@@ -60,6 +60,15 @@ pub trait RolloutRecorder: Send + Sync + 'static {
 
     /// Queues `item` to be recorded.
     fn record(&self, item: RolloutItem);
+
+    /// Commits a history replacement and waits until it is recorded.
+    ///
+    /// Asynchronous recorders should resolve uncertain writes before reporting failure and must
+    /// not retry a failed replacement independently after returning.
+    async fn commit_compaction(&self, compacted: RolloutCompacted) -> Result<()> {
+        self.record(RolloutItem::Compacted(compacted));
+        self.persist(PersistContext::Standard).await
+    }
 
     /// Selects local trace observations. Ordinary recorders do not capture them.
     fn trace_mode(&self) -> RolloutTraceMode {
@@ -308,6 +317,8 @@ pub enum RolloutItem {
     TurnContext(RolloutTurnContext),
     /// A record the run added to the session.
     Item(RunItem),
+    /// A committed replacement of the thread's model-visible history.
+    Compacted(RolloutCompacted),
     /// A host event attributed to the run.
     Event(HostEvent),
     /// The usage of model calls the run paid for.
@@ -316,6 +327,52 @@ pub enum RolloutItem {
     RunEnded(RolloutRunEnded),
     /// Explicit local trace observation; it does not contribute conversation history or usage.
     Trace(RolloutTraceRecord),
+}
+
+/// A thread history replacement committed by a compaction turn.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutCompacted {
+    run_id: RunId,
+    item_id: ItemId,
+    replacement_history: Vec<ModelInputItem>,
+    #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
+    unknown: Unknown,
+}
+
+impl RolloutCompacted {
+    /// Captures the complete model-visible history after compaction.
+    #[must_use]
+    pub const fn new(
+        run_id: RunId,
+        item_id: ItemId,
+        replacement_history: Vec<ModelInputItem>,
+    ) -> Self {
+        Self {
+            run_id,
+            item_id,
+            replacement_history,
+            unknown: Unknown::new(),
+        }
+    }
+
+    /// The compaction turn.
+    #[must_use]
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// The item reported to clients for the compaction.
+    #[must_use]
+    pub const fn item_id(&self) -> &ItemId {
+        &self.item_id
+    }
+
+    /// The history to resume from, in model input order.
+    #[must_use]
+    pub fn into_replacement_history(self) -> Vec<ModelInputItem> {
+        self.replacement_history
+    }
 }
 
 /// A run or a segment of it started: Codex's `TurnStarted` with the user input of the turn.

@@ -1009,6 +1009,30 @@ pub async fn prepare_turn(request: TurnPreparationRequest<'_>) -> Result<Prepare
     })
 }
 
+/// Prepares the model and instructions of a standalone summary without resolving any tools.
+pub(crate) async fn prepare_compaction(
+    agent: &AgentBinding,
+    models: &dyn ModelResolver,
+    run: &RunContext,
+    cancel: &CancelScope,
+    config: &crate::runner::RunConfig,
+    mut input: Vec<ModelInputItem>,
+) -> Result<(ra_core::model::ResolvedModel, ModelRequest)> {
+    let execution = agent.execution();
+    let model = models.resolve_model(config.model().or(execution.model()))?;
+    let settings = model
+        .resolve_settings(execution.model_settings(), config.model_settings())
+        .reconcile_tool_surface(std::iter::empty::<&str>());
+    model.validate_settings(&settings)?;
+    let instructions = resolve_instructions(execution, agent.public_id(), run, cancel).await?;
+    input.extend(instructions.tail_items);
+    let mut request = ModelRequest::new(input, settings);
+    if let Some(prefix) = instructions.prefix {
+        request = request.with_system_instructions(prefix);
+    }
+    Ok((model, request))
+}
+
 struct EnabledTools {
     advertised: Vec<Arc<dyn Tool>>,
     protocol_tools: BTreeSet<usize>,

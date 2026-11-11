@@ -7,6 +7,13 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Manual compaction in thread rollouts
+
+`thread/compact/start` records a `compacted` rollout entry containing the model-visible
+replacement history. Existing rollouts replay as before. Upgrade readers before resuming or
+forking a manually compacted rollout. Older readers skip the new entry and reconstruct from the
+original transcript, so they can send pre-compaction history to the model again.
+
 ### `on_tool_end` carries the answer a call settled into
 
 `LifecycleHook::on_tool_end` now fires where the reference raises it: after the call's result is
