@@ -28,7 +28,16 @@ yanked = "deny"
 # 同一 rama 0.3.0-alpha.4 的 rama-core 依赖 tokio-graceful 0.2.2，后者只在 `cfg(loom)` 下依赖
 # loom 0.7.2 -> pin-utils 0.1.1；常规构建从不编译它。这是「不再维护」告警，没有修复版。
 # 2026-11-10 由维护者明确接受本条精确例外；rama 升级去掉 tokio-graceful/loom 后撤销。
+# 同一 hickory-proto 0.25.2 的另外四条修复都在 0.26.2，rama-dns 0.3.0-alpha.4 锁在 hickory 0.25。
+# 0487/0489/0490 只影响 zone 文件文本格式的解析，代理解析走 DNS 报文格式，不经过这些路径；
+# 0491 是报文解码按报头计数预分配，恶意 DNS 响应可致内存耗尽，代理解析域名时可达。
+# 固定版 Codex 同样停在 rama alpha.4 + hickory 0.25.2。2026-11-11 由维护者明确接受这四条精确例外；
+# rama 升级到 0.4（hickory-resolver 0.26.1+）或 hickory-proto >=0.26.2 后撤销。
 ignore = [
+    { id = "RUSTSEC-2026-0487", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the panic is in SVCB/HTTPS text (zone file) parsing, which DNS resolution does not use; fixed in 0.26.2, which rama 0.3 cannot take; remove when rama moves to hickory 0.26.2+" },
+    { id = "RUSTSEC-2026-0489", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the panic is in SVCB/HTTPS text (zone file) parameter unquoting, which DNS resolution does not use; fixed in 0.26.2; remove when rama moves to hickory 0.26.2+" },
+    { id = "RUSTSEC-2026-0490", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the assertion is in the zone file lexer, which DNS resolution does not use; fixed in 0.26.2; remove when rama moves to hickory 0.26.2+" },
+    { id = "RUSTSEC-2026-0491", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; message decoding preallocates from header counts, so a malicious DNS response can exhaust memory during proxy resolution; fixed in 0.26.2, which rama 0.3 cannot take; remove when rama moves to hickory 0.26.2+" },
     { id = "RUSTSEC-2026-0441", reason = "Maintainer explicitly accepted this exact exception on 2026-11-10. pin-utils 0.1.1 is unmaintained with no safe upgrade; it is reached only through rama-core 0.3.0-alpha.4 -> tokio-graceful 0.2.2 -> loom 0.7.2, a cfg(loom)-only dependency never compiled in normal builds; remove when rama drops tokio-graceful/loom" },
     { id = "RUSTSEC-2026-0118", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; DNSSEC features are not enabled; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2026-0119", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; no fixed rama release is available yet; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
