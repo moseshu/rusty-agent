@@ -870,7 +870,7 @@ pub(crate) fn tool_call_item(
     custom_tools: &BTreeSet<String>,
 ) -> RunItemKind {
     let text = arguments;
-    let parsed = crate::openai::function_arguments(text);
+    let parsed = crate::tool_arguments::function_arguments(text);
     // Text that is not JSON travels as the call's own record of it, with `null` arguments.
     let unparsed = parsed.is_none().then_some(text);
     let arguments = parsed.unwrap_or(Value::Null);

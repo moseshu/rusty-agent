@@ -31,5 +31,7 @@ pub mod protocol;
 pub mod provider;
 pub mod retry;
 #[cfg(any(feature = "openai", feature = "anthropic"))]
+pub(crate) mod tool_arguments;
+#[cfg(any(feature = "openai", feature = "anthropic"))]
 pub(crate) mod tool_namespaces;
 pub mod usage;

@@ -102,9 +102,12 @@ with its text and answered as a failure when it runs; the run continues.
   `update_plan` and `request_user_input` give `failed to parse function arguments: …`, after
   `update_plan`'s Plan-mode refusal and `request_user_input`'s root-thread and mode refusals as in
   Codex; the skills namespace tools give the parser's diagnostic alone.
-- **Not yet for Anthropic streams.** A streamed Anthropic tool input whose joined
-  `input_json_delta` fragments are not JSON still fails its response with `provider.behavior`
-  (`Anthropic streamed tool input is not valid JSON`), so such a run still fails under Anthropic.
+- **Anthropic streams too.** In a streamed response the adapter accepts (`stop_reason`
+  `tool_use`, `end_turn`, `stop_sequence` or none), malformed JSON assembled from
+  `input_json_delta` fragments becomes a `ToolCall::unparsed` or a `HandoffCall` with
+  `with_unparsed_arguments`, as above. Replay sends the call with `input: {}`. Empty or
+  whitespace-only input keeps the initial `{}`. A response stopped at `max_tokens` still
+  returns `provider.context_overflow`.
 
 #### Coding product: reported before any approval
 

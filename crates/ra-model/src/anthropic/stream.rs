@@ -16,11 +16,10 @@ use serde_json::Value;
 
 use super::convert;
 
-/// Where a tool call's streamed argument fragments accumulate until the block is closed.
-///
-/// It is removed again while the message is assembled: the name is scratch space of this decoder,
-/// not a field any consumer should ever see.
-const INPUT_JSON_SCRATCH: &str = "__input_json";
+struct StreamBlock {
+    raw: Value,
+    input_json: String,
+}
 
 pub(crate) fn events(
     response: reqwest::Response,
@@ -69,7 +68,7 @@ struct Driver {
     ready: VecDeque<Result<Value>>,
     pending: VecDeque<Result<ModelStreamEvent>>,
     message: Option<Value>,
-    blocks: BTreeMap<u64, Value>,
+    blocks: BTreeMap<u64, StreamBlock>,
     started_items: BTreeSet<String>,
     emitted: bool,
     finished: bool,
@@ -204,7 +203,10 @@ impl Driver {
                 })?;
                 self.blocks.insert(
                     index,
-                    object(frame, "content_block", "content_block_start")?,
+                    StreamBlock {
+                        raw: object(frame, "content_block", "content_block_start")?,
+                        input_json: String::new(),
+                    },
                 );
                 self.block_narration(index, None, &mut events);
             }
@@ -216,9 +218,10 @@ impl Driver {
             }
             "message_delta" => self.apply_message_delta(frame),
             "message_stop" => {
-                let payload = self.assembled()?;
+                let (payload, unparsed_inputs) = self.assembled()?;
                 let response = convert::convert_response(
                     &payload,
+                    &unparsed_inputs,
                     self.request_id.clone(),
                     &self.handoffs,
                     &self.custom_tools,
@@ -257,6 +260,7 @@ impl Driver {
         let Some(block) = self.blocks.get(&index) else {
             return;
         };
+        let block = &block.raw;
         let kind = block
             .get("type")
             .and_then(Value::as_str)
@@ -268,7 +272,7 @@ impl Driver {
                     0,
                     |start, (position, (_, block))| {
                         if matches!(
-                            block.get("type").and_then(Value::as_str),
+                            block.raw.get("type").and_then(Value::as_str),
                             Some("text" | "refusal")
                         ) {
                             start
@@ -336,13 +340,15 @@ impl Driver {
             convert::behavior_error("Anthropic content block delta arrived before its start")
         })?;
         match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => append(block, "text", required(delta, "text")?),
-            Some("thinking_delta") => append(block, "thinking", required(delta, "thinking")?),
+            Some("text_delta") => append(&mut block.raw, "text", required(delta, "text")?),
+            Some("thinking_delta") => {
+                append(&mut block.raw, "thinking", required(delta, "thinking")?);
+            }
             Some("input_json_delta") => {
-                append(block, INPUT_JSON_SCRATCH, required(delta, "partial_json")?);
+                block.input_json.push_str(required(delta, "partial_json")?);
             }
             Some("signature_delta") => {
-                block["signature"] = Value::String(required(delta, "signature")?.to_owned());
+                block.raw["signature"] = Value::String(required(delta, "signature")?.to_owned());
             }
             Some(other) => {
                 return Err(convert::behavior_error(format!(
@@ -404,28 +410,34 @@ impl Driver {
             }
         }
     }
-    fn assembled(&mut self) -> Result<Value> {
+    fn assembled(&mut self) -> Result<(Value, BTreeMap<usize, String>)> {
         let mut message = self.message.take().ok_or_else(|| {
             convert::behavior_error("Anthropic stream ended before message_start")
         })?;
         let mut content = Vec::new();
-        for (_, mut block) in std::mem::take(&mut self.blocks) {
-            if let Some(partial) = block
-                .as_object_mut()
-                .and_then(|block| block.remove(INPUT_JSON_SCRATCH))
-            {
-                let input = serde_json::from_str(partial.as_str().unwrap_or_default()).map_err(
-                    |error| {
-                        convert::behavior_error("Anthropic streamed tool input is not valid JSON")
-                            .with_source(error)
-                    },
-                )?;
-                block["input"] = input;
+        let mut unparsed_inputs = BTreeMap::new();
+        for (
+            index,
+            StreamBlock {
+                mut raw,
+                input_json,
+            },
+        ) in std::mem::take(&mut self.blocks).into_values().enumerate()
+        {
+            // Empty or whitespace-only fragments leave the initial input in place.
+            // Keep malformed tool input separate from the assembled provider payload.
+            if !input_json.trim().is_empty() {
+                match crate::tool_arguments::function_arguments(&input_json) {
+                    Some(input) => raw["input"] = input,
+                    None => {
+                        unparsed_inputs.insert(index, input_json);
+                    }
+                }
             }
-            content.push(block);
+            content.push(raw);
         }
         message["content"] = Value::Array(content);
-        Ok(message)
+        Ok((message, unparsed_inputs))
     }
 }
 

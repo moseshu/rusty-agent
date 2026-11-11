@@ -260,6 +260,7 @@ impl AnthropicMessagesModel {
         }
         convert::convert_response(
             &payload,
+            &BTreeMap::new(),
             facts.request_id,
             request.handoffs(),
             &crate::custom_tools::advertised_as_functions(self.custom_tools_as_functions, &request),

@@ -1,9 +1,9 @@
 //! Function-call argument text that is not JSON, through the OpenAI and Anthropic adapters. In an
 //! OpenAI response it does not fail the response: the call keeps the text, with `null` arguments,
 //! and is answered as a failure when it runs, as the reference parses arguments only when it
-//! invokes the tool. Replay hands the text back to OpenAI verbatim; Anthropic, whose
-//! `tool_use.input` must be an object, gets `{}` beside the paired result's error flag. Streamed
-//! Anthropic tool input that is not JSON still fails its response, a boundary pinned below.
+//! invokes the tool. Streamed Anthropic tool input whose fragments join into text that is not JSON
+//! is kept the same way. Replay hands the text back to OpenAI verbatim; Anthropic, whose
+//! `tool_use.input` must be an object, gets `{}` beside the paired result's error flag.
 
 use std::sync::Arc;
 
@@ -447,12 +447,14 @@ impl ModelResolver for Resolver {
 }
 
 /// Item 4: through the runner, the response with argument text that is not JSON does not fail the
-/// run; the next request carries the call, with its text, and its error output, and the run ends.
+/// run; the next request carries the call, with its text (Anthropic: `{}`), and its error output,
+/// and the run ends.
 #[tokio::test]
 async fn the_runner_answers_the_call_and_continues() {
     for protocol in [
         ApiProtocol::OpenAiResponses,
         ApiProtocol::OpenAiChatCompletions,
+        ApiProtocol::AnthropicMessages,
     ] {
         let server = MockServer::start().await;
         // The runner streams, so both turns answer with event streams.
@@ -474,6 +476,21 @@ async fn the_runner_answers_the_call_and_continues() {
                     "/v1/responses",
                 )
             }
+            ApiProtocol::AnthropicMessages => (
+                anthropic_tool_frames("echo", &["{b", "ad"]),
+                sse(
+                    &[
+                        json!({"type":"message_start","message":{"id":"m-2","type":"message","role":"assistant","content":[],"model":"claude-test","usage":{"input_tokens":1,"output_tokens":0}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                        json!({"type":"message_stop"}),
+                    ],
+                    false,
+                ),
+                "/v1/messages",
+            ),
             _ => (
                 chat_frames("echo", TEXT),
                 sse(
@@ -502,6 +519,14 @@ async fn the_runner_answers_the_call_and_continues() {
             ApiProtocol::OpenAiResponses => {
                 Arc::new(OpenAiResponsesModel::new("gpt-test", auth()).unwrap())
             }
+            ApiProtocol::AnthropicMessages => Arc::new(
+                AnthropicMessagesModel::new(
+                    "claude-test",
+                    AnthropicAuth::new("test-secret")
+                        .with_base_url(format!("{}/v1/", server.uri())),
+                )
+                .unwrap(),
+            ),
             _ => Arc::new(OpenAiChatModel::new("gpt-test", auth()).unwrap()),
         };
         let agent = AgentSpec::builder()
@@ -549,6 +574,26 @@ async fn the_runner_answers_the_call_and_continues() {
                             && item["call_id"] == "call-1"),
                     "{text}"
                 );
+            }
+            ApiProtocol::AnthropicMessages => {
+                let blocks: Vec<&Value> = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .collect();
+                let tool_use = blocks
+                    .iter()
+                    .find(|block| block["type"] == "tool_use")
+                    .unwrap();
+                assert_eq!(tool_use["input"], json!({}), "{text}");
+                let result = blocks
+                    .iter()
+                    .find(|block| block["type"] == "tool_result")
+                    .unwrap();
+                assert_eq!(result["tool_use_id"], "call-1", "{text}");
+                assert_eq!(result["is_error"], json!(true), "{text}");
             }
             _ => {
                 let messages = body["messages"].as_array().unwrap();
@@ -615,43 +660,163 @@ async fn chat_fragments_that_join_into_text_that_is_not_json_are_kept() {
     assert_eq!(call.unparsed_arguments(), Some("{\"path\": \"a.txt\""));
 }
 
-/// The Anthropic stream does not yet keep such text: tool input whose joined `input_json_delta`
-/// fragments are not JSON fails the whole response, as before. This pins the current boundary,
-/// registered as a separate task; the fix rewrites this assertion.
-#[tokio::test]
-async fn an_anthropic_stream_still_fails_on_tool_input_that_is_not_json() {
-    let server = MockServer::start().await;
-    let frames = [
+/// Anthropic stream frames for one `tool_use` block named `name` whose input arrives as the
+/// `input_json_delta` fragments `fragments`.
+fn anthropic_tool_frames(name: &str, fragments: &[&str]) -> ResponseTemplate {
+    sse(
+        &anthropic_tool_events(0, name, fragments, "tool_use"),
+        false,
+    )
+}
+
+fn anthropic_tool_events(
+    index: u64,
+    name: &str,
+    fragments: &[&str],
+    stop_reason: &str,
+) -> Vec<Value> {
+    let mut frames = vec![
         json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-test","usage":{"input_tokens":1,"output_tokens":0}}}),
-        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"echo","input":{}}}),
-        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\": "}}),
-        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.txt\""}}),
-        json!({"type":"content_block_stop","index":0}),
-        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
-        json!({"type":"message_stop"}),
+        json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":"call-1","name":name,"input":{}}}),
     ];
+    frames.extend(fragments.iter().map(|fragment| {
+        json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":fragment}})
+    }));
+    frames.extend([
+        json!({"type":"content_block_stop","index":index}),
+        json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":1}}),
+        json!({"type":"message_stop"}),
+    ]);
+    frames
+}
+
+async fn anthropic_streaming(
+    server: &MockServer,
+    template: ResponseTemplate,
+) -> AnthropicMessagesModel {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(sse(&frames, false))
-        .mount(&server)
+        .respond_with(template)
+        .mount(server)
         .await;
-    let model = AnthropicMessagesModel::new(
+    AnthropicMessagesModel::new(
         "claude-test",
         AnthropicAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
     )
-    .unwrap();
-    let error = model
-        .stream_response(asks())
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .find_map(std::result::Result::err)
-        .expect("the stream fails");
-    assert_eq!(error.code(), "provider.behavior");
-    assert!(
-        error
-            .to_string()
-            .contains("streamed tool input is not valid JSON"),
-        "{error}"
+    .unwrap()
+}
+
+/// Fine-grained tool streaming keeps malformed input on the call while preserving raw payloads.
+/// The tool block's stream index (3) differs from its position in the content (1), so the text is
+/// tied to the assembled block, not to the SSE index.
+#[tokio::test]
+async fn anthropic_stream_fragments_that_join_into_text_that_is_not_json_are_kept() {
+    let server = MockServer::start().await;
+    let mut frames = anthropic_tool_events(3, "echo", &["{\"path\": ", "\"a.txt\""], "tool_use");
+    let narration = json!({"type":"text","text":"Calling echo"});
+    frames.splice(
+        1..1,
+        [
+            json!({"type":"content_block_start","index":0,"content_block":narration}),
+            json!({"type":"content_block_stop","index":0}),
+        ],
     );
+    let tool_block = frames[3]["content_block"].clone();
+    let model = anthropic_streaming(&server, sse(&frames, false)).await;
+    let (items, response) = streamed(&model, asks()).await;
+    for (kind, label) in [
+        (&items[1], "stream item"),
+        (response.output()[1].kind(), "response"),
+    ] {
+        let call = the_call(kind);
+        assert_eq!(call.name(), "echo", "{label}");
+        assert_eq!(call.arguments(), &Value::Null, "{label}");
+        assert_eq!(
+            call.unparsed_arguments(),
+            Some("{\"path\": \"a.txt\""),
+            "{label}"
+        );
+    }
+    let raw = |index: usize| {
+        response.output()[index]
+            .raw_provider_item()
+            .unwrap()
+            .payload()
+    };
+    assert_eq!(raw(0)["content"], json!([narration, tool_block]));
+    assert_eq!(raw(1), &tool_block);
+}
+
+/// A buffered response has no stream state: a provider field that happens to share a decoder
+/// name is kept, and the valid input stays the call's arguments.
+#[tokio::test]
+async fn anthropic_nonstream_tool_input_preserves_provider_fields() {
+    let server = MockServer::start().await;
+    let block = json!({
+        "type":"tool_use", "id":"call-1", "name":"echo", "input":{"path":"a.txt"},
+        "__unparsed_input":"provider metadata", "__input_json":"provider metadata"
+    });
+    let model = anthropic_streaming(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id":"m", "type":"message", "role":"assistant", "content":[block], "stop_reason":"tool_use"
+        })),
+    )
+    .await;
+    let response = model.get_response(asks()).await.unwrap();
+    let item = &response.output()[0];
+    let call = the_call(item.kind());
+    assert_eq!(call.arguments(), &block["input"]);
+    assert_eq!(call.unparsed_arguments(), None);
+    assert_eq!(item.raw_provider_item().unwrap().payload(), &block);
+}
+
+/// Tool input cut short by `max_tokens` is not kept as a call: the response fails with
+/// `provider.context_overflow`, as every Anthropic response stopped at `max_tokens` does.
+#[tokio::test]
+async fn anthropic_stream_with_truncated_tool_input_reports_max_tokens() {
+    let server = MockServer::start().await;
+    let frames = anthropic_tool_events(0, "echo", &["{b", "ad"], "max_tokens");
+    let model = anthropic_streaming(&server, sse(&frames, false)).await;
+    let events = model.stream_response(asks()).collect::<Vec<_>>().await;
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Ok(ModelStreamEvent::RunItem(_) | ModelStreamEvent::Completed(_))
+    )));
+    assert_eq!(
+        events.last().unwrap().as_ref().unwrap_err().code(),
+        "provider.context_overflow"
+    );
+}
+
+/// A handoff whose streamed input is not JSON keeps the text on the handoff call.
+#[tokio::test]
+async fn an_anthropic_streamed_handoff_keeps_its_text() {
+    let server = MockServer::start().await;
+    let model = anthropic_streaming(
+        &server,
+        anthropic_tool_frames("transfer_to_reviewer", &["{b", "ad"]),
+    )
+    .await;
+    let (items, response) = streamed(&model, with_handoff(asks())).await;
+    assert_unparsed_handoff(&items[0], "anthropic stream item");
+    assert_unparsed_handoff(response.output()[0].kind(), "anthropic stream response");
+}
+
+/// Input that parses is the call's arguments, and blank input keeps the initial `{}`.
+#[tokio::test]
+async fn anthropic_stream_input_that_parses_or_is_blank_carries_no_unparsed_text() {
+    for (fragments, expected) in [
+        (vec!["{\"path\": ", "\"a.txt\"}"], json!({"path": "a.txt"})),
+        (vec![""], json!({})),
+        (vec![" ", "\n"], json!({})),
+        (vec![], json!({})),
+    ] {
+        let server = MockServer::start().await;
+        let model = anthropic_streaming(&server, anthropic_tool_frames("echo", &fragments)).await;
+        let (_, response) = streamed(&model, asks()).await;
+        let call = the_call(response.output()[0].kind());
+        assert_eq!(call.arguments(), &expected, "{fragments:?}");
+        assert_eq!(call.unparsed_arguments(), None, "{fragments:?}");
+    }
 }

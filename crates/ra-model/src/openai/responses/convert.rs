@@ -424,7 +424,7 @@ pub(crate) fn convert_function_call(
     let call_id = CallId::new(required_str(item, "call_id", "function_call")?);
     let name = required_str(item, "name", "function_call")?;
     let arguments_text = required_str(item, "arguments", "function_call")?;
-    let arguments = crate::openai::function_arguments(arguments_text);
+    let arguments = crate::tool_arguments::function_arguments(arguments_text);
     // Text that is not JSON travels as the call's own record of it, with `null` arguments.
     let unparsed = arguments.is_none().then_some(arguments_text);
     let arguments = arguments.unwrap_or(Value::Null);
