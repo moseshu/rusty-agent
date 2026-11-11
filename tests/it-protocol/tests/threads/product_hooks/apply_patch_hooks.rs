@@ -457,3 +457,53 @@ async fn a_patch_that_cannot_be_written_ends_failed() {
         [("blocked".to_owned(), "failed".to_owned())]
     );
 }
+
+/// A hook section selected by `matcher`.
+fn matched(event: &str, matcher: &str, command: &str) -> String {
+    format!(
+        "[[hooks.{event}]]\nmatcher = '{matcher}'\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = '''{command}'''\n"
+    )
+}
+
+/// Codex's exact patch payloads (`pre_tool_use_payload_uses_freeform_patch_input`,
+/// `post_tool_use_payload_uses_patch_input_and_tool_output`,
+/// `permission_request_payload_uses_apply_patch_hook_name_and_aliases`): every event names
+/// `apply_patch` and carries the patch as `command`; `Write` and `Edit` select the same handlers
+/// without changing that name; PostToolUse reports the call and the text the model read.
+#[tokio::test]
+async fn patch_hook_payloads_name_apply_patch_and_match_its_aliases() {
+    let home = HooksHome::new();
+    let logs = Logs::new(&home);
+    let bash = home.path("bash.jsonl");
+    configure(
+        &home,
+        Asking::Asks,
+        &[
+            matched("PreToolUse", "^Write$", &logging(&logs.pre)),
+            matched(
+                "PermissionRequest",
+                "^Edit$",
+                &format!("{}; {ALLOW}", logging(&logs.permission)),
+            ),
+            matched("PostToolUse", "^(Write|Edit)$", &logging(&logs.post)),
+            matched("PreToolUse", "^Bash$", &logging(&bash)),
+        ],
+    );
+
+    run_patch(&home, ADD, "patched").await;
+
+    assert_eq!(logs.counts(), (1, 1, 1));
+    assert!(logged(&bash).is_empty());
+    let pre = &logged(&logs.pre)[0];
+    let permission = &logged(&logs.permission)[0];
+    let post = &logged(&logs.post)[0];
+    for payload in [pre, permission, post] {
+        assert_eq!(payload["tool_name"], "apply_patch", "{payload}");
+        assert_eq!(payload["tool_input"], json!({"command": ADD}), "{payload}");
+    }
+    assert_eq!(post["tool_use_id"], "patched");
+    assert_eq!(
+        post["tool_response"],
+        json!(model_text(&home.script, "patched"))
+    );
+}

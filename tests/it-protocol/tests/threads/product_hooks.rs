@@ -675,3 +675,6 @@ mod stdin_permission;
 
 #[path = "product_hooks/unparsed_arguments.rs"]
 mod unparsed_arguments;
+
+#[path = "product_hooks/payload_acceptance.rs"]
+mod payload_acceptance;

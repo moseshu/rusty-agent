@@ -1870,3 +1870,57 @@ command = '''cat >> '{}'; echo >> '{}' '''
     assert_eq!(logged(&named).len(), 3);
     assert_eq!(logged(&write).len(), 1);
 }
+
+/// Codex's `spawn_agent_function_tools_use_agent_matcher_alias`: `spawn_agent` in the default
+/// namespace (none, or `functions`) and in `multi_agent_v1` is named `spawn_agent` and selected by
+/// `Agent`, whatever the namespace.
+#[tokio::test]
+async fn spawn_agent_is_named_spawn_agent_and_matched_by_agent() {
+    let home = TempDir::new().unwrap();
+    let log = home.path().join("agent.log");
+    let config = hooks_config(
+        home.path(),
+        &format!(
+            r#"
+[[hooks.PreToolUse]]
+matcher = "^Agent$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '''cat >> '{0}'; echo >> '{0}' '''
+"#,
+            log.display()
+        ),
+    )
+    .await;
+    let runtime = ProductHookRuntime::new(config, session(home.path()), mcp_executor()).unwrap();
+    let queue = ra_core::hook::HookContextQueue::default();
+    let bound = bound_with_queue(&runtime, &queue);
+    let namespaced = |namespace: &str| {
+        ToolOrigin::namespaced(
+            ra_core::tool::ToolNamespace::new(namespace).unwrap(),
+            "spawn_agent",
+        )
+        .unwrap()
+    };
+    let origins = [
+        ToolOrigin::new("spawn_agent").unwrap(),
+        namespaced("functions"),
+        namespaced("multi_agent_v1"),
+    ];
+    let id = CallId::new("call-1");
+    let arguments = serde_json::json!({"message": "inspect this repo"});
+    for origin in &origins {
+        bound
+            .dispatch(HookEvent::PreToolUse(ToolHookData::new(
+                origin, &id, &arguments,
+            )))
+            .await
+            .unwrap();
+    }
+    let inputs = logged(&log);
+    assert_eq!(inputs.len(), 3);
+    for input in inputs {
+        assert_eq!(input["tool_name"], "spawn_agent");
+        assert_eq!(input["tool_input"], arguments);
+    }
+}

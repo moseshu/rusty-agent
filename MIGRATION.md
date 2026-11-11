@@ -7,6 +7,26 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Namespaced tools are hooked under Codex's flat names
+
+Product hooks name a namespaced function tool as Codex's `flat_tool_name` does. In Codex's
+default namespace (none, an empty one, or `functions`) the name is the bare tool name; in any
+other namespace it is the namespace and the name joined with nothing between them. Both kinds
+change from the dotted name used before:
+
+- `functions.echo` is now `echo`.
+- `collaboration.spawn_agent` is now `collaborationspawn_agent`, and the other collaboration
+  tools likewise; a namespaced dynamic tool changes the same way (`crm.lookup` is `crmlookup`).
+
+MCP tools keep their `mcp__server__tool` names, and tools without a namespace keep their names.
+**A hook matcher written for a dotted name must be rewritten.** Matchers are regular expressions:
+the regex `^collaboration\.spawn_agent$` becomes `^collaborationspawn_agent$`, and
+`^functions\.echo$` becomes `^echo$`. In a TOML basic string the backslash is itself escaped
+(`matcher = "^collaboration\\.spawn_agent$"`); a literal string keeps it single
+(`matcher = '^collaboration\.spawn_agent$'`). As in Codex, `spawn_agent` has the `Agent` matcher
+alias in the default namespace (which now includes `functions`) and in `multi_agent_v1`, and none
+in `collaboration`. `ToolOrigin::qualified_name` is unchanged.
+
 ### Typed tool inputs accept what their type defaults, whatever strictness advertises
 
 `FuncSchema::for_input`, and with it `ToolInput::func_schema` and every tool built on a

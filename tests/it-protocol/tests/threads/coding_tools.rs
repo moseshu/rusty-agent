@@ -774,3 +774,105 @@ async fn ending_a_thread_with_spawned_agents_runs_session_end_once_for_the_root(
     assert_eq!(inputs[0]["hook_event_name"], "SessionEnd");
     assert_eq!(inputs[0]["session_id"], thread.id());
 }
+
+/// Codex hooks a namespaced function tool under `flat_tool_name`, the namespace and the name
+/// joined with nothing between them, and gives `spawn_agent` the `Agent` alias only in the default
+/// namespace and `multi_agent_v1`: the collaboration tools are `collaborationlist_agents` and
+/// `collaborationspawn_agent`, matched by neither their dotted name nor `Agent`.
+#[tokio::test]
+async fn collaboration_tools_are_hooked_under_codexs_flat_names() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let flat = home_path.join("flat.jsonl");
+    let other = home_path.join("other.jsonl");
+    let section = |matcher: &str, log: &std::path::Path| {
+        format!(
+            "[[hooks.PreToolUse]]\nmatcher = '{matcher}'\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = '''cat >> '{0}'; echo >> '{0}' '''\n",
+            log.display()
+        )
+    };
+    std::fs::write(
+        home_path.join("config.toml"),
+        format!(
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\n\n{}{}{}",
+            section("^collaboration(list_agents|spawn_agent)$", &flat),
+            section("^collaboration\\.", &other),
+            section("^Agent$", &other)
+        ),
+    )
+    .unwrap();
+    let read = |log: &std::path::Path| -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let builder = ra_coding::config::ConfigBuilder::default()
+        .codex_home(home_path.clone())
+        .loader_overrides(ra_config::LoaderOverrides {
+            managed_config_path: Some(home_path.join("managed_config.toml")),
+            system_config_path: Some(home_path.join("system_config.toml")),
+            system_requirements_path: Some(home_path.join("requirements.toml")),
+            ..ra_config::LoaderOverrides::without_managed_config_for_tests()
+        })
+        .harness_overrides(ra_coding::config::ConfigOverrides {
+            bypass_hook_trust: Some(true),
+            ..ra_coding::config::ConfigOverrides::default()
+        });
+    let script = Arc::new(Script::default());
+    let agents = Agents::new(&script);
+    let services = Arc::new(configured_host::Services::default());
+    let host = services.install(CodingHost::open(&root).unwrap());
+    let settings = CodingThreadSettingsAdapter::new(
+        &root,
+        SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    )
+    .unwrap()
+    .with_rules_home(&home_path);
+    let factory = CodingThreadFactory::new(
+        host,
+        Arc::new(AgentsResolver(Arc::clone(&agents))),
+        settings,
+    )
+    .with_profile(ra_coding::CodingProfile::CodexLike)
+    .with_product_config(builder);
+    let (server, _) = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(Arc::new(factory)),
+            unload_delay: Some(Duration::ZERO),
+        },
+        None,
+    );
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.push(Step::Respond(collab("list_agents", json!({}))));
+    script.push(Step::Respond(collab(
+        "spawn_agent",
+        json!({"task_name": "worker", "message": "worker task", "fork_turns": "none"}),
+    )));
+    script.answer("listed");
+    server.run_turn(&mut connection, thread.id(), "list").await;
+    agents.wait_for_child_calls(1).await;
+
+    let names: Vec<Value> = read(&flat)
+        .iter()
+        .map(|input| input["tool_name"].clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            json!("collaborationlist_agents"),
+            json!("collaborationspawn_agent")
+        ]
+    );
+    assert!(read(&other).is_empty(), "{:?}", read(&other));
+}

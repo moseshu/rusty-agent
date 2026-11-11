@@ -1271,6 +1271,7 @@ impl HookToolName {
             };
         }
         let origin = call.origin();
+        let namespace = origin.namespace().map(ra_core::tool::ToolNamespace::as_str);
         match origin.name() {
             // Shell-like tools keep the historical hook name.
             "exec_command" | "shell" | "shell_command" | "local_shell"
@@ -1281,15 +1282,44 @@ impl HookToolName {
                     matcher_aliases: Vec::new(),
                 }
             }
-            "spawn_agent" if origin.namespace().is_none() => Self {
-                name: "spawn_agent".to_owned(),
-                matcher_aliases: vec!["Agent".to_owned()],
-            },
-            _ => Self {
-                name: origin.qualified_name().to_owned(),
+            // Codex's `function_hook_tool_name`: the `Agent` alias holds in the default namespace
+            // and in `multi_agent_v1`, not in other namespaces such as `collaboration`.
+            "spawn_agent"
+                if is_default_namespace(namespace)
+                    || namespace == Some(MULTI_AGENT_V1_NAMESPACE) =>
+            {
+                Self {
+                    name: "spawn_agent".to_owned(),
+                    matcher_aliases: vec!["Agent".to_owned()],
+                }
+            }
+            name => Self {
+                name: flat_tool_name(namespace, name),
                 matcher_aliases: Vec::new(),
             },
         }
+    }
+}
+
+/// Codex's `DEFAULT_FUNCTION_NAMESPACE`, which names a tool as if it had no namespace.
+const DEFAULT_FUNCTION_NAMESPACE: &str = "functions";
+
+/// The namespace of Codex's first multi-agent tools, whose `spawn_agent` keeps the `Agent` alias.
+const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+
+/// Codex's `ToolName::is_default_namespace`: no namespace, an empty one, or `functions`.
+fn is_default_namespace(namespace: Option<&str>) -> bool {
+    matches!(namespace, None | Some("" | DEFAULT_FUNCTION_NAMESPACE))
+}
+
+/// Codex's `flat_tool_name`, the hook-facing name of a function tool: the bare name in the
+/// default namespace, otherwise the namespace and the name joined with nothing between them, so
+/// `collaboration` and `spawn_agent` give `collaborationspawn_agent`. It is not the origin's
+/// qualified name (`collaboration.spawn_agent`), which registries and persisted state key on.
+fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) if !is_default_namespace(Some(namespace)) => format!("{namespace}{name}"),
+        _ => name.to_owned(),
     }
 }
 
