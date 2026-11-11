@@ -3235,16 +3235,9 @@ async fn resolve_interrupted_turn(
                 let message = state
                     .rejection_message_for(answer.item_id())
                     .map(str::to_owned);
-                end_rejected_continuation(
-                    context,
-                    agent,
-                    state,
-                    lifecycle,
-                    &approval,
-                    message.as_deref(),
-                )
-                .await?;
                 let result = rejection(&approval, message.as_deref());
+                end_rejected_continuation(context, agent, state, lifecycle, &approval, &result.0)
+                    .await?;
                 if let Some(key) = approval.lookup_key().cloned() {
                     tool_results.push(ToolUseResult::new(
                         ra_core::tool::ToolOrigin::from_lookup_key(key)?,
@@ -3991,14 +3984,15 @@ fn resumed_run_context(
     live_context(context, agent, state)
 }
 
-/// A rejected in-call question settles an invocation that already announced its start.
+/// A rejected in-call question settles an invocation that already announced its start: its end
+/// carries the rejection the call is answered with, filed as a permission refusal.
 async fn end_rejected_continuation(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,
     state: &RunState,
     lifecycle: &LifecycleHooks,
     approval: &ToolApproval,
-    message: Option<&str>,
+    answer: &ToolCallOutput,
 ) -> Result<()> {
     if lifecycle.is_empty()
         || !approval
@@ -4025,14 +4019,14 @@ async fn end_rejected_continuation(
         approval.arguments(),
     )
     .with_services(context.services);
-    let outcome = Err(Error::tool(
+    let refusal = Error::tool(
         ToolErrorKind::PermissionDenied,
         tool.origin().qualified_name(),
-        message.unwrap_or(crate::permission::DEFAULT_APPROVAL_REJECTION_MESSAGE),
-    ));
+        "the host rejected the approval this call asked for",
+    );
     lifecycle_dispatch::tool_end(
         lifecycle,
-        &ToolEndInput::new(start, &outcome),
+        &ToolEndInput::new(start, answer).with_failure_code(refusal.code()),
         context.cancel,
     )
     .await
@@ -4229,7 +4223,8 @@ async fn execute_resumed_call(
     .with_tool_guardrails(context.tool_guardrails.clone())
     .with_user_hooks(context.config.user_hooks().clone())
     .with_lifecycle_hooks(lifecycle.clone())
-    .with_unparsed_arguments(unparsed_arguments);
+    .with_unparsed_arguments(unparsed_arguments)
+    .with_call_kind(kind);
     let request = match (nested, resume) {
         (Some(checkpoint), _) => request.with_nested_resume(checkpoint),
         (None, Some(resume)) => request.with_approval_granted().with_resume(resume),
@@ -4294,7 +4289,13 @@ async fn dispatch_with_committed_output(
     request: ToolDispatchRequest,
 ) -> Result<(crate::tool::dispatch::ToolDispatchOutcome, Option<Error>)> {
     let slot = Arc::new(std::sync::Mutex::new(None));
-    match dispatch_tool(request.with_output_committer(Arc::clone(&slot))).await {
+    // Boxed as the batch boxes its dispatches: the chain is large, and inline it would grow every
+    // resumed turn's future by its whole size.
+    match Box::pin(dispatch_tool(
+        request.with_output_committer(Arc::clone(&slot)),
+    ))
+    .await
+    {
         Ok(outcome) => Ok((outcome, None)),
         Err(error) => match slot
             .lock()

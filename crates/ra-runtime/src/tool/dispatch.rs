@@ -29,11 +29,12 @@
 //! framework's rendering of it, and the stable code for any other error, as the reference falls back
 //! to the exception's class name when its text is empty.
 //!
-//! The [lifecycle](ra_core::lifecycle) narration sits one step further in still, immediately around
-//! the invocation and below the admission gate, and it is not a stage: it decides nothing, so it
-//! carries no number in the order above and cannot refuse anything. What it brackets is
-//! execution — which is why every call it announced is announced again when it settles, whichever
-//! way that went.
+//! The [lifecycle](ra_core::lifecycle) narration is not a stage: it decides nothing, so it carries
+//! no number in the order above and cannot refuse anything. Its start sits immediately before the
+//! invocation, below the admission gate; its end follows everything that shapes the answer the call
+//! is given, as the reference raises `on_tool_end` with its `final_result`. A call it announced is
+//! announced again when it settles into an answer, whether that answer is a result, a handled
+//! failure or a refusal; a call that leaves as an error raises only its start.
 //!
 //! Concurrency ceilings, batch settlement, and cancellation draining belong to the batch module.
 
@@ -328,6 +329,7 @@ pub struct ToolDispatchRequest {
     resume: Option<ToolResume>,
     output_committer: Option<Arc<Mutex<Option<ToolDispatchOutcome>>>>,
     unparsed_arguments: Option<Box<str>>,
+    call_kind: ToolCallKind,
 }
 
 impl ToolDispatchRequest {
@@ -341,6 +343,15 @@ impl ToolDispatchRequest {
             self.arguments = Value::String(text.to_owned());
             self.unparsed_arguments = Some(text.into());
         }
+        self
+    }
+
+    /// Records the kind of call the model made, which its answer is recorded under.
+    ///
+    /// The batch and the resume path know it from the call item; a request built without it uses
+    /// the kind the tool declares to the model.
+    pub(crate) const fn with_call_kind(mut self, kind: ToolCallKind) -> Self {
+        self.call_kind = kind;
         self
     }
 
@@ -369,6 +380,7 @@ impl ToolDispatchRequest {
         history: CallHistory,
         permission: PermissionEngine,
     ) -> Self {
+        let call_kind = ToolCallKind::from(tool.model_definition().kind());
         Self {
             tool,
             call_id,
@@ -387,6 +399,7 @@ impl ToolDispatchRequest {
             resume: None,
             output_committer: None,
             unparsed_arguments: None,
+            call_kind,
         }
     }
 
@@ -584,7 +597,9 @@ pub(crate) async fn dispatch_tool_with_admission(
 /// Long on purpose. The order is the contract this module documents, and every stage that can
 /// refuse reads the two above it — splitting the chain into three functions would put that order
 /// somewhere no single function states it, which is the drift having one insertion point per
-/// milestone exists to prevent.
+/// milestone exists to prevent. The one exception is what a finished invocation settles into
+/// (stages 8 and 9, in [`settle_invocation`]): it is a single call here so that the tool-end
+/// narration wraps every way the answer is shaped, and by then the tool has already run.
 #[allow(clippy::too_many_lines)]
 async fn run_chain(
     request: &mut ToolDispatchRequest,
@@ -686,6 +701,7 @@ async fn run_chain(
                 &options,
                 &name,
                 error,
+                FailureStage::BeforeInvocation,
                 &output_guardrails,
                 records,
             )
@@ -735,17 +751,12 @@ async fn run_chain(
         // state the tool kept for it, as an approval the host answered resumes with it.
         Admission::Proceed(Some(state)) => request.resume = Some(ToolResume::before_call(state)),
         Admission::Proceed(None) => {}
-        Admission::Answered(answer) => {
-            if continuation_denied {
-                let outcome = Err(Error::tool(
-                    ToolErrorKind::PermissionDenied,
-                    &name,
-                    "continuation denied by current policy",
-                ));
-                announce_invocation_end(request, &outcome).await?;
-            }
-            return Ok(answer);
+        // A continuation was announced when its invocation started, so the refusal the current
+        // policy gives it is how that invocation settles.
+        Admission::Answered(answer) if continuation_denied => {
+            return announce_settlement(request, Ok(answer)).await;
         }
+        Admission::Answered(answer) => return Ok(answer),
     }
 
     // 4. Input guardrail, on the arguments the tool is about to be handed. A refusal here means the
@@ -770,9 +781,9 @@ async fn run_chain(
         };
         // The reference parses arguments inside the invocation, so this failure is an invocation
         // that started and failed: its lifecycle starts once the input guardrails allow the call
-        // and ends with the error, before the failure policy shapes or raises it, as every other
-        // failed invocation is narrated here. Like any invocation it starts only once the
-        // concurrency gate admits it, so an exclusive tool still running is not overlapped by
+        // and ends with the answer the failure policy gives, or not at all when the policy raises,
+        // as every other failed invocation is narrated. Like any invocation it starts only once
+        // the concurrency gate admits it, so an exclusive tool still running is not overlapped by
         // another's start. It declares no resources: the tool cannot read its arguments, so its
         // dynamic claims are not asked for.
         let permits = if let Some(gate) = admission {
@@ -795,27 +806,20 @@ async fn run_chain(
         )
         .await?;
         drop(permits);
-        announce_invocation_end(request, &Err(failure())).await?;
         let failed = shape_failure(
             tool,
             request,
             &options,
             &name,
             failure(),
+            FailureStage::Invocation,
             &output_guardrails,
             records,
         )
         .await?;
-        // The output is a failure whichever way it was rendered, as the reference answers such a
-        // call with `success: false`. A tool's own text is already marked where it is finished
-        // (`finish_output`), before it is committed; this covers the paths that commit nothing.
-        return Ok(match failed {
-            ToolDispatch::Observed(mut observation) => {
-                observation.output = observation.output.with_error(true);
-                ToolDispatch::Observed(observation)
-            }
-            other => other,
-        });
+        // The answer is a failure whichever way it was rendered, as the reference answers such a
+        // call with `success: false`; it is marked where it is committed (`commit_and_extract`).
+        return announce_settlement(request, Ok(failed)).await;
     }
 
     // Stages 5 to 7 repeat only when the tool asks for approval from inside its invocation and a
@@ -835,16 +839,28 @@ async fn run_chain(
             match claims_result {
                 Ok(Ok(claims)) => claims,
                 Ok(Err(error)) => {
-                    return shape_failure(
+                    let stage = if continuation {
+                        FailureStage::Invocation
+                    } else {
+                        FailureStage::BeforeInvocation
+                    };
+                    let failed = shape_failure(
                         tool,
                         request,
                         &options,
                         &name,
                         error,
+                        stage,
                         &output_guardrails,
                         records,
                     )
                     .await;
+                    // A continuation re-acquiring its resources has already started.
+                    return if continuation {
+                        announce_settlement(request, failed).await
+                    } else {
+                        failed
+                    };
                 }
                 Err(error) => return Err(error),
             }
@@ -867,16 +883,16 @@ async fn run_chain(
             None
         };
 
-        // Lifecycle narration, immediately around the invocation and nowhere wider. It is not a
-        // stage: it decides nothing, and it is unnumbered so the numbering keeps meaning "a point
-        // where this call can still be refused". Every stage above decides whether the call happens
-        // at all, so announcing a tool start ahead of them would announce tools the chain then
-        // refuses to run, and a host counting invocations would be counting decisions. It sits
-        // below the admission gate too, so the pair brackets execution rather than execution plus
-        // queueing — the waiting already has its own field.
+        // Lifecycle narration starts immediately before the invocation and nowhere earlier. It is
+        // not a stage: it decides nothing, and it is unnumbered so the numbering keeps meaning "a
+        // point where this call can still be refused". Every stage above decides whether the call
+        // happens at all, so announcing a tool start ahead of them would announce tools the chain
+        // then refuses to run, and a host counting invocations would be counting decisions. It sits
+        // below the admission gate too, so the pair does not include queueing — the waiting
+        // already has its own field.
         //
-        // A continuation was announced when it first started, and its end is announced once,
-        // below, when it has a result.
+        // A continuation was announced when it first started. Every call that started ends once,
+        // with the answer it settles into (`announce_settlement`).
         if !continuation {
             lifecycle_dispatch::tool_start(
                 &request.lifecycle,
@@ -944,30 +960,27 @@ async fn run_chain(
                 decoded_input = match tool.decode_input(&request.arguments) {
                     Ok(decoded) => decoded,
                     Err(error) => {
-                        return shape_failure(
+                        let failed = shape_failure(
                             tool,
                             request,
                             &options,
                             &name,
                             error,
+                            FailureStage::Invocation,
                             &output_guardrails,
                             records,
                         )
                         .await;
+                        return announce_settlement(request, failed).await;
                     }
                 };
             }
+            // The invocation started before it asked, so the refusal settles it.
             HookDecision::Deny { message } => {
-                let denied = Err(Error::tool(
-                    ToolErrorKind::PermissionDenied,
-                    &name,
-                    "a permission hook denied the approval this call asked for",
-                ));
-                announce_invocation_end(request, &denied).await?;
-                return Ok(ToolDispatch::Refused(ToolRefusal::new(
-                    pre_invocation_rejection(request, message)?,
-                    PERMISSION_REQUEST_HOOK_CODE,
-                )));
+                let refused = pre_invocation_rejection(request, message).map(|output| {
+                    ToolDispatch::Refused(ToolRefusal::new(output, PERMISSION_REQUEST_HOOK_CODE))
+                });
+                return announce_settlement(request, refused).await;
             }
             _ => {
                 return Ok(ToolDispatch::AwaitingApproval(
@@ -979,6 +992,33 @@ async fn run_chain(
         }
     };
 
+    let settled = settle_invocation(
+        tool,
+        request,
+        &options,
+        &name,
+        outcome,
+        deadline_elapsed,
+        &output_guardrails,
+        records,
+    )
+    .await;
+    announce_settlement(request, settled).await
+}
+
+/// Turns a finished invocation into the answer the call is given: failure policy, `PostToolUse`,
+/// output guardrails, projection, commitment and custom-data extraction, in that order.
+#[allow(clippy::too_many_arguments)]
+async fn settle_invocation(
+    tool: &Arc<dyn Tool>,
+    request: &ToolDispatchRequest,
+    options: &ToolOptions,
+    name: &str,
+    outcome: Result<ToolOutput>,
+    deadline_elapsed: bool,
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<ToolDispatch> {
     // A failed Session append retains completed child work. It must leave through the parent
     // checkpoint rather than become a model-visible tool failure that invites another execution.
     let outcome = match outcome {
@@ -1001,22 +1041,20 @@ async fn run_chain(
         outcome => outcome,
     };
 
-    announce_invocation_end(request, &outcome).await?;
-
     let output = match outcome {
         Ok(output) => output,
         Err(error) if deadline_elapsed => {
-            return shape_deadline(tool, request, &options, error, &output_guardrails, records)
-                .await;
+            return shape_deadline(tool, request, options, error, output_guardrails, records).await;
         }
         Err(error) => {
             return shape_failure(
                 tool,
                 request,
-                &options,
-                &name,
+                options,
+                name,
                 error,
-                &output_guardrails,
+                FailureStage::Invocation,
+                output_guardrails,
                 records,
             )
             .await;
@@ -1038,7 +1076,7 @@ async fn run_chain(
     // model reads. That answer *is* the record in this framework — history is what the next request
     // is built from — so the refused content does not travel on beside the message that replaced it.
     if let Some(replacement) =
-        check_output_guardrails(request, &output_guardrails, &output, records).await?
+        check_output_guardrails(request, output_guardrails, &output, records).await?
     {
         return finish_guardrail_output(request, replacement).await;
     }
@@ -1097,19 +1135,46 @@ fn lifecycle_call(request: &ToolDispatchRequest) -> ToolStartInput<'_> {
     }
 }
 
-/// Tells the lifecycle narration how the invocation it announced settled.
+/// Tells the lifecycle narration the answer a started call settled into, and passes it on.
 ///
-/// Runs before any output transformation, including asynchronous custom failure handling and the
-/// output guardrails, so an observer measures invocation rather than settlement.
-async fn announce_invocation_end(
+/// Called only where the call's start was announced, now or in an earlier segment. It runs after
+/// everything that shapes the answer — failure policy, output guardrails, commitment and custom-data
+/// extraction — as the reference raises `on_tool_end` with its `final_result`. Nothing is
+/// announced for a call that leaves as an error, or that is waiting on an approval: the first did
+/// not settle and the second settles later, in the continuation that announces it once.
+async fn announce_settlement(
     request: &ToolDispatchRequest,
-    outcome: &Result<ToolOutput>,
-) -> Result<()> {
+    settled: Result<ToolDispatch>,
+) -> Result<ToolDispatch> {
+    // Recorded under the kind of call the model made; an answer that was finished has it already.
+    let settled = match settled? {
+        ToolDispatch::Observed(mut observation) => {
+            observation.output = observation.output.with_kind(request.call_kind);
+            ToolDispatch::Observed(observation)
+        }
+        ToolDispatch::Refused(mut refusal) => {
+            refusal.output = refusal.output.with_kind(request.call_kind);
+            ToolDispatch::Refused(refusal)
+        }
+        waiting => waiting,
+    };
     if request.lifecycle.is_empty() {
-        return Ok(());
+        return Ok(settled);
     }
-    let settled = ToolEndInput::new(lifecycle_call(request), outcome);
-    lifecycle_dispatch::tool_end(&request.lifecycle, &settled, &request.cancel).await
+    let (output, failure_code) = match &settled {
+        ToolDispatch::Observed(observation) => (observation.output(), observation.failure_code()),
+        ToolDispatch::Refused(refusal) => (refusal.output(), Some(refusal.code())),
+        ToolDispatch::AwaitingApproval(_) | ToolDispatch::AwaitingNestedApproval(_) => {
+            return Ok(settled);
+        }
+    };
+    let ended = ToolEndInput::new(lifecycle_call(request), output);
+    let ended = match failure_code {
+        Some(code) => ended.with_failure_code(code),
+        None => ended,
+    };
+    lifecycle_dispatch::tool_end(&request.lifecycle, &ended, &request.cancel).await?;
+    Ok(settled)
 }
 
 async fn run_user_hook(
@@ -1213,6 +1278,7 @@ async fn admit_permission(
                         options,
                         name,
                         error,
+                        FailureStage::BeforeInvocation,
                         output_guardrails,
                         records,
                     )
@@ -1438,26 +1504,38 @@ pub(crate) fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Turns an invocation failure into either a model-visible observation or a stopped turn.
+/// Whether the call had started when the error occurred.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureStage {
+    BeforeInvocation,
+    Invocation,
+}
+
+/// Turns a tool failure into either a model-visible observation or a stopped turn.
 ///
-/// The output guardrails are carried in because one branch below produces tool-authored text the
-/// model will read — [`ToolFailureHandling::Custom`] — and that is a tool result like any other. The
-/// branches that render a stable code are not offered to them: a code and a qualified name are the
-/// framework's own vocabulary, with nothing a check written about tool content could inspect.
+/// A started invocation's answer goes through output guardrails, commitment, and custom-data
+/// extraction, as in the reference. Before invocation, retain the existing failure policy without
+/// adding those steps to framework-rendered errors.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn shape_failure(
+async fn shape_failure(
     tool: &Arc<dyn Tool>,
     request: &ToolDispatchRequest,
     options: &ToolOptions,
     name: &str,
     error: Error,
+    stage: FailureStage,
     output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
     records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
-    // A cancellation is never an observation. Reporting it to the model as a tool failure would
-    // let the loop continue past the very thing that asked it to stop, and the run would keep
-    // spending after the user interrupted it.
-    if error.is_cancelled() {
+    // A cancellation of this call's scope is never an observation: a parent cancellation or a
+    // failing sibling's teardown asked the run to stop, and reporting it to the model as a tool
+    // failure would let the loop continue past it. A cancellation the tool reports while its scope
+    // is still live is the tool's own failure, and its failure policy answers it like any other,
+    // as the reference hands a tool's own `CancelledError` to the failure function and raises only
+    // a teardown's. Errors before invocation keep the existing cancellation behavior.
+    if error.is_cancelled()
+        && (stage == FailureStage::BeforeInvocation || request.cancel.is_cancelled())
+    {
         return Err(error);
     }
     // Nor is a question a nested agent is waiting on. The invocation site turns it into a paused
@@ -1481,7 +1559,7 @@ pub(crate) async fn shape_failure(
     ) {
         return match options.timeout_behavior() {
             ToolTimeoutBehavior::ModelVisible => {
-                Ok(observed_failure(&request.call_id, name, &error))
+                failure_answer(request, name, &error, stage, output_guardrails, records).await
             }
             ToolTimeoutBehavior::Propagate => Err(error),
             behavior => Err(Error::caller(format!(
@@ -1492,9 +1570,11 @@ pub(crate) async fn shape_failure(
 
     match options.failure_handling() {
         ToolFailureHandling::ModelVisible if tool.model_definition().kind().is_custom() => {
-            custom_tool_failure(request, &error, output_guardrails, records).await
+            custom_tool_failure(request, &error, stage, output_guardrails, records).await
         }
-        ToolFailureHandling::ModelVisible => Ok(observed_failure(&request.call_id, name, &error)),
+        ToolFailureHandling::ModelVisible => {
+            failure_answer(request, name, &error, stage, output_guardrails, records).await
+        }
         ToolFailureHandling::Propagate => Err(error),
         // The one path where a tool writes its own model-facing failure text. Returning `None`
         // normally means the tool declined to handle it, and an unhandled failure propagates.
@@ -1532,7 +1612,7 @@ pub(crate) async fn shape_failure(
                     && !(tool.output_schema().is_some()
                         && request.caller == ToolCaller::Programmatic) =>
                 {
-                    Ok(observed_failure(&request.call_id, name, &error))
+                    failure_answer(request, name, &error, stage, output_guardrails, records).await
                 }
                 None => Err(error),
             }
@@ -1570,21 +1650,38 @@ async fn finish_output(
             "a completed tool output must be an observation",
         ));
     };
-    // A call whose arguments were not JSON never runs, so any failure finished here is its answer,
-    // and it is a failure however the tool worded it, as the reference answers such a call with
-    // `success: false`. Marked before the output is committed or handed to the extractor, so the
-    // copy a resumed run reads carries the same flag as the answer this call returns.
     if matches!(
         failure_code,
         Some("tool.timeout" | TOOL_OUTPUT_GUARDRAIL_CODE | "hook.post_tool_use")
-    ) || (failure_code.is_some() && request.unparsed_arguments.is_some())
-    {
+    ) {
+        observation.output = observation.output.with_error(true);
+    }
+    commit_and_extract(request, &output, observation).await
+}
+
+/// Commits a finished answer and runs the custom-data extractor over it.
+///
+/// `output` is the result the extractor is told the call produced; `observation` is the answer
+/// as recorded.
+async fn commit_and_extract(
+    request: &ToolDispatchRequest,
+    output: &ToolOutput,
+    mut observation: ToolObservation,
+) -> Result<ToolDispatch> {
+    // Recorded under the kind of call the model made, as history replays it, before the extractor,
+    // the committed copy and the end narration are given it.
+    observation.output = observation.output.with_kind(request.call_kind);
+    // A call whose arguments were not JSON never runs, so any failure finished for it is its
+    // answer, and it is a failure however the tool worded it, as the reference answers such a call
+    // with `success: false`. Marked before the output is committed or handed to the extractor, so
+    // the copy a resumed run reads carries the same flag as the answer this call returns.
+    if observation.failure_code.is_some() && request.unparsed_arguments.is_some() {
         observation.output = observation.output.with_error(true);
     }
     let mut context = FunctionToolCustomDataContext::new(
         request.context(),
         request.tool.as_ref(),
-        &output,
+        output,
         observation.output.clone(),
     );
     // The callable has completed. Preserve its final output before running user extraction code,
@@ -1599,6 +1696,17 @@ async fn finish_output(
     }
     if let Some(data) = extract_custom_data(request, &mut context).await? {
         observation.output = observation.output.with_custom_data(data);
+        // The committed copy is the answer a resumed run settles from when anything after this
+        // fails, the end narration included, so it carries the extracted data too, as the
+        // reference sets it on the very item it committed.
+        if let Some(committer) = &request.output_committer {
+            let mut committed = committer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(outcome) = committed.as_mut() {
+                outcome.dispatch = ToolDispatch::Observed(observation.clone());
+            }
+        }
     }
     Ok(ToolDispatch::Observed(observation))
 }
@@ -1665,6 +1773,7 @@ fn project_output(request: &ToolDispatchRequest, output: ToolOutput) -> Result<T
 async fn custom_tool_failure(
     request: &ToolDispatchRequest,
     error: &Error,
+    stage: FailureStage,
     output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
     records: &mut ToolGuardrailRecords,
 ) -> Result<ToolDispatch> {
@@ -1676,10 +1785,48 @@ async fn custom_tool_failure(
     if let Some(replacement) =
         check_output_guardrails(request, output_guardrails, &output, records).await?
     {
-        return Ok(replacement);
+        return match stage {
+            FailureStage::BeforeInvocation => Ok(replacement),
+            FailureStage::Invocation => finish_guardrail_output(request, replacement).await,
+        };
     }
-    let output = project_output(request, output)?;
-    observed(&request.call_id, &output, Some(error.code()))
+    let rendered = project_output(request, output.clone())?;
+    let dispatch = observed(&request.call_id, &rendered, Some(error.code()))?;
+    match (stage, dispatch) {
+        (FailureStage::Invocation, ToolDispatch::Observed(observation)) => {
+            commit_and_extract(request, &output, observation).await
+        }
+        (_, dispatch) => Ok(dispatch),
+    }
+}
+
+/// Builds the framework's stable failure object and settles it if the call started.
+///
+/// The object is the model-visible answer and stays one: a code and the tool it came from, no
+/// prose. The output guardrails and the extractor are given it as text, as the reference gives
+/// them its default failure message; a guardrail refusal replaces it. It is committed before the
+/// extractor runs, so a failure after that settles a resumed run from it rather than from another
+/// execution.
+async fn failure_answer(
+    request: &ToolDispatchRequest,
+    name: &str,
+    error: &Error,
+    stage: FailureStage,
+    output_guardrails: &[Arc<dyn ToolOutputGuardrail>],
+    records: &mut ToolGuardrailRecords,
+) -> Result<ToolDispatch> {
+    let answer = failure_output(&request.call_id, name, error);
+    let observation = ToolObservation::failed(answer, error.code());
+    if stage == FailureStage::BeforeInvocation {
+        return Ok(ToolDispatch::Observed(observation));
+    }
+    let view = ToolOutput::text(observation.output().output().to_string());
+    if let Some(replacement) =
+        check_output_guardrails(request, output_guardrails, &view, records).await?
+    {
+        return finish_guardrail_output(request, replacement).await;
+    }
+    commit_and_extract(request, &view, observation).await
 }
 
 fn is_invalid_input(error: &Error) -> bool {
@@ -1827,17 +1974,6 @@ pub(crate) fn observed(
     }))
 }
 
-/// Builds the model-visible form of a failure: a stable code and the tool it came from.
-///
-/// No prose. See the module documentation — framework error text is written for logs and for the
-/// user, not for the model, and a downstream reader must branch on the code rather than on wording.
-pub(crate) fn observed_failure(call_id: &CallId, name: &str, error: &Error) -> ToolDispatch {
-    ToolDispatch::Observed(ToolObservation::failed(
-        failure_output(call_id, name, error),
-        error.code(),
-    ))
-}
-
 /// Answers a call the chain declined to run, in the shape a failing tool would have used.
 ///
 /// One error format reaches the model, not two. What differs is the record left behind: nothing
@@ -1849,6 +1985,10 @@ pub(crate) fn refused(call_id: &CallId, name: &str, error: &Error) -> ToolDispat
     ))
 }
 
+/// Builds the model-visible form of a failure: a stable code and the tool it came from.
+///
+/// No prose. See the module documentation — framework error text is written for logs and for the
+/// user, not for the model, and a downstream reader must branch on the code rather than on wording.
 pub(crate) fn failure_output(call_id: &CallId, name: &str, error: &Error) -> ToolCallOutput {
     ToolCallOutput::new(
         call_id.clone(),

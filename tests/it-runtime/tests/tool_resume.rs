@@ -191,9 +191,12 @@ impl Tool for ResumingTool {
     }
 }
 
-/// Records tool starts and ends.
+/// Records tool starts and ends, and the answer each end was told about.
 #[derive(Default)]
-struct Narration(Mutex<Vec<String>>);
+struct Narration(
+    Mutex<Vec<String>>,
+    Mutex<Vec<ra_core::item::ToolCallOutput>>,
+);
 
 #[async_trait]
 impl LifecycleHook for Narration {
@@ -215,6 +218,7 @@ impl LifecycleHook for Narration {
             .lock()
             .unwrap()
             .push(format!("end/{}", input.failure_code().unwrap_or("ok")));
+        self.1.lock().unwrap().push(input.output().clone());
         Ok(())
     }
 }
@@ -555,10 +559,15 @@ async fn a_rejected_second_question_settles_without_another_invocation() {
     .unwrap();
     assert!(matches!(completed.outcome(), RunOutcome::Completed { .. }));
     assert_eq!(tool.invocations().len(), 1);
-    let narration = narration.0.lock().unwrap();
-    assert_eq!(narration.len(), 2);
-    assert_eq!(narration[0], "start");
-    assert!(narration[1].starts_with("end/"));
+    // The host's rejection is the answer the started invocation settles into.
+    assert_eq!(
+        *narration.0.lock().unwrap(),
+        ["start", "end/tool.permission_denied"]
+    );
+    let ended = narration.1.lock().unwrap();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].output(), &json!("stop here"));
+    assert!(ended[0].is_error());
     assert!(completed.state().generated_items().iter().any(|item| matches!(item.kind(), RunItemKind::ToolCallOutput(output) if output.output() == &json!("stop here"))));
 }
 
@@ -587,10 +596,21 @@ async fn a_denied_continuation_closes_the_started_invocation() {
     .unwrap();
     assert!(matches!(completed.outcome(), RunOutcome::Completed { .. }));
     assert_eq!(tool.invocations(), [None]);
-    let narration = narration.0.lock().unwrap();
-    assert_eq!(narration.len(), 2);
-    assert_eq!(narration[0], "start");
-    assert!(narration[1].starts_with("end/"));
+    // The current policy's refusal is the answer the started invocation settles into.
+    assert_eq!(
+        *narration.0.lock().unwrap(),
+        ["start", "end/tool.permission_denied"]
+    );
+    let answer = completed
+        .state()
+        .generated_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the refusal answers the call");
+    assert_eq!(*narration.1.lock().unwrap(), [answer]);
 }
 
 #[tokio::test]
@@ -605,6 +625,8 @@ async fn a_failed_continuation_cannot_be_replayed_from_its_error_checkpoint() {
     .await
     .unwrap_err();
     assert_eq!(tool.invocations().len(), 2);
+    // A continuation that leaves as an error settles into no answer: only its start was told.
+    assert_eq!(*narration.0.lock().unwrap(), ["start"]);
     let failed = error
         .run_state()
         .expect("a failed resume carries its checkpoint");
@@ -650,9 +672,12 @@ async fn an_ordinary_checkpointed_tool_failure_uses_its_failure_policy() {
         assert!(completed.state().generated_items().iter().any(
             |item| matches!(item.kind(), RunItemKind::ToolCallOutput(output) if output.is_error())
         ));
-        let narration = narration.0.lock().unwrap();
-        assert_eq!(narration.len(), 2);
-        assert_eq!(narration[0], "start");
-        assert!(narration[1].starts_with("end/"));
+        let narration_log = narration.0.lock().unwrap();
+        assert_eq!(narration_log.len(), 2);
+        assert_eq!(narration_log[0], "start");
+        assert_ne!(narration_log[1], "end/ok");
+        let ended = narration.1.lock().unwrap();
+        assert_eq!(ended.len(), 1);
+        assert!(ended[0].is_error());
     }
 }

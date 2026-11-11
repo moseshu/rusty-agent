@@ -7,6 +7,65 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### `on_tool_end` carries the answer a call settled into
+
+`LifecycleHook::on_tool_end` now fires where the reference raises it: after the call's result is
+final, with that result. A failure has been answered by the tool's failure policy (the generic
+failure object, the tool's `handle_failure` text, or the timeout message), PostToolUse and the
+output guardrails have run and a refusal has replaced what they refused, and the output has been
+committed and its custom data extracted. Before, it fired right after the invocation, before any of
+that, with the tool's own `Result`.
+
+- **`ToolEndInput::output()` returns `&ToolCallOutput`**, the answer the model is shown and history
+  records — including the kind of call it answers (a custom call's answer is a custom one) and the
+  custom data extracted for it — instead of `Result<&ToolOutput, &Error>`. A tool's own output is read back with
+  `ToolOutput::from_stored(input.output().output())`; a framework-rendered failure is the
+  `{"error": {"code", "tool"}}` object. **A hook that matched on `Ok`/`Err` must be rewritten**:
+  `failure_code()` still tells a failure from a result, and now also names failures the tool worded
+  itself, output guardrail refusals (`guardrail.tool_output`), PostToolUse denials and in-call
+  approval refusals.
+- **`ToolEndInput::new(call, output)` takes `&ToolCallOutput`**; `with_failure_code(code)` marks a
+  failure. Code that only implements `on_tool_end` does not construct it.
+- **A call that leaves as an error raises only `on_tool_start`.** A failure the policy propagates
+  (`ToolFailureHandling::Propagate`, a `Custom` handler that declines), a timeout under
+  `ToolTimeoutBehavior::Propagate`, an output guardrail that raises, and a failing custom-data
+  extractor no longer raise `on_tool_end`. A cancellation of the call's scope (the run's, or a
+  failing sibling's teardown) and calls waiting on an approval raise none, as before. A host that
+  paired every start with an end must allow for unpaired starts on failed runs.
+- **A refusal of a started call ends it with that refusal.** A permission hook or the host
+  rejecting an approval the tool asked for from inside its invocation, or the current policy
+  denying its continuation, ends the call with the rejection message the model is shown
+  (`hook.permission_request` or `tool.permission_denied`) rather than with a `PermissionDenied`
+  error.
+- **An end that fails no longer re-runs the tool.** The output is committed before `on_tool_end`
+  runs, so a run that fails in the callback resumes from the committed output, as it already did
+  for a failing custom-data extractor. The committed output now carries the custom data the
+  extractor added, so the resumed run has it without running the extractor again.
+
+Two failure paths change with it, so that every answer settles the same way:
+
+- **A model-visible failure from a started call is checked, committed and extracted.** Under
+  `ToolFailureHandling::ModelVisible` the `{"error": {"code", "tool"}}` object the model is shown is
+  now given to the tool's output guardrails, committed, and handed to the custom-data extractor,
+  as the reference sends its default failure message through all three. Guardrails and the
+  extractor see the object as text (`ToolOutput::text` of its JSON), and a guardrail refusal
+  replaces it; what the model is shown otherwise is unchanged. A custom tool's failure text, which
+  was already checked, is now committed and extracted too. An approved call that fails this way and
+  then fails in `on_tool_end` resumes from its committed answer instead of running again.
+- **A cancellation an invoked tool reports itself is its own failure.** A tool (or an agent tool's stream
+  handler, which stops the nested run) that returns `Error::Cancelled` while its call's scope is
+  still live is answered by its failure policy like any other failure — the failure object with code
+  `cancelled`, its `handle_failure` text, or propagation under `Propagate` — and the run continues,
+  as the reference hands a tool's own `CancelledError` to the failure function. Before, it always
+  stopped the run. A cancellation of the call's scope still stops the run without asking the policy.
+
+Typed argument decoding still reports errors before the permission stage, without approval or
+`on_tool_start`/`on_tool_end`. Framework-rendered errors at this stage bypass output guardrails,
+commitment and extraction. A `Custom` failure handler can still provide its own answer at this
+stage. The reference validates typed arguments inside the approved invocation, so it emits
+`on_tool_start` and emits `on_tool_end` if the failure policy produces an answer. The approval
+and decoding order is tracked separately.
+
 ### Namespaced tools are hooked under Codex's flat names
 
 Product hooks name a namespaced function tool as Codex's `flat_tool_name` does. In Codex's
@@ -89,9 +148,9 @@ with its text and answered as a failure when it runs; the run continues.
   PostToolUse does not fire.
 - **Lifecycle.** As the reference parses arguments inside the invocation, an admitted call is
   narrated as an invocation that started and failed: `on_tool_start` fires once the input
-  guardrails allow it, with `ToolStartInput::has_unparsed_arguments()` set, and `on_tool_end`
-  follows with the `tool.invalid_input` error before the failure policy answers or raises, as for
-  any other failed invocation in this framework.
+  guardrails allow it, with `ToolStartInput::has_unparsed_arguments()` set. `on_tool_end` follows
+  with the answer the failure policy gives, under the `tool.invalid_input` code; when the policy
+  raises, only the start fires (see "`on_tool_end` carries the answer a call settled into").
 - **Repeat detection.** The repeat breaker fingerprints such text apart from every parsed value:
   a model that corrects the text into a real `null`, or into the same characters as a JSON
   string, has changed its call; the same text sent again is a repeat.

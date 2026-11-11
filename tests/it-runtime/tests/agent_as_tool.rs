@@ -2485,6 +2485,10 @@ async fn cancelling_the_parent_does_not_wait_for_the_handler() {
     assert!(handler.dropped.load(Ordering::SeqCst));
 }
 
+/// A handler's cancellation stops the nested run, and the call then fails with it like any other
+/// failure of the tool's own: its failure policy answers it and the parent continues, as the
+/// reference hands a tool's own `CancelledError` to the failure function (probed against
+/// `f53c6245`: the parent finishes and `on_tool_end` gets the default failure message).
 #[tokio::test]
 async fn a_handler_that_reports_cancellation_stops_the_nested_run() {
     let calls = Arc::new(Mutex::new(0));
@@ -2494,6 +2498,48 @@ async fn a_handler_that_reports_cancellation_stops_the_nested_run() {
             calls: Arc::clone(&calls),
             error: || Error::cancelled("handler_stop"),
         }))
+        .build()
+        .unwrap();
+    let scripted = ScriptedResolver::new(vec![
+        tool_call("p-1", "call-1", "streamer", json!({"input": "x"})),
+        final_message("p-2", "done"),
+    ]);
+    let deltas = DeltaModel::new(3, None);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        Runner::run(delta_request(tool, &scripted, &deltas, CancelScope::root())),
+    )
+    .await
+    .expect("the call stopped")
+    .expect("the failure policy answers the call");
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert!(
+        deltas.stopped.load(Ordering::SeqCst),
+        "the nested model call was stopped"
+    );
+    let answer = result
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) => Some(output),
+            _ => None,
+        })
+        .expect("the call is answered");
+    assert!(answer.is_error(), "{answer:?}");
+}
+
+/// Under a policy that propagates failures, the handler's cancellation leaves the parent run.
+#[tokio::test]
+async fn a_handler_cancellation_under_propagation_stops_the_parent_run() {
+    let calls = Arc::new(Mutex::new(0));
+    let tool = delta_agent()
+        .as_tool()
+        .on_stream(Arc::new(FailingHandler {
+            calls: Arc::clone(&calls),
+            error: || Error::cancelled("handler_stop"),
+        }))
+        .propagate_failures()
         .build()
         .unwrap();
     let scripted = ScriptedResolver::new(vec![tool_call(
@@ -2512,10 +2558,7 @@ async fn a_handler_that_reports_cancellation_stops_the_nested_run() {
     .unwrap_err();
     assert!(error.is_cancelled(), "{error:?}");
     assert_eq!(*calls.lock().unwrap(), 1);
-    assert!(
-        deltas.stopped.load(Ordering::SeqCst),
-        "the nested model call was stopped"
-    );
+    assert!(deltas.stopped.load(Ordering::SeqCst));
 }
 
 struct PanickingHandler;

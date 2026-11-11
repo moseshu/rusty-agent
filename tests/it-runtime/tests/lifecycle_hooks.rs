@@ -610,7 +610,9 @@ impl ra_core::guardrail::ToolOutputGuardrail for PausedOutputCheck {
 }
 
 #[tokio::test]
-async fn invocation_end_precedes_a_blocked_output_guardrail() {
+async fn the_end_waits_for_a_blocked_output_guardrail() {
+    // The end carries the answer the call settles into, which the output guardrail is still
+    // deciding, as the reference raises `on_tool_end` after its output guardrails.
     let hooks = Recording::new("metrics");
     let id = ToolGuardrailId::new("output_check").expect("a guardrail identity");
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -641,14 +643,17 @@ async fn invocation_end_precedes_a_blocked_output_guardrail() {
         .expect("the task finishes")
         .expect("the output is admitted");
     assert!(was_blocked);
+    assert_eq!(seen_while_blocked, vec!["tool_start:apply_patch"]);
     assert_eq!(
-        seen_while_blocked,
+        hooks.seen(),
         vec!["tool_start:apply_patch", "tool_end:apply_patch/ok"]
     );
 }
 
 #[tokio::test]
-async fn a_propagated_invocation_failure_is_announced_before_it_leaves() {
+async fn a_propagated_invocation_failure_leaves_with_only_its_start() {
+    // The call settled into no answer, so nothing settled is announced, as the reference raises
+    // the failure before `on_tool_end` when there is no failure function.
     let hooks = Recording::new("metrics");
     let mut tool = CountingTool::failing("run_tests");
     Arc::get_mut(&mut tool)
@@ -659,13 +664,7 @@ async fn a_propagated_invocation_failure_is_announced_before_it_leaves() {
         .await
         .expect_err("the raw invocation error propagates");
     assert_eq!(error.code(), "tool.execution_failed");
-    assert_eq!(
-        hooks.seen(),
-        vec![
-            "tool_start:run_tests",
-            "tool_end:run_tests/tool.execution_failed"
-        ]
-    );
+    assert_eq!(hooks.seen(), vec!["tool_start:run_tests"]);
 }
 
 // ---------------------------------------------------------------------------

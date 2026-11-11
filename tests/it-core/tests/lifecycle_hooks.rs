@@ -12,6 +12,7 @@ use ra_core::{
     finish::FinishReason,
     item::{
         CallId, ItemId, Message, ModelInputItem, ModelResponse, OutputPhase, RunItem, RunItemKind,
+        ToolCallOutput,
     },
     lifecycle::{
         AgentEndInput, AgentStartInput, HandoffInput, LifecycleEvent, LifecycleHook,
@@ -294,13 +295,17 @@ fn the_two_tool_moments_describe_one_call_the_same_way() {
     let arguments = json!({"path": "src/lib.rs"});
 
     let started = ToolStartInput::new(&run, &origin, &call_id, &arguments);
-    let output = Ok(ToolOutput::text("raw output"));
+    let output = settled(&call_id, "final output");
     let ended = ToolEndInput::new(started, &output);
 
     assert_eq!(
-        ended.output().expect("raw tool output").as_text(),
-        Some("raw output")
+        ToolOutput::from_stored(ended.output().output())
+            .expect("a stored tool result")
+            .expect("a tool output")
+            .as_text(),
+        Some("final output")
     );
+    assert_eq!(ended.output().call_id(), &call_id);
     assert_eq!(ended.origin().qualified_name(), "apply_patch");
     assert_eq!(ended.call_id(), started.call_id());
     assert_eq!(ended.arguments(), started.arguments());
@@ -308,30 +313,27 @@ fn the_two_tool_moments_describe_one_call_the_same_way() {
 }
 
 #[test]
-fn a_settled_call_preserves_the_raw_invocation_error() {
-    // Failure handling has not replaced the invocation error with model-facing text.
+fn a_settled_failure_carries_its_code_beside_the_answer() {
+    // A tool's own failure text reads as a plain answer, so the code is what says it failed.
     let run = run_context();
     let origin = origin("run_tests");
     let call_id = CallId::new("call-1");
     let arguments = json!({});
-    let output = Ok(ToolOutput::text("raw output"));
+    let output = settled(&call_id, "two tests failed");
     let started = ToolStartInput::new(&run, &origin, &call_id, &arguments);
 
     assert_eq!(ToolEndInput::new(started, &output).failure_code(), None);
-    let failure = Err(ra_core::error::Error::tool(
-        ra_core::error::ToolErrorKind::ExecutionFailed,
-        "run_tests",
-        "raw failure",
-    ));
-    let ended = ToolEndInput::new(started, &failure);
+    let ended = ToolEndInput::new(started, &output).with_failure_code("tool.execution_failed");
     assert_eq!(ended.failure_code(), Some("tool.execution_failed"));
-    assert!(
-        ended
-            .output()
-            .expect_err("the raw error")
-            .to_string()
-            .contains("raw failure")
-    );
+    assert_eq!(ended.output(), &output);
+}
+
+/// The record a call answered with `text` settles into.
+fn settled(call_id: &CallId, text: &str) -> ToolCallOutput {
+    ToolCallOutput::new(
+        call_id.clone(),
+        serde_json::to_value(ToolOutput::text(text)).expect("a tool output renders"),
+    )
 }
 
 #[test]
@@ -400,7 +402,7 @@ async fn a_hook_that_overrides_nothing_succeeds_at_every_moment() {
     let origin = origin("apply_patch");
     let call_id = CallId::new("call-1");
     let arguments = json!({});
-    let output = Ok(ToolOutput::text("raw output"));
+    let output = settled(&call_id, "final output");
     let response = ModelResponse::new(Vec::new());
     let input: Vec<ModelInputItem> = Vec::new();
     let arriving = other_agent();

@@ -643,7 +643,8 @@ impl StreamedFunctionDispatches {
         .with_tool_guardrails(self.guardrails.clone())
         .with_user_hooks(self.user_hooks.clone())
         .with_lifecycle_hooks(self.lifecycle.clone())
-        .with_unparsed_arguments(action.call().unparsed_arguments());
+        .with_unparsed_arguments(action.call().unparsed_arguments())
+        .with_call_kind(action.call().kind());
         let tool = action.tool().origin().clone();
         let function_span = function_span(&tool, &call_id);
         let task_id = spawn_dispatch_task(
@@ -843,7 +844,8 @@ fn spawn_function_dispatches(
         .with_tool_guardrails(request.guardrails.clone())
         .with_user_hooks(request.user_hooks.clone())
         .with_lifecycle_hooks(request.lifecycle.clone())
-        .with_unparsed_arguments(action.call().unparsed_arguments());
+        .with_unparsed_arguments(action.call().unparsed_arguments())
+        .with_call_kind(action.call().kind());
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let call_id = action.call_id().clone();

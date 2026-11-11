@@ -39,11 +39,12 @@
 //!
 //! # A lifecycle moment names a thing, and brackets exactly that thing
 //!
-//! [`LifecycleEvent::ToolStart`] and [`LifecycleEvent::ToolEnd`] are the innermost pair: they fire
-//! after the permission chain, the approval, the input guardrails and the deciding hooks have all
-//! let the call through, and immediately around the invocation itself. A "tool start" announced
-//! before the permission chain would announce a tool that the chain then refuses to run, and a host
-//! counting invocations would be counting decisions.
+//! [`LifecycleEvent::ToolStart`] and [`LifecycleEvent::ToolEnd`] are the innermost pair: the start
+//! fires after the permission chain, the approval, the input guardrails and the deciding hooks have
+//! all let the call through, immediately before the invocation itself, and the end fires once the
+//! invocation has settled into the answer the call is given. A "tool start" announced before the
+//! permission chain would announce a tool that the chain then refuses to run, and a host counting
+//! invocations would be counting decisions.
 //!
 //! [`LifecycleEvent::AgentStart`] and [`LifecycleEvent::AgentEnd`] bracket an agent rather than a
 //! run, which is the reference implementation's rule and not an approximation of it: a start is
@@ -80,7 +81,7 @@ use crate::{
     finish::FinishReason,
     item::{CallId, Message, ModelInputItem, ModelResponse, ToolCallOutput},
     model::ModelSelector,
-    tool::{ToolOrigin, ToolOutput, ToolServices},
+    tool::{ToolOrigin, ToolServices},
 };
 
 // ---------------------------------------------------------------------------
@@ -526,8 +527,8 @@ impl<'a> LlmEndInput<'a> {
 /// raises nothing here, because no tool was about to start.
 ///
 /// It is raised after the concurrency and resource gates too, so the pair with
-/// [`LifecycleEvent::ToolEnd`] measures execution rather than execution plus queueing —
-/// `tool.admission_wait_ms` is where the waiting already is.
+/// [`LifecycleEvent::ToolEnd`] does not include queueing — `tool.admission_wait_ms` is where the
+/// waiting already is.
 ///
 /// The tool is named by its [`ToolOrigin`] rather than handed over as an object, which is where
 /// this differs from the reference implementation's `on_tool_start(context, agent, tool)`. A
@@ -579,7 +580,8 @@ impl<'a> ToolStartInput<'a> {
 
     /// Whether [`arguments`](Self::arguments) is argument text that was not JSON, rather than a
     /// parsed value (which may itself be a JSON string). Such a call starts and then ends with
-    /// the error of reading its arguments; the tool itself is not run.
+    /// the answer its failure policy gives the error of reading its arguments; the tool itself is
+    /// not run.
     #[must_use]
     pub const fn has_unparsed_arguments(&self) -> bool {
         self.unparsed_arguments
@@ -621,25 +623,54 @@ impl<'a> ToolStartInput<'a> {
     }
 }
 
-/// A tool invocation settled.
+/// A started tool invocation settled into the result the call is answered with.
 ///
-/// Raised immediately after invocation, before failure handling, output guardrails and projection.
-/// The result is the tool's own output or error, not the model-facing observation: the reference
-/// implementation hands over the local tool's own result, and a fallible Rust invocation says the
-/// same thing with an explicit [`Result`]. Cancellation can tear down the callback along with the
-/// containing turn.
+/// Raised once that result is final, as the reference raises `on_tool_end` with its
+/// `final_result`: a failure has already been shaped by the tool's failure policy (the generic
+/// failure object, a tool's own `handle_failure` text, or a timeout message), the output
+/// guardrails have run and a refusal has replaced what they refused, the output has been committed
+/// and the custom-data extractor has run. [`output`](Self::output) is that answer, as the model is
+/// shown it and history records it: under the kind of call it answers, with the extracted data.
+///
+/// A call that does not settle into an answer raises no end: a failure the policy propagates
+/// (`Propagate`, a timeout that propagates, an output guardrail that raises, an extractor that
+/// fails), a cancellation of the call's scope, and a call left waiting on an approval — an agent
+/// tool whose nested run paused, or a tool that asked from inside its invocation — whose end is
+/// raised once, when its continuation settles. A cancellation the tool reports itself while its
+/// scope is live is a failure like any other. A call refused before it started raises neither
+/// moment.
+///
+/// The answer is the record rather than the tool's own return value, which is where this differs
+/// in representation from the reference: a framework-rendered failure here is a stable code object,
+/// not a [`ToolOutput`](crate::tool::ToolOutput), and the record is the one value every settlement
+/// has. A tool's own output is read back with
+/// [`ToolOutput::from_stored`](crate::tool::ToolOutput::from_stored) on
+/// [`ToolCallOutput::output`]. Whether the call failed is carried beside it as
+/// [`failure_code`](Self::failure_code), because a tool's own failure text reads as a plain answer.
 #[must_use]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct ToolEndInput<'a> {
     call: ToolStartInput<'a>,
-    outcome: &'a Result<ToolOutput>,
+    output: &'a ToolCallOutput,
+    failure_code: Option<&'static str>,
 }
 
 impl<'a> ToolEndInput<'a> {
-    /// Describes the raw result of a completed invocation.
-    pub const fn new(call: ToolStartInput<'a>, outcome: &'a Result<ToolOutput>) -> Self {
-        Self { call, outcome }
+    /// Describes a call that settled into `output`, as a success until
+    /// [`with_failure_code`](Self::with_failure_code) says otherwise.
+    pub const fn new(call: ToolStartInput<'a>, output: &'a ToolCallOutput) -> Self {
+        Self {
+            call,
+            output,
+            failure_code: None,
+        }
+    }
+
+    /// Records that the call settled as a failure, under the stable code of that failure.
+    pub const fn with_failure_code(mut self, code: &'static str) -> Self {
+        self.failure_code = Some(code);
+        self
     }
 
     /// The call this result answers, in the view the start callback was given.
@@ -682,15 +713,17 @@ impl<'a> ToolEndInput<'a> {
         self.call.arguments()
     }
 
-    /// The tool's raw output or error, before model-facing transformations.
-    pub fn output(&self) -> core::result::Result<&'a ToolOutput, &'a crate::error::Error> {
-        self.outcome.as_ref()
+    /// The answer the call settled with, after failure handling, output guardrails and
+    /// custom-data extraction.
+    #[must_use]
+    pub const fn output(&self) -> &'a ToolCallOutput {
+        self.output
     }
 
-    /// The invocation's failure code, or `None` when the tool succeeded.
+    /// Stable code of the failure the call settled as, or `None` when it produced a usable result.
     #[must_use]
-    pub fn failure_code(&self) -> Option<&'static str> {
-        self.outcome.as_ref().err().map(crate::error::Error::code)
+    pub const fn failure_code(&self) -> Option<&'static str> {
+        self.failure_code
     }
 }
 

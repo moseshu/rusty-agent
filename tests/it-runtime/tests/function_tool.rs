@@ -1207,6 +1207,296 @@ async fn approved_output_is_committed_before_a_failed_extraction() {
     }
 }
 
+#[tool(needs_approval = true)]
+fn approved_receipt(context: &RunContext) -> &'static str {
+    context
+        .app_context::<App>()
+        .unwrap()
+        .bodies
+        .fetch_add(1, Ordering::SeqCst);
+    "receipt"
+}
+
+fn receipt_data(
+    context: &mut ra_core::tool::FunctionToolCustomDataContext<'_>,
+) -> Result<Option<serde_json::Map<String, Value>>> {
+    context
+        .tool_context()
+        .run()
+        .app_context::<App>()
+        .unwrap()
+        .extractions
+        .fetch_add(1, Ordering::SeqCst);
+    Ok(Some(json!({"receipt": "r-7"}).as_object().unwrap().clone()))
+}
+
+#[tool(needs_approval = true, custom_data_extractor = sync(receipt_data))]
+fn approved_receipt_with_data(context: &RunContext) -> &'static str {
+    context
+        .app_context::<App>()
+        .unwrap()
+        .bodies
+        .fetch_add(1, Ordering::SeqCst);
+    "receipt"
+}
+
+/// An approval-gated tool whose body always fails and whose failures the model is shown as the
+/// framework's stable failure object.
+struct ApprovedFailure;
+
+#[async_trait]
+impl Tool for ApprovedFailure {
+    fn origin(&self) -> &ra_core::tool::ToolOrigin {
+        static ORIGIN: std::sync::LazyLock<ra_core::tool::ToolOrigin> =
+            std::sync::LazyLock::new(|| {
+                ra_core::tool::ToolOrigin::new("approved_failure").unwrap()
+            });
+        &ORIGIN
+    }
+
+    fn schema(&self) -> &ra_core::tool::ToolSchema {
+        static SCHEMA: std::sync::LazyLock<ra_core::tool::ToolSchema> =
+            std::sync::LazyLock::new(|| {
+                ra_core::tool::ToolSchema::loose("approved_failure", json!({"type": "object"}))
+                    .unwrap()
+            });
+        &SCHEMA
+    }
+
+    fn options(&self) -> ToolOptions {
+        ToolOptions::new().with_approval(ra_core::tool::ToolApprovalPolicy::Always)
+    }
+
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        context
+            .run()
+            .app_context::<App>()
+            .unwrap()
+            .bodies
+            .fetch_add(1, Ordering::SeqCst);
+        Err(Error::tool(
+            ToolErrorKind::ExecutionFailed,
+            "approved_failure",
+            "the charge was declined",
+        ))
+    }
+}
+
+/// Narration whose tool end always fails, as a host whose collector is down.
+struct FailingToolEnd;
+
+#[async_trait]
+impl ra_core::lifecycle::LifecycleHook for FailingToolEnd {
+    fn name(&self) -> &str {
+        "failing-end"
+    }
+
+    async fn on_tool_end(
+        &self,
+        _scope: ra_core::lifecycle::LifecycleScope,
+        _input: &ra_core::lifecycle::ToolEndInput<'_>,
+    ) -> Result<()> {
+        Err(Error::caller("the end callback failed"))
+    }
+}
+
+/// Approves the one call `tool` was asked for, resumes it under a tool end that fails, and returns
+/// the checkpoint that failure left.
+async fn approved_then_end_fails(tool: Arc<dyn Tool>, name: &str, app: &Arc<App>) -> RunState {
+    let model = ScriptedModel::new(vec![calls(name, json!({}))]);
+    let paused = Runner::run(request(tool.clone(), &model, app))
+        .await
+        .unwrap();
+    let RunOutcome::Interrupted { items } = paused.outcome() else {
+        panic!("approval required")
+    };
+    let mut state: RunState =
+        serde_json::from_value(serde_json::to_value(paused.state()).unwrap()).unwrap();
+    state.approve(&items[0], false).unwrap();
+
+    let config = RunConfig::new().with_lifecycle_hook(Arc::new(FailingToolEnd));
+    let error = Runner::run(
+        request(tool, &ScriptedModel::new(vec![]), app)
+            .with_config(config)
+            .with_state(state),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("the end callback failed"),
+        "{error}"
+    );
+    serde_json::from_value(serde_json::to_value(error.run_state().unwrap()).unwrap()).unwrap()
+}
+
+/// The one answer to `call-1` among `items`.
+fn the_answer(items: &[RunItem]) -> ra_core::item::ToolCallOutput {
+    let answers: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id() == &CallId::new("call-1") => {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    answers.into_iter().next().unwrap()
+}
+
+/// Resumes `state` without the failing tool end and returns how many answers to `call-1` the model
+/// was shown.
+async fn retried(tool: Arc<dyn Tool>, state: RunState, app: &Arc<App>) -> usize {
+    let model = ScriptedModel::new(vec![finishes()]);
+    let result = Runner::run(request(tool, &model, app).with_state(state))
+        .await
+        .unwrap();
+    assert_eq!(result.final_text(), "done");
+    let requests = model.requests.lock().unwrap();
+    requests[0]
+        .input()
+        .iter()
+        .filter(|item| {
+            matches!(item, ModelInputItem::ToolCallOutput(output)
+                if output.call_id() == &CallId::new("call-1"))
+        })
+        .count()
+}
+
+/// `on_tool_end` runs after the approved call's output is committed, so its failure leaves that
+/// output in the checkpoint and the retry finalizes from it without running the tool again, as in
+/// the reference's committed-output retry after a failing end hook.
+#[tokio::test]
+async fn approved_output_is_committed_before_a_failed_tool_end() {
+    let app = Arc::new(App::default());
+    let tool: Arc<dyn Tool> = Arc::new(approved_receipt::tool().unwrap());
+    let state = approved_then_end_fails(tool.clone(), "approved_receipt", &app).await;
+    assert_eq!(app.bodies.load(Ordering::SeqCst), 1);
+    assert_eq!(output_text(state.generated_items()), "receipt");
+
+    assert_eq!(retried(tool, state, &app).await, 1);
+    assert_eq!(app.bodies.load(Ordering::SeqCst), 1);
+}
+
+/// The committed answer carries what the extractor added to it, as the reference sets custom data
+/// on the item it committed: a run that fails in `on_tool_end` resumes with that data and does not
+/// run the extractor again.
+#[tokio::test]
+async fn the_committed_answer_keeps_its_custom_data_when_the_tool_end_fails() {
+    let app = Arc::new(App::default());
+    let tool: Arc<dyn Tool> = Arc::new(approved_receipt_with_data::tool().unwrap());
+    let state = approved_then_end_fails(tool.clone(), "approved_receipt_with_data", &app).await;
+    assert_eq!(app.extractions.load(Ordering::SeqCst), 1);
+    let committed = the_answer(state.generated_items());
+    assert_eq!(
+        committed.custom_data().and_then(|data| data.get("receipt")),
+        Some(&json!("r-7"))
+    );
+
+    let model = ScriptedModel::new(vec![finishes()]);
+    let result = Runner::run(request(tool, &model, &app).with_state(state))
+        .await
+        .unwrap();
+    assert_eq!(app.bodies.load(Ordering::SeqCst), 1);
+    assert_eq!(app.extractions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        the_answer(result.state().generated_items())
+            .custom_data()
+            .and_then(|data| data.get("receipt")),
+        Some(&json!("r-7"))
+    );
+}
+
+/// A failure the model is shown as the framework's failure object is committed like any answer, so
+/// a failing `on_tool_end` does not run the approved tool a second time.
+#[tokio::test]
+async fn an_approved_model_visible_failure_is_committed_before_a_failed_tool_end() {
+    let app = Arc::new(App::default());
+    let tool: Arc<dyn Tool> = Arc::new(ApprovedFailure);
+    let state = approved_then_end_fails(tool.clone(), "approved_failure", &app).await;
+    assert_eq!(app.bodies.load(Ordering::SeqCst), 1);
+    let committed = the_answer(state.generated_items());
+    assert!(committed.is_error());
+    assert_eq!(
+        committed.output(),
+        &json!({"error": {"code": "tool.execution_failed", "tool": "approved_failure"}})
+    );
+
+    assert_eq!(retried(tool, state, &app).await, 1);
+    assert_eq!(app.bodies.load(Ordering::SeqCst), 1);
+}
+
+/// A custom (free-form input) tool that echoes what it was sent.
+struct CustomEcho;
+
+#[async_trait]
+impl Tool for CustomEcho {
+    fn origin(&self) -> &ra_core::tool::ToolOrigin {
+        static ORIGIN: std::sync::LazyLock<ra_core::tool::ToolOrigin> =
+            std::sync::LazyLock::new(|| ra_core::tool::ToolOrigin::new("custom_echo").unwrap());
+        &ORIGIN
+    }
+
+    fn schema(&self) -> &ra_core::tool::ToolSchema {
+        static SCHEMA: std::sync::LazyLock<ra_core::tool::ToolSchema> =
+            std::sync::LazyLock::new(|| {
+                ra_core::tool::ToolSchema::custom("custom_echo", None).unwrap()
+            });
+        &SCHEMA
+    }
+
+    async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("echoed"))
+    }
+}
+
+/// Narration that keeps the answer every tool end was told about.
+#[derive(Default)]
+struct EndAnswers(Mutex<Vec<ra_core::item::ToolCallOutput>>);
+
+#[async_trait]
+impl ra_core::lifecycle::LifecycleHook for EndAnswers {
+    fn name(&self) -> &str {
+        "end-answers"
+    }
+
+    async fn on_tool_end(
+        &self,
+        _scope: ra_core::lifecycle::LifecycleScope,
+        input: &ra_core::lifecycle::ToolEndInput<'_>,
+    ) -> Result<()> {
+        self.0.lock().unwrap().push(input.output().clone());
+        Ok(())
+    }
+}
+
+/// The end is told the answer exactly as history records it, including the kind of call it answers.
+#[tokio::test]
+async fn a_custom_call_ends_with_the_answer_history_records() {
+    let app = Arc::new(App::default());
+    let answers = Arc::new(EndAnswers::default());
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![RunItem::new(
+            ItemId::new("call-item"),
+            RunItemKind::ToolCall(ToolCall::custom(
+                CallId::new("call-1"),
+                "custom_echo",
+                "raw input",
+            )),
+        )]),
+        finishes(),
+    ]);
+    let config = RunConfig::new().with_lifecycle_hook(answers.clone());
+    let result = Runner::run(request(Arc::new(CustomEcho), &model, &app).with_config(config))
+        .await
+        .unwrap();
+    assert_eq!(result.final_text(), "done");
+    let recorded = the_answer(result.new_items());
+    assert_eq!(recorded.kind(), ra_core::item::ToolCallKind::Custom);
+    assert_eq!(*answers.0.lock().unwrap(), [recorded]);
+}
+
 struct CancelOnReturn(CancelScope);
 
 #[tool]

@@ -449,8 +449,9 @@ fn permission() -> String {
 fn guardrail() -> String {
     entry("guardrail", &json!(TEXT), true)
 }
-/// The lifecycle of an admitted call: it starts with the text, marked, and ends with the error of
-/// reading it.
+/// The lifecycle of an admitted call: it starts with the text, marked, and ends once the failure
+/// policy has answered the error of reading it, under that error's code; a policy that raises
+/// leaves it with only its start.
 fn started() -> String {
     entry("start", &json!(TEXT), true)
 }
@@ -498,7 +499,7 @@ async fn an_admitted_unparsed_call_is_answered_by_the_failure_handler_alone() {
     assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
     assert_eq!(
         case.journal(),
-        [pre(), guardrail(), started(), ended(), handled()]
+        [pre(), guardrail(), started(), handled(), ended()]
     );
     let (text, is_error) = answer(result.new_items());
     assert_eq!(text, "the probe could not read its arguments");
@@ -520,8 +521,9 @@ async fn the_other_failure_policies_answer_or_raise() {
     let case = Case::new(ToolApprovalPolicy::Never).failure(ToolFailureHandling::Propagate);
     let error = case.run().await.unwrap_err();
     assert_eq!(error.code(), "tool.invalid_input", "{error}");
-    // The invocation's end is narrated before its error leaves, as for any other failed call.
-    assert_eq!(case.journal(), [pre(), guardrail(), started(), ended()]);
+    // The call settled into no answer, so only its start is narrated, as for any other failure
+    // that leaves as an error.
+    assert_eq!(case.journal(), [pre(), guardrail(), started()]);
 }
 
 /// Item 7: the input guardrail sees the text and its refusal is the answer; no argument error is
@@ -552,8 +554,8 @@ async fn a_pre_tool_use_rewrite_into_json_runs_the_call() {
             entry("guardrail", &fixed, false),
             entry("start", &fixed, false),
             format!("call({fixed})"),
-            "end(ok)".to_owned(),
             entry("post", &fixed, false),
+            "end(ok)".to_owned(),
         ]
     );
     assert_eq!(answer(result.new_items()), ("ran".to_owned(), false));
@@ -574,7 +576,7 @@ async fn the_permission_stage_asks_without_consulting_the_tool() {
     case.run().await.unwrap();
     assert_eq!(
         case.journal(),
-        [pre(), guardrail(), started(), ended(), handled()]
+        [pre(), guardrail(), started(), handled(), ended()]
     );
 
     let case = Case::new(ToolApprovalPolicy::Never).rule(PermissionDecision::Deny);
@@ -599,8 +601,8 @@ async fn an_answered_approval_resumes_as_the_unparsed_call() {
             permission(),
             guardrail(),
             started(),
-            ended(),
-            handled()
+            handled(),
+            ended()
         ]
     );
     assert!(answer(result.new_items()).1);
@@ -611,7 +613,7 @@ async fn an_answered_approval_resumes_as_the_unparsed_call() {
     assert_eq!(error.code(), "tool.invalid_input", "{error}");
     assert_eq!(
         case.journal(),
-        [pre(), permission(), guardrail(), started(), ended()]
+        [pre(), permission(), guardrail(), started()]
     );
 
     let case = Case::new(ToolApprovalPolicy::Always).failure(ToolFailureHandling::Propagate);
@@ -667,8 +669,8 @@ async fn the_existing_permission_chain_still_applies() {
             permission(),
             guardrail(),
             started(),
-            ended(),
-            handled()
+            handled(),
+            ended()
         ]
     );
 }
@@ -694,7 +696,7 @@ async fn reported_first_skips_a_question_that_prompts_off_would_refuse() {
         assert!(matches!(result.outcome(), RunOutcome::Completed { .. }));
         assert_eq!(
             case.journal(),
-            [pre(), guardrail(), started(), ended(), handled()]
+            [pre(), guardrail(), started(), handled(), ended()]
         );
         assert_eq!(
             answer(result.new_items()),

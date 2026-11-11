@@ -188,8 +188,12 @@ impl UserHook for PermissionHook {
     }
 }
 
+/// Both moments in order, and the answer each end was told about.
 #[derive(Default)]
-struct Narration(Mutex<Vec<String>>);
+struct Narration(
+    Mutex<Vec<String>>,
+    Mutex<Vec<ra_core::item::ToolCallOutput>>,
+);
 
 #[async_trait]
 impl LifecycleHook for Narration {
@@ -209,6 +213,7 @@ impl LifecycleHook for Narration {
             .lock()
             .unwrap()
             .push(format!("end/{}", input.failure_code().unwrap_or("ok")));
+        self.1.lock().unwrap().push(input.output().clone());
         Ok(())
     }
 }
@@ -342,10 +347,12 @@ async fn a_denied_request_refuses_the_call_and_closes_the_invocation() {
         output.output(),
         &serde_json::to_value(ToolOutput::text("blocked by hook")).unwrap()
     );
-    let narration = narration.0.lock().unwrap();
-    assert_eq!(narration.len(), 2);
-    assert_eq!(narration[0], "start");
-    assert_ne!(narration[1], "end/ok");
+    // The refusal is the answer the started invocation settles into.
+    assert_eq!(
+        *narration.0.lock().unwrap(),
+        ["start", "end/hook.permission_request"]
+    );
+    assert_eq!(*narration.1.lock().unwrap(), [output.clone()]);
 }
 
 #[tokio::test]

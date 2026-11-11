@@ -23,8 +23,10 @@
 //!
 //! An error from the handler is logged and forwarding continues, as in the reference. The one
 //! exception is a cancellation, which the reference lets escape the handler because it is not an
-//! ordinary exception there: a handler that reports one stops the nested run, and the call ends
-//! with that cancellation.
+//! ordinary exception there: a handler that reports one stops the nested run, and the call fails
+//! with that cancellation. The call's own scope is still live, so it is the tool's own failure and
+//! the tool's failure policy answers it, as the reference's failure function answers a tool's own
+//! `CancelledError`; only a policy that propagates failures stops the parent with it.
 //!
 //! # Rust adaptations
 //!
