@@ -296,6 +296,47 @@ async fn framework_permission_bypass_keeps_the_sandbox_boundary() {
     model.assert_complete();
 }
 
+#[tokio::test]
+async fn a_sandbox_command_can_pass_dynamic_approval_without_asking_the_host() {
+    let (_directory, root, session) = live_session().await;
+    let checked = Arc::new(Mutex::new(Vec::new()));
+    let check_calls = checked.clone();
+    let agent = shell_agent(
+        "checked-command",
+        Shell::new().with_configure_tools(move |toolset: &mut ShellToolSet| {
+            let checked = check_calls.clone();
+            toolset
+                .exec_command_mut()
+                .set_needs_approval(NeedsApproval::check(
+                    move |context: &ra_core::tool::ToolContext<'_>| {
+                        checked.lock().unwrap().push(context.arguments().clone());
+                        Ok(false)
+                    },
+                ));
+        }),
+    );
+    let arguments = json!({"cmd": "printf approved > marker.txt", "login": false});
+    let model = ScriptedModel::new(vec![
+        call("checked_shell", "exec_command", arguments.clone()),
+        answer("checked_message"),
+    ]);
+    let result = Runner::run(request(
+        agent,
+        &model,
+        "run-checked",
+        in_session(&session, "."),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(*checked.lock().unwrap(), [arguments]);
+    assert_eq!(result.final_text(), "done");
+    assert_eq!(
+        std::fs::read_to_string(root.join("marker.txt")).unwrap(),
+        "approved"
+    );
+    model.assert_complete();
+}
+
 // `test_resumed_run_rebinds_cwd_to_pending_sandbox_tool`
 #[tokio::test]
 async fn an_approved_command_runs_in_the_resumed_runs_working_directory() {

@@ -44,6 +44,7 @@ use serde_json::{Value, json};
 struct App {
     bodies: AtomicUsize,
     extractions: AtomicUsize,
+    approvals: AtomicUsize,
     enabled: bool,
     barrier: Option<Arc<tokio::sync::Barrier>>,
 }
@@ -64,6 +65,12 @@ async fn enabled(context: &RunContext) -> Result<bool> {
 }
 
 async fn approval(context: &ToolContext<'_>) -> Result<bool> {
+    context
+        .run()
+        .app_context::<App>()
+        .unwrap()
+        .approvals
+        .fetch_add(1, Ordering::SeqCst);
     Ok(context.arguments()["a"] == 7)
 }
 
@@ -296,6 +303,234 @@ async fn approval_round_trips_a_checkpoint_and_invokes_the_body_once() {
     .await
     .unwrap();
     assert!(matches!(result.outcome(), RunOutcome::Interrupted { .. }));
+}
+
+#[tokio::test]
+async fn invalid_typed_arguments_wait_for_approval_before_failure_handling() {
+    for arguments in [json!({"a": "bad"}), json!({"a": -1})] {
+        for approve in [false, true] {
+            let app = Arc::new(App {
+                enabled: true,
+                ..App::default()
+            });
+            let lifecycle = Arc::new(EndAnswers::default());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let guardrail = Arc::new(Check {
+                id: ToolGuardrailId::new("check").unwrap(),
+                seen: seen.clone(),
+                reject: false,
+            });
+            let config = RunConfig::new()
+                .with_lifecycle_hook(lifecycle.clone())
+                .with_tool_input_guardrail(guardrail);
+            let options = controlled::options()
+                .unwrap()
+                .with_input_guardrail(ToolGuardrailId::new("check").unwrap());
+            let tool: Arc<dyn Tool> = Arc::new(controlled::tool_with_options(options).unwrap());
+            let model = ScriptedModel::new(vec![calls("controlled", arguments.clone())]);
+            let paused =
+                Runner::run(request(tool.clone(), &model, &app).with_config(config.clone()))
+                    .await
+                    .unwrap();
+            let RunOutcome::Interrupted { items } = paused.outcome() else {
+                panic!("uninspectable arguments require approval");
+            };
+            let RunItemKind::ToolApproval(approval) = items[0].kind() else {
+                panic!("expected a tool approval");
+            };
+            assert_eq!(approval.arguments(), &arguments);
+            assert!(approval.resume().is_none());
+            assert_eq!(app.approvals.load(Ordering::SeqCst), 0);
+            assert!(lifecycle.0.lock().unwrap().is_empty());
+            assert_eq!(lifecycle.1.load(Ordering::SeqCst), 0);
+            assert!(seen.lock().unwrap().is_empty());
+            let mut state: RunState =
+                serde_json::from_value(serde_json::to_value(paused.state()).unwrap()).unwrap();
+            if approve {
+                state.approve(&items[0], false).unwrap();
+            } else {
+                state.reject(&items[0], false).unwrap();
+            }
+            let model = ScriptedModel::new(vec![finishes()]);
+            let result = Runner::run(
+                request(tool, &model, &app)
+                    .with_config(config)
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+            let answer = the_answer(result.new_items());
+            let ends = lifecycle.0.lock().unwrap();
+            assert_eq!(lifecycle.1.load(Ordering::SeqCst), usize::from(approve));
+            if approve {
+                assert_eq!(*seen.lock().unwrap(), ["input"]);
+                assert_eq!(*ends, [answer]);
+                assert_eq!(
+                    output_text(result.new_items()),
+                    "An error occurred while running the tool. Please try again."
+                );
+            } else {
+                assert!(seen.lock().unwrap().is_empty());
+                assert!(ends.is_empty());
+                assert!(answer.is_error());
+            }
+            assert_eq!(app.approvals.load(Ordering::SeqCst), 0);
+            assert_eq!(app.bodies.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+static DEFAULT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn default_protected_number() -> u32 {
+    DEFAULT_CALLS.fetch_add(1, Ordering::SeqCst);
+    7
+}
+
+#[tool(needs_approval = approval)]
+fn with_approval_default(#[tool(default = default_protected_number())] a: u32) -> u32 {
+    a
+}
+
+#[tokio::test]
+async fn dynamic_approval_checks_explicit_defaulted_fields_without_running_the_default() {
+    for (arguments, checks, interrupted) in [
+        (json!({}), 0, true),
+        (json!({"a": 7}), 1, true),
+        (json!({"a": 1}), 1, false),
+    ] {
+        let app = Arc::new(App::default());
+        let model = ScriptedModel::new(vec![calls("with_approval_default", arguments), finishes()]);
+        let tool = Arc::new(with_approval_default::tool().unwrap());
+        let defaults_before_dispatch = DEFAULT_CALLS.load(Ordering::SeqCst);
+        let result = Runner::run(request(tool, &model, &app)).await.unwrap();
+        assert_eq!(
+            matches!(result.outcome(), RunOutcome::Interrupted { .. }),
+            interrupted
+        );
+        assert_eq!(app.approvals.load(Ordering::SeqCst), checks);
+        assert_eq!(
+            DEFAULT_CALLS.load(Ordering::SeqCst),
+            defaults_before_dispatch
+        );
+        if !interrupted {
+            assert_eq!(output_text(result.new_items()), "1");
+        }
+    }
+}
+
+#[tool(needs_approval = approval)]
+fn double_for_approval(value: f64) -> f64 {
+    value
+}
+
+#[tool(needs_approval = approval)]
+fn float_for_approval(value: f32) -> f32 {
+    value
+}
+
+#[tool(strict = false, needs_approval = approval)]
+fn nested_for_approval(value: std::collections::BTreeMap<String, Vec<Option<f64>>>) -> usize {
+    value.len()
+}
+
+#[tool(strict = false, needs_approval = approval)]
+fn numeric_keys_for_approval(value: std::collections::HashMap<i32, u32>) -> usize {
+    value.len()
+}
+
+#[tokio::test]
+async fn dynamic_approval_requires_arguments_that_bind_without_changes() {
+    let double: Arc<dyn Tool> = Arc::new(double_for_approval::tool().unwrap());
+    let float: Arc<dyn Tool> = Arc::new(float_for_approval::tool().unwrap());
+    let nested: Arc<dyn Tool> = Arc::new(nested_for_approval::tool().unwrap());
+    let numeric_keys: Arc<dyn Tool> = Arc::new(numeric_keys_for_approval::tool().unwrap());
+    let integer: Arc<dyn Tool> = Arc::new(controlled::tool().unwrap());
+    for (tool, arguments, interrupted) in [
+        (double.clone(), json!({"value": 1}), true),
+        (
+            double.clone(),
+            json!({"value": 9_007_199_254_740_993_u64}),
+            true,
+        ),
+        (double, json!({"value": 1.0}), false),
+        (float.clone(), json!({"value": 0.1}), true),
+        (float, json!({"value": 0.5}), false),
+        (nested.clone(), json!({"value": {"field": [null, 1]}}), true),
+        (nested, json!({"value": {"field": [null, 1.0]}}), false),
+        (numeric_keys, json!({"value": {"1": 1, "01": 2}}), true),
+        (integer.clone(), json!({"a": "1"}), true),
+        (integer.clone(), json!({"a": true}), true),
+        (integer, json!({"a": 1, "extra": 2}), true),
+    ] {
+        let app = Arc::new(App {
+            enabled: true,
+            ..App::default()
+        });
+        let model = ScriptedModel::new(vec![calls(tool.schema().name(), arguments), finishes()]);
+        let result = Runner::run(request(tool, &model, &app)).await.unwrap();
+        assert_eq!(
+            matches!(result.outcome(), RunOutcome::Interrupted { .. }),
+            interrupted
+        );
+        assert_eq!(
+            app.approvals.load(Ordering::SeqCst),
+            usize::from(!interrupted)
+        );
+        if !interrupted {
+            assert_eq!(result.final_text(), "done");
+        }
+    }
+}
+
+static APPLICATION_DECODES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(schemars::JsonSchema)]
+struct ApplicationNumber(u32);
+
+impl<'de> serde::Deserialize<'de> for ApplicationNumber {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
+        APPLICATION_DECODES.fetch_add(1, Ordering::SeqCst);
+        let number = <u32 as serde::Deserialize>::deserialize(decoder)?;
+        if number == 13 {
+            return Err(serde::de::Error::custom(
+                "application validation rejected the number",
+            ));
+        }
+        Ok(Self(number))
+    }
+}
+
+#[tool(needs_approval = approval)]
+fn application_validated(a: ApplicationNumber) -> u32 {
+    a.0
+}
+
+#[tokio::test]
+async fn application_deserialization_runs_only_after_approval() {
+    let app = Arc::new(App::default());
+    let tool: Arc<dyn Tool> = Arc::new(application_validated::tool().unwrap());
+    let model = ScriptedModel::new(vec![calls("application_validated", json!({"a": 13}))]);
+    let paused = Runner::run(request(tool.clone(), &model, &app))
+        .await
+        .unwrap();
+    let RunOutcome::Interrupted { items } = paused.outcome() else {
+        panic!("application deserialization requires approval");
+    };
+    assert_eq!(APPLICATION_DECODES.load(Ordering::SeqCst), 0);
+    assert_eq!(app.approvals.load(Ordering::SeqCst), 0);
+    let mut state = paused.state().clone();
+    state.approve(&items[0], false).unwrap();
+    let model = ScriptedModel::new(vec![finishes()]);
+    let result = Runner::run(request(tool, &model, &app).with_state(state))
+        .await
+        .unwrap();
+    assert_eq!(APPLICATION_DECODES.load(Ordering::SeqCst), 1);
+    assert_eq!(app.approvals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        output_text(result.new_items()),
+        "An error occurred while running the tool. Please try again."
+    );
 }
 
 #[tokio::test]
@@ -1453,12 +1688,21 @@ impl Tool for CustomEcho {
 
 /// Narration that keeps the answer every tool end was told about.
 #[derive(Default)]
-struct EndAnswers(Mutex<Vec<ra_core::item::ToolCallOutput>>);
+struct EndAnswers(Mutex<Vec<ra_core::item::ToolCallOutput>>, AtomicUsize);
 
 #[async_trait]
 impl ra_core::lifecycle::LifecycleHook for EndAnswers {
     fn name(&self) -> &str {
         "end-answers"
+    }
+
+    async fn on_tool_start(
+        &self,
+        _scope: ra_core::lifecycle::LifecycleScope,
+        _input: &ra_core::lifecycle::ToolStartInput<'_>,
+    ) -> Result<()> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn on_tool_end(

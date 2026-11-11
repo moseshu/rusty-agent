@@ -220,6 +220,17 @@ pub trait Tool: std::any::Any + Send + Sync + 'static {
             .transpose()
     }
 
+    /// Whether the approval callbacks can inspect these arguments.
+    ///
+    /// By default, handwritten tools can inspect the original parsed arguments. Generated
+    /// function bindings override this to check that the arguments can be bound unchanged without
+    /// running application code. Returning false skips the dynamic callback and requires explicit
+    /// approval when the policy is dynamic. An approval question then carries the original
+    /// arguments without prepared state.
+    fn approval_arguments_inspectable(&self, _arguments: &Value) -> bool {
+        true
+    }
+
     /// Executes one already-resolved call.
     ///
     /// The context carries the call and the run it belongs to; see [`ToolContext`] for why those
@@ -293,12 +304,12 @@ pub trait Tool: std::any::Any + Send + Sync + 'static {
     /// State to keep with the approval this call is about to be asked about, handed back through
     /// [`ToolContext::resume_state`] when the approved call runs.
     ///
-    /// The runtime calls this once for each question it is about to put, whatever decided that the
-    /// call asks — [`Tool::needs_approval`], a fixed `ask` rule, or an `Always` policy — and before
-    /// the permission hooks are asked, so the state reaches the call whether a hook or the host
-    /// answers. A tool keeps here what it decided while asking, so the approved call runs as it
-    /// was decided even when the approval is answered in another process. The default keeps
-    /// nothing.
+    /// For inspectable arguments, the runtime calls this once per question before the permission
+    /// hooks, so the state reaches the call whether a hook or the host answers. This applies to
+    /// dynamic approval, a fixed `ask` rule, and an `Always` policy. When arguments cannot be
+    /// inspected, the runtime asks about the original input without prepared state. A tool keeps
+    /// here what it decided while asking, so the approved call runs as it was decided even when
+    /// the approval is answered in another process. The default keeps nothing.
     ///
     /// This is also where a tool prepares what the question is about, as Codex's handlers verify a
     /// call and announce its item before their orchestrator asks: it may check the call against

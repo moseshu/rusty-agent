@@ -317,6 +317,7 @@ fn last_type_name(ty: &Type) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep the generated tool and its constructor in one template.
 pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
     let options = Options::parse(attributes)?;
     let mut function = syn::parse2::<ItemFn>(input)?;
@@ -341,8 +342,10 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
         defaults,
         arguments,
         required,
+        approval_checks,
         inject_context,
-    } = parameters::expand(&mut function.sig, use_docs)?;
+    } = parameters::expand(&mut function.sig, use_docs, &support)?;
+    let approval_inspection = parameters::approval_inspection(&approval_checks, &support);
     let execute = invocation(&function, &arguments, inject_context, &support, &tool_name);
     let implementation = format_ident!(
         "__ra_tool_{}",
@@ -408,6 +411,7 @@ pub(crate) fn expand(attributes: TokenStream, input: TokenStream) -> syn::Result
                 fn origin(&self) -> &#core::tool::ToolOrigin { &self.origin }
                 fn schema(&self) -> &#core::tool::ToolSchema { self.function.tool_schema() }
                 fn func_schema(&self) -> ::core::option::Option<&#core::tool::FuncSchema> { ::core::option::Option::Some(&self.function) }
+                #approval_inspection
                 fn options(&self) -> #core::tool::ToolOptions { self.options.clone() }
                 fn output_schema(&self) -> ::core::option::Option<&#core::tool::FunctionToolOutputSchema> { self.output_schema.as_ref() }
                 async fn call(&self, mut __ra_context: #core::tool::ToolContext<'_>) -> #core::error::Result<#core::tool::ToolOutput> {

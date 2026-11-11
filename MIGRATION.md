@@ -59,12 +59,18 @@ Two failure paths change with it, so that every answer settles the same way:
   as the reference hands a tool's own `CancelledError` to the failure function. Before, it always
   stopped the run. A cancellation of the call's scope still stops the run without asking the policy.
 
-Typed argument decoding still reports errors before the permission stage, without approval or
-`on_tool_start`/`on_tool_end`. Framework-rendered errors at this stage bypass output guardrails,
-commitment and extraction. A `Custom` failure handler can still provide its own answer at this
-stage. The reference validates typed arguments inside the approved invocation, so it emits
-`on_tool_start` and emits `on_tool_end` if the failure policy produces an answer. The approval
-and decoding order is tracked separately.
+Typed function arguments are now decoded inside the admitted invocation, after permission,
+approval, input guardrails, and `on_tool_start`. If decoding fails, the tool body is skipped.
+The failure policy and output settlement run as they do for other invocation failures. An error
+that propagates emits only `on_tool_start`.
+
+For generated function tools, dynamic approval evaluates the original arguments when they can
+bind unchanged without running application code. Omitted fields, including those with defaults,
+and values that change on binding require explicit approval. An explicitly supplied defaulted
+field is checked like any other field. The approval question carries the original arguments
+without tool-prepared state when inspection cannot proceed. Handwritten tools, including typed
+agent tools and sandbox capabilities, continue to give their approval callbacks the parsed
+arguments. Fixed permission decisions still take precedence.
 
 ### Namespaced tools are hooked under Codex's flat names
 

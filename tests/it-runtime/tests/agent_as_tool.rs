@@ -721,9 +721,15 @@ fn translator_with_probe() -> (Arc<AgentSpec>, SeenToolInput) {
 #[tokio::test]
 async fn structured_input_renders_data_and_exposes_tool_input_to_the_nested_run() {
     let (nested, seen) = translator_with_probe();
+    let approval_arguments = Arc::new(Mutex::new(Vec::new()));
+    let checked = approval_arguments.clone();
     let tool = nested
         .as_tool()
         .parameters::<TranslationInput>()
+        .needs_approval_fn(Arc::new(move |context: &ToolContext<'_>| {
+            checked.lock().unwrap().push(context.arguments().clone());
+            Ok(false)
+        }))
         .build()
         .unwrap();
     assert_eq!(
@@ -745,6 +751,10 @@ async fn structured_input_renders_data_and_exposes_tool_input_to_the_nested_run(
     Runner::run(request(orchestrator(tool), &resolver))
         .await
         .unwrap();
+    assert_eq!(
+        *approval_arguments.lock().unwrap(),
+        [json!({"text": "hola", "target": "en"})]
+    );
 
     let nested_input = message_texts(&resolver.calls()[1].input);
     assert_eq!(nested_input.len(), 1);

@@ -550,9 +550,9 @@ async fn a_pre_tool_use_rewrite_into_json_runs_the_call() {
         case.journal(),
         [
             pre(),
-            format!("decode({fixed})"),
             entry("guardrail", &fixed, false),
             entry("start", &fixed, false),
+            format!("decode({fixed})"),
             format!("call({fixed})"),
             entry("post", &fixed, false),
             "end(ok)".to_owned(),

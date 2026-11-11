@@ -3,7 +3,7 @@
 //! only its start.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
@@ -13,15 +13,18 @@ use ra_core::{
     cancel::CancelScope,
     context::RunContext,
     error::{Error, Result, ToolErrorKind},
-    guardrail::{ToolGuardrailFunctionOutput, ToolOutputGuardrail, ToolOutputGuardrailData},
+    guardrail::{
+        ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData,
+        ToolOutputGuardrail, ToolOutputGuardrailData,
+    },
     item::{CallId, ToolCallKind, ToolCallOutput},
     lifecycle::{LifecycleHook, LifecycleScope, ToolEndInput, ToolStartInput},
     permission::{PermissionDecision, PermissionRule},
     state::RunId,
     tool::{
-        DecodedToolInput, FunctionToolCustomDataContext, Tool, ToolContext, ToolFailureHandling,
-        ToolGuardrailId, ToolOptions, ToolOrigin, ToolOutput, ToolSchema, ToolTimeoutBehavior,
-        ToolTimeoutError,
+        DecodedToolInput, FuncSchema, FunctionToolCustomDataContext, Tool, ToolApprovalPolicy,
+        ToolContext, ToolFailureHandling, ToolGuardrailId, ToolOptions, ToolOrigin, ToolOutput,
+        ToolSchema, ToolTimeoutBehavior, ToolTimeoutError,
     },
 };
 use ra_runtime::{
@@ -49,6 +52,9 @@ enum Body {
     /// Cancels its call's scope, then reports the cancellation in the same poll.
     CancelsItsScope,
 }
+
+#[derive(serde::Deserialize, schemars::JsonSchema, ra_macros::ToolInput)]
+struct ProbeInput {}
 
 /// A tool whose body, failure text, timeout text and extractor are each chosen per case, and which
 /// writes into the same log as the narration so their order is observable.
@@ -109,8 +115,33 @@ impl Tool for Probe {
         self.options.clone()
     }
 
+    fn func_schema(&self) -> Option<&FuncSchema> {
+        static SCHEMA: LazyLock<FuncSchema> =
+            LazyLock::new(|| FuncSchema::for_input::<ProbeInput>("probe").unwrap());
+        self.decode_error.then(|| &*SCHEMA)
+    }
+
+    fn approval_arguments_inspectable(&self, _: &Value) -> bool {
+        !self.decode_error
+    }
+
+    async fn needs_approval(&self, _: &ToolContext<'_>) -> Result<bool> {
+        self.write("approval policy");
+        Ok(false)
+    }
+
+    async fn approval_state(&self, _: &ToolContext<'_>) -> Result<Option<Value>> {
+        self.write("approval state");
+        Err(Error::tool(
+            ToolErrorKind::InvalidInput,
+            "probe",
+            "the approval input could not be prepared",
+        ))
+    }
+
     fn decode_input(&self, _: &Value) -> Result<Option<DecodedToolInput>> {
         if self.decode_error {
+            self.write("decode");
             return Err(Error::tool(
                 ToolErrorKind::InvalidInput,
                 "probe",
@@ -225,15 +256,30 @@ impl LifecycleHook for Narration {
     }
 }
 
-/// An output guardrail that answers every result the same way, and says when it ran.
-struct OutputCheck {
+/// A guardrail with a fixed verdict that records the boundary where it ran.
+struct GuardrailCheck {
     id: ToolGuardrailId,
     verdict: ToolGuardrailFunctionOutput,
     log: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
-impl ToolOutputGuardrail for OutputCheck {
+impl ToolInputGuardrail for GuardrailCheck {
+    fn id(&self) -> &ToolGuardrailId {
+        &self.id
+    }
+
+    async fn check(&self, _: &ToolInputGuardrailData<'_>) -> Result<ToolGuardrailFunctionOutput> {
+        self.log
+            .lock()
+            .expect("no poisoned log")
+            .push("input guardrail".into());
+        Ok(self.verdict.clone())
+    }
+}
+
+#[async_trait]
+impl ToolOutputGuardrail for GuardrailCheck {
     fn id(&self) -> &ToolGuardrailId {
         &self.id
     }
@@ -257,7 +303,7 @@ fn check_id() -> ToolGuardrailId {
 fn guarded(verdict: ToolGuardrailFunctionOutput, log: &Arc<Mutex<Vec<String>>>) -> ToolGuardrails {
     ToolGuardrails::install(
         Vec::new(),
-        vec![Arc::new(OutputCheck {
+        vec![Arc::new(GuardrailCheck {
             id: check_id(),
             verdict,
             log: Arc::clone(log),
@@ -606,7 +652,7 @@ async fn a_failing_extractor_leaves_with_only_the_start() {
 }
 
 #[tokio::test]
-async fn a_decode_failure_before_permission_skips_output_callbacks() {
+async fn permission_denial_precedes_typed_argument_decoding() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let narration = Narration::new(&log);
     let mut probe = Probe::new(
@@ -623,14 +669,106 @@ async fn a_decode_failure_before_permission_skips_output_callbacks() {
 
     let outcome = dispatch_tool(request)
         .await
-        .expect("the decode error is reported");
+        .expect("permission denied the call");
     assert_eq!(seen(&log), Vec::<String>::new());
     let output = answer(outcome.dispatch());
     assert_eq!(
         output.output(),
-        &json!({"error": {"code": "tool.invalid_input", "tool": "probe"}})
+        &json!({"error": {"code": "tool.permission_denied", "tool": "probe"}})
     );
     assert!(output.custom_data().is_none());
+}
+
+#[tokio::test]
+async fn uninspectable_typed_arguments_are_asked_about_without_tool_preparation() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let narration = Narration::new(&log);
+    let mut probe = Probe::new(
+        Body::Succeeds,
+        ToolOptions::new().with_approval(ToolApprovalPolicy::Dynamic),
+        &log,
+    );
+    probe.decode_error = true;
+    let outcome = dispatch_tool(request(probe, &narration)).await.unwrap();
+    let ToolDispatch::AwaitingApproval(approval) = outcome.dispatch() else {
+        panic!("uninspectable arguments require approval");
+    };
+    assert_eq!(approval.arguments(), &json!({}));
+    assert!(approval.resume().is_none());
+    assert!(seen(&log).is_empty());
+}
+
+#[tokio::test]
+async fn the_input_guardrail_can_refuse_before_typed_argument_decoding() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let narration = Narration::new(&log);
+    let mut probe = Probe::new(
+        Body::Succeeds,
+        ToolOptions::new().with_input_guardrail(check_id()),
+        &log,
+    );
+    probe.decode_error = true;
+    let guardrails = ToolGuardrails::install(
+        vec![Arc::new(GuardrailCheck {
+            id: check_id(),
+            verdict: ToolGuardrailFunctionOutput::reject_content("blocked input"),
+            log: Arc::clone(&log),
+        }) as Arc<dyn ToolInputGuardrail>],
+        Vec::new(),
+        false,
+    )
+    .unwrap();
+    let outcome = dispatch_tool(request(probe, &narration).with_tool_guardrails(guardrails))
+        .await
+        .unwrap();
+    assert_eq!(seen(&log), ["input guardrail"]);
+    assert_eq!(text(answer(outcome.dispatch())), "blocked input");
+}
+
+#[tokio::test]
+async fn typed_decode_failure_settles_after_start_or_propagates() {
+    for handling in [ToolFailureHandling::Custom, ToolFailureHandling::Propagate] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let narration = Narration::new(&log);
+        let mut probe = Probe::new(
+            Body::Succeeds,
+            ToolOptions::new()
+                .with_failure_handling(handling)
+                .with_output_guardrail(check_id()),
+            &log,
+        );
+        probe.decode_error = true;
+        probe.failure_text = Some("correct the argument");
+        probe.extractor = Some(Ok("decode failure"));
+        let outcome = dispatch_tool(
+            request(probe, &narration)
+                .with_tool_guardrails(guarded(ToolGuardrailFunctionOutput::allow(), &log)),
+        )
+        .await;
+        if handling == ToolFailureHandling::Propagate {
+            assert_eq!(outcome.unwrap_err().code(), "tool.invalid_input");
+            assert_eq!(seen(&log), ["start", "decode"]);
+        } else {
+            let outcome = outcome.unwrap();
+            assert_eq!(
+                seen(&log),
+                [
+                    "start",
+                    "decode",
+                    "failure handler",
+                    "output guardrail",
+                    "extractor",
+                    "end/tool.invalid_input"
+                ]
+            );
+            let output = answer(outcome.dispatch());
+            assert_eq!(text(output), "correct the argument");
+            assert_eq!(
+                narration.ends(),
+                [(output.clone(), Some("tool.invalid_input"))]
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -1,9 +1,9 @@
 //! One tool invocation, in the only permitted stage order.
 //!
-//! The chain is guardrail resolution -> typed argument decoding -> repeat admission -> permission
-//! -> approval -> input guardrail -> invoke -> output guardrail. Every stage that can refuse does
-//! so by **returning a value**, never by throwing prose a caller has to read. That is what keeps
-//! the turn's control flow out of error strings.
+//! The chain is guardrail resolution -> repeat admission -> permission -> approval -> input
+//! guardrail -> invoke (including typed argument decoding) -> output guardrail. Every stage that
+//! can refuse does so by **returning a value**, never by throwing prose a caller has to read. That
+//! is what keeps the turn's control flow out of error strings.
 //!
 //! Resolution is first and separate from the two stages that use it, because it answers a
 //! configuration question rather than one about this call: whether the checks the tool names exist
@@ -525,17 +525,6 @@ impl ToolDispatchRequest {
         }
     }
 
-    fn context_with_decoded(
-        &self,
-        decoded: Option<ra_core::tool::DecodedToolInput>,
-    ) -> ToolContext<'_> {
-        let context = self.context();
-        match decoded {
-            Some(decoded) => context.with_decoded_input(decoded),
-            None => context,
-        }
-    }
-
     /// The view of this call its input guardrails are given.
     ///
     /// Built from the same fields [`Self::context`] is: a check deciding over a different view of
@@ -681,34 +670,6 @@ async fn run_chain(
         }
     }
 
-    // Typed function tools are decoded exactly once at the common invocation boundary. A tool
-    // implementation receives the checked value from its context instead of each implementation
-    // independently reinterpreting provider JSON. Untyped and remote tools retain the parsed
-    // JSON-only contract.
-    //
-    // A call whose text was not JSON has nothing to decode: it is reported as a failure once it is
-    // admitted, below, as the reference parses arguments only when the tool is invoked.
-    let decoded_input = match if request.unparsed_arguments.is_some() {
-        Ok(None)
-    } else {
-        tool.decode_input(&request.arguments)
-    } {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            return shape_failure(
-                tool,
-                request,
-                &options,
-                &name,
-                error,
-                FailureStage::BeforeInvocation,
-                &output_guardrails,
-                records,
-            )
-            .await;
-        }
-    };
-
     // 2. Loop-breaker admission, before approval so a host is not asked about a call that will not
     // run. Both breakers live behind one insertion point rather than being bolted onto whichever
     // call site notices the repetition first, and they refuse the way this stage chain refuses:
@@ -827,7 +788,6 @@ async fn run_chain(
     // answer, re-acquiring the resources it released. Every such request is put to the hooks; how
     // often a tool may ask is its own contract, not a limit of this chain.
     let mut continuation = continuation;
-    let mut decoded_input = decoded_input;
     let (outcome, deadline_elapsed) = loop {
         // 5. Dynamic resource claims evaluation.
         // Exclusive tools run alone under a global write gate and skip fine-grained claims.
@@ -902,10 +862,10 @@ async fn run_chain(
             .await?;
         }
 
-        // 7. Invoke tool.
+        // 7. Invoke tool, including typed argument decoding.
         let (outcome, deadline_elapsed) = invoke(
             tool,
-            request.context_with_decoded(decoded_input.take()),
+            request.context(),
             &options,
             &request.cancel,
             &name,
@@ -957,23 +917,6 @@ async fn run_chain(
                 request.resume = Some(ToolResume::during_call(state));
                 request.approval_granted = true;
                 continuation = true;
-                decoded_input = match tool.decode_input(&request.arguments) {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        let failed = shape_failure(
-                            tool,
-                            request,
-                            &options,
-                            &name,
-                            error,
-                            FailureStage::Invocation,
-                            &output_guardrails,
-                            records,
-                        )
-                        .await;
-                        return announce_settlement(request, failed).await;
-                    }
-                };
             }
             // The invocation started before it asked, so the refusal settles it.
             HookDecision::Deny { message } => {
@@ -1217,7 +1160,8 @@ async fn admit_permission(
     records: &mut ToolGuardrailRecords,
 ) -> Result<Admission> {
     let tool = &request.tool;
-    let permission = resolve_permission(tool, options, request).await?;
+    let mut arguments_inspectable = None;
+    let permission = resolve_permission(tool, options, request, &mut arguments_inspectable).await?;
     match permission {
         PermissionDecision::Allow => Ok(Admission::Proceed(None)),
         PermissionDecision::Deny => {
@@ -1260,14 +1204,18 @@ async fn admit_permission(
             // asking stays with the question, so the approved call runs as it was decided whoever
             // answers and wherever. A call the tool finds it cannot run ends here, unasked.
             //
-            // A call whose text was not JSON is asked about as it is: the tool cannot read it.
-            let state = if request.unparsed_arguments.is_some() {
-                Ok(None)
-            } else {
+            // Ask about the original arguments without preparing state when a function's
+            // arguments cannot be safely inspected. Its validation belongs to the invocation.
+            let inspectable = request.unparsed_arguments.is_none()
+                && *arguments_inspectable
+                    .get_or_insert_with(|| tool.approval_arguments_inspectable(&request.arguments));
+            let state = if inspectable {
                 request
                     .cancel
                     .run(tool.approval_state(&request.context()))
                     .await?
+            } else {
+                Ok(None)
             };
             let state = match state {
                 Ok(state) => state,
@@ -1358,6 +1306,7 @@ async fn resolve_permission(
     tool: &Arc<dyn Tool>,
     options: &ToolOptions,
     request: &ToolDispatchRequest,
+    arguments_inspectable: &mut Option<bool>,
 ) -> Result<PermissionDecision> {
     let origin = tool.origin();
     // A product that reports calls whose text was not JSON before any approval asks nobody about
@@ -1403,7 +1352,10 @@ async fn resolve_permission(
         ));
     }
 
-    let fallback = if needs_approval(tool, options, request).await? {
+    let cannot_inspect = matches!(options.approval(), ToolApprovalPolicy::Dynamic)
+        && !*arguments_inspectable
+            .get_or_insert_with(|| tool.approval_arguments_inspectable(&request.arguments));
+    let fallback = if cannot_inspect || needs_approval(tool, options, request).await? {
         PermissionDecision::Ask
     } else {
         PermissionDecision::Allow
@@ -1432,7 +1384,13 @@ async fn invoke(
     let started = Instant::now();
     // Scoped to this call so an agent tool can start its nested run under the call's own
     // cancellation scope — or continue the one it paused on; see `agent::tool::parent`.
-    let call = crate::agent::tool::parent::within_call(cancel, nested_resume, tool.call(context));
+    let call = crate::agent::tool::parent::within_call(cancel, nested_resume, async {
+        let context = match tool.decode_input(context.arguments())? {
+            Some(decoded) => context.with_decoded_input(decoded),
+            None => context,
+        };
+        tool.call(context).await
+    });
     let mut deadline_elapsed = false;
     let result = match options.timeout() {
         None => cancel.run(call).await.and_then(|result| result),
