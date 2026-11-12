@@ -34,6 +34,7 @@ fn all_errors() -> Vec<Error> {
         ProviderErrorKind::Refusal,
         ProviderErrorKind::Behavior,
         ProviderErrorKind::ContextOverflow,
+        ProviderErrorKind::OutputLimit,
     ] {
         v.push(Error::provider(kind, "provider 失败"));
     }

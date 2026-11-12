@@ -684,6 +684,8 @@ pub struct ContextProcessorRequest {
     input: Vec<ModelInputItem>,
     user_hooks: Option<Arc<dyn UserHookDispatcher>>,
     force_compaction: bool,
+    session_history: bool,
+    reported_tokens: Option<u64>,
 }
 
 impl fmt::Debug for ContextProcessorRequest {
@@ -698,6 +700,8 @@ impl fmt::Debug for ContextProcessorRequest {
             .field("suffix", &self.suffix)
             .field("input", &self.input)
             .field("force_compaction", &self.force_compaction)
+            .field("session_history", &self.session_history)
+            .field("reported_tokens", &self.reported_tokens)
             .field("user_hooks", &self.user_hooks.is_some())
             .finish()
     }
@@ -728,6 +732,8 @@ impl ContextProcessorRequest {
             input,
             user_hooks: None,
             force_compaction: false,
+            session_history: false,
+            reported_tokens: None,
         }
     }
 
@@ -742,6 +748,52 @@ impl ContextProcessorRequest {
     #[must_use]
     pub const fn force_compaction(&self) -> bool {
         self.force_compaction
+    }
+
+    /// Marks [`Self::history`] as the complete model-visible history of a session, earlier turns
+    /// included, which a compaction replaces as a whole.
+    ///
+    /// Without it, `history` is the records one run generated after a caller-owned prefix, and a
+    /// processor may only project that region. A session owner that keeps its history across
+    /// turns — Codex's thread, `openai-agents-python`'s compaction session — measures and replaces
+    /// all of it instead; projecting one run's records would leave a long session of short turns
+    /// never compacted.
+    ///
+    /// In this mode [`Self::prefix`] is empty, a compacting result's
+    /// [`ContextProcessorResult::input`] is the replacement history alone (the caller re-attaches
+    /// [`Self::suffix`]), and the processor announces only `PreCompact`, for an attempt it decided on
+    /// itself. The session owner commits the replacement and announces `PostCompact` after it, as
+    /// Codex runs `PostCompact` once `replace_compacted_history` has completed. A forced attempt was
+    /// announced by whoever forced it.
+    #[must_use]
+    pub const fn with_session_history(mut self, session_history: bool) -> Self {
+        self.session_history = session_history;
+        self
+    }
+
+    /// Whether [`Self::history`] is a whole session's history; see [`Self::with_session_history`].
+    #[must_use]
+    pub const fn session_history(&self) -> bool {
+        self.session_history
+    }
+
+    /// Supplies the tokens the provider reported for the most recent model response in
+    /// [`Self::history`]: that request's complete input, instructions and tool definitions
+    /// included, plus its output.
+    ///
+    /// Items recorded after that response's output are not covered by the figure and are left to
+    /// the processor to estimate, as Codex's `get_total_token_usage` adds the estimate of items
+    /// after the last model-generated item to the last reported total.
+    #[must_use]
+    pub const fn with_reported_tokens(mut self, tokens: u64) -> Self {
+        self.reported_tokens = Some(tokens);
+        self
+    }
+
+    /// Provider-reported tokens of the latest response in the history, when the caller knows them.
+    #[must_use]
+    pub const fn reported_tokens(&self) -> Option<u64> {
+        self.reported_tokens
     }
 
     /// Attaches the runner's existing host hook dispatcher without a dependency on its runtime.

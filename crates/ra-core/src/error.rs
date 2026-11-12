@@ -129,6 +129,12 @@ pub enum ProviderErrorKind {
     Behavior,
     /// Input exceeds the model context window. Compact first, then retry.
     ContextOverflow,
+    /// The response stopped at its output token limit before it finished.
+    ///
+    /// Held apart from [`Self::ContextOverflow`] because shortening the input does not answer it:
+    /// Codex reports an incomplete response as its own error and stops a compaction on it, where a
+    /// context-window error makes the compaction drop its oldest history item and ask again.
+    OutputLimit,
 }
 
 /// Why a tool execution failed.
@@ -749,9 +755,11 @@ impl Error {
                 | ProviderErrorKind::Conflict => Recoverability::Retryable,
                 // Refusal -> change model; protocol violation -> change prompt; context
                 // overflow -> compact first.
+                // A response cut off at its output limit needs a larger limit or a shorter answer.
                 ProviderErrorKind::Refusal
                 | ProviderErrorKind::Behavior
-                | ProviderErrorKind::ContextOverflow => Recoverability::RetryableWithChange,
+                | ProviderErrorKind::ContextOverflow
+                | ProviderErrorKind::OutputLimit => Recoverability::RetryableWithChange,
                 ProviderErrorKind::Auth => Recoverability::NeedsIntervention,
                 ProviderErrorKind::BadRequest => Recoverability::Fatal,
             },
@@ -859,6 +867,7 @@ impl Error {
                 ProviderErrorKind::Refusal => "provider.refusal",
                 ProviderErrorKind::Behavior => "provider.behavior",
                 ProviderErrorKind::ContextOverflow => "provider.context_overflow",
+                ProviderErrorKind::OutputLimit => "provider.output_limit",
             },
             Self::Tool { kind, .. } => match kind {
                 ToolErrorKind::NotFound => "tool.not_found",
@@ -937,6 +946,7 @@ impl Error {
                 ProviderErrorKind::ContextOverflow => {
                     "上下文超出模型窗口，正在压缩后重试。".to_owned()
                 }
+                ProviderErrorKind::OutputLimit => "模型回答达到输出长度上限，未能完成。".to_owned(),
             },
 
             Self::Tool { kind, tool, .. } => match kind {

@@ -705,3 +705,175 @@ async fn the_reader_rebuilds_the_history_written_to_a_rollout_file() {
     );
     assert_eq!(rebuilt.history().len(), 8);
 }
+
+/// A rollout in which run `two` compacted the history before recording its prompt: the thread
+/// records `two`'s start first, as Codex persists `TurnStarted`, then the summary request's usage
+/// and the replacement, then `two`'s start again with its prompt.
+fn compacted_before_its_prompt() -> Rollout {
+    let usage = |total: u64| Usage::from_request(RequestUsage::new(total - 10, 10));
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["first user"])
+        .item(said("answer", "first reply"))
+        .push(RolloutModelUsage::new(RunId::new("one"), usage(5_000_000)).with_sampling())
+        .end("one", RolloutRunEnd::Completed)
+        .start("two", &[])
+        .push(RolloutModelUsage::new(RunId::new("two"), usage(1_000)))
+        .push(RolloutPayload::Compacted(RolloutCompacted::new(
+            RunId::new("two"),
+            ItemId::new("compaction"),
+            vec![user("first user"), user("summary of one")],
+        )))
+        .start("two", &["second user"])
+        .item(said("answer", "second reply"))
+        .end("two", RolloutRunEnd::Completed);
+    rollout
+}
+
+/// Codex persists `TurnStarted` before the compaction that precedes a turn's prompt, so a cut at
+/// that turn's boundary leaves the replacement out.
+#[test]
+fn a_cut_at_a_run_leaves_out_the_compaction_that_run_wrote_before_its_start() {
+    let records = compacted_before_its_prompt().records();
+    let first_turn = [
+        user("first user"),
+        said("answer", "first reply").to_model_input().unwrap(),
+    ];
+    for cut in [
+        truncate_rollout_before_run(records.clone(), &RunId::new("two")).unwrap(),
+        truncate_rollout_after_run(records.clone(), &RunId::new("one")).unwrap(),
+    ] {
+        assert_eq!(history(&cut), first_turn);
+        assert!(
+            !cut.iter().any(|record| record.type_name() == "compacted"),
+            "{cut:?}"
+        );
+        assert_eq!(
+            reconstruct_history(&cut).unwrap().reported_tokens(),
+            Some(5_000_000)
+        );
+    }
+    assert_eq!(
+        history(&records),
+        [
+            user("first user"),
+            user("summary of one"),
+            user("second user"),
+            said("answer", "second reply").to_model_input().unwrap(),
+        ]
+    );
+}
+
+/// Codex's `truncate_rollout_before_nth_user_message_from_start` cuts at the message's own record,
+/// so a replacement its turn compacted to before recording it stays: the history is the
+/// replacement, without the message.
+#[test]
+fn a_cut_before_a_message_keeps_the_compaction_its_turn_wrote_ahead_of_it() {
+    let records = compacted_before_its_prompt().records();
+    let cut = truncate_rollout_before_nth_user_message(records, 1).unwrap();
+    assert_eq!(cut.last().unwrap().type_name(), "compacted", "{cut:?}");
+    assert_eq!(history(&cut), [user("first user"), user("summary of one")]);
+}
+
+/// A message that a run's later segment starts on is cut at that segment's start: the run's earlier
+/// input and what it produced before pausing stay, as Codex keeps every record before the message.
+#[test]
+fn a_cut_before_a_later_segments_first_message_keeps_the_runs_earlier_history() {
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["first user"])
+        .item(said("answer", "first reply"))
+        .end("one", RolloutRunEnd::Interrupted)
+        .start("one", &["second user"])
+        .item(said("answer", "second reply"))
+        .end("one", RolloutRunEnd::Completed);
+    let records = rollout.records();
+    let cut = truncate_rollout_before_nth_user_message(records, 1).unwrap();
+    assert_eq!(
+        history(&cut),
+        [
+            user("first user"),
+            said("answer", "first reply").to_model_input().unwrap(),
+        ]
+    );
+}
+
+/// The reported total a resumed thread checks is the latest sampling usage after the last
+/// replacement: a summary request's own usage, billed even when its summary was unusable, describes
+/// a different input and is not read, as the live thread never reads it either.
+#[test]
+fn reported_tokens_come_from_sampling_after_the_last_replacement() {
+    let usage = |total: u64| Usage::from_request(RequestUsage::new(total - 10, 10));
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["first user"])
+        .push(RolloutModelUsage::new(RunId::new("one"), usage(5_000_000)).with_sampling())
+        .end("one", RolloutRunEnd::Completed)
+        .push(RolloutModelUsage::new(RunId::new("two"), usage(1_000)));
+    assert_eq!(
+        reconstruct_history(&rollout.records())
+            .unwrap()
+            .reported_tokens(),
+        Some(5_000_000)
+    );
+    let compacted = compacted_before_its_prompt().records();
+    assert_eq!(
+        reconstruct_history(&compacted).unwrap().reported_tokens(),
+        None,
+        "the replacement makes the earlier total describe a history that is gone"
+    );
+}
+
+/// While run `two` is still compacting ahead of its prompt, the rollout ends with what it wrote so
+/// far — its start, the replacement, a settings event — and a cut after `one` leaves all of it
+/// out.
+#[test]
+fn a_cut_after_a_run_leaves_out_what_a_run_not_yet_started_wrote() {
+    let usage = |total: u64| Usage::from_request(RequestUsage::new(total - 10, 10));
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["first user"])
+        .item(said("answer", "first reply"))
+        .push(RolloutModelUsage::new(RunId::new("one"), usage(5_000_000)).with_sampling())
+        .end("one", RolloutRunEnd::Completed)
+        .start("two", &[])
+        .push(RolloutModelUsage::new(RunId::new("two"), usage(1_000)))
+        .push(RolloutPayload::Compacted(RolloutCompacted::new(
+            RunId::new("two"),
+            ItemId::new("compaction"),
+            vec![user("first user"), user("summary of one")],
+        )))
+        .push(RolloutTurnContext::new(RunId::new("settings"), 0));
+    let cut = truncate_rollout_after_run(rollout.records(), &RunId::new("one")).unwrap();
+    assert_eq!(
+        history(&cut),
+        [
+            user("first user"),
+            said("answer", "first reply").to_model_input().unwrap(),
+        ]
+    );
+    assert!(
+        !cut.iter().any(|record| record.type_name() == "compacted"),
+        "{cut:?}"
+    );
+}
+
+/// A sampling that reported nothing leaves no total, as the live thread reads the same response.
+#[test]
+fn a_sampling_that_reported_no_usage_clears_the_reported_total() {
+    let usage = |total: u64| Usage::from_request(RequestUsage::new(total - 10, 10));
+    let mut rollout = Rollout::default();
+    rollout
+        .start("one", &["first user"])
+        .push(RolloutModelUsage::new(RunId::new("one"), usage(5_000_000)).with_sampling())
+        .end("one", RolloutRunEnd::Completed)
+        .start("two", &["second user"])
+        .push(RolloutModelUsage::new(RunId::new("two"), Usage::default()).with_sampling())
+        .end("two", RolloutRunEnd::Completed);
+    assert_eq!(
+        reconstruct_history(&rollout.records())
+            .unwrap()
+            .reported_tokens(),
+        None
+    );
+}

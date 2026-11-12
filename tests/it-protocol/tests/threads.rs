@@ -120,6 +120,8 @@ enum Step {
     After(Arc<Notify>, ModelResponse),
     AwaitCancellation(CancellationGate),
     Fail,
+    /// Fails with a provider error of this kind.
+    FailWith(ra_core::error::ProviderErrorKind),
 }
 
 /// Holds a cancelled model call in teardown until the test lets it settle.
@@ -207,6 +209,7 @@ impl Model for ScriptedModel {
                 std::future::pending().await
             }
             Some(Step::Fail) => Err(Error::caller("the model failed")),
+            Some(Step::FailWith(kind)) => Err(Error::provider(kind, "the provider failed")),
             None => Err(Error::caller("the model ran out of responses")),
         }
     }

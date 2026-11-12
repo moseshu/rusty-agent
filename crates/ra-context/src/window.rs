@@ -202,6 +202,19 @@ impl ContextWindowConfig {
         })
     }
 
+    /// Replaces the fraction of a known window that triggers compaction.
+    ///
+    /// Infallible, unlike [`Self::new`]: the ratio is validated by its own type and plays no part
+    /// in the window table.
+    #[must_use]
+    pub const fn with_compaction_threshold_ratio(
+        mut self,
+        compaction_threshold_ratio: ContextWindowThresholdRatio,
+    ) -> Self {
+        self.compaction_threshold_ratio = compaction_threshold_ratio;
+        self
+    }
+
     /// Host overrides before normalization and application to the built-in table.
     #[must_use]
     pub const fn context_windows(&self) -> &BTreeMap<String, u64> {

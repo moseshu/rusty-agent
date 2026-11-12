@@ -786,6 +786,68 @@ async fn a_nested_agent_tool_run_is_not_recorded_but_the_usage_it_bills_to_the_r
     assert_eq!(result.usage().input_tokens(), 100);
 }
 
+/// The usage an agent-tool run bills to the run is recorded when the run settles, after the run's
+/// own last sampling. It counts toward the run's totals, as the reference bills it, but it measures
+/// the nested run's history: a rebuilt thread restores the total of the run's own last sampling,
+/// as the live thread read it.
+#[tokio::test]
+async fn a_rebuilt_total_is_the_runs_own_sampling_not_the_usage_a_nested_run_bills() {
+    let scripts = Arc::new(Scripts::default());
+    let recorder = Arc::new(MemoryRecorder::default());
+    let nested = agent("nested", vec![Arc::new(TouchTool::new())]);
+    let lead = agent("lead", vec![Arc::new(nested.as_tool().build().unwrap())]);
+    scripts.push(
+        "lead",
+        Step::Respond(billed(
+            tool_call("l-1", "l-1-call", "nested", json!({"input": "look"})),
+            10,
+        )),
+    );
+    scripts.push(
+        "nested",
+        Step::Respond(billed(final_message("n-1", "looked"), 30)),
+    );
+    scripts.push(
+        "lead",
+        Step::Respond(billed(final_message("l-2", "done"), 40)),
+    );
+
+    Runner::run(request(&scripts, lead, "run-1", &recorder))
+        .await
+        .unwrap();
+
+    let records: Vec<ra_session::RolloutRecord> = recorder
+        .items()
+        .into_iter()
+        .enumerate()
+        .map(|(seq, item)| {
+            let seq = seq as u64;
+            ra_session::RolloutRecord::new(
+                seq,
+                ra_core::event::EventTimestamp::from_millis(seq),
+                item.into(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let usage: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record.payload().unwrap() {
+            ra_session::RolloutPayload::ModelUsage(usage) => {
+                Some((usage.usage().total_tokens(), usage.is_sampling()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.last(), Some(&(31, false)), "{usage:?}");
+    assert_eq!(
+        ra_session::reconstruct_history(&records)
+            .unwrap()
+            .reported_tokens(),
+        Some(41)
+    );
+}
+
 #[tokio::test]
 async fn a_spawned_agents_events_stay_out_while_its_late_completion_is_recorded() {
     let scripts = Arc::new(Scripts::default());

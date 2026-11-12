@@ -81,6 +81,7 @@ pub struct RolloutReconstruction {
     history: Vec<ModelInputItem>,
     last_run: Option<ReconstructedRun>,
     turn_context: Option<RolloutTurnContext>,
+    reported_tokens: Option<u64>,
 }
 
 impl RolloutReconstruction {
@@ -106,6 +107,19 @@ impl RolloutReconstruction {
     #[must_use]
     pub const fn turn_context(&self) -> Option<&RolloutTurnContext> {
         self.turn_context.as_ref()
+    }
+
+    /// The total the provider reported for the latest sampling request recorded after the history's
+    /// last compaction, if it reported one: Codex's `last_token_usage.total_tokens` as a resumed session
+    /// restores it, which its next automatic compaction check reads.
+    ///
+    /// A compaction replaces the history the figure described, so one recorded before the newest
+    /// replacement snapshot does not count. Only sampling usage counts
+    /// (`RolloutModelUsage::is_sampling`): neither a context summary request's nor an agent-tool
+    /// run's, which the live thread never reads either.
+    #[must_use]
+    pub const fn reported_tokens(&self) -> Option<u64> {
+        self.reported_tokens
     }
 }
 
@@ -181,6 +195,7 @@ pub fn reconstruct_history(records: &[RolloutRecord]) -> Result<RolloutReconstru
     let mut current: Option<RunId> = None;
     let mut last_run: Option<ReconstructedRun> = None;
     let mut turn_context = None;
+    let mut reported_tokens = None;
 
     for record in records {
         match record.payload()? {
@@ -197,6 +212,7 @@ pub fn reconstruct_history(records: &[RolloutRecord]) -> Result<RolloutReconstru
                 last_run = Some(ReconstructedRun::started(&started));
             }
             RolloutPayload::Compacted(compacted) => {
+                reported_tokens = None;
                 entries.clear();
                 positions.clear();
                 entries.extend(
@@ -230,6 +246,19 @@ pub fn reconstruct_history(records: &[RolloutRecord]) -> Result<RolloutReconstru
                 }
             }
             RolloutPayload::TurnContext(context) => turn_context = Some(context),
+            // Only the run's own sampling measures the history; a summary request's usage describes
+            // the input it summarized, and an agent-tool run's usage that run's history.
+            RolloutPayload::ModelUsage(record) if record.is_sampling() => {
+                // Judged as the live thread judges the same response: one that reported nothing
+                // leaves no figure, and the next check estimates the whole history instead.
+                let usage = record.usage();
+                reported_tokens = usage
+                    .request_usage_entries()
+                    .last()
+                    .map(ra_core::usage::RequestUsage::total_tokens)
+                    .or_else(|| (usage.requests() > 0).then(|| usage.total_tokens()))
+                    .filter(|tokens| *tokens > 0);
+            }
             _ => {}
         }
     }
@@ -238,6 +267,7 @@ pub fn reconstruct_history(records: &[RolloutRecord]) -> Result<RolloutReconstru
         history: model_visible(&entries),
         last_run,
         turn_context,
+        reported_tokens,
     })
 }
 

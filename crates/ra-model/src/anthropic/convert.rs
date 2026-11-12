@@ -220,7 +220,7 @@ fn reject_stop_reason(payload: &Value) -> Result<()> {
     match payload.get("stop_reason").and_then(Value::as_str) {
         Some("end_turn" | "tool_use" | "stop_sequence") | None => Ok(()),
         Some("max_tokens") => Err(Error::provider(
-            ProviderErrorKind::ContextOverflow,
+            ProviderErrorKind::OutputLimit,
             "Anthropic response stopped at max_tokens",
         )),
         Some("refusal") => Err(Error::provider(

@@ -340,7 +340,7 @@ fn failure(event_type: &str, frame: &Value) -> Error {
         .and_then(|details| details.get("reason"))
         .and_then(Value::as_str)
     {
-        Some("max_output_tokens") => ProviderErrorKind::ContextOverflow,
+        Some("max_output_tokens") => ProviderErrorKind::OutputLimit,
         Some("content_filter") => ProviderErrorKind::Refusal,
         _ => return behavior_error(message),
     };

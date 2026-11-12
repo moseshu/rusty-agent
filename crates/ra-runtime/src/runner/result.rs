@@ -808,26 +808,33 @@ impl RunResult {
     /// [`HistoryProjection`](ra_core::agent::HistoryProjection) exists to prevent, with the host
     /// given no way to notice. A caller that wants the unprojected history reads
     /// [`RunState::generated_items`](ra_core::state::RunState::generated_items), which says what it
-    /// is.
+    /// is. **So does a compaction of a thread's whole history**: the turn continues from the
+    /// replacement Codex's `replace_compacted_history` installed and the records generated after
+    /// it ([`RunState::compacted_history`](ra_core::state::RunState::compacted_history)).
     #[must_use]
     pub fn continuation_input(&self, policy: ContinuationInput) -> Vec<ModelInputItem> {
-        let items = match self.state.handoff_projection() {
-            None => {
-                let mut items = self.original_input.clone();
-                items.extend(self.new_items.iter().filter_map(RunItem::to_model_input));
-                items
-            }
+        let items = if self.state.has_model_input_base() {
             // A projection naming a boundary the history does not hold is a broken checkpoint, and
             // the infallible answer to it has to be the narrow one: sending the projection alone
             // loses work, while falling back to the records loses the restriction.
-            Some(projection) => match self.state.model_input_base() {
+            match self.state.model_input_base() {
                 Ok((base, carried)) => {
                     let mut items = base.to_vec();
                     items.extend(carried.iter().filter_map(RunItem::to_model_input));
                     items
                 }
-                Err(_) => projection.input().to_vec(),
-            },
+                Err(_) => self
+                    .state
+                    .handoff_projection()
+                    .map(ra_core::state::HandoffProjection::input)
+                    .or_else(|| self.state.compacted_history())
+                    .unwrap_or_default()
+                    .to_vec(),
+            }
+        } else {
+            let mut items = self.original_input.clone();
+            items.extend(self.new_items.iter().filter_map(RunItem::to_model_input));
+            items
         };
         match policy {
             ContinuationInput::PreserveAll => items,

@@ -831,3 +831,200 @@ async fn compaction_is_installed_as_a_capability_whose_whole_contribution_is_the
         "the summary request carries its own settings; the agent's are not compaction's to change"
     );
 }
+
+/// Whole-session compaction: the history Codex's thread measures and replaces as one, before a turn
+/// and between its steps.
+mod session_history {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use ra_core::capability::{
+        ContextProcessor, ContextProcessorRequest, ContextSummarizer, ContextSummaryRequest,
+        ContextSummaryResponse,
+    };
+    use ra_core::error::{Error, ProviderErrorKind, Result};
+    use ra_core::item::ModelResponse;
+    use ra_core::state::RunId;
+
+    use super::*;
+
+    const SUMMARY: &str = r#"{"primary_request_and_intent":"intent","key_technical_concepts":"concepts","files_and_code_sections":"files","errors_and_fixes":"errors","problem_solving":"solving","pending_tasks":"tasks","current_work":"session summary sentinel","optional_next_step":"next"}"#;
+
+    /// Answers each summary request with the next scripted result and keeps what it was asked.
+    #[derive(Default)]
+    struct Summaries {
+        failures: Mutex<Vec<Error>>,
+        inputs: Mutex<Vec<Vec<ModelInputItem>>>,
+    }
+
+    #[async_trait]
+    impl ContextSummarizer for Summaries {
+        async fn summarize(
+            &self,
+            request: ContextSummaryRequest,
+        ) -> Result<ContextSummaryResponse> {
+            self.inputs.lock().unwrap().push(request.input().to_vec());
+            if let Some(error) = self.failures.lock().unwrap().pop() {
+                return Err(error);
+            }
+            Ok(ContextSummaryResponse::new(
+                SUMMARY,
+                ModelResponse::new(Vec::new()),
+            ))
+        }
+    }
+
+    /// A 1,000-token window, so the default ratio puts the trigger at 600 tokens.
+    fn capability() -> CompactionCapability {
+        CompactionCapability::default().with_context_windows(
+            ContextWindowConfig::new(
+                BTreeMap::from([("tiny".to_owned(), 1_000)]),
+                DEFAULT_COMPACTION_THRESHOLD_RATIO,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn request(history: Vec<RunItem>) -> ContextProcessorRequest {
+        let input = history.iter().filter_map(RunItem::to_model_input).collect();
+        ContextProcessorRequest::new(
+            RunId::new("turn"),
+            1,
+            ItemId::new("compaction"),
+            Some("tiny".to_owned()),
+            Vec::new(),
+            history,
+            Vec::new(),
+            input,
+        )
+        .with_session_history(true)
+    }
+
+    fn short_thread() -> Vec<RunItem> {
+        vec![
+            user_message("u1", "first user message"),
+            RunItem::new(
+                ItemId::new("a1"),
+                RunItemKind::Message(Message::assistant("first answer", OutputPhase::Final)),
+            ),
+            user_message("u2", "second user message"),
+        ]
+    }
+
+    /// Codex counts the provider's last reported total plus what was recorded after the last model
+    /// output, so a short history whose requests were large compacts, and the replacement is the
+    /// user messages and the summary, with nothing of the history projected around it.
+    #[tokio::test]
+    async fn a_session_compacts_on_its_reported_total_and_is_replaced_whole() {
+        let summaries = Summaries::default();
+        let unchanged = capability()
+            .process_context(request(short_thread()), &summaries)
+            .await
+            .unwrap();
+        assert!(unchanged.generated_items().is_empty());
+        assert!(summaries.inputs.lock().unwrap().is_empty());
+        let below = capability()
+            .process_context(
+                request(short_thread()).with_reported_tokens(100),
+                &summaries,
+            )
+            .await
+            .unwrap();
+        assert!(below.generated_items().is_empty());
+
+        let compacted = capability()
+            .process_context(
+                request(short_thread()).with_reported_tokens(5_000),
+                &summaries,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summaries.inputs.lock().unwrap().len(), 1);
+        let [record] = compacted.generated_items() else {
+            panic!("one compaction record");
+        };
+        assert_eq!(record.id().as_str(), "compaction");
+        let RunItemKind::Compaction(compaction) = record.kind() else {
+            panic!("a compaction record");
+        };
+        assert!(compaction.compacted_items().is_empty());
+        assert!(compaction.summary().contains("session summary sentinel"));
+        assert_eq!(
+            labels_of(compacted.input()),
+            ["message", "message", "compaction"]
+        );
+        let texts: Vec<String> = compacted
+            .input()
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message(message) => Some(message.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["first user message", "second user message"]);
+    }
+
+    fn labels_of(input: &[ModelInputItem]) -> Vec<&'static str> {
+        input.iter().map(ModelInputItem::label).collect()
+    }
+
+    /// A run-scoped projection declines a summary it cannot get; a session's compaction reports the
+    /// failure, as Codex ends the turn with the error.
+    #[tokio::test]
+    async fn a_session_summary_failure_is_an_error_rather_than_a_decline() {
+        let summaries = Summaries::default();
+        summaries
+            .failures
+            .lock()
+            .unwrap()
+            .push(Error::caller("the summary request failed"));
+        let error = capability()
+            .process_context(
+                request(short_thread()).with_reported_tokens(5_000),
+                &summaries,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("the summary request failed"));
+    }
+
+    /// Codex's compaction loop drops the oldest item when the summary request overflows the
+    /// window, with the other half of its call/output pair, and asks again.
+    #[tokio::test]
+    async fn an_overflowing_summary_request_drops_the_oldest_item_with_its_pair() {
+        let history = vec![
+            RunItem::new(
+                ItemId::new("call"),
+                RunItemKind::ToolCall(ToolCall::new(
+                    CallId::new("call-1"),
+                    "run_tests",
+                    serde_json::json!({}),
+                )),
+            ),
+            user_message("u1", "kept user message"),
+            RunItem::new(
+                ItemId::new("output"),
+                RunItemKind::ToolCallOutput(ToolCallOutput::new(
+                    CallId::new("call-1"),
+                    serde_json::json!({"ok": true}),
+                )),
+            ),
+        ];
+        let summaries = Summaries::default();
+        summaries.failures.lock().unwrap().push(Error::provider(
+            ProviderErrorKind::ContextOverflow,
+            "context_length_exceeded",
+        ));
+        let compacted = capability()
+            .process_context(request(history).with_force_compaction(true), &summaries)
+            .await
+            .unwrap();
+        assert_eq!(compacted.generated_items().len(), 1);
+        let inputs = summaries.inputs.lock().unwrap();
+        assert_eq!(
+            labels_of(&inputs[0]),
+            ["tool_call", "message", "tool_call_output"]
+        );
+        assert_eq!(labels_of(&inputs[1]), ["message"]);
+    }
+}

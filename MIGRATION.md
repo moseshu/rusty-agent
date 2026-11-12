@@ -7,6 +7,59 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Automatic compaction covers a thread's whole history
+
+An `AgentThread` whose run configuration installs the compaction capability now compacts its whole
+history the way Codex does. The check runs before a turn records its prompt, and again between two
+steps of a turn that needs a follow-up. It reads the provider's last reported total plus an estimate
+of what was recorded after it. When the policy's limit is reached, everything is replaced with the
+retained user messages and a summary, and a `compacted` rollout entry is written. Before, only
+the records of the running turn were measured and projected, so a thread of many short turns never
+compacted.
+
+- **A thread's run no longer produces an in-run `Compaction` record** from the compaction
+  capability. A run can now install a compacted history as its model-input base mid-turn. New
+  `RunState::compacted_history` and `RunState::has_model_input_base` report that, and
+  `RunState::handoff_projection` returns `None` while a compaction's base is in force.
+  `RunResult::continuation_input` continues from the replacement. Code that read
+  `handoff_projection().is_some()` to decide whether `model_input_base` differs from the opening
+  input should call `has_model_input_base()`.
+- **A thread's automatic compaction fails the turn when no summary can be obtained**, and keeps the
+  prompt, as Codex does. Before the prompt is recorded, the turn ends `failed` without sampling.
+  Between steps, the run fails. The summary request is retried under the run's retry policy, and a
+  request whose input overflows the window is resent without its oldest item; a summary cut off
+  at its output limit ends the attempt. A mid-turn summary is charged to the run's usage and
+  budget, and a run whose token budget the summary spends ends before sampling again. Runs without a thread keep the previous behaviour: they continue uncompacted.
+- **`ContextProcessorRequest::with_session_history` and `with_reported_tokens`** let a host mark a
+  request's history as a whole session's and pass the provider's reported total. A processor that
+  ignores them behaves as before.
+- **The coding host's compaction capability triggers at 90% of the model's window**, Codex's
+  `auto_compact_token_limit`, measured against the reported total. The framework default stays at
+  60% of an item-only estimate.
+- **A rebuilt thread restores the reported total** (`RolloutReconstruction::reported_tokens`,
+  `AgentThreadBuilder::with_reported_tokens`), so a thread resumed over the limit compacts before
+  its first turn. Only the run's own sampling usage is restored: it is now marked
+  (`RolloutModelUsage::with_sampling`), while summary requests and agent-tool runs keep billing
+  the run unmarked. A sampling that reported no usage clears the total, as it does in the live
+  thread. Usage records written before this change carry no mark and restore no total.
+- **A turn that compacts before its prompt records its start first**, as Codex persists
+  `TurnStarted`: a `run_started` record with no input, then the compaction, then the turn's start
+  again with its prompt. Cuts at a turn boundary therefore leave the compaction with its turn,
+  also while it is still running. `truncate_rollout_before_nth_user_message` still cuts at the
+  message itself, as Codex does, so a compaction its turn wrote ahead of it stays in the cut.
+- **Replay numbers only the input it shows.** A turn's prompt is replayed as
+  `turn_input_item_id(turn, 0)` even when hook context (for example a `SessionStart`
+  `additionalContext`) was recorded ahead of it in the same start, matching the id the live thread
+  reported. Hidden context messages no longer take a number.
+- **A response stopped at its output token limit reports `provider.output_limit`**
+  (`ProviderErrorKind::OutputLimit`) instead of `provider.context_overflow`. This covers OpenAI
+  Responses `incomplete/max_output_tokens`, Chat Completions `finish_reason: length` and Anthropic
+  `stop_reason: max_tokens`. `provider.context_overflow` now means only that the input exceeded the
+  window. Code that matched `ContextOverflow` to detect a truncated answer should match
+  `OutputLimit`. Recoverability is unchanged (`RetryableWithChange`).
+- **`RunConfig::with_compaction_retry`** supplies retries for a thread's compaction summary
+  request when the model settings configure none. The coding host installs Codex's five.
+
 ### Manual compaction in thread rollouts
 
 `thread/compact/start` records a `compacted` rollout entry containing the model-visible

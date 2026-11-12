@@ -1094,3 +1094,63 @@ async fn a_stale_compaction_abort_cannot_cancel_the_next_turn() {
         Some(ThreadEvent::TurnComplete { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// A thread's whole-history compaction between steps
+// ---------------------------------------------------------------------------------------------
+
+fn reporting(response: ModelResponse, total_tokens: u64) -> ModelResponse {
+    response.with_usage(ra_core::usage::Usage::from_request(
+        ra_core::usage::RequestUsage::new(total_tokens - 10, 10),
+    ))
+}
+
+const SUMMARY: &str = r#"{"primary_request_and_intent":"intent","key_technical_concepts":"concepts","files_and_code_sections":"files","errors_and_fixes":"errors","problem_solving":"solving","pending_tasks":"tasks","current_work":"mid-turn summary","optional_next_step":"next"}"#;
+
+/// A mid-turn summary is paid for by the run, as the processor path's summaries are: its spend
+/// reaches the run's ledger and the budget that reads it. When the summary is what takes the run
+/// past its token budget, the run ends before sampling again; with room left, the turn samples
+/// from the replacement.
+#[tokio::test]
+async fn a_mid_turn_summary_is_spent_by_the_run_and_counts_toward_its_budget() {
+    for (budget, samples) in [(5_005_000, 2), (6_000_000, 4)] {
+        let script = Script::new([
+            Step::Respond(reporting(
+                tool_call("t-1", "missing_tool", json!({})),
+                5_000_000,
+            )),
+            Step::Respond(reporting(final_message("summary", SUMMARY), 7_777)),
+            Step::Respond(reporting(tool_call("t-2", "missing_tool", json!({})), 200)),
+            Step::Respond(final_message("final", "done")),
+        ]);
+        let compaction = ra_context::compaction::CompactionCapability::default()
+            .with_context_windows(
+                ra_context::window::ContextWindowConfig::new(
+                    std::collections::BTreeMap::from([("canonical-model".to_owned(), 1_000)]),
+                    ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO,
+                )
+                .unwrap(),
+            );
+        let thread = thread(
+            &script,
+            RunConfig::new()
+                .with_capability(Arc::new(compaction))
+                .with_budget(ra_core::budget::BudgetLimit::new().with_max_tokens(budget)),
+        );
+
+        start(&thread, "first user message").await;
+        let events = until_turn_end(&thread).await;
+
+        let inputs = script.inputs();
+        assert_eq!(inputs.len(), samples, "budget {budget}: {events:?}");
+        if samples > 2 {
+            assert!(
+                inputs[2]
+                    .iter()
+                    .any(|item| matches!(item, ModelInputItem::Compaction(_))),
+                "{:?}",
+                inputs[2]
+            );
+        }
+    }
+}

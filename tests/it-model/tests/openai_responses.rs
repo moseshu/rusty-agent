@@ -530,7 +530,7 @@ async fn truncated_responses_are_not_reported_as_finished_answers() {
         .get_response(ModelRequest::new(vec![], resolved(ModelSettings::new())))
         .await
         .expect_err("a truncated response must not lift as a final answer");
-    assert_eq!(error.code(), "provider.context_overflow");
+    assert_eq!(error.code(), "provider.output_limit");
 }
 
 #[tokio::test]
@@ -895,7 +895,7 @@ async fn a_stream_without_the_terminal_frame_is_refused() {
 
 /// A failure frame states an outcome that nothing later in the stream repeats.
 #[rstest]
-#[case::truncated("max_output_tokens", "provider.context_overflow")]
+#[case::truncated("max_output_tokens", "provider.output_limit")]
 #[case::filtered("content_filter", "provider.refusal")]
 #[tokio::test]
 async fn a_failure_frame_is_classified_rather_than_read_as_a_dropped_connection(

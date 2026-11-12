@@ -850,7 +850,7 @@ async fn anthropic_nonstream_tool_input_preserves_provider_fields() {
 }
 
 /// Tool input cut short by `max_tokens` is not kept as a call: the response fails with
-/// `provider.context_overflow`, as every Anthropic response stopped at `max_tokens` does.
+/// `provider.output_limit`, as every Anthropic response stopped at `max_tokens` does.
 #[tokio::test]
 async fn anthropic_stream_with_truncated_tool_input_reports_max_tokens() {
     let server = MockServer::start().await;
@@ -863,7 +863,7 @@ async fn anthropic_stream_with_truncated_tool_input_reports_max_tokens() {
     )));
     assert_eq!(
         events.last().unwrap().as_ref().unwrap_err().code(),
-        "provider.context_overflow"
+        "provider.output_limit"
     );
 }
 

@@ -169,6 +169,11 @@ pub fn user_message_positions_in_rollout(
 /// [`user_message_positions_in_rollout`] finds; a cut inside a run start's input keeps the start
 /// with the input before the message.
 ///
+/// The cut falls at the message itself, as Codex cuts at the message's own record: what its turn
+/// recorded ahead of it stays, the earlier input of a run that continued after approval and a
+/// replacement the turn compacted to before recording its prompt included. A cut at the turn's own
+/// boundary is [`truncate_rollout_before_run`].
+///
 /// # Errors
 ///
 /// Returns an error if a run start cannot be read.

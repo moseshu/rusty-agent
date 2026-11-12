@@ -362,9 +362,10 @@ pub enum SteerSubmission {
     },
 }
 
-/// The id under which the turn `turn_id` reports the message at `index` of the input it started
-/// on. The rollout keeps a run's input without ids; a reader rebuilding the turn from it gives the
-/// message the same id the live thread reported it under.
+/// The id under which the turn `turn_id` reports the `index`th message it shows of the input it
+/// started on. The rollout keeps a run's input without ids; a reader rebuilding the turn from it
+/// gives the message the same id the live thread reported it under, so it numbers only the
+/// messages it shows: context a hook added ahead of the prompt is hidden and takes no number.
 #[must_use]
 pub fn turn_input_item_id(turn_id: &str, index: usize) -> ItemId {
     ItemId::new(format!("{turn_id}-input-{index}"))
@@ -583,6 +584,7 @@ pub struct AgentThreadBuilder {
     config: RunConfig,
     services: ToolServices,
     history: Vec<ModelInputItem>,
+    reported_tokens: Option<u64>,
     session_start_source: ra_core::hook::SessionStartSource,
     rollout: Option<Arc<dyn RolloutRecorder>>,
     agent_control: Option<AgentControl>,
@@ -640,6 +642,14 @@ impl AgentThreadBuilder {
     pub fn with_history(mut self, history: Vec<ModelInputItem>) -> Self {
         self.history = history;
         self.session_start_source = ra_core::hook::SessionStartSource::Resume;
+        self
+    }
+
+    /// What the provider reported for the latest model call in the history the thread starts
+    /// from, as Codex restores the last token usage of a resumed session: the next turn's
+    /// automatic compaction check reads it instead of estimating the whole history.
+    pub const fn with_reported_tokens(mut self, tokens: Option<u64>) -> Self {
+        self.reported_tokens = tokens;
         self
     }
 
@@ -725,6 +735,7 @@ impl AgentThreadBuilder {
                 agent_control: self.agent_control,
                 state: Mutex::new(ThreadState {
                     history: self.history,
+                    reported_tokens: self.reported_tokens,
                     config,
                     active_turn: None,
                     pending_compactions: VecDeque::new(),
@@ -795,6 +806,9 @@ struct ThreadInner {
 
 struct ThreadState {
     history: Vec<ModelInputItem>,
+    /// What the provider reported for the latest model call in `history`, until a compaction
+    /// replaces the history it describes: Codex's `last_token_usage`.
+    reported_tokens: Option<u64>,
     /// The configuration the next turn starts with, the thread's settings among it.
     config: RunConfig,
     active_turn: Option<ActiveTurn>,
@@ -868,6 +882,7 @@ impl AgentThread {
             config: RunConfig::new(),
             services: ToolServices::new(),
             history: Vec::new(),
+            reported_tokens: None,
             session_start_source: ra_core::hook::SessionStartSource::Startup,
             rollout: None,
             agent_control: None,
@@ -1611,6 +1626,7 @@ impl TurnAbort {
         if let Some(inner) = self.thread.upgrade() {
             let mut state = inner.lock();
             state.history = history.to_vec();
+            state.reported_tokens = None;
             state
                 .pending_session_starts
                 .push_back(ra_core::hook::SessionStartSource::Compact);
@@ -1682,26 +1698,57 @@ pub(crate) struct ThreadRecorder {
     turn_id: String,
     store: Option<Arc<dyn RolloutRecorder>>,
     ending: Mutex<Option<RolloutItem>>,
+    /// The history a compaction during the current run segment replaced the thread's with, and
+    /// the records it folded in; see [`Self::take_compacted`].
+    compacted: Mutex<Option<CompactedHistory>>,
+}
+
+/// A replacement installed during a run, with the records generated before it.
+struct CompactedHistory {
+    history: Vec<ModelInputItem>,
+    superseded: std::collections::HashSet<ItemId>,
 }
 
 impl ThreadRecorder {
-    pub(crate) async fn commit_compaction(
-        &self,
-        compacted: RolloutCompacted,
-    ) -> ra_core::error::Result<()> {
-        if let Some(store) = &self.store {
-            store.commit_compaction(compacted).await?;
+    fn new(inner: &Arc<ThreadInner>, turn_id: String) -> Self {
+        Self {
+            thread: Arc::downgrade(inner),
+            turn_id,
+            store: inner.rollout.clone(),
+            ending: Mutex::new(None),
+            compacted: Mutex::new(None),
         }
-        Ok(())
     }
 
-    pub(crate) fn compaction_completed(&self, item: RunItem) {
-        if let Some(thread) = self.thread.upgrade() {
-            thread.emit(ThreadEvent::Item {
-                turn_id: self.turn_id.clone(),
-                item,
-            });
+    /// The history a segment that ended without a result leaves: the replacement a compaction
+    /// installed during it, followed by what the segment produced after that, or `fallback` and
+    /// everything it produced. As a rebuild from the rollout reads the replacement snapshot, the
+    /// records the replacement folded in are not repeated.
+    fn history_after(
+        &self,
+        fallback: Vec<ModelInputItem>,
+        produced: &[RunItem],
+    ) -> Vec<ModelInputItem> {
+        match self.take_compacted() {
+            Some(compacted) => {
+                let after: Vec<RunItem> = produced
+                    .iter()
+                    .filter(|item| !compacted.superseded.contains(item.id()))
+                    .cloned()
+                    .collect();
+                partial_history(compacted.history, &after)
+            }
+            None => partial_history(fallback, produced),
         }
+    }
+
+    /// Forgets the replacement installed during the segment that just ended, which a successful
+    /// segment's own continuation already starts from.
+    fn take_compacted(&self) -> Option<CompactedHistory> {
+        self.compacted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     async fn finish(&self) {
@@ -1751,6 +1798,35 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
     fn warning(&self, message: String) {
         if let Some(thread) = self.thread.upgrade() {
             thread.emit(ThreadEvent::Warning { message });
+        }
+    }
+
+    fn response_usage(&self, usage: &ra_core::usage::Usage) {
+        if let Some(thread) = self.thread.upgrade() {
+            thread.lock().reported_tokens =
+                crate::runner::history_compaction::reported_tokens(usage);
+        }
+    }
+
+    fn history_compacted(&self, history: &[ModelInputItem], superseded: &[ItemId]) {
+        *self
+            .compacted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(CompactedHistory {
+            history: history.to_vec(),
+            superseded: superseded.iter().cloned().collect(),
+        });
+        if let Some(thread) = self.thread.upgrade() {
+            thread.lock().reported_tokens = None;
+        }
+    }
+
+    fn compaction_completed(&self, item: &RunItem) {
+        if let Some(thread) = self.thread.upgrade() {
+            thread.emit(ThreadEvent::Item {
+                turn_id: self.turn_id.clone(),
+                item: item.clone(),
+            });
         }
     }
 }
@@ -1812,6 +1888,13 @@ impl RolloutRecorder for ThreadRecorder {
         }
     }
 
+    async fn commit_compaction(&self, compacted: RolloutCompacted) -> ra_core::error::Result<()> {
+        if let Some(store) = &self.store {
+            store.commit_compaction(compacted).await?;
+        }
+        Ok(())
+    }
+
     async fn persist(&self, context: PersistContext) -> ra_core::error::Result<()> {
         if let Some(store) = &self.store {
             store.persist(context).await
@@ -1840,25 +1923,50 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
         settings,
         cancel,
     } = turn;
-    let history_len = history.len();
-    let run_input = history;
+    let mut run_input = history;
     // What the turn's Interrupt notice needs, kept past the run that consumes the configuration.
     let interrupt_hooks = config.user_hooks().clone();
     let interrupt_config = config.clone();
-    let submitted: Vec<_> = input.map(ModelInputItem::Message).into_iter().collect();
-    let recorder = Arc::new(ThreadRecorder {
-        thread: Arc::downgrade(&inner),
-        turn_id: turn_id.clone(),
-        store: inner.rollout.clone(),
-        ending: Mutex::new(None),
-    });
-    let (run_input, stopped, hook_context) = if compact {
-        (run_input, false, context)
+    let mut submitted: Vec<_> = input.map(ModelInputItem::Message).into_iter().collect();
+    let recorder = Arc::new(ThreadRecorder::new(&inner, turn_id.clone()));
+    // Codex's `run_pre_sampling_compact`: before the turn records its prompt, the thread's history
+    // is compacted once it has reached the limit.
+    let pre_turn = if compact {
+        Ok(())
     } else {
-        prepare_host_input(
-            &inner, &recorder, &config, &cancel, context, run_input, submitted,
+        compact_before_turn(
+            &inner,
+            &recorder,
+            &config,
+            &cancel,
+            &context,
+            &mut run_input,
         )
         .await
+    };
+    let history_len = run_input.len();
+    let (run_input, stopped, hook_context, failure) = match pre_turn {
+        _ if compact => (run_input, false, context, None),
+        // Codex preserves the prompt whichever way compaction failed, and a turn aborted by a
+        // stopping hook ends there; the prompt's own hooks are not run for a turn that will not
+        // sample.
+        Err(error) if error.is_cancelled() => {
+            run_input.append(&mut submitted);
+            (run_input, true, context, None)
+        }
+        result => {
+            let (run_input, stopped, hook_context) = prepare_host_input(
+                &inner, &recorder, &config, &cancel, context, run_input, submitted,
+            )
+            .await;
+            let failure = result.err().map(|error| error.to_string());
+            (
+                run_input,
+                stopped || failure.is_some(),
+                hook_context,
+                failure,
+            )
+        }
     };
     let (end, history) = if stopped {
         recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
@@ -1873,22 +1981,23 @@ async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
                 )));
             }
         }
-        recorder.record(RolloutItem::RunEnded(RolloutRunEnded::new(
-            RunId::new(&turn_id),
-            if cancel.is_cancelled() {
-                RolloutRunEnd::Cancelled
-            } else {
-                RolloutRunEnd::Completed
-            },
-        )));
-        (
-            if cancel.is_cancelled() {
-                TurnEnd::Cancelled
-            } else {
-                TurnEnd::Completed(None)
-            },
-            run_input,
-        )
+        let (end, record) = match failure {
+            Some(message) => (
+                TurnEnd::Failed(message.clone()),
+                RolloutRunEnded::new(RunId::new(&turn_id), RolloutRunEnd::Failed)
+                    .with_error(message),
+            ),
+            None if cancel.is_cancelled() => (
+                TurnEnd::Cancelled,
+                RolloutRunEnded::new(RunId::new(&turn_id), RolloutRunEnd::Cancelled),
+            ),
+            None => (
+                TurnEnd::Completed(None),
+                RolloutRunEnded::new(RunId::new(&turn_id), RolloutRunEnd::Completed),
+            ),
+        };
+        recorder.record(RolloutItem::RunEnded(record));
+        (end, run_input)
     } else if compact {
         run_compaction_turn(&inner, &recorder, &config, &cancel, hook_context, run_input).await
     } else {
@@ -2031,6 +2140,73 @@ async fn persist_injected_context(inner: &ThreadInner) {
     }
 }
 
+/// Compacts the thread's history before a turn records its prompt, when the compaction capability
+/// finds it has reached the limit: Codex's `run_pre_sampling_compact`.
+///
+/// The compaction belongs to the turn about to run, under that turn's run identity, and the
+/// context it re-establishes is started by the turn's own `SessionStart` before its prompt. An
+/// error leaves `history` as it was, unless it came from a `PostCompact` stop after the replacement
+/// was installed.
+async fn compact_before_turn(
+    inner: &Arc<ThreadInner>,
+    recorder: &Arc<ThreadRecorder>,
+    config: &RunConfig,
+    cancel: &CancelScope,
+    hook_context: &ra_core::hook::HookContextQueue,
+    history: &mut Vec<ModelInputItem>,
+) -> ra_core::error::Result<()> {
+    let run_id = RunId::new(&recorder.turn_id);
+    let owner = Arc::new(TurnAbort {
+        thread: Arc::downgrade(inner),
+        turn_id: recorder.turn_id.clone(),
+    });
+    let services = inner
+        .services
+        .clone()
+        .with_hook_context(hook_context.clone());
+    let reported_tokens = inner.lock().reported_tokens;
+    let (start_recorder, start_run, start_agent) = (
+        Arc::clone(recorder),
+        run_id.clone(),
+        inner.agent.public_id().clone(),
+    );
+    let mut installed = None;
+    let result = crate::runner::history_compaction::HistoryCompaction {
+        agent: &inner.agent,
+        models: inner.model_resolver.as_ref(),
+        config,
+        services: &services,
+        cancel,
+        run_cancel: cancel,
+        rollout: Some(recorder.as_ref()),
+        sink: Some(recorder.as_ref()),
+        owner: Some(crate::runner::RunOwner::Thread(Arc::clone(&owner))),
+        run_id: run_id.clone(),
+        run: Arc::new(thread_hook_context(inner, run_id, config)),
+        trigger: ra_core::hook::CompactTrigger::Automatic,
+        turn: 1,
+        reported_tokens,
+        session_start_on_stop: None,
+        spent: None,
+        turn_start: Some(Box::new(move || {
+            start_recorder.record(RolloutItem::RunStarted(RolloutRunStarted::new(
+                start_run,
+                start_agent,
+            )));
+        })),
+    }
+    .run(history, |replacement, _| {
+        owner.install_compaction(replacement);
+        installed = Some(replacement.to_vec());
+    })
+    .await;
+    // Taken whichever way the attempt ends: a `PostCompact` stop keeps the replacement it followed.
+    if let Some(replacement) = installed {
+        *history = replacement;
+    }
+    result.map(drop)
+}
+
 async fn run_compaction_turn(
     inner: &Arc<ThreadInner>,
     recorder: &Arc<ThreadRecorder>,
@@ -2052,18 +2228,36 @@ async fn run_compaction_turn(
         .services
         .clone()
         .with_hook_context(hook_context.clone());
-    let result = crate::runner::manual_compaction::ManualCompaction {
+    let mut installed = None;
+    let result = crate::runner::history_compaction::HistoryCompaction {
         agent: &inner.agent,
         models: inner.model_resolver.as_ref(),
         config,
         services: &services,
         cancel,
-        recorder,
-        owner,
+        run_cancel: cancel,
+        rollout: Some(recorder.as_ref()),
+        sink: Some(recorder.as_ref()),
+        owner: Some(crate::runner::RunOwner::Thread(Arc::clone(&owner))),
         run_id: run_id.clone(),
+        run: Arc::new(thread_hook_context(inner, run_id.clone(), config)),
+        trigger: ra_core::hook::CompactTrigger::Manual,
+        turn: 1,
+        reported_tokens: None,
+        session_start_on_stop: None,
+        spent: None,
+        turn_start: None,
     }
-    .run(&mut history)
-    .await;
+    .run(&history, |replacement, _| {
+        owner.install_compaction(replacement);
+        installed = Some(replacement.to_vec());
+    })
+    .await
+    .map(drop);
+    // Taken whichever way the turn ends: a `PostCompact` stop keeps the replacement it followed.
+    if let Some(replacement) = installed {
+        history = replacement;
+    }
     record_context_history(
         inner,
         recorder,
@@ -2159,7 +2353,7 @@ async fn run_to_end(
         let result = match stream.finish().await {
             Ok(result) => result,
             Err(error) => {
-                let mut history = partial_history(fallback, &produced);
+                let mut history = recorder.history_after(fallback, &produced);
                 let contexts = error
                     .run_state()
                     .map_or_else(Vec::new, |state| state.clone().take_hook_context());
@@ -2176,6 +2370,7 @@ async fn run_to_end(
                 return (TurnEnd::Failed(error.to_string()), history);
             }
         };
+        recorder.take_compacted();
         let history = result.continuation_input(ContinuationInput::Normalized);
         if let RunOutcome::Completed { .. } = result.outcome() {
             let message = result.final_message().map(Message::text_content);

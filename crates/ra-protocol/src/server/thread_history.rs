@@ -273,6 +273,10 @@ struct PendingTurn {
     started_at_ms: Option<u64>,
     /// Opened by a turn's start rather than by a record outside any turn.
     opened_explicitly: bool,
+    /// Whether a start of the turn has carried input yet. A thread records a turn's start before
+    /// compacting ahead of its prompt, as Codex persists `TurnStarted` first, so the prompt can
+    /// arrive with a later start of the same turn and still be the turn's first input.
+    input_recorded: bool,
 }
 
 impl PendingTurn {
@@ -287,6 +291,7 @@ impl PendingTurn {
             duration_ms: None,
             started_at_ms: None,
             opened_explicitly: false,
+            input_recorded: false,
         }
     }
 
@@ -649,22 +654,36 @@ impl ThreadHistoryBuilder {
         } else if let Some(turn) = self.current_turn.as_mut() {
             turn.started_at_ms = Some(at_ms);
         }
+        // The turn's first input is numbered from zero, as the live thread numbers its prompt, even
+        // when an earlier start of the turn opened it to record a compaction ahead of that prompt.
         let offset = if continues {
             self.current_turn
                 .as_ref()
+                .filter(|turn| turn.input_recorded)
                 .map_or(0, |turn| turn.items.len())
         } else {
             0
         };
-        for (index, input) in started.input().iter().enumerate() {
+        if !started.input().is_empty()
+            && let Some(turn) = self.current_turn.as_mut()
+        {
+            turn.input_recorded = true;
+        }
+        // Only the input the turn shows is numbered: context a hook added ahead of the prompt stays
+        // hidden and takes no number, as the live thread reports the prompt first, before its hooks
+        // add anything.
+        let mut shown = 0;
+        for input in started.input() {
             let ModelInputItem::Message(message) = input else {
                 continue;
             };
             let item = RunItem::new(
-                turn_input_item_id(turn_id, offset + index),
+                turn_input_item_id(turn_id, offset + shown),
                 RunItemKind::Message(message.clone()),
             );
-            self.item(Some(turn_id), &item, tool_items);
+            if !self.item(Some(turn_id), &item, tool_items).is_empty() {
+                shown += 1;
+            }
         }
     }
 

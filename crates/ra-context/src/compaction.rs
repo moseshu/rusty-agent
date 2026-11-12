@@ -424,6 +424,16 @@ impl CompactionCapability {
         })
     }
 
+    /// Replaces the context-window lookup configuration, keeping the retention and item limits.
+    ///
+    /// Infallible, unlike [`Self::new`]: windows resolve only the total-token threshold, which
+    /// takes no part in the retention convergence check.
+    #[must_use]
+    pub fn with_context_windows(mut self, context_windows: ContextWindowConfig) -> Self {
+        self.context_windows = context_windows;
+        self
+    }
+
     /// Context-window lookup configuration used to resolve total-token thresholds.
     #[must_use]
     pub const fn context_windows(&self) -> &ContextWindowConfig {
@@ -500,8 +510,11 @@ impl ContextProcessor for CompactionCapability {
         request: ContextProcessorRequest,
         summarizer: &dyn ContextSummarizer,
     ) -> Result<ContextProcessorResult> {
+        if request.session_history() {
+            return self.process_session(request, summarizer).await;
+        }
         if request.force_compaction() {
-            return Self::compact_thread(request, summarizer).await;
+            return Self::compact_session(request, summarizer).await;
         }
         let Some(limits) = self.limits_for_model(request.model_name())? else {
             tracing::debug!(
@@ -571,16 +584,74 @@ impl ContextProcessor for CompactionCapability {
 }
 
 impl CompactionCapability {
-    async fn compact_thread(
+    /// Compacts a whole session's history once it reaches this policy's limits, or unconditionally
+    /// when forced.
+    ///
+    /// Codex measures the session's history before a turn and between the steps of one, and when
+    /// `token_limit_reached` replaces all of it (`run_auto_compact`). Unlike the run-scoped
+    /// projection, a summary that cannot be obtained ends the attempt with its error, as Codex's
+    /// automatic compaction reports the failure and ends the turn rather than sampling on.
+    async fn process_session(
+        &self,
         request: ContextProcessorRequest,
         summarizer: &dyn ContextSummarizer,
     ) -> Result<ContextProcessorResult> {
-        let response = summarizer
-            .summarize(
-                ContextSummaryRequest::new(request.input().to_vec(), summary_instruction(&[]))
-                    .with_output_schema(summary_output_schema()),
-            )
+        if request.force_compaction() {
+            return Self::compact_session(request, summarizer).await;
+        }
+        let unchanged = || Ok(ContextProcessorResult::new(request.input().to_vec()));
+        let Some(limits) = self.limits_for_model(request.model_name())? else {
+            return unchanged();
+        };
+        if request.history().is_empty() {
+            return unchanged();
+        }
+        let view = compacted_history_view(request.history());
+        let estimated = ContextUsage::estimate_model_input(&view)?;
+        let assessment = match request.reported_tokens() {
+            Some(reported) => {
+                assess_reported(limits, estimated, reported, &after_last_model_output(&view))?
+            }
+            None => limits.assess(estimated),
+        };
+        if !assessment.is_required() {
+            return unchanged();
+        }
+        request
+            .notify_pre_compact(CompactTrigger::Automatic)
             .await?;
+        Self::compact_session(request, summarizer).await
+    }
+
+    /// Replaces a session's history with its retained user messages and a summary: Codex's
+    /// `run_compact_task_inner_impl` followed by `build_compacted_history`.
+    ///
+    /// When the summary request itself overflows the model's window, the oldest item is dropped —
+    /// with the other half of its call/output pair — and the request is sent again, as Codex's
+    /// compaction loop does on `ContextWindowExceeded` while more than one item is left.
+    async fn compact_session(
+        request: ContextProcessorRequest,
+        summarizer: &dyn ContextSummarizer,
+    ) -> Result<ContextProcessorResult> {
+        let mut input = request.input().to_vec();
+        let response = loop {
+            let attempt = summarizer
+                .summarize(
+                    ContextSummaryRequest::new(input.clone(), summary_instruction(&[]))
+                        .with_output_schema(summary_output_schema()),
+                )
+                .await;
+            match attempt {
+                Err(error) if error.code() == CONTEXT_OVERFLOW && input.len() > 1 => {
+                    tracing::warn!(
+                        %error,
+                        "the compaction request exceeded the context window; removing the oldest history item"
+                    );
+                    remove_first_item(&mut input);
+                }
+                attempt => break attempt?,
+            }
+        };
         let summary = parse_summary(response.text(), Vec::new())?;
         let compaction = Compaction::new(summary.render(), Vec::new());
         let record = RunItem::new(
@@ -642,6 +713,75 @@ impl CompactionCapability {
         )?;
         Ok((Some(projected), Some(response)))
     }
+}
+
+/// The error code a provider adapter gives a request that exceeded the model's context window.
+const CONTEXT_OVERFLOW: &str = "provider.context_overflow";
+
+/// Removes the oldest item and, when it is one half of a call/output pair, the other half: Codex's
+/// `ContextManager::remove_first_item`, so the shortened request keeps every call answered.
+fn remove_first_item(input: &mut Vec<ModelInputItem>) {
+    if input.is_empty() {
+        return;
+    }
+    let removed = input.remove(0);
+    if let Some(call_id) = removed.call_id() {
+        input.retain(|item| item.call_id() != Some(call_id));
+    }
+}
+
+/// Whether the model produced the item, as Codex's `is_model_generated_item` classifies history.
+fn is_model_output(item: &ModelInputItem) -> bool {
+    match item {
+        ModelInputItem::Message(message) => message.role() == MessageRole::Assistant,
+        ModelInputItem::Reasoning(_)
+        | ModelInputItem::ToolCall(_)
+        | ModelInputItem::HostedToolCall(_)
+        | ModelInputItem::ToolSearchCall(_)
+        | ModelInputItem::HandoffCall(_)
+        | ModelInputItem::McpCall(_)
+        | ModelInputItem::McpListTools(_)
+        | ModelInputItem::McpApprovalRequest(_)
+        | ModelInputItem::Compaction(_)
+        | ModelInputItem::ProviderCompaction(_) => true,
+        _ => false,
+    }
+}
+
+/// The items recorded after the last model output, which a provider's reported total cannot cover.
+fn after_last_model_output(view: &[ModelInputItem]) -> Vec<ModelInputItem> {
+    let start = view
+        .iter()
+        .rposition(is_model_output)
+        .map_or(0, |index| index + 1);
+    view[start..].to_vec()
+}
+
+/// Assesses a session against its limits with the provider's reported total in place of the
+/// estimated one: Codex's `get_total_token_usage`, the last response's `total_tokens` plus an
+/// estimate of the items after the last model output.
+///
+/// The reported figure includes instructions and tool definitions, which an item estimate never
+/// sees, so it can exceed what the items alone add up to. It therefore replaces only the total
+/// that the total-token limit reads; the item count and the largest item stay estimated.
+fn assess_reported(
+    limits: CompactionLimits,
+    estimated: ContextUsage,
+    reported: u64,
+    tail: &[ModelInputItem],
+) -> Result<CompactionAssessment> {
+    let tail_tokens = ContextUsage::estimate_model_input(tail)?.total_tokens();
+    let total = usize::try_from(reported)
+        .unwrap_or(usize::MAX)
+        .saturating_add(tail_tokens);
+    let mut assessment = limits.assess(estimated);
+    assessment
+        .reasons
+        .retain(|reason| *reason != CompactionReason::TotalTokens);
+    if limits.max_total_tokens.is_some_and(|limit| total >= limit) {
+        assessment.reasons.push(CompactionReason::TotalTokens);
+    }
+    Ok(assessment)
 }
 
 /// Rebuilds the complete request input around a history projection.

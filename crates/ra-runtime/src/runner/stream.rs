@@ -41,6 +41,23 @@ pub(crate) trait ModelStreamSink: Send + Sync {
     /// A background hook reported a warning, shown when its context is delivered: Codex's
     /// `Warning` event from `drain_async_hook_results`.
     fn warning(&self, _message: String) {}
+
+    /// The usage the provider reported for one of the run's own model calls, after it settled.
+    /// A context summary request is not one of them.
+    fn response_usage(&self, _usage: &ra_core::usage::Usage) {}
+
+    /// The run replaced its owner's whole history with `history`, which every record in
+    /// `superseded` is folded into: Codex's `replace_compacted_history` during a turn.
+    fn history_compacted(
+        &self,
+        _history: &[ra_core::item::ModelInputItem],
+        _superseded: &[ra_core::item::ItemId],
+    ) {
+    }
+
+    /// A compaction of the owner's history completed: Codex's `item/completed` for its
+    /// `ContextCompaction` item. Shown, not recorded — the replacement snapshot is the record.
+    fn compaction_completed(&self, _item: &ra_core::item::RunItem) {}
 }
 
 /// One thing that happened during a run.

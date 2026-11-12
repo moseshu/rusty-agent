@@ -3,13 +3,64 @@
 use std::{collections::BTreeMap, fmt, io, path::Path, sync::Arc};
 
 use ra_context::{
-    budget::ToolResultBudget, compaction::CompactionCapability,
+    budget::ToolResultBudget,
+    compaction::CompactionCapability,
     eviction::ToolOutputReferenceTrimmer,
+    window::{ContextWindowConfig, ContextWindowThresholdRatio},
 };
+
+/// Codex's `ModelInfo::auto_compact_token_limit` without a configured limit: nine tenths of the
+/// model's context window. The thread compares it with the provider-reported total of its whole
+/// history, as Codex does, so it sits above the framework default, which an item-only estimate
+/// reaches with instructions and tool definitions left out.
+const CODEX_AUTO_COMPACT_RATIO: ContextWindowThresholdRatio =
+    ContextWindowThresholdRatio::from_basis_points(9_000);
+
+/// Codex's `DEFAULT_STREAM_MAX_RETRIES`, which bounds its compaction request's retries.
+const CODEX_COMPACTION_MAX_RETRIES: u32 = 5;
+
+/// Retries a thread's compaction summary request the way Codex retries its compaction request.
+///
+/// Codex retries a failed compaction request with backoff up to the provider's retry limit, except
+/// for the failures it treats as final, and waits as long as the server's `Retry-After` asks
+/// (`d3147716e0`, after the pinned baseline, narrows the retried failures to those). The runner
+/// already refuses to retry what is not transient — an incomplete response, a window overflow,
+/// a rejected request — and what could replay accepted output, so this policy accepts every
+/// failure that reaches it and adopts the delay a provider asked for.
+fn compaction_retry() -> ModelRetrySettings {
+    ModelRetrySettings::new()
+        .with_max_retries(CODEX_COMPACTION_MAX_RETRIES)
+        .with_policy(Arc::new(CompactionRetryPolicy))
+}
+
+#[derive(Debug)]
+struct CompactionRetryPolicy;
+
+#[async_trait::async_trait]
+impl ModelRetryPolicy for CompactionRetryPolicy {
+    async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
+        let delay = context
+            .provider_advice()
+            .and_then(RetryAdvice::retry_after)
+            .or_else(|| {
+                context
+                    .normalized()
+                    .and_then(NormalizedProviderError::retry_after)
+            });
+        match delay {
+            Some(delay) => RetryDecision::retry().with_delay(delay),
+            None => RetryDecision::retry(),
+        }
+    }
+}
 use ra_core::{
     capability::Capability,
     event::{HostEventEmitter, HostEventSink, NoopHostEventSink},
     item::AgentId,
+    model::{
+        ModelRetryPolicy, ModelRetrySettings, NormalizedProviderError, RetryAdvice, RetryDecision,
+        RetryPolicyContext,
+    },
     skill::SkillCatalog,
     state::EventSeqAllocator,
     tool::{Tool, ToolNamespace, ToolServices},
@@ -635,7 +686,13 @@ impl CodingHost {
             .with_max_turns(None)
             .with_max_function_tool_concurrency(8)
             .with_context_filter(Arc::new(ToolOutputReferenceTrimmer::default()))
-            .with_capability(Arc::new(CompactionCapability::default()))
+            .with_compaction_retry(compaction_retry())
+            .with_capability(Arc::new(
+                CompactionCapability::default().with_context_windows(
+                    ContextWindowConfig::default()
+                        .with_compaction_threshold_ratio(CODEX_AUTO_COMPACT_RATIO),
+                ),
+            ))
     }
 
     /// Creates the workspace-confined editing capability.

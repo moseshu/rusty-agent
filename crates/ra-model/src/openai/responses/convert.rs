@@ -80,7 +80,7 @@ fn reject_unfinished_response(payload: &Value) -> Result<()> {
         "completed" => Ok(()),
         "incomplete" => match reason() {
             "max_output_tokens" => Err(Error::provider(
-                ProviderErrorKind::ContextOverflow,
+                ProviderErrorKind::OutputLimit,
                 "OpenAI response stopped at max_output_tokens",
             )),
             "content_filter" => Err(Error::provider(

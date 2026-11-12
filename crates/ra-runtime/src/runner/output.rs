@@ -88,7 +88,7 @@ pub(super) async fn call_handler(
     let Some(handler) = context.config.error_handler.as_ref() else {
         return Ok(None);
     };
-    let (base, carried) = if state.handoff_projection().is_some() {
+    let (base, carried) = if state.has_model_input_base() {
         state.model_input_base()?
     } else {
         (context.input_base, progress.segment_items(state))

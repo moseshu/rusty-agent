@@ -2535,3 +2535,66 @@ async fn context_injected_while_awaiting_approval_survives_an_interrupt() {
         texts(&thread.history())
     );
 }
+
+/// A turn that paused for approval after a sampling over the compaction limit continues from that
+/// sampling: the continued run checks the limit with the total the paused response reported and
+/// compacts before its next sampling, as Codex's turn checks it after every step that needs a
+/// follow-up.
+#[tokio::test]
+async fn a_turn_continued_after_approval_compacts_on_the_total_it_paused_with() {
+    let script = Arc::new(Script::default());
+    let compaction = ra_context::compaction::CompactionCapability::default().with_context_windows(
+        ra_context::window::ContextWindowConfig::new(
+            std::collections::BTreeMap::from([("canonical-model".to_owned(), 1_000)]),
+            ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO,
+        )
+        .unwrap(),
+    );
+    let thread = thread_with(
+        &script,
+        RunConfig::new().with_capability(Arc::new(compaction)),
+    );
+    script.push(Step::Respond(
+        tool_call("m-1", "c-1", "guarded_look").with_usage(ra_core::usage::Usage::from_request(
+            ra_core::usage::RequestUsage::new(4_999_990, 10),
+        )),
+    ));
+    script.push(Step::Respond(final_message(
+        "summary",
+        r#"{"primary_request_and_intent":"intent","key_technical_concepts":"concepts","files_and_code_sections":"files","errors_and_fixes":"errors","problem_solving":"solving","pending_tasks":"tasks","current_work":"approval summary","optional_next_step":"next"}"#,
+    )));
+    script.push(Step::Respond(final_message("m-2", "looked")));
+
+    let turn_id = started(&thread, text("look")).await;
+    match next_event(&thread).await {
+        ThreadEvent::TurnStarted { .. } => {}
+        other => panic!("expected the turn to start, got {other:?}"),
+    }
+    let state = approve_paused(&thread, &turn_id).await;
+    thread.resume_turn(state).unwrap();
+    loop {
+        match next_event(&thread).await {
+            ThreadEvent::TurnComplete { .. } => break,
+            ThreadEvent::Warning { .. } | ThreadEvent::ItemStarted { .. } => {}
+            other => panic!("expected the turn to complete, got {other:?}"),
+        }
+    }
+
+    let calls = script.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(
+        texts(&calls[1].input)
+            .iter()
+            .any(|text| text.contains("Summarize the conversation context")),
+        "{:?}",
+        texts(&calls[1].input)
+    );
+    assert!(
+        calls[2]
+            .input
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::Compaction(_))),
+        "{:?}",
+        texts(&calls[2].input)
+    );
+}

@@ -765,7 +765,7 @@ pub(crate) fn primary_choice(choices: &[Value]) -> Option<&Value> {
 pub(crate) fn reject_unfinished_choice(finish_reason: Option<&str>) -> Result<()> {
     if finish_reason == Some("length") {
         return Err(Error::provider(
-            ProviderErrorKind::ContextOverflow,
+            ProviderErrorKind::OutputLimit,
             "OpenAI chat completion stopped at the output token limit",
         ));
     }

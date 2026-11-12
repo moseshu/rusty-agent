@@ -391,6 +391,7 @@ impl ThreadRequestProcessor {
         attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
         let builder = builder
             .with_history(reconstruction.history().to_vec())
+            .with_reported_tokens(reconstruction.reported_tokens())
             .with_rollout_recorder(recorder);
         let info = LoadedThreadInfo {
             ephemeral: false,
@@ -547,7 +548,9 @@ impl ThreadRequestProcessor {
             let reconstruction = reconstruct_history(&fork_records)
                 .map_err(|error| fork_error(&source_id, &error))?;
             (
-                builder.with_history(reconstruction.history().to_vec()),
+                builder
+                    .with_history(reconstruction.history().to_vec())
+                    .with_reported_tokens(reconstruction.reported_tokens()),
                 fork_records,
             )
         } else {
@@ -574,6 +577,7 @@ impl ThreadRequestProcessor {
             (
                 builder
                     .with_history(reconstruction.history().to_vec())
+                    .with_reported_tokens(reconstruction.reported_tokens())
                     .with_rollout_recorder(recorder),
                 Vec::new(),
             )

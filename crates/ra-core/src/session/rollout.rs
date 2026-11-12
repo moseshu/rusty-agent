@@ -731,6 +731,8 @@ pub struct RolloutModelUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     usage: Usage,
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    sampling: bool,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -745,8 +747,29 @@ impl RolloutModelUsage {
             turn_index: None,
             model: None,
             usage,
+            sampling: false,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Marks the usage as one of the run's own sampling requests: the request built from the
+    /// run's history, whose reported total measures that history.
+    ///
+    /// Every record counts toward totals alike, as the reference bills agent-tool runs to the run
+    /// that called them. Only a sampling request describes the history the next request is built
+    /// from, which is what Codex's `last_token_usage` is restored for. A context summary request
+    /// sends a different input and may fail after it was billed, and an agent-tool run's usage —
+    /// recorded here when the calling run settles — measures that run's history, not this one's.
+    #[must_use]
+    pub const fn with_sampling(mut self) -> Self {
+        self.sampling = true;
+        self
+    }
+
+    /// Whether the usage is one of the run's own sampling requests; see [`Self::with_sampling`].
+    #[must_use]
+    pub const fn is_sampling(&self) -> bool {
+        self.sampling
     }
 
     /// Sets the turn index.

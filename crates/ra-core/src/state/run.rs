@@ -1186,6 +1186,10 @@ pub struct RunState {
     input_history_is_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_projection: Option<HandoffProjection>,
+    /// Whether [`Self::handoff_projection`] holds the history a compaction replaced the base with,
+    /// rather than the input a transfer of control selected.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    projection_from_compaction: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_handoff: Option<PendingHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1322,6 +1326,8 @@ struct RunStateRecord {
     #[serde(default)]
     handoff_projection: Option<HandoffProjection>,
     #[serde(default)]
+    projection_from_compaction: bool,
+    #[serde(default)]
     pending_handoff: Option<PendingHandoff>,
     #[serde(default)]
     session_persisted_item_count: Option<usize>,
@@ -1401,6 +1407,7 @@ impl TryFrom<RunStateRecord> for RunState {
             mut permission_rules,
             input_history_is_complete,
             handoff_projection,
+            projection_from_compaction,
             pending_handoff,
             session_persisted_item_count,
             pending_session_write,
@@ -1555,6 +1562,7 @@ impl TryFrom<RunStateRecord> for RunState {
             permission_rules,
             input_history_is_complete,
             handoff_projection,
+            projection_from_compaction,
             pending_handoff,
             session_persisted_item_count,
             pending_session_write,
@@ -1627,6 +1635,7 @@ impl RunState {
             permission_rules: Vec::new(),
             input_history_is_complete: true,
             handoff_projection: None,
+            projection_from_compaction: false,
             pending_handoff: None,
             session_persisted_item_count: None,
             pending_session_write: None,
@@ -2119,7 +2128,9 @@ impl RunState {
     /// Without a transfer of control these are the run's opening input and its whole history, which
     /// is the projection [`Self::original_input`] and [`Self::generated_items`] describe on their
     /// own. Once a handoff has installed a [`HandoffProjection`], they are that projection and only
-    /// the records appended after it — which is the entire point of installing one.
+    /// the records appended after it — which is the entire point of installing one. A compaction
+    /// that replaced the session's history ([`Self::compacted_history`]) installs a base the same
+    /// way, and whichever of the two was installed last is the one in force.
     ///
     /// # Errors
     ///
@@ -2149,9 +2160,40 @@ impl RunState {
     }
 
     /// The model-input projection a transfer of control installed, if one is in force.
+    ///
+    /// `None` while the base in force is a compacted history instead; see
+    /// [`Self::compacted_history`].
     #[must_use]
     pub const fn handoff_projection(&self) -> Option<&HandoffProjection> {
-        self.handoff_projection.as_ref()
+        if self.projection_from_compaction {
+            None
+        } else {
+            self.handoff_projection.as_ref()
+        }
+    }
+
+    /// The replacement history a compaction installed as this run's model-input base, if it is the
+    /// base in force.
+    ///
+    /// Codex's automatic compaction replaces the whole session history in the middle of a turn and
+    /// the turn samples again from the replacement (`replace_compacted_history`). Here the run's
+    /// opening input and the records generated before the compaction stay in
+    /// [`Self::original_input`] and [`Self::generated_items`], because they are what happened; the
+    /// model continues from this replacement and the records generated after it, which
+    /// [`Self::model_input_base`] returns.
+    #[must_use]
+    pub fn compacted_history(&self) -> Option<&[ModelInputItem]> {
+        self.handoff_projection
+            .as_ref()
+            .filter(|_| self.projection_from_compaction)
+            .map(HandoffProjection::input)
+    }
+
+    /// Whether a handoff or a compaction installed the model-input base in force, so that
+    /// [`Self::model_input_base`] differs from the opening input and the whole history.
+    #[must_use]
+    pub const fn has_model_input_base(&self) -> bool {
+        self.handoff_projection.is_some()
     }
 
     /// Transfer waiting for this turn's function tools to finish.
@@ -2966,6 +3008,7 @@ impl RunState {
                 if !input.is_empty() {
                     self.input_history_is_complete = false;
                     self.handoff_projection = None;
+                    self.projection_from_compaction = false;
                 }
                 Ok(())
             }
@@ -2994,6 +3037,28 @@ impl RunState {
     /// failure would surface one turn later with nothing left to say which transfer caused it.
     #[doc(hidden)]
     pub fn install_handoff_projection(&mut self, projection: HandoffProjection) -> Result<()> {
+        self.install_projection(projection)?;
+        self.projection_from_compaction = false;
+        Ok(())
+    }
+
+    /// Installs the history a compaction replaced the session's history with as the base the run
+    /// continues from; see [`Self::compacted_history`].
+    ///
+    /// `compaction` names the compaction, which is kept for diagnostics and is not looked up. Every
+    /// record already generated is folded into the replacement, so history carries on after the
+    /// last of them.
+    #[doc(hidden)]
+    pub fn install_compacted_history(&mut self, history: Vec<ModelInputItem>, compaction: ItemId) {
+        let projection = match self.generated_items.last() {
+            Some(boundary) => HandoffProjection::new(history, boundary.id().clone()),
+            None => HandoffProjection::from_start(history, compaction),
+        };
+        self.handoff_projection = Some(projection);
+        self.projection_from_compaction = true;
+    }
+
+    fn install_projection(&mut self, projection: HandoffProjection) -> Result<()> {
         if projection.is_from_start() {
             if !self.generated_items.is_empty() {
                 return Err(Error::caller(

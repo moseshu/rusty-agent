@@ -45,7 +45,7 @@ use ra_core::{
     budget::BudgetLimit,
     cancel::{CancelReason, CancelScope, Deadline, ScopeKind},
     capability::{
-        Capability, ContextProcessor, ContextProcessorRequest, ContextSummarizer,
+        Capability, CapabilityFamily, ContextProcessor, ContextProcessorRequest, ContextSummarizer,
         ContextSummaryRequest, ContextSummaryResponse, LoadSignal,
     },
     context::RunContext,
@@ -100,8 +100,8 @@ use tracing::{Instrument, info_span, warn};
 
 mod entry;
 mod grouping;
+pub(crate) mod history_compaction;
 mod live_settings;
-pub(crate) mod manual_compaction;
 mod output;
 mod pending_input;
 mod prompt_cache_key;
@@ -267,6 +267,7 @@ pub struct RunConfig {
     pre_approval_tool_input_guardrails: bool,
     user_hooks: UserHooks,
     step_observer: Option<Arc<dyn StepExecutionObserver>>,
+    compaction_retry: Option<ra_core::model::ModelRetrySettings>,
     lifecycle_hooks: Vec<Arc<dyn LifecycleHook>>,
     sandbox: Option<SandboxRunConfig>,
     group_id: Option<String>,
@@ -313,6 +314,7 @@ impl RunConfig {
             pre_approval_tool_input_guardrails: false,
             user_hooks: UserHooks::default(),
             step_observer: None,
+            compaction_retry: None,
             lifecycle_hooks: Vec::new(),
             sandbox: None,
             group_id: None,
@@ -880,6 +882,23 @@ impl RunConfig {
         self
     }
 
+    /// Retries a thread's compaction summary request under `retry` when the model settings
+    /// configure no retries of their own, as Codex retries its compaction request up to the
+    /// provider's `stream_max_retries`.
+    ///
+    /// Only the summary request reads it; ordinary sampling keeps the model settings' retries. A
+    /// product supplies its default here: the framework installs none.
+    pub fn with_compaction_retry(mut self, retry: ra_core::model::ModelRetrySettings) -> Self {
+        self.compaction_retry = Some(retry);
+        self
+    }
+
+    /// Retries for a thread's compaction summary request; see [`Self::with_compaction_retry`].
+    #[must_use]
+    pub const fn compaction_retry(&self) -> Option<&ra_core::model::ModelRetrySettings> {
+        self.compaction_retry.as_ref()
+    }
+
     /// Installs a shared host hook registry, also usable for host-owned session events.
     pub fn with_user_hooks(mut self, hooks: UserHooks) -> Self {
         self.user_hooks = hooks;
@@ -988,6 +1007,7 @@ impl std::fmt::Debug for RunConfig {
             .debug_struct("RunConfig")
             .field("has_app_context", &self.app_context.is_some())
             .field("has_step_observer", &self.step_observer.is_some())
+            .field("compaction_retry", &self.compaction_retry)
             .field("budget", &self.budget)
             .field(
                 "max_function_tool_concurrency",
@@ -1601,6 +1621,9 @@ struct TurnLoopContext<'a> {
     deferred_prompts: &'a [DeferredPrompt],
     /// Run-bound processors remain separate from declarative settings snapshots.
     capability_processors: &'a [Arc<dyn ContextProcessor>],
+    /// The same processors without the compaction family's, for a run whose owner compacts its
+    /// whole history between steps instead; see [`history_compaction`].
+    session_capability_processors: &'a [Arc<dyn ContextProcessor>],
     /// Bound contributors process accepted input independently of model history projections.
     input_contributors: &'a [Arc<dyn Capability>],
     /// Declaration-owned preparation, reused when control returns to that declaration.
@@ -1671,6 +1694,9 @@ struct TurnLoopProgress {
     /// Whether this segment has recorded its turn context in the run's rollout.
     turn_context_recorded: bool,
     stop_processing: bool,
+    /// What the provider reported for this segment's latest model call, until a compaction of the
+    /// owner's history makes it describe a history that no longer exists.
+    last_response_tokens: Option<u64>,
 }
 
 impl TurnLoopProgress {
@@ -2367,6 +2393,12 @@ async fn run_loop_inner(
         session_compaction_usage: std::sync::Mutex::new(Usage::default()),
         turn_context_recorded: false,
         stop_processing: false,
+        // A segment finishing a turn that paused for approval continues after the sampling it
+        // paused on, which the checkpoint keeps; the first step of a new turn has none before it.
+        last_response_tokens: continues_turn
+            .then(|| state.model_responses().last())
+            .flatten()
+            .and_then(|response| history_compaction::reported_tokens(response.usage())),
     };
     let permission = config
         .permission()
@@ -2404,6 +2436,9 @@ async fn run_loop_inner(
         capability_processors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.context_processors),
+        session_capability_processors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.session_processors),
         input_contributors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.input_contributors),
@@ -2995,6 +3030,7 @@ fn initial_capability_agent(
 struct PreparedRunCapabilities {
     agent: AgentBinding,
     context_processors: Vec<Arc<dyn ContextProcessor>>,
+    session_processors: Vec<Arc<dyn ContextProcessor>>,
     deferred_prompts: Vec<DeferredPrompt>,
     input_contributors: Vec<Arc<dyn Capability>>,
 }
@@ -3091,9 +3127,23 @@ async fn assemble_capabilities(
     }
     let execution = assembled.prepare_agent_with_sampling_context(&base, &sampling)?;
     let execution = agent.with_prepared_execution(execution)?;
+    let session_processors = assembled
+        .capabilities()
+        .iter()
+        .filter(|capability| {
+            capability.kind() != CapabilityFamily::COMPACTION
+                && capability.context_processor().is_some()
+        })
+        .map(|capability| {
+            Arc::new(crate::capability::CapabilityContextProcessor::new(
+                Arc::clone(capability),
+            )) as Arc<dyn ContextProcessor>
+        })
+        .collect();
     Ok(PreparedRunCapabilities {
         agent: execution,
         context_processors: assembled.context_processors().to_vec(),
+        session_processors,
         deferred_prompts: assembled.deferred_prompts().to_vec(),
         input_contributors: assembled.capabilities().to_vec(),
     })
@@ -5052,6 +5102,9 @@ async fn run_one_turn(
         capability_processors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.context_processors),
+        session_capability_processors: prepared_capabilities
+            .as_ref()
+            .map_or(&[], |prepared| &prepared.session_processors),
         input_contributors: prepared_capabilities
             .as_ref()
             .map_or(&[], |prepared| &prepared.input_contributors),
@@ -5098,6 +5151,15 @@ async fn run_one_turn(
         persist_rollout(rollout, context.run_id, PersistContext::SteeredUserInput).await;
     }
     deliver_rollout_budget_reminder(context, state, progress);
+    // Between steps of a turn that continues, before this step's request is built from the base,
+    // as Codex compacts mid-turn once a step that needs a follow-up has reached the token limit.
+    if history_compaction::due_mid_turn(context, state, progress)
+        && let Some(outcome) =
+            history_compaction::compact_mid_turn(context, agent, state, progress, turn_scope)
+                .await?
+    {
+        return Ok(Some(outcome));
+    }
     let reminder = budget_reminder(context.spend, config.budget());
     // What this turn's request is built from: the base the run continues on, and the records
     // appended since. The two ways of decomposing that are equivalent until a transfer of control
@@ -5161,7 +5223,7 @@ async fn run_one_turn(
             total.accumulate(response.usage())
         });
     if context_usage.requests() > 0 {
-        record_spend(context, state, &context_usage, None, progress);
+        record_spend(context, state, &context_usage, None, progress, false);
     }
     for response in context_responses {
         state.record_model_response(response);
@@ -5301,7 +5363,18 @@ async fn run_one_turn(
     // call ran. The copy is what that costs, next to the history copy this turn already makes for
     // settlement.
     record_usage(turn_span, response.usage());
-    record_spend(context, state, response.usage(), selector.model(), progress);
+    record_spend(
+        context,
+        state,
+        response.usage(),
+        selector.model(),
+        progress,
+        true,
+    );
+    progress.last_response_tokens = history_compaction::reported_tokens(response.usage());
+    if let Some(sink) = context.events.model_stream_sink {
+        sink.response_usage(response.usage());
+    }
     state.record_model_response(response.clone());
     if let Some(compaction) = compaction {
         for item in response.output().iter().filter_map(RunItem::to_model_input) {
@@ -6005,11 +6078,15 @@ fn record_spend(
     usage: &Usage,
     model: Option<&str>,
     progress: &TurnLoopProgress,
+    sampling: bool,
 ) {
     state.record_usage(usage);
     context.spend.record_own(usage);
     if let Some(rollout) = context.events.rollout {
         let mut record = RolloutModelUsage::new(context.run_id.clone(), usage.clone());
+        if sampling {
+            record = record.with_sampling();
+        }
         if let Ok(turn) = u32::try_from(progress.reference_turn()) {
             record = record.with_turn_index(turn);
         }
@@ -6094,7 +6171,11 @@ async fn process_context_processors(
                 .config
                 .context_processors()
                 .iter()
-                .chain(context.capability_processors)
+                .chain(if history_compaction::compacts_session(context) {
+                    context.session_capability_processors
+                } else {
+                    context.capability_processors
+                })
                 .filter(|_| decomposition.is_some()),
         )
         .collect();
@@ -6141,6 +6222,7 @@ async fn process_context_processors(
             turn_scope: turn_scope.clone(),
             stopped_after_compaction: std::sync::atomic::AtomicBool::new(false),
             session_start_on_stop: Some(ra_core::hook::SessionStartSource::Compact),
+            before_attempt: std::sync::Mutex::new(None),
         })
     });
 
@@ -6312,7 +6394,12 @@ struct CompactionHookDispatcher {
     turn_scope: CancelScope,
     stopped_after_compaction: std::sync::atomic::AtomicBool,
     session_start_on_stop: Option<ra_core::hook::SessionStartSource>,
+    /// Runs once, before the first `PreCompact`: what an owner records when an attempt begins.
+    before_attempt: std::sync::Mutex<Option<AttemptStart>>,
 }
+
+/// What an owner records once a compaction attempt begins, before its `PreCompact` hooks run.
+pub(crate) type AttemptStart = Box<dyn FnOnce() + Send + Sync>;
 
 impl CompactionHookDispatcher {
     /// Ends the turn — or, with nothing above the run, the run — for a stopping hook.
@@ -6344,6 +6431,16 @@ impl CompactionHookDispatcher {
 impl ra_core::hook::UserHookDispatcher for CompactionHookDispatcher {
     async fn dispatch(&self, event: HookEvent<'_>) -> Result<HookDecision> {
         let name = event.name();
+        if name == HookEventName::PreCompact {
+            let start = self
+                .before_attempt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(start) = start {
+                start();
+            }
+        }
         let decision = self.hooks.dispatch(event).await?;
         let stopped = matches!(decision, HookDecision::Deny { .. });
         match name {
@@ -6433,7 +6530,7 @@ impl TurnInput {
         state: &RunState,
         progress: &TurnLoopProgress,
     ) -> Result<Self> {
-        let (base, carried) = if state.handoff_projection().is_some() {
+        let (base, carried) = if state.has_model_input_base() {
             state.model_input_base()?
         } else if context.authoritative_history_complete {
             (state.original_input(), state.generated_items())
@@ -6497,12 +6594,31 @@ impl HistorySpan {
     }
 }
 
+/// Where a summary request's usage goes, which is decided by who pays for it.
+#[derive(Clone, Copy)]
+enum SummaryUsage<'a> {
+    /// Back to the processor with the response; the turn loop records what processors return.
+    Returned,
+    /// Straight into a thread's rollout, for a compaction no run pays for.
+    Rollout(&'a dyn RolloutRecorder, &'a RunId),
+    /// Into a run's spend, which the caller records once, failed summaries included.
+    Spent(&'a std::sync::Mutex<Usage>),
+}
+
 /// Executes a context-summary request with the resolved model and stable instructions of a turn.
 struct RunnerContextSummarizer<'a> {
     model: &'a Arc<dyn Model>,
     template: &'a ModelRequest,
     cancel: &'a CancelScope,
-    record_usage: Option<(&'a dyn RolloutRecorder, &'a RunId)>,
+    record_usage: SummaryUsage<'a>,
+    /// Retries a failed summary request under the template's retry policy, as Codex's compaction
+    /// loop does. Without it the request is sent once, which is what a run-scoped projection does:
+    /// it declines on failure instead.
+    retry: bool,
+    /// Where each retry is reported, as Codex's compaction loop calls `notify_stream_error`.
+    retry_sink: Option<&'a dyn stream::ModelStreamSink>,
+    /// The retries used when the template's model settings configure none.
+    fallback_retry: Option<&'a ra_core::model::ModelRetrySettings>,
 }
 
 impl<'a> RunnerContextSummarizer<'a> {
@@ -6511,7 +6627,57 @@ impl<'a> RunnerContextSummarizer<'a> {
             model: prepared.model(),
             template: prepared.request(),
             cancel,
-            record_usage: None,
+            record_usage: SummaryUsage::Returned,
+            retry: false,
+            retry_sink: None,
+            fallback_retry: None,
+        }
+    }
+
+    /// Sends the request, and again under the template's retry policy when `retry_sink` asks for
+    /// it, with the same limits and replay boundary as an ordinary model call.
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        if !self.retry {
+            return self.cancel.run(self.model.get_response(request)).await?;
+        }
+        let retry_settings = request
+            .model_settings()
+            .retry()
+            .or(self.fallback_retry)
+            .cloned();
+        let max_retries = retry_settings
+            .as_ref()
+            .and_then(ra_core::model::ModelRetrySettings::max_retries)
+            .unwrap_or(0);
+        let mut attempt = 0;
+        loop {
+            let error = match self
+                .cancel
+                .run(self.model.get_response(request.clone()))
+                .await?
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            let Some((_, delay)) = evaluate_retry(RetryEvaluation {
+                turn_scope: self.cancel,
+                model: self.model,
+                request: &request,
+                error: &error,
+                retry_settings: retry_settings.as_ref(),
+                attempt,
+                max_retries,
+                consumed: CallConsumption::default(),
+            })
+            .await?
+            else {
+                return Err(error);
+            };
+            if let Some(sink) = self.retry_sink {
+                sink.retrying(attempt.saturating_add(1), max_retries, &error);
+            }
+            self.cancel.run(tokio::time::sleep(delay)).await?;
+            attempt = attempt.saturating_add(1);
         }
     }
 }
@@ -6540,17 +6706,23 @@ impl ContextSummarizer for RunnerContextSummarizer<'_> {
             model_request = model_request.with_output_schema(output_schema.clone());
         }
         model_request.validate_cache_plan()?;
-        let response = self
-            .cancel
-            .run(self.model.get_response(model_request))
-            .await??;
-        if let Some((recorder, run_id)) = self.record_usage
-            && response.usage().requests() > 0
-        {
-            recorder.record(RolloutItem::ModelUsage(RolloutModelUsage::new(
-                run_id.clone(),
-                response.usage().clone(),
-            )));
+        let response = self.get_response(model_request).await?;
+        if response.usage().requests() > 0 {
+            match self.record_usage {
+                SummaryUsage::Returned => {}
+                SummaryUsage::Rollout(recorder, run_id) => {
+                    recorder.record(RolloutItem::ModelUsage(RolloutModelUsage::new(
+                        run_id.clone(),
+                        response.usage().clone(),
+                    )));
+                }
+                SummaryUsage::Spent(spent) => {
+                    let mut spent = spent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *spent = spent.accumulate(response.usage());
+                }
+            }
         }
         let text = response
             .output()

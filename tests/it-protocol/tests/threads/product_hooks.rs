@@ -681,3 +681,6 @@ mod payload_acceptance;
 
 #[path = "product_hooks/manual_compaction.rs"]
 mod manual_compaction;
+
+#[path = "product_hooks/auto_compaction.rs"]
+mod auto_compaction;
