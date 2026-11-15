@@ -1952,6 +1952,8 @@ async fn a_child_of_the_same_declaration_keeps_the_prepared_surface() {
 struct GuardedTool {
     origin: ToolOrigin,
     schema: ToolSchema,
+    /// Told when a call starts, for a tool that then never finishes.
+    hangs: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl GuardedTool {
@@ -1963,6 +1965,15 @@ impl GuardedTool {
                 json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
             )
             .unwrap(),
+            hangs: None,
+        }
+    }
+
+    /// The same tool, whose approved call tells `started` and then runs until it is cancelled.
+    fn hanging(started: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            hangs: Some(started),
+            ..Self::new()
         }
     }
 }
@@ -1982,6 +1993,10 @@ impl Tool for GuardedTool {
     }
 
     async fn call(&self, _context: ToolContext<'_>) -> Result<ToolOutput> {
+        if let Some(started) = &self.hangs {
+            started.notify_one();
+            return std::future::pending().await;
+        }
         Ok(ToolOutput::text("deployed"))
     }
 }
@@ -4535,5 +4550,899 @@ fn skill_context_is_retained_without_becoming_a_fork_turn_boundary() {
     assert_eq!(
         fork_history(&history, SpawnAgentForkMode::FullHistory),
         history
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spawn reservations
+// ---------------------------------------------------------------------------------------------
+
+/// A store whose rollout creation waits until the test lets it go on.
+struct GatedStore {
+    inner: Arc<dyn ra_core::session::rollout::RolloutThreadStore>,
+    entered: Notify,
+    proceed: Notify,
+}
+
+impl GatedStore {
+    fn new(inner: Arc<dyn ra_core::session::rollout::RolloutThreadStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            entered: Notify::new(),
+            proceed: Notify::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl ra_core::session::rollout::RolloutThreadStore for GatedStore {
+    async fn create_thread(
+        &self,
+        session_id: &ra_core::session::SessionId,
+        spawn: &ra_core::session::rollout::RolloutThreadSpawn,
+    ) -> Result<Arc<dyn ra_core::session::rollout::RolloutRecorder>> {
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        self.inner.create_thread(session_id, spawn).await
+    }
+}
+
+async fn until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// As Codex's `SpawnReservation` and `PendingSpawn`: a spawn dropped after the factory handed over
+/// the agent's resources, while its rollout is still being created, releases them once and frees
+/// its path, though nobody waits for it.
+#[tokio::test]
+async fn a_spawn_cancelled_while_creating_its_rollout_releases_what_it_was_given() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let store = GatedStore::new(Arc::new(ra_session::InMemoryThreadStore::new()));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(control.live_instances().len(), 1, "the path is reserved");
+    run.abort();
+    let _ = run.await;
+    until("the cancelled spawn released its resources", || {
+        factory.released.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    until("the reservation was freed", || {
+        control.live_instances().is_empty()
+    })
+    .await;
+    store.proceed.notify_one();
+    assert_eq!(paths(&control), ["/root"]);
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+}
+
+/// A close that reaches a spawn still preparing its agent freezes it: the agent is admitted
+/// closed, stopped by that close — its rollout written out — and the spawn is refused.
+#[tokio::test]
+async fn a_close_reaching_a_preparing_spawn_admits_and_stops_its_agent() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(GatedFactory {
+        inner: PreparingFactory::new(prepared_worker(), false),
+        entered: Notify::new(),
+        proceed: Notify::new(),
+    });
+    let store = Arc::new(ra_session::InMemoryThreadStore::new());
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), factory.entered.notified())
+        .await
+        .unwrap();
+    let frozen = control.live_instances();
+    assert_eq!(frozen.len(), 1);
+    let closing = {
+        let control = control.clone();
+        tokio::spawn(async move { control.close(&AgentPath::root()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    factory.proceed.notify_one();
+    closing.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(paths(&control), ["/root"]);
+    assert_eq!(factory.inner.released.load(Ordering::SeqCst), 1);
+    let session = frozen[0].session_id();
+    assert!(
+        store.thread_metadata(session).is_some(),
+        "the agent's rollout was materialized when it was stopped"
+    );
+}
+
+/// A spawn refused after its rollout was created, whose rollout then cannot be discarded, keeps its
+/// path and holds the rollout; closing its session again discards it and frees the path.
+#[tokio::test]
+async fn a_spawn_whose_rollout_cannot_be_discarded_holds_its_path_until_closed_again() {
+    use ra_session::rollout::faults::{RolloutFaultPoint, RolloutFaults};
+    let directory = tempfile::tempdir().unwrap();
+    let faults = RolloutFaults::new();
+    let store = GatedStore::new(Arc::new(
+        ra_session::RolloutThreadDirectory::new(directory.path()).with_faults(Arc::clone(&faults)),
+    ));
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+        .await
+        .unwrap();
+    let session = control.live_instances()[0].session_id().clone();
+    // Shutting down refuses the agent once its rollout exists; its discard fails once.
+    faults.fail(RolloutFaultPoint::Discard, 1);
+    control.shutdown().await;
+    store.proceed.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    until("the spawn tried to discard its rollout", || {
+        faults.calls(RolloutFaultPoint::Discard) == 1
+    })
+    .await;
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        control
+            .live_instances()
+            .iter()
+            .map(|agent| agent.session_id().clone())
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&session),
+        "the reservation still holds the rollout"
+    );
+    let report = control.close_session(&session).unwrap().finished().await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(faults.calls(RolloutFaultPoint::Discard), 2);
+    assert!(control.live_instances().is_empty());
+    assert_eq!(factory.released.load(Ordering::SeqCst), 1);
+}
+
+/// Removal waits for the spawns a shutdown did not wait for: a spawn still creating its rollout
+/// when the tree shut down settles later, and a cleanup that cannot discard its rollout is
+/// reported, then retried by the next settle.
+#[tokio::test]
+async fn settling_spawns_reports_a_cleanup_that_failed_after_shutdown() {
+    use ra_session::rollout::faults::{RolloutFaultPoint, RolloutFaults};
+    let directory = tempfile::tempdir().unwrap();
+    let faults = RolloutFaults::new();
+    let store = GatedStore::new(Arc::new(
+        ra_session::RolloutThreadDirectory::new(directory.path()).with_faults(Arc::clone(&faults)),
+    ));
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+        .await
+        .unwrap();
+    faults.fail(RolloutFaultPoint::Discard, 1);
+    let shutdown = control.shutdown_close().finished().await;
+    assert!(shutdown.is_complete(), "the shutdown does not wait for it");
+    let settling = {
+        let control = control.clone();
+        tokio::spawn(async move { control.settle_spawns().await })
+    };
+    store.proceed.notify_one();
+    let first = settling.await.unwrap();
+    assert_eq!(first.failed().len(), 1, "{first:?}");
+    let _ = run.await;
+    let second = control.settle_spawns().await;
+    assert!(second.is_complete(), "{second:?}");
+    assert!(control.live_instances().is_empty());
+    assert_eq!(faults.calls(RolloutFaultPoint::Discard), 2);
+}
+
+/// A close by an agent's session reaches only that instance: once it has gone and the path was
+/// spawned again, closing the old session closes nothing, and the new agent goes on.
+#[tokio::test]
+async fn closing_an_old_session_leaves_the_agent_spawned_again_at_its_path() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_root_session_id(ra_core::session::SessionId::new("root"))
+        .unwrap();
+    for round in ["1", "2"] {
+        scripts.push(
+            "lead",
+            Step::Respond(spawn_worker(&format!("l-{round}"), "work")),
+        );
+        scripts.push(
+            "lead",
+            Step::Respond(final_message(&format!("l-{round}-end"), "spawned")),
+        );
+        scripts.push(
+            "prepared",
+            Step::Respond(final_message(&format!("p-{round}"), "prepared done")),
+        );
+    }
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let old = control.live_instances()[0].session_id().clone();
+    control.close(&worker_path()).await.unwrap();
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let new = control.live_instances()[0].session_id().clone();
+    assert_ne!(new, old);
+
+    assert!(control.close_session(&old).is_none());
+    assert_eq!(paths(&control), ["/root", "/root/worker"]);
+    assert_eq!(
+        control
+            .live_instances()
+            .iter()
+            .map(|agent| agent.session_id().clone())
+            .collect::<Vec<_>>(),
+        [new]
+    );
+}
+
+/// Context injected into an idle spawned agent — a network rule it saved, for instance — reaches
+/// the input of its next run, as Codex's `inject_no_new_turn` adds it to the session.
+#[tokio::test]
+async fn context_injected_into_an_idle_agent_reaches_its_next_run() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_root_session_id(ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-1-end", "spawned")));
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("p-1", "prepared done")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(&session, vec![Message::developer("network rule saved")]));
+
+    scripts.push(
+        "lead",
+        Step::Respond(tool_call(
+            "l-2",
+            "l-2-call",
+            "followup_task",
+            json!({"target": "worker", "message": "again"}),
+        )),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-2-end", "asked")));
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("p-2", "prepared again")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    until("the worker ran again", || {
+        scripts.inputs("prepared").len() == 2
+    })
+    .await;
+    let input = texts(&scripts.inputs("prepared")[1]);
+    assert!(
+        input.iter().any(|text| text == "network rule saved"),
+        "{input:?}"
+    );
+}
+
+/// Closes that meet a spawn's cleanup retry in progress share its outcome: none of them reports the
+/// path free while the rollout is still held, even when the retry fails again.
+#[tokio::test]
+async fn concurrent_closes_share_a_spawns_cleanup_retry() {
+    use ra_session::rollout::faults::{RolloutFaultPoint, RolloutFaults};
+    let directory = tempfile::tempdir().unwrap();
+    let faults = RolloutFaults::new();
+    let store = GatedStore::new(Arc::new(
+        ra_session::RolloutThreadDirectory::new(directory.path()).with_faults(Arc::clone(&faults)),
+    ));
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+        .await
+        .unwrap();
+    let session = control.live_instances()[0].session_id().clone();
+    faults.fail(RolloutFaultPoint::Discard, 1);
+    control.shutdown().await;
+    store.proceed.notify_one();
+    let _ = run.await;
+    until("the first cleanup failed", || {
+        faults.calls(RolloutFaultPoint::Discard) == 1
+    })
+    .await;
+
+    // The retry is held and fails once more; a second close arrives while it is held.
+    faults.fail(RolloutFaultPoint::Discard, 1);
+    let hold = faults.hold(RolloutFaultPoint::Discard);
+    let first = control.close_session(&session).unwrap();
+    until("the retry reached the writer", || {
+        faults.calls(RolloutFaultPoint::Discard) == 2
+    })
+    .await;
+    let second = control.close_session(&session).unwrap();
+    let second = tokio::spawn(second.finished());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !second.is_finished(),
+        "the second close waits for the retry"
+    );
+    hold.release();
+    assert!(!first.finished().await.is_complete());
+    assert!(!second.await.unwrap().is_complete());
+    assert_eq!(control.live_instances().len(), 1, "the path is still held");
+    assert_eq!(faults.calls(RolloutFaultPoint::Discard), 2);
+}
+
+/// Context injected into an idle spawned agent is recorded into its rollout at once, as Codex
+/// records into an idle session, so it is there even if the agent never runs again.
+#[tokio::test]
+async fn context_injected_into_an_idle_agent_is_recorded_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(PreparingFactory::new(prepared_worker(), false));
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "work")));
+    scripts.push("lead", Step::Respond(final_message("l-1-end", "spawned")));
+    scripts.push(
+        "prepared",
+        Step::Respond(final_message("p-1", "prepared done")),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(&session, vec![Message::developer("saved network rule")]));
+    let path = store.rollout_path(&session).unwrap();
+    until("the injected context reached the rollout", || {
+        std::fs::read_to_string(&path).is_ok_and(|text| text.contains("saved network rule"))
+    })
+    .await;
+    control.shutdown().await;
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("saved network rule")
+    );
+}
+
+/// Context injected while a spawned run waits for approval reaches the run once the host answers
+/// the checkpoint it took before the injection, as the thread hands a paused turn's context to the
+/// continued run rather than to the checkpoint it handed out.
+#[tokio::test]
+async fn context_injected_while_a_run_waits_for_approval_reaches_the_continued_run() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_root_session_id(ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let paused = spawn_guarded_worker(&scripts, &control).await;
+    let mut state = paused.state().clone();
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(
+        &session,
+        vec![Message::developer("rule saved while paused")]
+    ));
+
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    scripts.push("worker", Step::Respond(final_message("w-2", "deployed")));
+    control.resume(&worker_path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let worker = scripts.inputs("worker");
+    assert_eq!(worker.len(), 2);
+    let resumed = texts(&worker[1]);
+    assert!(
+        resumed.iter().any(|text| text == "rule saved while paused"),
+        "{resumed:?}"
+    );
+}
+
+/// Context injected while a spawned run waits for approval stays in the agent's history when the
+/// run is cancelled instead, and reaches its next run.
+#[tokio::test]
+async fn context_injected_while_a_run_waits_for_approval_survives_its_cancellation() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_root_session_id(ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let _paused = spawn_guarded_worker(&scripts, &control).await;
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(
+        &session,
+        vec![Message::developer("rule saved while paused")]
+    ));
+
+    control.root().interrupt("worker").await.unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Interrupted
+    })
+    .await;
+    scripts.push("worker", Step::Respond(final_message("w-2", "done")));
+    control
+        .root()
+        .send(
+            "worker",
+            "carry on".to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    until("the worker ran again", || {
+        scripts.inputs("worker").len() == 2
+    })
+    .await;
+    let next = texts(&scripts.inputs("worker")[1]);
+    assert!(
+        next.iter().any(|text| text == "rule saved while paused"),
+        "{next:?}"
+    );
+}
+
+/// Context injected after the runner has closed a run's context lane for an approval stop, but
+/// before the tree has taken the pause, reaches the run once the host answers: it is handed to the
+/// paused run's own lane rather than kept until the whole run ends.
+#[tokio::test]
+async fn context_injected_as_a_run_stops_for_approval_reaches_the_continued_run() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_root_session_id(ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_control = control.clone();
+    let hook_injected = Arc::clone(&injected);
+    control.set_before_pause_hook(Arc::new(move || {
+        if hook_injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let session = hook_control.live_instances()[0].session_id().clone();
+        assert!(hook_control.inject_context(
+            &session,
+            vec![Message::developer("rule saved as the run stopped")]
+        ));
+    }));
+    let paused = spawn_guarded_worker(&scripts, &control).await;
+    assert!(injected.load(std::sync::atomic::Ordering::SeqCst));
+
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    scripts.push("worker", Step::Respond(final_message("w-2", "deployed")));
+    control.resume(&worker_path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let resumed = texts(&scripts.inputs("worker")[1]);
+    assert!(
+        resumed
+            .iter()
+            .any(|text| text == "rule saved as the run stopped"),
+        "{resumed:?}"
+    );
+}
+
+/// Context a spawned run took in while it waited for approval, and had not delivered when the
+/// continued run failed — here interrupted while the approved call runs — stays in the agent's
+/// history and reaches its next run, as the thread keeps a failed turn's context.
+#[tokio::test]
+async fn context_a_continued_run_had_not_delivered_when_it_failed_reaches_the_next_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "deploy", json!({}))),
+    );
+    Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(GuardedTool::hanging(Arc::clone(&started)))]),
+    ))
+    .await
+    .unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(
+        &session,
+        vec![Message::developer("rule saved while paused")]
+    ));
+
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    control.resume(&worker_path(), state).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("the approved call runs");
+    control.root().interrupt("worker").await.unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Interrupted
+    })
+    .await;
+    assert_eq!(
+        scripts.inputs("worker").len(),
+        1,
+        "the run sampled nothing more"
+    );
+
+    scripts.push("worker", Step::Respond(final_message("w-2", "done")));
+    control
+        .root()
+        .send(
+            "worker",
+            "carry on".to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    until("the worker ran again", || {
+        scripts.inputs("worker").len() == 2
+    })
+    .await;
+    let next = texts(&scripts.inputs("worker")[1]);
+    assert!(
+        next.iter().any(|text| text == "rule saved while paused"),
+        "{next:?}"
+    );
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("rule saved while paused"),
+        "the agent's rollout keeps the context"
+    );
+}
+
+/// A spawn a host froze while it was still preparing, and that cleaned up once the tree shut
+/// down, is reported closed by a later settle even though nothing of it is left in the tree: the
+/// host holding it as frozen learns it may let go of it.
+#[tokio::test]
+async fn a_frozen_spawn_that_cleaned_up_during_shutdown_is_reported_closed() {
+    let scripts = Arc::new(Scripts::default());
+    let factory = Arc::new(GatedFactory {
+        inner: PreparingFactory::new(prepared_worker(), false),
+        entered: Notify::new(),
+        proceed: Notify::new(),
+    });
+    let store = Arc::new(ra_session::InMemoryThreadStore::new());
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory.clone())
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("r-parent-1", "work")));
+    scripts.push(
+        "lead",
+        Step::Respond(final_message("r-parent-2", "finished")),
+    );
+    let run = tokio::spawn(Runner::run(root_request(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+    )));
+    tokio::time::timeout(Duration::from_secs(5), factory.entered.notified())
+        .await
+        .unwrap();
+    let frozen = control.stop_spawning();
+    assert_eq!(frozen.len(), 1, "the preparing spawn is frozen");
+
+    let shutdown = control.shutdown_close().finished().await;
+    assert!(shutdown.is_complete(), "{shutdown:?}");
+    factory.proceed.notify_one();
+    let _ = run.await;
+    until("the refused spawn cleaned up", || {
+        control.live_instances().is_empty()
+    })
+    .await;
+    assert_eq!(factory.inner.released.load(Ordering::SeqCst), 1);
+
+    let settled = control.settle_spawns().await;
+    assert!(settled.failed().is_empty(), "{settled:?}");
+    assert_eq!(settled.closed(), frozen.as_slice());
+}
+
+/// Fails the step it captures once armed, with an error that carries no checkpoint.
+#[derive(Default)]
+struct FailingStepObserver(std::sync::atomic::AtomicBool);
+
+#[async_trait]
+impl ra_runtime::runner::StepExecutionObserver for FailingStepObserver {
+    async fn capture(
+        &self,
+        _run: &ra_core::context::RunContext,
+        _cancel: &CancelScope,
+    ) -> Result<()> {
+        if self.0.load(Ordering::SeqCst) {
+            return Err(Error::caller("the step could not be captured"));
+        }
+        Ok(())
+    }
+}
+
+/// Context a spawned run took in while it waited for approval stays in the agent's history and
+/// rollout when the continued run fails, after the approved call returned and before the context
+/// was delivered, with an error that carries no checkpoint to find it in.
+#[tokio::test]
+async fn context_a_continued_run_had_not_delivered_survives_an_error_without_a_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let observer = Arc::new(FailingStepObserver::default());
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "deploy", json!({}))),
+    );
+    let worker = worker_agent(vec![Arc::new(GuardedTool::new())]);
+    let registry = AgentRegistry::builder()
+        .register(Arc::clone(&worker))
+        .build()
+        .unwrap();
+    let config = RunConfig::new()
+        .with_max_turns(32)
+        .with_agent_registry(registry)
+        .with_step_execution_observer(Arc::clone(&observer) as _);
+    Runner::run(root_request(&scripts, &control, worker).with_config(config))
+        .await
+        .unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(
+        &session,
+        vec![Message::developer("rule saved while paused")]
+    ));
+
+    observer.0.store(true, Ordering::SeqCst);
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    control.resume(&worker_path(), state).unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(_))
+    })
+    .await;
+    assert_eq!(
+        scripts.inputs("worker").len(),
+        1,
+        "the run sampled nothing more"
+    );
+
+    observer.0.store(false, Ordering::SeqCst);
+    scripts.push("worker", Step::Respond(final_message("w-2", "done")));
+    control
+        .root()
+        .send(
+            "worker",
+            "carry on".to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+    until("the worker ran again", || {
+        scripts.inputs("worker").len() == 2
+    })
+    .await;
+    let next = texts(&scripts.inputs("worker")[1]);
+    assert!(
+        next.iter().any(|text| text == "rule saved while paused"),
+        "{next:?}"
+    );
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("rule saved while paused"),
+        "the agent's rollout keeps the context"
+    );
+}
+
+/// Prepares every spawn as `worker`, whose runs stop on a wall clock `deadline_after` from when it
+/// is spawned.
+struct DeadlineFactory {
+    worker: Arc<AgentSpec>,
+    deadline_after: Duration,
+}
+
+#[async_trait]
+impl SpawnedAgentFactory for DeadlineFactory {
+    async fn prepare(&self, _request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        let deadline = ra_core::cancel::Deadline::after(self.deadline_after);
+        Ok(PreparedSpawnedAgent::new(Arc::clone(&self.worker))
+            .with_run_config(move |config| config.with_deadline(deadline)))
+    }
+}
+
+/// Context a spawned run took in while it waited for approval is delivered, and recorded in the
+/// agent's rollout, when the continued run stops softly on its wall clock while the approved call
+/// runs: the runner ends it as a completed run, so nothing reads its context as a failed run's.
+#[tokio::test]
+async fn context_injected_while_paused_is_recorded_when_the_continued_run_runs_out_of_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let started = Arc::new(Notify::new());
+    let factory = Arc::new(DeadlineFactory {
+        worker: worker_agent(vec![Arc::new(GuardedTool::hanging(Arc::clone(&started)))]),
+        deadline_after: Duration::from_millis(500),
+    });
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(factory)
+        .unwrap()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "ship it")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    scripts.push(
+        "worker",
+        Step::Respond(tool_call("w-1", "w-1-call", "deploy", json!({}))),
+    );
+    Runner::run(root_request(&scripts, &control, worker_agent(Vec::new())))
+        .await
+        .unwrap();
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+    let session = control.live_instances()[0].session_id().clone();
+    assert!(control.inject_context(
+        &session,
+        vec![Message::developer("rule saved while paused")]
+    ));
+
+    let mut state = paused.state().clone();
+    let pending: Vec<RunItem> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    control.resume(&worker_path(), state).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("the approved call runs");
+    // The run ends on its budget without concluding, which the tree reports as such.
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(message) if message.contains("budget_exhausted"))
+    })
+    .await;
+    assert_eq!(
+        scripts.inputs("worker").len(),
+        1,
+        "the run sampled nothing more"
+    );
+
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("rule saved while paused"),
+        "the agent's rollout keeps the context"
     );
 }

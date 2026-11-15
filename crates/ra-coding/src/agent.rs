@@ -136,7 +136,13 @@ pub async fn build_agent_with_control(
     let assembled = assemble_agent(id.clone(), name.clone(), role, host, profile).await?;
     let control = if assembled.collaborates {
         Some(crate::spawned::agent_control(
-            host, id, name, role, profile, None,
+            host,
+            id,
+            name,
+            role,
+            profile,
+            None,
+            crate::spawned::ThreadServices::default(),
         )?)
     } else {
         None

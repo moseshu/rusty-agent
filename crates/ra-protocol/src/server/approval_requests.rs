@@ -172,7 +172,14 @@ async fn run_approval_batch(
             ApprovalTarget::Parent => Some(method.guard(thread_watch, loaded.thread_id()).await),
             ApprovalTarget::Spawned { .. } => None,
         };
-        let (request_id, answer) = outgoing.send_request(request).await;
+        // A spawned agent's batch is raised by a task of its own; see
+        // `send_request_to_current_connections`.
+        let (request_id, answer) = match target {
+            ApprovalTarget::Parent => outgoing.send_request(request).await,
+            ApprovalTarget::Spawned { .. } => {
+                outgoing.send_request_to_current_connections(request).await
+            }
+        };
         asked.push(request_id.clone());
         let item = item.clone();
         waiting.push(async move {

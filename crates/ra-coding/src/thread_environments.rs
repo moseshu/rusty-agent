@@ -110,7 +110,7 @@ struct ExecutingStep {
 
 pub(crate) struct ThreadExecutorHooks {
     runtime: std::sync::Weak<ProductHookRuntime>,
-    cache: ExecutorCapabilityDiscoveryCache,
+    cache: Arc<ExecutorCapabilityDiscoveryCache>,
     manager: Arc<EnvironmentManager>,
     environment: Arc<ra_executor::Environment>,
     config: Arc<Config>,
@@ -154,7 +154,7 @@ impl ThreadExecutorHooks {
             environment: manager
                 .try_local_environment()
                 .ok_or_else(|| anyhow::anyhow!("local environment is unavailable"))?,
-            cache: ExecutorCapabilityDiscoveryCache::new(Arc::clone(&manager)),
+            cache: Arc::new(ExecutorCapabilityDiscoveryCache::new(Arc::clone(&manager))),
             manager,
             config: Arc::new(config.clone()),
             mcp: host.mcp_runtime().cloned(),
@@ -164,6 +164,21 @@ impl ThreadExecutorHooks {
 
     pub(crate) fn manager(&self) -> Arc<EnvironmentManager> {
         Arc::clone(&self.manager)
+    }
+
+    /// The executor hooks of a spawned agent whose hooks are `runtime`: the same environments,
+    /// discovery cache, configuration and MCP runtime, with steps of its own, captured and found by
+    /// the agent's own turns.
+    pub(crate) fn for_runtime(&self, runtime: &Arc<ProductHookRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: Arc::downgrade(runtime),
+            cache: Arc::clone(&self.cache),
+            manager: Arc::clone(&self.manager),
+            environment: Arc::clone(&self.environment),
+            config: Arc::clone(&self.config),
+            mcp: self.mcp.clone(),
+            steps: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn discovery_sandbox(

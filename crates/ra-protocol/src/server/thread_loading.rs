@@ -109,9 +109,20 @@ use crate::frame::JsonRpcErrorObject;
 /// The version of the program that creates a thread, recorded as Codex records its CLI version.
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// How long an idle loaded thread is given to shut down before `thread/resume` reloads it with
-/// new settings: Codex's `wait_for_thread_shutdown`.
-const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `thread/resume` waits for a loaded thread's close — before reloading an idle thread
+/// with new settings, or finishing a close that started earlier — by default: Codex's
+/// `wait_for_thread_shutdown`.
+pub(super) const THREAD_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a resume asking for other settings did with the loaded thread.
+enum OverrideReload {
+    /// The thread is kept and rejoined as it is.
+    Kept,
+    /// The thread was closed and is resumed from the store with the settings asked for.
+    Reloaded,
+    /// The thread's close started and has not finished: it takes no further turn.
+    CloseUnfinished(String),
+}
 
 /// The host event family a thread's settings snapshots are recorded under (see
 /// [`AgentThread::persist_settings_snapshot`]).
@@ -231,6 +242,7 @@ impl ThreadRequestProcessor {
                             "error creating thread: {error}"
                         ))
                     })?;
+                install_agent_store(&builder, store, &thread_id)?;
                 builder.with_rollout_recorder(recorder)
             }
             None => builder,
@@ -288,12 +300,46 @@ impl ThreadRequestProcessor {
         self.refuse_closing(&thread_id).await?;
         check_sandbox_and_permissions(&params.policy)?;
 
+        if let Some(loaded) = self.thread_manager.get_thread(&thread_id)
+            && loaded.close_started()
+        {
+            // A thread whose close started — an idle unload that could not finish it — is shut
+            // down and takes no input: its close is finished first, and the thread is resumed from
+            // the store, rather than handed back as it is. The wait is bounded as the reload's is,
+            // since it holds the lock every thread's start, resume and removal take; the close
+            // goes on in its own task, and a later resume waits for it again.
+            let Ok(close) = tokio::time::timeout(self.close_timeout(), loaded.close()).await else {
+                return Err(JsonRpcErrorObject::invalid_request(format!(
+                    "thread {thread_id} is closing and could not be closed yet: its shutdown \
+                     timed out; retry thread/resume"
+                )));
+            };
+            if !close.is_complete() {
+                return Err(JsonRpcErrorObject::invalid_request(format!(
+                    "thread {thread_id} is closing and could not be closed yet: {}; retry \
+                     thread/resume",
+                    close.failures.join("; ")
+                )));
+            }
+            if self.thread_manager.remove_thread_if_matches(&loaded) {
+                self.finalize_thread_teardown(&thread_id).await;
+            }
+        }
         if let Some(loaded) = self.thread_manager.get_thread(&thread_id) {
             let stored = read_stored_thread_for_resume(context.history.store(), &thread_id).await?;
-            if !self.reload_for_overrides(&loaded, &params).await {
-                return self
-                    .resume_running_thread(request_id, &params, loaded, &stored, context)
-                    .await;
+            match self.reload_for_overrides(&loaded, &params).await {
+                OverrideReload::Kept => {
+                    return self
+                        .resume_running_thread(request_id, &params, loaded, &stored, context)
+                        .await;
+                }
+                OverrideReload::Reloaded => {}
+                OverrideReload::CloseUnfinished(reason) => {
+                    return Err(JsonRpcErrorObject::invalid_request(format!(
+                        "thread {thread_id} is closing and could not be closed yet: {reason}; \
+                         retry thread/resume"
+                    )));
+                }
             }
         }
 
@@ -314,23 +360,24 @@ impl ThreadRequestProcessor {
             return Err(error);
         }
 
-        let prepared = match factory
-            .prepare_thread(
-                &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Resume)
-                    .with_session_context(
-                        SessionSource::from_metadata(stored.source()),
-                        stored.thread_spawn().cloned(),
-                        false,
-                        None,
-                    )
-                    .with_policy(restore_persisted_policy(
-                        to_policy_overrides(&params.policy),
-                        &records,
-                        true,
-                    )),
-            )
-            .await
-        {
+        let mut factory_request =
+            ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Resume)
+                .with_session_context(
+                    SessionSource::from_metadata(stored.source()),
+                    stored.thread_spawn().cloned(),
+                    false,
+                    None,
+                )
+                .with_policy(restore_persisted_policy(
+                    to_policy_overrides(&params.policy),
+                    &records,
+                    true,
+                ));
+        if let Some(spawn) = stored.thread_spawn() {
+            factory_request =
+                factory_request.with_parent_transcript(parent_transcript_lookup(&store, spawn));
+        }
+        let prepared = match factory.prepare_thread(&factory_request).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 discard(&recorder).await;
@@ -389,6 +436,10 @@ impl ThreadRequestProcessor {
             };
         let builder = install_user_input(builder, &self.outgoing);
         attach_server_requests(&builder, adapter.as_deref(), &self.outgoing);
+        if let Err(error) = install_agent_store(&builder, &store, &thread_id) {
+            discard(&recorder).await;
+            return Err(error);
+        }
         let builder = builder
             .with_history(reconstruction.history().to_vec())
             .with_reported_tokens(reconstruction.reported_tokens())
@@ -574,6 +625,10 @@ impl ThreadRequestProcessor {
             .await
             .map_err(|error| fork_error(&source_id, &error))?;
             let (recorder, reconstruction) = forked.into_parts();
+            if let Err(error) = install_agent_store(&builder, &store, &thread_id) {
+                discard(&recorder).await;
+                return Err(error);
+            }
             (
                 builder
                     .with_history(reconstruction.history().to_vec())
@@ -864,10 +919,10 @@ impl ThreadRequestProcessor {
         &self,
         loaded: &LoadedThread,
         params: &ThreadResumeParams,
-    ) -> bool {
+    ) -> OverrideReload {
         let mismatches = collect_resume_override_mismatches(params, loaded);
         if mismatches.is_empty() {
-            return false;
+            return OverrideReload::Kept;
         }
         let thread_id = loaded.thread_id();
         let has_subscribers = !self
@@ -877,29 +932,35 @@ impl ThreadRequestProcessor {
             .is_empty();
         let idle = self.thread_watch.loaded_status_for_thread(thread_id) == ThreadStatus::Idle;
         if !has_subscribers && idle && !loaded.is_running() {
-            if tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, async {
-                loaded.shutdown().await;
-                loaded.close_rollout().await
-            })
-            .await
-            .is_ok_and(|result| result.is_ok())
-            {
-                self.thread_manager.remove_thread_if_matches(loaded);
-                self.finalize_thread_teardown(thread_id).await;
-                return true;
+            match tokio::time::timeout(self.close_timeout(), loaded.close()).await {
+                Ok(close) if close.is_complete() => {
+                    self.thread_manager.remove_thread_if_matches(loaded);
+                    self.finalize_thread_teardown(thread_id).await;
+                    return OverrideReload::Reloaded;
+                }
+                // Codex warns and rejoins the thread here. This thread's close has already shut
+                // it down, so it would take no further turn: the resume fails instead, and the
+                // next one finishes the close before resuming from the store.
+                Ok(close) => {
+                    tracing::warn!(%thread_id, "thread shutdown failed");
+                    return OverrideReload::CloseUnfinished(close.failures.join("; "));
+                }
+                Err(_) => {
+                    tracing::warn!(%thread_id, "thread shutdown timed out");
+                    return OverrideReload::CloseUnfinished("its shutdown timed out".to_owned());
+                }
             }
-            tracing::warn!(%thread_id, "thread shutdown failed or timed out");
         }
         tracing::warn!(
             "thread/resume overrides ignored for loaded thread {thread_id}: {}",
             mismatches.join("; ")
         );
-        false
+        OverrideReload::Kept
     }
 
     /// Refuses a thread being unloaded: Codex's check of its pending unloads.
     async fn refuse_closing(&self, thread_id: &SessionId) -> Result<(), JsonRpcErrorObject> {
-        if self.pending_thread_unloads.lock().await.contains(thread_id) {
+        if self.pending_thread_unloads.lock().await.is_held(thread_id) {
             return Err(JsonRpcErrorObject::invalid_request(format!(
                 "thread {thread_id} is closing; retry thread/resume after the thread is closed"
             )));
@@ -1697,4 +1758,56 @@ fn thread_settings_record(
         get("multiAgentMode").unwrap_or_else(|| json!("explicitRequestOnly")),
     );
     record
+}
+
+/// Reads the rollout path of the thread `spawn` was spawned from, archived or not, each time it is
+/// asked, as Codex's `SubagentStop` reads its parent thread from the store; a parent the store
+/// cannot read is reported as having no path.
+fn parent_transcript_lookup(
+    store: &Arc<dyn ThreadStore>,
+    spawn: &ra_core::session::rollout::RolloutThreadSpawn,
+) -> super::thread_factory::ThreadTranscriptLookup {
+    let store = Arc::clone(store);
+    let parent = spawn.parent_session_id().clone();
+    super::thread_factory::ThreadTranscriptLookup::new(move || {
+        let store = Arc::clone(&store);
+        let parent = parent.clone();
+        Box::pin(async move {
+            match store
+                .read_thread(&ReadThreadParams::new(parent.clone()).including_archived())
+                .await
+            {
+                Ok(thread) => thread.rollout_path().map(std::path::Path::to_path_buf),
+                Err(error) => {
+                    tracing::warn!(
+                        parent_thread_id = %parent,
+                        %error,
+                        "failed to resolve parent transcript path for subagent hook"
+                    );
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// Records the agents the thread spawns into `store`, as Codex's thread manager records every
+/// spawned thread, with the thread itself as their tree's root. An ephemeral thread is never given
+/// a store, and its agents record nothing, as Codex's spawned threads inherit `ephemeral`.
+fn install_agent_store(
+    builder: &ra_runtime::thread::AgentThreadBuilder,
+    store: &Arc<dyn ThreadStore>,
+    thread_id: &SessionId,
+) -> Result<(), JsonRpcErrorObject> {
+    let Some(control) = builder.agent_control() else {
+        return Ok(());
+    };
+    let store: Arc<dyn ra_core::session::rollout::RolloutThreadStore> = Arc::clone(store) as _;
+    control
+        .clone()
+        .with_rollout_store(store, thread_id.clone())
+        .map(drop)
+        .map_err(|error| {
+            JsonRpcErrorObject::internal_error(format!("error creating thread: {error}"))
+        })
 }

@@ -32,7 +32,6 @@ use std::{
     time::Duration,
 };
 
-use ra_core::session::SessionId;
 use serde::Serialize;
 use tokio::{sync::Mutex, time::timeout};
 
@@ -155,7 +154,7 @@ pub(crate) struct MessageProcessor {
     thread_processor: ThreadRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
     pub(crate) turn_admission: TurnAdmission,
-    pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pending_thread_unloads: Arc<Mutex<super::unload_ledger::UnloadLedger>>,
     thread_unload_delay: std::sync::Mutex<Duration>,
     /// Where threads' history is read from, and how their tools' calls show.
     pub(crate) history: Arc<HistorySources>,
@@ -169,7 +168,8 @@ pub(crate) struct MessageProcessor {
 impl MessageProcessor {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, codex_home: PathBuf) -> Self {
         let thread_manager = Arc::new(ThreadManager::default());
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads =
+            Arc::new(Mutex::new(super::unload_ledger::UnloadLedger::default()));
         let thread_watch = Arc::new(ThreadWatchManager::new(Arc::clone(&outgoing)));
         Self {
             turn_processor: TurnRequestProcessor::new(
@@ -235,6 +235,11 @@ impl MessageProcessor {
 
     /// Sets how long a thread with no subscribers and no active turn stays loaded, for the
     /// listeners started from now on.
+    #[cfg(feature = "test-api")]
+    pub(crate) const fn thread_processor(&self) -> &ThreadRequestProcessor {
+        &self.thread_processor
+    }
+
     pub(crate) fn set_thread_unload_delay(&self, delay: Duration) {
         *self
             .thread_unload_delay

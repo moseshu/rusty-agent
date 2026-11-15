@@ -111,6 +111,7 @@ impl CodingThreadHooks {
         thread_id: SessionId,
         ignore_user_config: bool,
         environments: Option<&[ra_protocol::server::protocol::TurnEnvironmentParams]>,
+        role: crate::hooks::HookThreadRole,
     ) -> anyhow::Result<Self> {
         let hooks_config =
             build_hooks_config(config, host.plugin_services().map(Arc::as_ref), &[]).await;
@@ -122,7 +123,7 @@ impl CodingThreadHooks {
             )),
             None => Arc::new(NoMcpRuntime),
         };
-        let runtime = ProductHookRuntime::new(
+        let runtime = ProductHookRuntime::with_role(
             hooks_config,
             ProductHookSession {
                 session_id: thread_id,
@@ -132,6 +133,7 @@ impl CodingThreadHooks {
                 transcript_path: None,
             },
             mcp_executor,
+            role,
         )?;
         runtime.set_feedback_policy(config);
         let executor = crate::thread_environments::ThreadExecutorHooks::build(
@@ -160,6 +162,7 @@ impl CodingThreadHooks {
         thread_id: SessionId,
         generation: u64,
         environments: Option<&[ra_protocol::server::protocol::TurnEnvironmentParams]>,
+        role: crate::hooks::HookThreadRole,
     ) -> anyhow::Result<Self> {
         let hooks = Self::build(
             &config,
@@ -167,6 +170,7 @@ impl CodingThreadHooks {
             thread_id,
             builder.ignores_user_config(),
             environments,
+            role,
         )
         .await?;
         if let Some(plugins) = host.plugin_services() {
@@ -249,7 +253,15 @@ impl CodingThreadHooks {
         host: &CodingHost,
         thread_id: SessionId,
     ) -> anyhow::Result<Self> {
-        Self::build(config, host, thread_id, false, None).await
+        Self::build(
+            config,
+            host,
+            thread_id,
+            false,
+            None,
+            crate::hooks::HookThreadRole::Root,
+        )
+        .await
     }
 
     /// Builds and binds the production refresh path for integration tests.
@@ -265,7 +277,13 @@ impl CodingThreadHooks {
             .map_or(0, |plugins| plugins.hook_generation());
         let config = builder.clone().build().await?;
         Box::pin(Self::build_refreshing(
-            config, builder, host, thread_id, generation, None,
+            config,
+            builder,
+            host,
+            thread_id,
+            generation,
+            None,
+            crate::hooks::HookThreadRole::Root,
         ))
         .await
     }
@@ -294,6 +312,51 @@ impl CodingThreadHooks {
     #[must_use]
     pub fn runtime(&self) -> &Arc<ProductHookRuntime> {
         &self.runtime
+    }
+
+    /// The hooks of an agent this thread spawns, as session `session_id`: Codex's spawned
+    /// session builds its own hook runtime from the configuration it copies, with an MCP executor
+    /// naming its own thread, the same feedback limits, and executor hooks of its own over the same
+    /// environments. Built before the agent's rollout exists; see
+    /// [`ProductHookRuntime::set_own_rollout`].
+    pub(crate) fn spawn_child(
+        &self,
+        session_id: SessionId,
+        identity: crate::hooks::ChildHookIdentity,
+        host: &CodingHost,
+    ) -> anyhow::Result<Self> {
+        let mcp_executor: Arc<dyn HookMcpExecutor> = match host.mcp_runtime() {
+            Some(runtime) => Arc::new(CodingHookMcpExecutor::new(
+                Arc::clone(runtime),
+                session_id.clone(),
+            )),
+            None => Arc::new(NoMcpRuntime),
+        };
+        let parent = self.runtime.session();
+        let session = ProductHookSession {
+            session_id,
+            cwd: parent.cwd.clone(),
+            model: parent.model.clone(),
+            approval_policy: parent.approval_policy,
+            transcript_path: None,
+        };
+        let runtime = self.runtime.spawn_child(session, identity, mcp_executor)?;
+        let executor = self.executor.for_runtime(&runtime);
+        runtime.set_executor_hook_sources(executor.clone());
+        Ok(Self {
+            runtime,
+            refresh: OnceLock::new(),
+            refresh_task: Mutex::new(None),
+            executor,
+            startup_warnings: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Forgets what was kept for the turn `turn_id`: its executor steps and the tool results no
+    /// post hook took. Done when a turn ends, not while it waits for approval.
+    pub(crate) fn finish_turn(&self, turn_id: &str) {
+        self.executor.finish_turn(turn_id);
+        self.runtime.finish_turn_tool_results(turn_id);
     }
 }
 
@@ -326,8 +389,7 @@ impl ThreadProductRuntime for CodingThreadHooks {
         if let ThreadEvent::TurnComplete { turn_id, .. }
         | ThreadEvent::TurnAborted { turn_id, .. } = event
         {
-            self.executor.finish_turn(turn_id);
-            self.runtime.finish_turn_tool_results(turn_id);
+            self.finish_turn(turn_id);
         }
     }
 

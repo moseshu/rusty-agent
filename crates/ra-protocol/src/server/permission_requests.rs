@@ -53,6 +53,8 @@ pub struct ThreadServerRequests {
     events: mpsc::UnboundedSender<ThreadEvent>,
     outgoing: Arc<OutgoingMessageSender>,
     thread_id: SessionId,
+    /// The spawned agent of the thread's tree the requests are made for, when not the thread.
+    spawned: Option<SessionId>,
 }
 
 impl fmt::Debug for ThreadServerRequests {
@@ -76,21 +78,39 @@ impl ThreadServerRequests {
             events,
             outgoing: Arc::clone(outgoing),
             thread_id: thread_id.clone(),
+            spawned: None,
+        }
+    }
+
+    /// The requests of the spawned agent `session_id` of this thread's tree: Codex's spawned thread
+    /// asks the client as a thread of its own. Its requests name the agent's thread and its running
+    /// run, go to this thread's connections as the agent's own — as spawned approvals already do —
+    /// and are withdrawn once that run ends.
+    #[must_use]
+    pub fn for_spawned_agent(&self, session_id: SessionId) -> Self {
+        Self {
+            spawned: Some(session_id),
+            ..self.clone()
         }
     }
 
     /// The thread the requests are made for.
     #[must_use]
     pub fn thread_id(&self) -> &str {
-        self.thread_id.as_str()
+        self.spawned.as_ref().unwrap_or(&self.thread_id).as_str()
     }
 
     /// The running turn and the settings its next step runs with: what Codex's
     /// `active_turn_context_and_strict_auto_review` reads, so a decision made while the turn runs
-    /// follows a mid-turn settings change. `None` while no turn runs.
+    /// follows a mid-turn settings change. `None` while no turn runs. For a spawned agent, its
+    /// running run, whatever the thread's own turn is doing.
     #[must_use]
     pub fn running_turn(&self) -> Option<(String, RunConfig)> {
         let thread = self.thread.upgrade()?;
+        if let Some(session_id) = &self.spawned {
+            let (run_id, config) = thread.agent_control()?.running_run(session_id)?;
+            return Some((run_id.as_str().to_owned(), config));
+        }
         let turn_id = thread.active_turn_id()?;
         let config = thread.turn_config(&turn_id)?;
         Some((turn_id, config))
@@ -106,6 +126,18 @@ impl ThreadServerRequests {
     /// Adds `messages` to the running turn's context, or records them in the thread's history
     /// without starting a turn: Codex's `inject_no_new_turn`.
     pub async fn inject_context(&self, messages: Vec<Message>) {
+        if let Some(session_id) = &self.spawned {
+            // The spawned agent's own context, as Codex injects into the session that asked.
+            if let Some(control) = self
+                .thread
+                .upgrade()
+                .and_then(|thread| thread.agent_control().cloned())
+                && !control.inject_context(session_id, messages)
+            {
+                tracing::debug!(%session_id, "the spawned agent is gone; its context is dropped");
+            }
+            return;
+        }
         if let Some(thread) = self.thread.upgrade() {
             thread.inject_context(messages).await;
         }
@@ -122,6 +154,18 @@ impl ThreadServerRequests {
         &self,
         params: PermissionsRequestApprovalParams,
     ) -> Option<PermissionsRequestApprovalResponse> {
+        if let Some(session_id) = &self.spawned {
+            let run_id = ra_core::state::RunId::new(params.turn_id());
+            let answer = self
+                .ask_as_spawned_agent(
+                    session_id,
+                    &run_id,
+                    ServerRequestPayload::PermissionsRequestApproval(params),
+                )
+                .await?;
+            return request_permissions_response(answer)
+                .filter(|response| localize_granted_paths(response).is_ok());
+        }
         let state = self.outgoing.thread_state().thread_state(&self.thread_id);
         let commands = state.lock().await.listener_command_tx()?;
         let (sender, receiver) = oneshot::channel();
@@ -144,6 +188,11 @@ impl ThreadServerRequests {
         &self,
         params: CommandExecutionRequestApprovalParams,
     ) -> Option<ReviewDecision> {
+        if let Some(session_id) = &self.spawned {
+            return self
+                .request_spawned_network_approval(session_id, params)
+                .await;
+        }
         let state = self.outgoing.thread_state().thread_state(&self.thread_id);
         let commands = state.lock().await.listener_command_tx()?;
         let (sender, receiver) = oneshot::channel();
@@ -154,6 +203,68 @@ impl ThreadServerRequests {
             })
             .ok()?;
         receiver.await.ok()
+    }
+
+    /// The spawned agent's network approval, asked as its own request.
+    async fn request_spawned_network_approval(
+        &self,
+        session_id: &SessionId,
+        params: CommandExecutionRequestApprovalParams,
+    ) -> Option<ReviewDecision> {
+        let run_id = ra_core::state::RunId::new(params.turn_id());
+        let answer = self
+            .ask_as_spawned_agent(
+                session_id,
+                &run_id,
+                ServerRequestPayload::CommandExecutionRequestApproval(params),
+            )
+            .await?;
+        command_execution_approval_decision(answer)
+    }
+
+    /// Asks the client as the spawned agent `session_id`: over the thread's connections as the
+    /// agent's own request, as spawned approvals are, and withdrawn once its run `run_id` ends, as
+    /// Codex's spawned thread withdraws its requests when its turn ends. `None` once withdrawn.
+    async fn ask_as_spawned_agent(
+        &self,
+        session_id: &SessionId,
+        run_id: &ra_core::state::RunId,
+        request: ServerRequestPayload,
+    ) -> Option<super::outgoing::ClientAnswer> {
+        let thread = self.thread.upgrade()?;
+        let control = thread.agent_control()?.clone();
+        let connections = self
+            .outgoing
+            .thread_state()
+            .subscribed_connection_ids(&self.thread_id);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&self.outgoing),
+            connections,
+            self.thread_id.clone(),
+        )
+        .with_request_owner(session_id.clone());
+        let session_id = session_id.clone();
+        let run_id = run_id.clone();
+        // The request belongs to a task of its own, not to the tool waiting for it: a tool that is
+        // cancelled stops waiting, and the request is still withdrawn — and the client told it is
+        // resolved — once the run that asked has ended.
+        let (answered, answer) = oneshot::channel();
+        tokio::spawn(async move {
+            let (request_id, answer) = outgoing.send_request_to_current_connections(request).await;
+            let waiting = outgoing.wait_for_answer(request_id.clone(), answer);
+            tokio::pin!(waiting);
+            let answer = tokio::select! {
+                answer = &mut waiting => Some(answer),
+                () = control.run_ended(&session_id, &run_id) => {
+                    outgoing.abort_server_requests(&[request_id]);
+                    // Completes with the withdrawal and tells the client it is resolved.
+                    drop((&mut waiting).await);
+                    None
+                }
+            };
+            let _ = answered.send(answer);
+        });
+        answer.await.ok().flatten()
     }
 
     /// Tells the thread's connections `message` as Codex's `warning` notification: the delivery of

@@ -13,6 +13,8 @@ workspace = true
 [features]
 default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
+# Failure injection for integration tests; not part of the supported API.
+test-api = []
 
 [dependencies]
 gix-url = { workspace = true }

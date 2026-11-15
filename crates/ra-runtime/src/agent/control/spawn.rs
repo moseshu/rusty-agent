@@ -17,6 +17,8 @@ use ra_core::{
     agent::{AgentId, AgentSpec, control::AgentPath},
     capability::Capability,
     error::Result,
+    session::{SessionId, rollout::RolloutRecorder},
+    state::RunId,
     tool::Tool,
 };
 
@@ -25,8 +27,10 @@ use ra_core::{
 pub trait SpawnedAgentFactory: Send + Sync {
     /// Prepares the agent about to be spawned at [`SpawnedAgentRequest::path`].
     ///
-    /// Called once per spawn, before the agent's rollout is created and before it is added to
-    /// the tree. An error refuses the spawn, and the model is told why.
+    /// Called once per spawn, after the agent's path is reserved and before its rollout is created
+    /// or it is added to the tree. An error refuses the spawn, and the model is told why. The spawn
+    /// may be cancelled while this is pending; whatever the factory set up and has not yet handed
+    /// back in the [`PreparedSpawnedAgent`] it must not leave behind needing to be released.
     ///
     /// # Errors
     ///
@@ -40,6 +44,9 @@ pub struct SpawnedAgentRequest<'a> {
     path: &'a AgentPath,
     agent: &'a Arc<AgentSpec>,
     agent_type: Option<&'a AgentId>,
+    session_id: &'a SessionId,
+    parent_session_id: Option<&'a SessionId>,
+    forked: bool,
 }
 
 impl<'a> SpawnedAgentRequest<'a> {
@@ -47,12 +54,39 @@ impl<'a> SpawnedAgentRequest<'a> {
         path: &'a AgentPath,
         agent: &'a Arc<AgentSpec>,
         agent_type: Option<&'a AgentId>,
+        session_id: &'a SessionId,
+        parent_session_id: Option<&'a SessionId>,
+        forked: bool,
     ) -> Self {
         Self {
             path,
             agent,
             agent_type,
+            session_id,
+            parent_session_id,
+            forked,
         }
+    }
+
+    /// The session the agent will be: Codex's spawned thread id, which its rollout, its hooks and
+    /// [`LiveAgent::session_id`](ra_core::agent::control::LiveAgent::session_id) name.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        self.session_id
+    }
+
+    /// The session of the agent that spawns it, when the tree knows it: the tree's root session
+    /// for an agent spawned by the root.
+    #[must_use]
+    pub const fn parent_session_id(&self) -> Option<&SessionId> {
+        self.parent_session_id
+    }
+
+    /// Whether the agent starts on a copy of its spawner's history, as Codex's spawned thread does
+    /// when it is forked rather than started fresh.
+    #[must_use]
+    pub const fn forked(&self) -> bool {
+        self.forked
     }
 
     /// Where the agent will live in the tree.
@@ -81,7 +115,10 @@ pub struct PreparedSpawnedAgent {
     resources: Option<Arc<dyn SpawnedAgentResources>>,
     capabilities: Option<PreparedCapabilities>,
     prompt_cache_key_override: Option<String>,
+    run_config: Option<RunConfigAdjustment>,
 }
+
+type RunConfigAdjustment = Arc<dyn Fn(RunConfig) -> RunConfig + Send + Sync>;
 
 struct PreparedCapabilities {
     capabilities: Vec<Arc<dyn Capability>>,
@@ -97,7 +134,20 @@ impl PreparedSpawnedAgent {
             resources: None,
             capabilities: None,
             prompt_cache_key_override: None,
+            run_config: None,
         }
+    }
+
+    /// Adjusts the run configuration the agent's runs use, after the inherited settings and the
+    /// other choices made here are applied: Codex's spawned session builds its own services, so a
+    /// host replaces, for instance, the hooks and the per-session state its configuration carries.
+    #[must_use]
+    pub fn with_run_config(
+        mut self,
+        adjust: impl Fn(RunConfig) -> RunConfig + Send + Sync + 'static,
+    ) -> Self {
+        self.run_config = Some(Arc::new(adjust));
+        self
     }
 
     /// Gives the agent resources of its own, released once the agent is closed or the tree shuts
@@ -154,12 +204,16 @@ impl PreparedSpawnedAgent {
         } else {
             config
         };
-        match &self.capabilities {
+        let config = match &self.capabilities {
             Some(prepared) => config.with_prepared_capabilities(
                 prepared.capabilities.iter().cloned(),
                 prepared.tools.iter().cloned(),
             ),
             None => config.inherited_by(&self.agent, initial_agent),
+        };
+        match &self.run_config {
+            Some(adjust) => adjust(config),
+            None => config,
         }
     }
 
@@ -176,6 +230,7 @@ impl std::fmt::Debug for PreparedSpawnedAgent {
             .field("has_resources", &self.resources.is_some())
             .field("has_prepared_capabilities", &self.capabilities.is_some())
             .field("prompt_cache_key_override", &self.prompt_cache_key_override)
+            .field("adjusts_run_config", &self.run_config.is_some())
             .finish()
     }
 }
@@ -185,4 +240,12 @@ impl std::fmt::Debug for PreparedSpawnedAgent {
 pub trait SpawnedAgentResources: Send + Sync {
     /// Releases the resources once the agent's runs have stopped. Called at most once.
     async fn shutdown(&self);
+
+    /// The agent's rollout has been created, with the recorder its runs record through. Called at
+    /// most once, before the agent's first run; not called for a tree without a rollout store.
+    fn rollout_created(&self, _recorder: &Arc<dyn RolloutRecorder>) {}
+
+    /// A run of the agent has ended — completed, failed or cancelled — so what was kept for that
+    /// run can go. A run paused for approval has not ended; it is reported once it does.
+    fn run_ended(&self, _run_id: &RunId) {}
 }

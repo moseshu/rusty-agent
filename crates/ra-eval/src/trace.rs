@@ -404,6 +404,20 @@ impl RolloutRecorder for ChildTrace {
         Ok(())
     }
 
+    /// Forwarded whole, so the recorder it wraps runs the sequence as one operation and resumes it
+    /// after a failure; the trace is drained first, and marked closed only once that succeeded.
+    async fn shutdown_materialized(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.capture.drain_pending().await;
+        if let Some(recorder) = &self.recorder {
+            recorder.shutdown_materialized().await?;
+        }
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+
     async fn discard(&self) -> Result<()> {
         if let Some(recorder) = &self.recorder {
             recorder.discard().await?;
@@ -471,6 +485,20 @@ impl RolloutRecorder for LocalTrace {
         self.drain_pending().await;
         if let Some(recorder) = &self.recorder {
             recorder.shutdown().await?;
+        }
+        self.lock().closed = true;
+        Ok(())
+    }
+
+    /// Forwarded whole to the recorder it wraps, after the trace is drained, as a child trace
+    /// forwards it.
+    async fn shutdown_materialized(&self) -> Result<()> {
+        if self.lock().closed {
+            return Ok(());
+        }
+        self.drain_pending().await;
+        if let Some(recorder) = &self.recorder {
+            recorder.shutdown_materialized().await?;
         }
         self.lock().closed = true;
         Ok(())

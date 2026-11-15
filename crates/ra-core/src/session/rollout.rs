@@ -133,6 +133,27 @@ pub trait RolloutRecorder: Send + Sync + 'static {
         self.flush().await
     }
 
+    /// Makes the thread durable, writes everything recorded so far, and then lets go of the
+    /// rollout: the order Codex's `shutdown_live_agent` closes a spawned agent's thread in, so a
+    /// thread that recorded nothing still leaves a rollout behind.
+    ///
+    /// The default persists with [`PersistContext::Standard`], flushes and shuts down, one after
+    /// the other. A recorder that keeps a writer may run the sequence as one operation and, when a
+    /// step fails, resume it from the first step that did not finish on the next call; ordinary
+    /// [`Self::persist`], [`Self::flush`] and [`Self::shutdown`] keep their own behavior either
+    /// way. A recorder that wraps another forwards this whole operation to the one it wraps rather
+    /// than relying on the default, which would split the sequence into three separate calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if materializing the thread, writing what was recorded, or letting go of
+    /// the rollout failed.
+    async fn shutdown_materialized(&self) -> Result<()> {
+        self.persist(PersistContext::Standard).await?;
+        self.flush().await?;
+        self.shutdown().await
+    }
+
     /// Discards a live writer without writing what has not been written yet, letting go of the
     /// rollout: Codex's `ThreadStore::discard_thread`, for a thread whose start failed after its
     /// writer was opened. What is already written stays.

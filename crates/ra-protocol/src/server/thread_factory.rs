@@ -46,6 +46,44 @@ pub enum ThreadOrigin {
     },
 }
 
+/// Reads, when called, where the transcript of the thread a spawned thread was spawned from is
+/// kept: Codex reads the parent thread's rollout path from its store each time a spawned thread's
+/// `SubagentStop` needs it, so a parent archived meanwhile is still found.
+#[derive(Clone)]
+pub struct ThreadTranscriptLookup(
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Option<std::path::PathBuf>> + Send + Sync>,
+);
+
+impl ThreadTranscriptLookup {
+    pub(crate) fn new(
+        lookup: impl Fn() -> futures::future::BoxFuture<'static, Option<std::path::PathBuf>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    /// The transcript's path, if the store holds the thread and keeps it locally.
+    pub async fn path(&self) -> Option<std::path::PathBuf> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for ThreadTranscriptLookup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ThreadTranscriptLookup")
+    }
+}
+
+impl PartialEq for ThreadTranscriptLookup {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ThreadTranscriptLookup {}
+
 /// The thread a factory is asked to prepare.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +95,7 @@ pub struct ThreadFactoryRequest {
     ephemeral: bool,
     policy: super::protocol::ThreadPolicyOverrides,
     fork_session_id: Option<SessionId>,
+    parent_transcript: Option<ThreadTranscriptLookup>,
 }
 
 impl ThreadFactoryRequest {
@@ -69,7 +108,19 @@ impl ThreadFactoryRequest {
             ephemeral: false,
             policy: super::protocol::ThreadPolicyOverrides::new(),
             fork_session_id: None,
+            parent_transcript: None,
         }
+    }
+
+    pub(crate) fn with_parent_transcript(mut self, lookup: ThreadTranscriptLookup) -> Self {
+        self.parent_transcript = Some(lookup);
+        self
+    }
+
+    /// For a spawned thread loaded on its own, where its parent thread's transcript is found.
+    #[must_use]
+    pub const fn parent_transcript(&self) -> Option<&ThreadTranscriptLookup> {
+        self.parent_transcript.as_ref()
     }
 
     pub(crate) fn with_session_context(

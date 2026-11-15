@@ -30,7 +30,7 @@
 //! time-ordered — so ids are opaque strings, sorted and compared as strings for paging, and an id
 //! that names no running terminal is simply not terminated rather than refused as malformed.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use ra_core::{error::SessionErrorKind, session::SessionId};
 use ra_session::{rollout::RolloutRecord, store::LoadThreadHistoryParams};
@@ -71,17 +71,20 @@ const THREAD_TURNS_MAX_LIMIT: usize = 100;
 pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
-    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pub(super) pending_thread_unloads: Arc<Mutex<super::unload_ledger::UnloadLedger>>,
     pub(super) thread_watch: Arc<ThreadWatchManager>,
     /// Serializes mutations spanning multiple threads with thread loading.
     pub(super) thread_list_state: Mutex<()>,
+    /// How long `thread/resume` waits for a loaded thread's close while it holds
+    /// `thread_list_state`: Codex's `wait_for_thread_shutdown` timeout.
+    close_timeout: std::sync::Mutex<std::time::Duration>,
 }
 
 impl ThreadRequestProcessor {
     pub(crate) const fn new(
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
-        pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+        pending_thread_unloads: Arc<Mutex<super::unload_ledger::UnloadLedger>>,
         thread_watch: Arc<ThreadWatchManager>,
     ) -> Self {
         Self {
@@ -90,7 +93,24 @@ impl ThreadRequestProcessor {
             pending_thread_unloads,
             thread_watch,
             thread_list_state: Mutex::const_new(()),
+            close_timeout: std::sync::Mutex::new(super::thread_loading::THREAD_CLOSE_TIMEOUT),
         }
+    }
+
+    /// How long `thread/resume` waits for a loaded thread's close.
+    pub(super) fn close_timeout(&self) -> std::time::Duration {
+        *self
+            .close_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(feature = "test-api")]
+    pub(crate) fn set_close_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .close_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
     }
 
     /// `thread/unsubscribe`: Codex's `thread_unsubscribe`.
@@ -326,7 +346,6 @@ impl ThreadRequestProcessor {
 
     /// Clears what the server kept of a thread that is gone: Codex's `finalize_thread_teardown`.
     pub(super) async fn finalize_thread_teardown(&self, thread_id: &SessionId) {
-        self.pending_thread_unloads.lock().await.remove(thread_id);
         self.outgoing.cancel_requests_for_thread(thread_id, None);
         self.outgoing
             .thread_state()

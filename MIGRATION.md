@@ -7,6 +7,72 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Spawned agents are threads of their own
+
+A coding thread's spawned agents now behave as Codex's spawned threads: each has a rollout, hooks,
+an MCP identity and a managed network proxy of its own. What changes for hosts and hook authors:
+
+- **Rollouts.** The app server records every agent a persistent thread spawns into the server's
+  store, with Codex's `ThreadSpawn` metadata (root and parent session, depth, path, agent type). An
+  ephemeral thread's agents record nothing. `AgentControl::with_root_session_id` names the root's
+  session without a store; `with_rollout_store` now requires the same session if one was named.
+  `with_root_lineage` lets a spawned thread resumed on its own continue its spawn lineage.
+- **Hook identity.** A spawned agent's hooks report its own `session_id` and transcript, and
+  `PreToolUse`, `PostToolUse`, `PermissionRequest` (network approvals included), `PreCompact`,
+  `PostCompact` and `UserPromptSubmit` carry `agent_id` (the agent's session) and `agent_type` (the
+  type the spawn asked for, or `default`). Hook MCP calls carry the agent's thread in
+  `_meta.threadId`, and `hook/started` and `hook/completed` name the agent's thread as `threadId`.
+- **Lifecycle hooks follow the thread's identity, not `parent_run_id`.** A spawned agent — live, or a
+  spawned thread resumed with `thread/resume` — runs `SubagentStart` once (on its first run) instead
+  of `SessionStart`, ends each turn with `SubagentStop` (parent transcript in `transcript_path`, its
+  own in `agent_transcript_path`), and runs no `SessionStart` (of any source, compaction included),
+  `Interrupt` or `SessionEnd`. Agent-as-tool runs inside a thread keep their previous behavior.
+- **Network.** Each thread a `CodingThreadFactory` prepares, and each spawned agent, has its own
+  managed network proxy and approval service, so `ApprovedForSession` and saved rules take effect
+  only in the session that made them until another session rebuilds its proxy. Threads from the same
+  factory no longer share one proxy. A spawned agent's network approvals reach the client over its
+  parent thread's connections with the agent's thread and run, and are withdrawn when that run ends.
+- **`thread/list`.** Spawned threads are left out unless asked for: with no `sourceKinds` and no
+  relation filter, and with `sourceKinds: []` whatever else is given. `parentThreadId` or
+  `ancestorThreadId` without `sourceKinds` still list them.
+- **Session state.** A spawned agent's command, patch and MCP approvals and its permission grants
+  are its own: an "allow for this session" in the parent does not carry over to it, nor the reverse.
+  Its permission requests reach the client as its own, like its network approvals.
+- **Archive, delete and unload** share one close per loaded thread: the thread shuts down (its
+  `SessionEnd` hooks first), then its tree's agents and pending spawns are let go of, then its
+  rollout. A thread leaves the server only once all of that succeeded; otherwise it stays loaded
+  and the next unload, archive or delete continues the close; an unload that outlasts its timeout
+  keeps waiting for it, and `thread/resume` of such a thread finishes the close and loads it again
+  from the store, or fails if it cannot. Archive and delete close every
+  running thread of the subtree before touching storage and fail without changing anything if one
+  cannot be closed. A thread being removed cannot be resumed until it is.
+- **`AgentControl`** gains `stop_spawning` (refuse spawns and runs without stopping anything),
+  `shutdown_report`, `settle_spawns` (wait for spawns a shutdown did not wait for) and
+  `inject_context` (add context to a spawned agent's run — while it waits for approval, to the
+  run it continues as, leaving the checkpoint the host holds unchanged, and to its history if it
+  is cancelled instead, or the continued run fails before delivering it — or, recorded at once, to
+  its history while it is idle). `settle_spawns` also reports, as closed, the spawns
+  `stop_spawning` returned that have cleaned up since. A spawned agent's pending client requests
+  are withdrawn, with `serverRequest/resolved`, when the run that asked ends, even if the tool
+  waiting for them was cancelled, and are sent again to a client that resumes the parent thread
+  while they wait; one raised while a client resumes the parent is sent to the connections
+  subscribed once it is kept, so it reaches that client either way.
+- **`thread/resume` with other settings.** When the resume closes the idle loaded thread to reload
+  it and that close fails or times out, the resume now fails (retry it) instead of rejoining the
+  shut-down thread; Codex rejoins there. A resume that meets a close still in progress waits for it
+  as long (ten seconds) and fails the same way, so a stuck close does not hold up other threads.
+- **Soft wall-clock stops deliver queued context.** A run that ends `BudgetExhausted` on its wall
+  clock now delivers the context its hook context queue holds into its history, as a completed run
+  does; before, a thread's run sealed the queue with nobody to read it, and a run without an owner
+  left the entries in its result's pending context. A spawned agent's run that fails or is
+  cancelled leaves its undelivered context in the queue for the tree, as a thread's run does.
+- **Recorders.** `RolloutRecorder::shutdown_materialized` closes a rollout the way Codex closes a
+  spawned thread (materialize, flush, shut down). A recorder that wraps another must forward it.
+- **Factories.** `SpawnedAgentRequest` gains `session_id`, `parent_session_id` and `forked`;
+  `PreparedSpawnedAgent::with_run_config` adjusts the agent's run configuration;
+  `SpawnedAgentResources` gains `rollout_created` and `run_ended`. A spawn now reserves its path
+  before the factory runs, and a cancelled or refused spawn releases what the factory gave it.
+
 ### Automatic compaction covers a thread's whole history
 
 An `AgentThread` whose run configuration installs the compaction capability now compacts its whole
@@ -1690,10 +1756,10 @@ still returning that path, and flushes before Interrupt and SessionEnd hooks. No
 are not materialized for hook queries. The default protocol/product binding uses a weak thread
 handle and queries on every dispatch. This adds no persistence requirement for non-local stores.
 
-SubagentStop for an agent spawned through `AgentControl` currently reports `agent_transcript_path`
-as `null`: the product does not yet give spawned agents a rollout of their own. Codex reports the
-child's own rollout there, and the field will carry that path once spawned-agent rollouts are wired
-into the product. Its `transcript_path` is already the parent thread's transcript, as in Codex.
+SubagentStop for an agent spawned through `AgentControl` reported `agent_transcript_path` as `null`
+here; since spawned agents got rollouts of their own (see "Spawned agents are threads of their own"
+under Unreleased), it reports the agent's own rollout, as Codex does, except in an ephemeral thread.
+Its `transcript_path` is the parent thread's transcript, as in Codex.
 
 ### Thread-owned product hook refresh
 

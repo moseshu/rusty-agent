@@ -398,6 +398,17 @@ impl Server {
         connection
     }
 
+    /// Closes `connection`, as its transport does when the client goes away.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    async fn disconnect(&self, connection: Connection) {
+        self.events
+            .send(TransportEvent::ConnectionClosed {
+                connection_id: connection.id,
+            })
+            .await
+            .unwrap();
+    }
+
     async fn send(&self, connection: &Connection, message: impl Into<JsonRpcMessage>) {
         self.events
             .send(TransportEvent::IncomingMessage {
@@ -534,7 +545,7 @@ fn build_with_session_source(
     requester_thread: Option<&str>,
     source: Option<ra_protocol::server::SessionSource>,
 ) -> (Server, Option<ThreadRequester>) {
-    build_server(options, requester_thread, source, None)
+    build_server(options, requester_thread, source, None, &|_| {})
 }
 
 /// Builds a server from `options` whose threads show their tools' calls as `tool_items` says.
@@ -542,7 +553,7 @@ fn build_showing_items(
     options: Options,
     tool_items: Arc<dyn ra_protocol::server::ThreadToolItems>,
 ) -> Server {
-    build_server(options, None, None, Some(tool_items)).0
+    build_server(options, None, None, Some(tool_items), &|_| {}).0
 }
 
 fn build_server(
@@ -550,6 +561,7 @@ fn build_server(
     requester_thread: Option<&str>,
     source: Option<ra_protocol::server::SessionSource>,
     tool_items: Option<Arc<dyn ra_protocol::server::ThreadToolItems>>,
+    configure: &dyn Fn(&AppServer),
 ) -> (Server, Option<ThreadRequester>) {
     let store = options
         .store
@@ -571,6 +583,7 @@ fn build_server(
     if let Some(tool_items) = tool_items {
         server = server.with_thread_tool_items(tool_items);
     }
+    configure(&server);
     let requester =
         requester_thread.map(|thread| ThreadRequester::new(&server, &[], SessionId::new(thread)));
     (Server::run(server, store), requester)
@@ -2774,8 +2787,19 @@ async fn thread_list_source_and_relation_filters_do_not_skip_page_matches() {
             vec!["third", "second", "first"],
         ),
         (json!({"sourceKinds": ["unknown"]}), vec!["other", "root"]),
+        // Codex's defaults: no spawned thread without an explicit source or a relation filter,
+        // and none with `sourceKinds: []` even with one.
+        (json!({}), vec!["other", "root"]),
+        (json!({"sourceKinds": []}), vec!["other", "root"]),
+        (json!({"parentThreadId": "root", "sourceKinds": []}), vec![]),
+        (
+            json!({"ancestorThreadId": "root", "sourceKinds": ["subAgentThreadSpawn"]}),
+            vec!["third", "second", "first"],
+        ),
     ] {
-        let result = server.call(&mut connection, "thread/list", params).await;
+        let result = server
+            .call(&mut connection, "thread/list", params.clone())
+            .await;
         assert_eq!(
             result["data"]
                 .as_array()
@@ -2783,7 +2807,8 @@ async fn thread_list_source_and_relation_filters_do_not_skip_page_matches() {
                 .iter()
                 .map(|thread| thread["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            expected
+            expected,
+            "{params}"
         );
     }
 }

@@ -32,6 +32,7 @@ use ra_core::hook::{
 };
 use ra_core::item::{Message, MessageRole, ModelInputItem};
 use ra_core::session::SessionId;
+use ra_core::session::rollout::{PersistContext, RolloutRecorder};
 use ra_paths::AbsolutePathBuf;
 use ra_protocol::server::protocol::{
     HOOK_COMPLETED_METHOD, HOOK_STARTED_METHOD, HookCompletedEvent, HookExecutionMode,
@@ -120,7 +121,13 @@ pub trait ExecutorHookSourceProvider: Send + Sync {
 /// One thread's product hooks, adapted to the runtime's host hook dispatcher.
 pub struct ProductHookRuntime {
     hooks: RwLock<Arc<Hooks>>,
+    /// The configuration the hooks were last built from, which a spawned agent's hooks start from.
+    config: RwLock<HooksConfig>,
     session: ProductHookSession,
+    /// Which thread the hooks speak for, which decides the lifecycle events they run.
+    role: HookThreadRole,
+    /// The hooks of the agents this thread spawned, refreshed with it.
+    children: Mutex<Vec<std::sync::Weak<ProductHookRuntime>>>,
     unapplied: Mutex<Vec<UnappliedHookEffect>>,
     /// Where hook runs are reported: the thread's ordered event stream, once it is bound.
     events: Mutex<Option<mpsc::UnboundedSender<ThreadEvent>>>,
@@ -131,6 +138,72 @@ pub struct ProductHookRuntime {
     feedback_policy: OnceLock<FeedbackPolicy>,
     tool_hook_results: ToolHookResults,
 }
+
+/// Which thread a runtime's hooks speak for: Codex's session source, as far as it decides which
+/// lifecycle hooks run.
+pub(crate) enum HookThreadRole {
+    /// A thread the host started: every lifecycle event runs.
+    Root,
+    /// A spawned agent's thread — live in its parent's tree, or resumed on its own: Codex's
+    /// `SubAgent(ThreadSpawn)` session, which runs `SubagentStart` once instead of `SessionStart`,
+    /// ends its turns with `SubagentStop`, and runs neither `Interrupt` nor `SessionEnd`.
+    Child(ChildHookIdentity),
+}
+
+/// What a spawned agent's hooks know of it.
+pub(crate) struct ChildHookIdentity {
+    /// The agent type the spawn asked for, or Codex's default role name.
+    agent_type: String,
+    /// Codex's pending session start source: set for a spawned agent that has not started, taken
+    /// by the first `SubagentStart` it receives.
+    pending_start: Mutex<Option<ra_core::hook::SessionStartSource>>,
+    /// The agent's own rollout, once its tree created it; a resumed thread uses its thread's.
+    own_rollout: OnceLock<Arc<dyn RolloutRecorder>>,
+    /// Where the transcript of the thread that spawned it is found.
+    parent_transcript: ParentTranscript,
+}
+
+/// Where a spawned agent's hooks find their parent thread's transcript.
+pub(crate) enum ParentTranscript {
+    /// The hooks of the thread that spawned it, live in the same process.
+    Runtime(std::sync::Weak<ProductHookRuntime>),
+    /// A lookup in the store, as Codex reads the parent thread's rollout path when it needs it.
+    Lookup(ParentTranscriptLookup),
+}
+
+/// Reads the parent thread's transcript path from the store when called.
+pub(crate) type ParentTranscriptLookup =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Option<PathBuf>> + Send + Sync>;
+
+impl ChildHookIdentity {
+    /// A spawned agent that has not started: its first run takes `start`.
+    pub(crate) fn spawned(
+        agent_type: Option<&str>,
+        start: ra_core::hook::SessionStartSource,
+        parent: &Arc<ProductHookRuntime>,
+    ) -> Self {
+        Self {
+            agent_type: agent_type.unwrap_or(DEFAULT_AGENT_TYPE).to_owned(),
+            pending_start: Mutex::new(Some(start)),
+            own_rollout: OnceLock::new(),
+            parent_transcript: ParentTranscript::Runtime(Arc::downgrade(parent)),
+        }
+    }
+
+    /// A spawned agent's thread resumed on its own: nothing is pending, as Codex's resumed
+    /// sub-agent session runs no start hook.
+    pub(crate) fn resumed(agent_type: Option<&str>, parent: ParentTranscriptLookup) -> Self {
+        Self {
+            agent_type: agent_type.unwrap_or(DEFAULT_AGENT_TYPE).to_owned(),
+            pending_start: Mutex::new(None),
+            own_rollout: OnceLock::new(),
+            parent_transcript: ParentTranscript::Lookup(parent),
+        }
+    }
+}
+
+/// Codex's `DEFAULT_ROLE_NAME`, the agent type of a spawn that named none.
+pub(crate) const DEFAULT_AGENT_TYPE: &str = "default";
 
 /// Tool results captured by invocations, keyed by run and call, for their own `PostToolUse` hooks.
 pub(crate) type ToolHookResults = Arc<
@@ -176,6 +249,7 @@ pub(crate) struct McpHookResult {
 }
 
 /// Model metadata belongs to the session; the selected model belongs to each active run.
+#[derive(Clone)]
 struct FeedbackPolicy {
     models: Vec<(String, ra_core::sandbox::token_truncation::TruncationPolicy)>,
     token_limit: Option<usize>,
@@ -216,7 +290,18 @@ impl ProductHookRuntime {
         session: ProductHookSession,
         mcp_executor: Arc<dyn super::HookMcpExecutor>,
     ) -> anyhow::Result<Arc<Self>> {
-        let (hooks, receiver) = Hooks::new(config, session.session_id.clone(), mcp_executor)?;
+        Self::with_role(config, session, mcp_executor, HookThreadRole::Root)
+    }
+
+    /// The hooks of a thread whose role is `role`.
+    pub(crate) fn with_role(
+        config: HooksConfig,
+        session: ProductHookSession,
+        mcp_executor: Arc<dyn super::HookMcpExecutor>,
+        role: HookThreadRole,
+    ) -> anyhow::Result<Arc<Self>> {
+        let (hooks, receiver) =
+            Hooks::new(config.clone(), session.session_id.clone(), mcp_executor)?;
         let context_delivery = Arc::new(Mutex::new(ContextDelivery::default()));
         let delivery = Arc::clone(&context_delivery);
         let results = receiver.clone();
@@ -244,7 +329,10 @@ impl ProductHookRuntime {
         });
         Ok(Arc::new(Self {
             hooks: RwLock::new(Arc::new(hooks)),
+            config: RwLock::new(config),
             session,
+            role,
+            children: Mutex::new(Vec::new()),
             unapplied: Mutex::new(Vec::new()),
             events: Mutex::new(None),
             background: BackgroundResults {
@@ -307,10 +395,107 @@ impl ProductHookRuntime {
         });
     }
 
-    /// Applies a refreshed configuration while background handlers keep running.
+    /// Applies a refreshed configuration while background handlers keep running, to these hooks
+    /// and to those of every agent this thread spawned that is still alive, as Codex rebuilds the
+    /// hook runtime of every loaded thread.
     pub fn refresh(&self, config: HooksConfig) {
-        let next = Arc::new(self.current().reconfigured(config));
+        let next = Arc::new(self.current().reconfigured(config.clone()));
         *self.hooks.write().unwrap_or_else(PoisonError::into_inner) = next;
+        let children: Vec<_> = {
+            let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+            children.retain(|child| child.strong_count() > 0);
+            children
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect()
+        };
+        for child in children {
+            child.refresh(config.clone());
+        }
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config;
+    }
+
+    /// The hooks of an agent this thread spawns: built from the configuration these hooks run
+    /// with now, as Codex's spawned session builds its hooks from the configuration it copies, for
+    /// the session `session`, with their own background results and delivery, and refreshed with
+    /// these. Notices about its hook runs reach this thread's connections, naming the agent's
+    /// thread.
+    pub(crate) fn spawn_child(
+        self: &Arc<Self>,
+        session: ProductHookSession,
+        identity: ChildHookIdentity,
+        mcp_executor: Arc<dyn super::HookMcpExecutor>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let child = Self::with_role(
+            config,
+            session,
+            mcp_executor,
+            HookThreadRole::Child(identity),
+        )?;
+        if let Some(policy) = self.feedback_policy.get() {
+            let _ = child.feedback_policy.set(policy.clone());
+        }
+        if let Some(events) = self
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            child.bind_thread_events(events);
+        }
+        self.children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::downgrade(&child));
+        Ok(child)
+    }
+
+    /// The spawned agent's own rollout, created by its tree: what its hooks report as their
+    /// transcript.
+    pub(crate) fn set_own_rollout(&self, recorder: &Arc<dyn RolloutRecorder>) {
+        if let HookThreadRole::Child(child) = &self.role {
+            let _ = child.own_rollout.set(Arc::clone(recorder));
+        }
+    }
+
+    /// The session the hooks were built for.
+    pub(crate) const fn session(&self) -> &ProductHookSession {
+        &self.session
+    }
+
+    /// Whether these hooks speak for a spawned agent's thread.
+    pub(crate) const fn is_child(&self) -> bool {
+        matches!(self.role, HookThreadRole::Child(_))
+    }
+
+    /// Codex's `thread_spawn_subagent_hook_context`: present only for a spawned agent's thread.
+    fn subagent(&self) -> Option<super::events::common::SubagentHookContext> {
+        match &self.role {
+            HookThreadRole::Root => None,
+            HookThreadRole::Child(child) => Some(super::events::common::SubagentHookContext {
+                agent_id: self.session.session_id.to_string(),
+                agent_type: child.agent_type.clone(),
+            }),
+        }
+    }
+
+    /// The transcript of the thread that spawned this one, for its `SubagentStop`.
+    async fn parent_transcript_path(&self) -> Option<PathBuf> {
+        let HookThreadRole::Child(child) = &self.role else {
+            return None;
+        };
+        match &child.parent_transcript {
+            ParentTranscript::Runtime(parent) => {
+                let parent = parent.upgrade()?;
+                Box::pin(parent.transcript_path(false)).await
+            }
+            ParentTranscript::Lookup(lookup) => lookup().await,
+        }
     }
 
     /// The hooks used by the next dispatch.
@@ -335,6 +520,19 @@ impl ProductHookRuntime {
     }
 
     async fn transcript_path(&self, flush: bool) -> Option<PathBuf> {
+        // A spawned agent's own rollout, materialized first, as Codex's `hook_transcript_path` does.
+        if let HookThreadRole::Child(child) = &self.role
+            && let Some(rollout) = child.own_rollout.get()
+        {
+            let path = rollout.local_path()?;
+            if let Err(error) = rollout.persist(PersistContext::Standard).await {
+                tracing::warn!(%error, "the hook transcript could not be materialized");
+            }
+            if flush && let Err(error) = rollout.flush().await {
+                tracing::warn!(%error, "failed to flush transcript before lifecycle hook");
+            }
+            return Some(path);
+        }
         let Some(source) = self.transcript.get() else {
             return self.session.transcript_path.clone();
         };
@@ -415,6 +613,7 @@ impl ProductHookRuntime {
             HookEventName::PermissionRequest,
             HookEventName::PostToolUse,
             HookEventName::Stop,
+            HookEventName::SubagentStart,
             HookEventName::SubagentStop,
             HookEventName::Interrupt,
             HookEventName::PreCompact,
@@ -470,7 +669,7 @@ impl ProductHookRuntime {
         let request = PermissionRequestRequest {
             session_id: session.session_id.clone(),
             turn_id: turn_id.to_owned(),
-            subagent: None,
+            subagent: self.subagent(),
             cwd: session.cwd.to_path_buf(),
             transcript_path: self.transcript_path(false).await,
             model: model.map_or_else(|| {
@@ -526,9 +725,11 @@ impl ProductHookRuntime {
         };
         match serde_json::to_value(params) {
             Ok(params) => {
-                let _ = events.send(ThreadEvent::Notice(ThreadNotice::new(
-                    turn_id, method, params,
-                )));
+                let mut notice = ThreadNotice::new(turn_id, method, params);
+                if self.is_child() {
+                    notice = notice.with_thread_id(self.session.session_id.clone());
+                }
+                let _ = events.send(ThreadEvent::Notice(notice));
             }
             Err(error) => tracing::warn!(%error, %method, "hook notice could not be serialized"),
         }
@@ -548,6 +749,11 @@ impl ProductHookRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .pending
             .extend(rejected);
+    }
+
+    /// Whether `run` is a turn of these hooks' thread rather than a run nested in one.
+    fn is_turn_root(&self, run: &ra_core::context::RunContext) -> bool {
+        self.turn_id(run) == run.run_id().as_str()
     }
 
     /// The thread turn `run` belongs to: Codex's turn `sub_id`, the root run's identity.
@@ -650,6 +856,9 @@ impl ProductHookRuntime {
                 self.permission_mode()
             }, |settings| hook_permission_mode(settings.approval_policy()));
         match *event {
+            // Codex's sub-agent sessions run no start hook other than `SubagentStart`, whatever
+            // the source — a resumed or compacted spawned thread included.
+            HookEvent::SessionStart { .. } if self.is_child() => HookDecision::Continue,
             HookEvent::SessionStart { source, .. } => {
                 let request = SessionStartRequest {
                     session_id: session.session_id.clone(),
@@ -677,7 +886,8 @@ impl ProductHookRuntime {
                 // background handler runs or reports after this point.
                 self.stop_background().await;
                 let preview = hooks.preview_session_end();
-                if preview.is_empty() {
+                // `SessionEnd` is root-only, as in Codex.
+                if preview.is_empty() || self.is_child() {
                     return HookDecision::Continue;
                 }
                 let request = SessionEndRequest {
@@ -696,7 +906,7 @@ impl ProductHookRuntime {
                 let request = UserPromptSubmitRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.clone(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -732,7 +942,7 @@ impl ProductHookRuntime {
                 let request = PreToolUseRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.clone(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -768,7 +978,7 @@ impl ProductHookRuntime {
                 let request = PermissionRequestRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.to_path_buf(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -893,7 +1103,7 @@ impl ProductHookRuntime {
                 let request = PostToolUseRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.clone(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -923,20 +1133,79 @@ impl ProductHookRuntime {
                         }
                     })
             }
+            HookEvent::SubagentStart { .. } => {
+                // Codex's pending start source: a spawned agent's first run takes it, once; later
+                // runs, approval resumes, nested runs and a resumed thread find nothing to take.
+                let HookThreadRole::Child(child) = &self.role else {
+                    return HookDecision::Continue;
+                };
+                if !self.is_turn_root(context.run()) {
+                    return HookDecision::Continue;
+                }
+                let pending = child
+                    .pending_start
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if pending.is_none() {
+                    return HookDecision::Continue;
+                }
+                let request = SessionStartRequest {
+                    session_id: session.session_id.clone(),
+                    cwd: session.cwd.clone(),
+                    transcript_path: self.transcript_path(false).await,
+                    model: model.clone(),
+                    permission_mode: permission_mode.clone(),
+                    target: StartHookTarget::SubagentStart {
+                        turn_id: turn_id.clone(),
+                        agent_id: session.session_id.to_string(),
+                        agent_type: child.agent_type.clone(),
+                    },
+                };
+                self.emit_started(&turn_id, hooks.preview_session_start(&request));
+                let outcome = hooks
+                    .run_session_start(request, Some(turn_id.clone()))
+                    .await;
+                self.emit_completed(outcome.hook_events);
+                self.record_contexts(context, outcome.additional_contexts);
+                // `continue: false` does not stop a spawned agent, as in Codex.
+                HookDecision::Continue
+            }
             HookEvent::Stop(delivery) | HookEvent::SubagentStop { delivery, .. } => {
-                let event_name = event.name();
-                // Codex's SubagentStop reports the parent thread's transcript and the child
-                // thread's own. A nested run records into its parent thread's rollout and has no
-                // transcript of its own, so only the parent path is known.
-                let transcript_path = self.transcript_path(false).await;
-                let target = if event_name == HookEventName::SubagentStop {
-                    StopHookTarget::SubagentStop {
-                        agent_id: context.run().run_id().to_string(),
-                        agent_type: context.run().agent().name().to_owned(),
-                        agent_transcript_path: None,
-                    }
+                // A spawned agent's turn ends with `SubagentStop`, reporting its parent thread's
+                // transcript and its own, as Codex's `ThreadSpawn` turns do — a resumed spawned
+                // thread's top-level turn included. A nested agent-tool run records into its
+                // thread's rollout and has no transcript of its own, so only that thread's path is
+                // known for it.
+                let spawned_turn = self.is_child() && self.is_turn_root(context.run());
+                let event_name = if spawned_turn {
+                    HookEventName::SubagentStop
                 } else {
-                    StopHookTarget::Stop
+                    event.name()
+                };
+                let (transcript_path, target) = if spawned_turn {
+                    let HookThreadRole::Child(child) = &self.role else {
+                        unreachable!("checked above");
+                    };
+                    (
+                        self.parent_transcript_path().await,
+                        StopHookTarget::SubagentStop {
+                            agent_id: session.session_id.to_string(),
+                            agent_type: child.agent_type.clone(),
+                            agent_transcript_path: self.transcript_path(false).await,
+                        },
+                    )
+                } else if event_name == HookEventName::SubagentStop {
+                    (
+                        self.transcript_path(false).await,
+                        StopHookTarget::SubagentStop {
+                            agent_id: context.run().run_id().to_string(),
+                            agent_type: context.run().agent().name().to_owned(),
+                            agent_transcript_path: None,
+                        },
+                    )
+                } else {
+                    (self.transcript_path(false).await, StopHookTarget::Stop)
                 };
                 let last_assistant_message =
                     delivery.message().map(ra_core::item::Message::text_content);
@@ -1005,8 +1274,9 @@ impl ProductHookRuntime {
             }
             HookEvent::Interrupt { .. } => {
                 // Codex runs Interrupt hooks once, for the turn: a nested agent-tool run's own
-                // interruption is part of that turn's.
-                if context.run().parent_run_id().is_some() {
+                // interruption is part of that turn's. A spawned agent's thread runs none, as
+                // Codex skips them for every sub-agent session.
+                if context.run().parent_run_id().is_some() || self.is_child() {
                     return HookDecision::Continue;
                 }
                 let executor_hook_sources = self.executor_hook_sources(context.run());
@@ -1034,7 +1304,7 @@ impl ProductHookRuntime {
                 let request = PreCompactRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.clone(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -1057,7 +1327,7 @@ impl ProductHookRuntime {
                 let request = PostCompactRequest {
                     session_id: session.session_id.clone(),
                     turn_id: turn_id.clone(),
-                    subagent: None,
+                    subagent: self.subagent(),
                     cwd: session.cwd.clone(),
                     transcript_path: self.transcript_path(false).await,
                     model: model.clone(),
@@ -1129,7 +1399,12 @@ impl UserHook for ProductHook {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let run_id = run.run_id().to_string();
-        match run.parent_run_id() {
+        // A spawned agent's hooks see their agent's runs, whose parents ran in the thread that
+        // spawned it: each is a turn of the agent's own thread.
+        let parent = run.parent_run_id().filter(|parent| {
+            !self.runtime.is_child() || delivery.turn_of.contains_key(parent.as_str())
+        });
+        match parent {
             // A root run is the thread's turn; runs of other turns are forgotten.
             None => {
                 delivery.turn_of.retain(|_, turn| *turn == run_id);

@@ -58,6 +58,16 @@ pub(crate) struct ThreadNetworkProxy {
     policy: Mutex<Option<(Arc<ExecPolicyManager>, Option<PathBuf>)>>,
     /// The thread's product hooks, which decide a network access before its client is asked.
     hooks: OnceLock<Arc<ProductHookRuntime>>,
+    /// The network configuration the proxy was last started or refreshed with, which a spawned
+    /// agent's own proxy is started from, as Codex's spawned session builds its proxy from the
+    /// configuration it copies.
+    started_with: Mutex<Option<StartedWith>>,
+}
+
+#[derive(Clone)]
+struct StartedWith {
+    spec: NetworkProxySpec,
+    permission_profile: PermissionProfile,
 }
 
 /// What a command's attempt runs under when the thread's managed proxy routes it: the
@@ -106,6 +116,13 @@ impl ThreadNetworkProxy {
         let Some(spec) = spec.filter(|spec| spec.enabled()) else {
             return Ok(());
         };
+        *self
+            .started_with
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(StartedWith {
+            spec: spec.clone(),
+            permission_profile: permission_profile.clone(),
+        });
         // The managed proxy can call back into the thread for allowlist-miss decisions.
         let network_policy_decider = managed_network_requirements_configured.then(|| {
             let session: Arc<dyn NetworkApprovalSession> = Arc::clone(self) as _;
@@ -137,6 +154,13 @@ impl ThreadNetworkProxy {
             self.store(None);
             return;
         };
+        *self
+            .started_with
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(StartedWith {
+            spec: spec.clone(),
+            permission_profile: permission_profile.clone(),
+        });
 
         let spec = match spec.recompute_for_permission_profile(permission_profile) {
             Ok(spec) => spec,
@@ -260,9 +284,65 @@ impl ThreadNetworkProxy {
         let _ = self.requests.set(requests);
     }
 
+    /// How the thread asks its client, once the app server has handed it over.
+    pub(crate) fn requests(&self) -> Option<&ThreadServerRequests> {
+        self.requests.get()
+    }
+
     /// Keeps the thread's product hooks; see `hooks`.
     pub(crate) fn attach_hooks(&self, hooks: Arc<ProductHookRuntime>) {
         let _ = self.hooks.set(hooks);
+    }
+
+    /// The proxy of an agent this thread spawns, as session `session_id`: Codex's spawned session
+    /// starts its own managed proxy and approval service from the configuration it copies, so
+    /// approvals it is given for the session, and rules it saves, take effect for it alone until
+    /// another session rebuilds its proxy. Started from what this proxy runs with now, with the
+    /// same exec policy, and decided by the agent's own hooks; it asks the client through this
+    /// thread's connections as the agent's thread. Not started when this thread runs none.
+    pub(crate) async fn spawn_child(
+        &self,
+        hooks: Option<Arc<ProductHookRuntime>>,
+        session_id: &ra_core::session::SessionId,
+    ) -> std::io::Result<Arc<Self>> {
+        let child = Arc::new(Self::default());
+        if let Some(hooks) = hooks {
+            let _ = child.hooks.set(hooks);
+        }
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(requests) = self.requests.get() {
+            let _ = child
+                .requests
+                .set(requests.for_spawned_agent(session_id.clone()));
+        }
+        let started_with = self
+            .started_with
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let (Some((exec_policy, rules_home)), Some(started_with)) = (policy, started_with) else {
+            return Ok(child);
+        };
+        child.bind_exec_policy(Arc::clone(&exec_policy), rules_home);
+        child
+            .start(
+                Some(&started_with.spec),
+                exec_policy.current().as_ref(),
+                &started_with.permission_profile,
+                self.managed_network_requirements_configured
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await?;
+        Ok(child)
+    }
+
+    /// Stops the proxy's listeners, for a spawned agent that has been closed.
+    pub(crate) fn stop(&self) {
+        self.store(None);
     }
 
     /// Keeps the exec policy and rules home network amendments are saved to.

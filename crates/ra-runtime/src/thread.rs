@@ -238,6 +238,7 @@ pub struct ThreadNotice {
     turn_id: Option<String>,
     method: String,
     params: Value,
+    thread_id: Option<SessionId>,
 }
 
 impl ThreadNotice {
@@ -248,7 +249,23 @@ impl ThreadNotice {
             turn_id,
             method: method.into(),
             params,
+            thread_id: None,
         }
+    }
+
+    /// The notice is about `thread_id` rather than the thread whose events carry it: a spawned
+    /// agent's, which is a thread of its own, as Codex's spawned thread reports its own events,
+    /// while it is delivered over its parent thread's connections.
+    #[must_use]
+    pub fn with_thread_id(mut self, thread_id: SessionId) -> Self {
+        self.thread_id = Some(thread_id);
+        self
+    }
+
+    /// The thread it is about, when that is not the thread whose events carry it.
+    #[must_use]
+    pub const fn thread_id(&self) -> Option<&SessionId> {
+        self.thread_id.as_ref()
     }
 
     /// The turn it concerns, if one.
@@ -631,6 +648,13 @@ impl AgentThreadBuilder {
         self
     }
 
+    /// The collaboration tree the thread will own, if it was given one, for a host to finish
+    /// setting it up — giving it a rollout store, for instance — before the thread is built.
+    #[must_use]
+    pub const fn agent_control(&self) -> Option<&AgentControl> {
+        self.agent_control.as_ref()
+    }
+
     /// The services every turn will be given, for a host to add a port of its own to before the
     /// thread is built.
     pub const fn services(&self) -> &ToolServices {
@@ -733,6 +757,7 @@ impl AgentThreadBuilder {
                 services: self.services,
                 rollout: self.rollout,
                 agent_control: self.agent_control,
+                shutting_down: Mutex::new(None),
                 state: Mutex::new(ThreadState {
                     history: self.history,
                     reported_tokens: self.reported_tokens,
@@ -798,6 +823,10 @@ struct ThreadInner {
     rollout: Option<Arc<dyn RolloutRecorder>>,
     agent_control: Option<AgentControl>,
     state: Mutex<ThreadState>,
+    /// The shutdown in progress, shared by every caller; one whose tree was left with an agent it
+    /// could not close is replaced by the next caller's.
+    shutting_down:
+        Mutex<Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>>,
     /// Woken when a turn ends, for a start that waits for a finishing turn to be gone.
     turn_ended: Notify,
     events: mpsc::UnboundedSender<ThreadEvent>,
@@ -1374,7 +1403,36 @@ impl AgentThread {
     /// waiting for approval — is aborted as [`AgentThread::interrupt`] aborts it, as Codex aborts
     /// its tasks on shutdown, and is waited for; then the rollout is flushed. Shutting down a thread
     /// that is already down only waits for that.
+    ///
+    /// Callers share one shutdown: a caller that arrives while it runs waits for it — its
+    /// `SessionEnd` hooks included, which run before the tree and the rollout are let go of — and
+    /// only a shutdown that left an agent of the tree unclosed is run again, without the hooks.
     pub async fn shutdown(&self) {
+        use futures::FutureExt;
+        let shutting_down = {
+            let mut shutting_down = self
+                .inner
+                .shutting_down
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let reusable = shutting_down
+                .as_ref()
+                .filter(|shutdown| shutdown.peek().is_none_or(|complete| *complete));
+            if let Some(shutdown) = reusable {
+                shutdown.clone()
+            } else {
+                let thread = self.clone();
+                let task = tokio::spawn(async move { thread.shut_down_once().await });
+                let shutdown = async move { task.await.unwrap_or(false) }.boxed().shared();
+                *shutting_down = Some(shutdown.clone());
+                shutdown
+            }
+        };
+        shutting_down.await;
+    }
+
+    /// One attempt at [`Self::shutdown`]; whether the tree's agents were all closed.
+    async fn shut_down_once(&self) -> bool {
         loop {
             let ended = {
                 let mut state = self.inner.lock();
@@ -1415,14 +1473,16 @@ impl AgentThread {
                 })
                 .await;
         }
-        if let Some(control) = &self.inner.agent_control {
-            control.shutdown().await;
-        }
+        let complete = match &self.inner.agent_control {
+            Some(control) => control.shutdown_close().finished().await.is_complete(),
+            None => true,
+        };
         if let Some(rollout) = &self.inner.rollout
             && let Err(error) = rollout.flush().await
         {
             tracing::warn!(thread_id = %self.inner.thread_id, %error, "the thread's rollout could not be flushed");
         }
+        complete
     }
 
     /// Returns the local transcript path after attempting to materialize it, as Codex does

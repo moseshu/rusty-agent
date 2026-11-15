@@ -50,6 +50,9 @@ enum Command {
     Flush(oneshot::Sender<Result<()>>),
     Persist(PersistContext, oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<Result<()>>),
+    /// Persist with [`PersistContext::Standard`], flush and shut down, resumed from the first step
+    /// that has not finished.
+    ShutdownMaterialized(oneshot::Sender<Result<()>>),
     Discard(oneshot::Sender<Result<()>>),
 }
 
@@ -80,6 +83,7 @@ impl LiveThreadRecorder {
             inner: Arc::clone(&inner),
             store,
             sync: Arc::clone(&sync),
+            writer_closed: false,
         };
         tokio::spawn(task.run(receiver));
         if commit {
@@ -183,6 +187,10 @@ impl RolloutRecorder for LiveThreadRecorder {
         self.barrier(Command::Shutdown).await
     }
 
+    async fn shutdown_materialized(&self) -> Result<()> {
+        self.barrier(Command::ShutdownMaterialized).await
+    }
+
     async fn discard(&self) -> Result<()> {
         self.barrier(Command::Discard).await
     }
@@ -194,10 +202,15 @@ struct ThreadTask {
     inner: Arc<dyn RolloutRecorder>,
     store: Arc<dyn ThreadStore>,
     sync: Arc<Mutex<ThreadMetadataSync>>,
+    /// Whether the store's recorder has been shut down. Recorded by this task before it answers,
+    /// so a shutdown asked for again — after its caller stopped waiting, or after the metadata
+    /// write failed — does not reach a writer that has already stopped. The pending metadata patch
+    /// needs no such note: it stays in the sync until it is written.
+    writer_closed: bool,
 }
 
 impl ThreadTask {
-    async fn run(self, mut commands: mpsc::UnboundedReceiver<Command>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         while let Some(command) = commands.recv().await {
             match command {
                 Command::Commit => {
@@ -218,6 +231,9 @@ impl ThreadTask {
                 }
                 Command::Shutdown(done) => {
                     let _ = done.send(self.shutdown().await);
+                }
+                Command::ShutdownMaterialized(done) => {
+                    let _ = done.send(self.shutdown_materialized().await);
                 }
                 Command::Discard(done) => {
                     lock(&self.sync).discard_pending_update();
@@ -249,11 +265,18 @@ impl ThreadTask {
     }
 
     /// Codex's `LiveThread::shutdown`: what is pending for a thread with history, then the
-    /// recorder, reporting both failures if both fail.
-    async fn shutdown(&self) -> Result<()> {
+    /// recorder, reporting both failures if both fail. Once the recorder has been shut down, only
+    /// the metadata is tried again.
+    async fn shutdown(&mut self) -> Result<()> {
         let update = lock(&self.sync).take_pending_update_for_existing_history();
         let metadata = self.write(update).await;
-        let shutdown = self.inner.shutdown().await;
+        let shutdown = if self.writer_closed {
+            Ok(())
+        } else {
+            let shutdown = self.inner.shutdown().await;
+            self.writer_closed = shutdown.is_ok();
+            shutdown
+        };
         match (metadata, shutdown) {
             (Err(metadata), Err(shutdown)) => Err(Error::session(
                 SessionErrorKind::Io,
@@ -264,6 +287,18 @@ impl ThreadTask {
             (Err(metadata), Ok(())) => Err(metadata),
             (Ok(()), result) => result,
         }
+    }
+
+    /// Codex's `shutdown_live_agent` order: the thread is materialized and flushed, then shut down.
+    /// While the recorder is still open, a repeated call persists and flushes again, which writes
+    /// nothing twice; once it has been shut down, materializing and flushing already succeeded, so
+    /// only what is left of the shutdown is tried.
+    async fn shutdown_materialized(&mut self) -> Result<()> {
+        if !self.writer_closed {
+            self.persist(PersistContext::Standard).await?;
+            self.flush().await?;
+        }
+        self.shutdown().await
     }
 
     /// Codex's `apply_pending_metadata_update`: writes `update` and marks it applied.

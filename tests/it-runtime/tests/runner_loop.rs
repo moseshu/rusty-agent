@@ -3052,6 +3052,74 @@ async fn the_wall_clock_stops_a_running_tool_too() {
     assert_eq!(result.usage().total_tokens(), 7);
 }
 
+/// Hands context to its run while it runs, then runs as long as [`SlowTool`].
+struct ContextThenSlowTool {
+    inner: Arc<ScriptedTool>,
+    context: ra_core::hook::HookContextQueue,
+}
+
+#[async_trait]
+impl Tool for ContextThenSlowTool {
+    fn origin(&self) -> &ToolOrigin {
+        self.inner.origin()
+    }
+
+    fn schema(&self) -> &ToolSchema {
+        self.inner.schema()
+    }
+
+    fn options(&self) -> ToolOptions {
+        self.inner.options()
+    }
+
+    async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        self.context
+            .push(vec![Message::developer(
+                "context taken in while the tool ran",
+            )])
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        self.inner.call(context).await
+    }
+}
+
+/// A run that stops softly on its wall clock ends as a completed run, and delivers the context it
+/// had taken in as a completed run does: into the history it hands back, not a checkpoint queue
+/// nobody reads once the run is over.
+#[tokio::test]
+async fn a_soft_wall_clock_stop_delivers_the_context_the_run_took_in() {
+    let context = ra_core::hook::HookContextQueue::default();
+    let tool: Arc<dyn Tool> = Arc::new(ContextThenSlowTool {
+        inner: Arc::new(ScriptedTool::new("write_file")),
+        context: context.clone(),
+    });
+    let model = ScriptedModel::new(vec![ModelResponse::new(vec![tool_call(
+        "c-1",
+        "call-1",
+        "write_file",
+    )])]);
+    let cancel = CancelScope::root();
+    let run = Runner::run(
+        request(vec![tool], &model, &cancel)
+            .with_config(RunConfig::new().with_deadline(Deadline::after(Duration::from_millis(50))))
+            .with_services(ToolServices::new().with_hook_context(context)),
+    );
+    let result = timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Completed {
+            reason: FinishReason::BudgetExhausted
+        }
+    ));
+    let history =
+        serde_json::to_string(&result.continuation_input(ContinuationInput::Normalized)).unwrap();
+    assert!(
+        history.contains("context taken in while the tool ran"),
+        "{history}"
+    );
+}
+
 #[tokio::test]
 async fn cancelling_the_caller_stops_a_pending_budget_closeout_handler() {
     let tool = Arc::new(ScriptedTool::new("write_file"));

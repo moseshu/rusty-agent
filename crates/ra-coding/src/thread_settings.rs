@@ -142,6 +142,7 @@ use std::{
 };
 
 mod network_proxy;
+pub(crate) use network_proxy::ThreadNetworkProxy;
 mod product;
 
 /// The environment id a local thread's commands and network reviews carry: Codex's
@@ -603,6 +604,24 @@ impl CodingThreadSettings {
         self.network_proxy.attach_hooks(hooks);
     }
 
+    /// The settings of a spawned agent's own session: its managed network proxy, and approval,
+    /// permission-grant and MCP-approval state of its own, as Codex initializes them for every
+    /// session, so what one session approves or is granted for itself does not carry over to the
+    /// other. Its permission requests reach the client through `requests`, as its own.
+    pub(crate) fn for_spawned_session(
+        mut self,
+        proxy: Arc<network_proxy::ThreadNetworkProxy>,
+    ) -> Self {
+        self.approvals = Arc::default();
+        self.permissions = Arc::default();
+        self.mcp_approvals = Arc::default();
+        if let Some(requests) = proxy.requests() {
+            self.permissions.attach(requests.clone());
+        }
+        self.network_proxy = proxy;
+        self
+    }
+
     /// What `request_permissions` granted the turn `run_id` while it runs: Codex's
     /// `granted_turn_permissions`.
     #[must_use]
@@ -707,6 +726,21 @@ impl CodingThreadSettingsAdapter {
     /// thread runs with share them.
     pub fn attach_hook_runtime(&self, hooks: Arc<crate::hooks::ProductHookRuntime>) {
         self.initial.attach_hook_runtime(hooks);
+    }
+
+    /// The adapter of one new thread: the managed network proxy and its approval service are this
+    /// thread's own, as Codex creates them for each session it initializes. Every configuration
+    /// the thread runs with keeps this one instance; adapters made from the same factory do not
+    /// share it.
+    #[must_use]
+    pub(crate) fn for_new_thread(mut self) -> Self {
+        self.initial.network_proxy = Arc::default();
+        self
+    }
+
+    /// The thread's managed network proxy.
+    pub(crate) const fn network_proxy(&self) -> &Arc<network_proxy::ThreadNetworkProxy> {
+        &self.initial.network_proxy
     }
 
     /// Decides commands with `exec_policy`'s rules, as Codex's session does with the rules its

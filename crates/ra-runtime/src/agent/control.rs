@@ -133,7 +133,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -159,7 +159,7 @@ use ra_core::{
         SubAgentActivityKind,
     },
     finish::FinishReason,
-    item::{InputItemNormalizer, ModelInputItem, NormalizedInput, RunItem},
+    item::{InputItemNormalizer, Message, ModelInputItem, NormalizedInput, RunItem},
     model::ModelResolver,
     session::{
         InterruptedTurnHistoryMarker, SessionId,
@@ -229,10 +229,15 @@ impl AgentControl {
             max_depth: AtomicUsize::new(usize::MAX),
             rollout_budget: OnceLock::new(),
             rollout_store: OnceLock::new(),
+            root_lineage: OnceLock::new(),
+            reservations: Mutex::new(BTreeMap::new()),
+            frozen_spawns: Mutex::new(Vec::new()),
             spawned_agent_factory: OnceLock::new(),
             shutdown: Mutex::new(None),
             paused_activity: watch::Sender::new(0),
             event_seqs: Mutex::new(HashMap::new()),
+            #[cfg(feature = "test-api")]
+            before_pause: OnceLock::new(),
         });
         Self { tree }
     }
@@ -302,13 +307,59 @@ impl AgentControl {
         store: Arc<dyn RolloutThreadStore>,
         root_session_id: SessionId,
     ) -> Result<Self> {
+        self.set_root_session(root_session_id)?;
         self.tree
             .rollout_store
             .set(store)
             .map_err(|_| Error::config("the agent tree already has a rollout store"))?;
-        // Only ever set here, behind the store, so it cannot already hold another session.
-        let _ = self.tree.root.session_id.set(root_session_id);
         Ok(self)
+    }
+
+    /// Names the session the root's runs belong to, without recording the tree's agents: the
+    /// identity a spawned agent's hooks report as its parent's, and the root and parent sessions
+    /// its spawn record names once the tree is also given a store with
+    /// [`Self::with_rollout_store`], which must then name the same session.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a session other than the one the root already has.
+    pub fn with_root_session_id(self, root_session_id: SessionId) -> Result<Self> {
+        self.set_root_session(root_session_id)?;
+        Ok(self)
+    }
+
+    /// Places the root inside the tree its own thread was spawned in: the root is the thread
+    /// `spawn` describes, resumed on its own, and the spawn records of its agents continue that
+    /// lineage — the original root session, depths counted from the root's own, and paths below its
+    /// own — as Codex derives a spawned thread's depth and path from its parent's source. Addressing
+    /// within this tree is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a second lineage for the same tree.
+    pub fn with_root_lineage(self, spawn: &RolloutThreadSpawn) -> Result<Self> {
+        self.tree
+            .root_lineage
+            .set(RootLineage {
+                root_session_id: spawn.root_session_id().clone(),
+                depth: spawn.depth(),
+                path: spawn.agent_path().clone(),
+            })
+            .map_err(|_| Error::config("the agent tree already has a lineage"))?;
+        Ok(self)
+    }
+
+    fn set_root_session(&self, root_session_id: SessionId) -> Result<()> {
+        match self.tree.root.session_id.get() {
+            Some(existing) if *existing != root_session_id => Err(Error::config(format!(
+                "the agent tree's root is session `{existing}`, not `{root_session_id}`"
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                let _ = self.tree.root.session_id.set(root_session_id);
+                Ok(())
+            }
+        }
     }
 
     /// Prepares every agent the tree spawns with `factory`, as Codex's thread manager prepares each
@@ -543,11 +594,11 @@ impl AgentControl {
             AgentControlError::Unsupported(format!("live agent path `{path}` not found"))
         })?;
         let previous = node.status();
-        self.tree
-            .close_subtree(&node, true)
-            .await
-            .map_err(|_| AgentControlError::Unavailable)??;
-        Ok(previous)
+        let report = self.tree.close_subtree(&node, true).finished().await;
+        match report.failed().first() {
+            Some((_, error)) => Err(AgentControlError::Unsupported(error.clone())),
+            None => Ok(previous),
+        }
     }
 
     /// Stops every spawned agent: cancels their runs, waits for them to end, shuts down their
@@ -555,14 +606,23 @@ impl AgentControl {
     /// refused. A rollout that cannot be shut down is logged and kept, and shutting the tree down
     /// again tries it again.
     pub async fn shutdown(&self) {
-        let finished = {
+        drop(self.shutdown_close().finished().await);
+    }
+
+    /// Starts shutting the tree down as [`Self::shutdown`] does, or joins the shutdown in
+    /// progress, and returns what it froze — every spawned agent, and every spawn still preparing
+    /// its agent — before anything is waited for, with the report of how each ended once it is
+    /// done. A shutdown that left an agent's rollout open is started again by the next call.
+    #[must_use]
+    pub fn shutdown_close(&self) -> AgentClose {
+        let (frozen, finished) = {
             let mut shutdown = lock(&self.tree.shutdown);
             if shutdown
                 .as_ref()
-                .is_none_or(|pending| pending.peek() == Some(&false))
+                .is_none_or(|pending| pending.peek().is_some_and(|report| !report.is_complete()))
             {
                 // Admission and shutdown observe the same lock. A preparation already in flight
-                // may finish, but cannot add an agent after shutdown has taken its snapshot.
+                // may finish, but its agent is then admitted closed and stopped here.
                 {
                     let _agents = lock(&self.tree.agents);
                     self.tree.shut_down.store(true, Ordering::Release);
@@ -574,25 +634,227 @@ impl AgentControl {
                     async move {
                         task.await.unwrap_or_else(|error| {
                             tracing::error!(%error, "the agent tree's shutdown task failed");
-                            false
+                            AgentCloseReport::default()
                         })
                     }
                     .boxed()
                     .shared(),
                 );
             }
-            shutdown.as_ref().cloned()
+            (self.tree.live_instances(), shutdown.as_ref().cloned())
         };
+        let (done, receiver) = oneshot::channel();
         if let Some(finished) = finished {
-            finished.await;
+            drop(tokio::spawn(async move {
+                let _ = done.send(finished.await);
+            }));
+        } else {
+            let _ = done.send(AgentCloseReport::default());
         }
+        AgentClose {
+            frozen,
+            finished: receiver,
+        }
+    }
+
+    /// The report of the shutdown in progress or last finished, without starting another: what a
+    /// host closing the tree's thread reads after the thread's own shutdown ran the tree's, so a
+    /// failure there is reported rather than retried at once. Starts a shutdown only when none was
+    /// ever started.
+    pub async fn shutdown_report(&self) -> AgentCloseReport {
+        let started = lock(&self.tree.shutdown).as_ref().cloned();
+        match started {
+            Some(shutdown) => shutdown.await,
+            None => self.shutdown_close().finished().await,
+        }
+    }
+
+    /// Closes the agent of `session_id` and every agent below it, as [`Self::close`] closes the one
+    /// at a path, and returns what the close froze before anything is waited for. Matching on the
+    /// session rather than the path, under the tree's lock, keeps a later agent spawned at the
+    /// same path out of it. A spawn still preparing that agent is frozen and its agent admitted
+    /// closed; one whose cleanup failed is cleaned up again. `None` when the tree has no agent or
+    /// spawn of that session — it has already gone.
+    #[must_use]
+    pub fn close_session(&self, session_id: &SessionId) -> Option<AgentClose> {
+        if let Some(node) = self.tree.node_of_session(session_id) {
+            return Some(self.tree.close_subtree(&node, true));
+        }
+        let reservation = lock(&self.tree.reservations)
+            .values()
+            .find(|reservation| reservation.session_id == *session_id)
+            .map(Arc::clone)?;
+        let target = CloseTarget::freeze(&reservation);
+        Some(self.tree.spawn_close(vec![target], None, None))
+    }
+
+    /// The run the agent of `session_id` is in, and the configuration its runs use: what a
+    /// decision made for that agent while it runs reads, as Codex reads its spawned session's
+    /// active turn. `None` while the agent runs nothing, or when the tree has no such agent.
+    #[must_use]
+    pub fn running_run(&self, session_id: &SessionId) -> Option<(RunId, RunConfig)> {
+        let node = self.tree.node_of_session(session_id)?;
+        let child = node.child.as_ref()?;
+        let run_id = child.running_run.borrow().clone()?;
+        Some((run_id, child.environment.config.clone()))
+    }
+
+    /// Waits until the agent of `session_id` is no longer in the run `run_id`: it ended, the agent
+    /// was closed, or the tree has no such agent.
+    pub async fn run_ended(&self, session_id: &SessionId, run_id: &RunId) {
+        let Some(node) = self.tree.node_of_session(session_id) else {
+            return;
+        };
+        let Some(child) = node.child.as_ref() else {
+            return;
+        };
+        let mut running = child.running_run.subscribe();
+        let _ = running
+            .wait_for(|running| running.as_ref() != Some(run_id))
+            .await;
+    }
+
+    /// Adds `messages` to the context of the agent of `session_id`, as Codex's `inject_no_new_turn`
+    /// adds them to a session: to the run in progress, which takes them in and records them at its
+    /// next step, or, while the agent runs nothing, to the history its next run starts from and
+    /// records. Whether the tree has such an agent.
+    #[must_use]
+    pub fn inject_context(&self, session_id: &SessionId, messages: Vec<Message>) -> bool {
+        let Some(node) = self.tree.node_of_session(session_id) else {
+            return false;
+        };
+        let Some(child) = &node.child else {
+            return false;
+        };
+        let mut state = lock(&child.state);
+        let mut messages = messages;
+        // A run waiting for approval has a fresh lane of its own, which the run reads once it
+        // continues and its cancellation writes to the history: the checkpoint the host answers
+        // is left as it was handed out.
+        if let Some(queue) = &state.run_context {
+            match queue.push(messages) {
+                Ok(()) => return true,
+                Err(rejected) => messages = rejected,
+            }
+        }
+        if state.current_run.is_some() {
+            // The run is ending: its result has not been written back yet, and would replace
+            // anything added to the history now.
+            state.pending_context.extend(messages);
+        } else {
+            append_context(child, &mut state, messages);
+        }
+        true
+    }
+
+    /// Calls `hook` each time a spawned agent's run has stopped for approval, before the tree takes
+    /// the pause: the moment the runner has closed the run's context lane and the paused run's own
+    /// lane is not there yet. Only for tests; a second hook is ignored.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    pub fn set_before_pause_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.tree.before_pause.set(hook);
+    }
+
+    /// Every spawned agent of the tree and every spawn still holding a path, as instances.
+    #[must_use]
+    pub fn live_instances(&self) -> Vec<AgentInstance> {
+        self.tree.live_instances()
+    }
+
+    /// Refuses every further spawn and follow-up run, as [`Self::shutdown`] does, without stopping
+    /// anything yet, and returns every agent and spawn the tree holds at that moment: what a host
+    /// closing the tree's thread freezes before the thread's own `SessionEnd` hooks run, so the
+    /// agents' rollouts are let go of only after them.
+    #[must_use]
+    pub fn stop_spawning(&self) -> Vec<AgentInstance> {
+        {
+            let _agents = lock(&self.tree.agents);
+            self.tree.shut_down.store(true, Ordering::Release);
+            // Reservations are locked after the agents, as everywhere: no spawn is reserved or
+            // settled between the flag and this snapshot.
+            let reservations = lock(&self.tree.reservations);
+            let mut frozen = lock(&self.tree.frozen_spawns);
+            for reservation in reservations.values() {
+                if !frozen.iter().any(|kept| Arc::ptr_eq(kept, reservation)) {
+                    frozen.push(Arc::clone(reservation));
+                }
+            }
+        }
+        self.tree.live_instances()
+    }
+
+    /// Waits until every spawn the tree holds a path for has settled, and reports each: one that
+    /// cleaned up is closed; one whose rollout could not be discarded is not, and stays reserved,
+    /// holding it. A spawn whose cleanup had already failed is cleaned up again first.
+    ///
+    /// [`Self::shutdown`] does not wait for spawns still preparing their agents — the tree refuses
+    /// them when they finish — so a host that must know every rollout of the tree was let go of,
+    /// before moving or removing them, waits here after shutting the tree down.
+    pub async fn settle_spawns(&self) -> AgentCloseReport {
+        let mut reservations: Vec<Arc<Reservation>> = lock(&self.tree.reservations)
+            .values()
+            .map(Arc::clone)
+            .collect();
+        // A spawn the host froze that has settled since is reported too: it cleaned up, and the
+        // host holding it as frozen learns it is closed only here.
+        for frozen in lock(&self.tree.frozen_spawns).iter() {
+            if !reservations
+                .iter()
+                .any(|reservation| Arc::ptr_eq(reservation, frozen))
+            {
+                reservations.push(Arc::clone(frozen));
+            }
+        }
+        let mut report = AgentCloseReport::default();
+        for reservation in reservations {
+            if matches!(
+                *reservation.state.borrow(),
+                ReservationState::CleanupFailed(_)
+            ) {
+                self.tree.retry_reservation(&reservation).await;
+            }
+            match reservation.settled().await {
+                ReservationState::CleanupFailed(error) => {
+                    report.failed.push((reservation.instance(), error));
+                }
+                ReservationState::Admitted(_) => {}
+                ReservationState::Released
+                | ReservationState::Discarded
+                | ReservationState::Pending => report.closed.push(reservation.instance()),
+            }
+        }
+        report
     }
 }
 
 impl Tree {
     /// The tree owns shutdown so cancelling any waiter leaves cleanup running for other waiters.
     /// A failed rollout close permits another shutdown attempt after this task completes.
-    async fn finish_shutdown(&self) -> bool {
+    async fn finish_shutdown(self: &Arc<Self>) -> AgentCloseReport {
+        let mut report = AgentCloseReport::default();
+        // A spawn still preparing its agent is not waited for: the tree refuses the agent when the
+        // preparation finishes, and the spawn cleans up. A spawn whose cleanup already failed is
+        // cleaned up again here; one that cannot be stays reserved for the next shutdown.
+        let failed: Vec<Arc<Reservation>> = lock(&self.reservations)
+            .values()
+            .filter(|reservation| {
+                matches!(
+                    *reservation.state.borrow(),
+                    ReservationState::CleanupFailed(_)
+                )
+            })
+            .map(Arc::clone)
+            .collect();
+        for reservation in failed {
+            self.retry_reservation(&reservation).await;
+            match &*reservation.state.borrow() {
+                ReservationState::CleanupFailed(error) => {
+                    report.failed.push((reservation.instance(), error.clone()));
+                }
+                _ => report.closed.push(reservation.instance()),
+            }
+        }
         loop {
             let tasks = std::mem::take(&mut *lock(&self.tasks));
             if tasks.is_empty() {
@@ -607,7 +869,6 @@ impl Tree {
             .filter(|node| !node.path.is_root())
             .map(Arc::clone)
             .collect();
-        let mut complete = true;
         for node in spawned {
             if let Some(child) = &node.child {
                 drop(lock(&child.state));
@@ -616,11 +877,29 @@ impl Tree {
             }
             // Logged by the node; a rollout that could not be shut down is tried again by the next
             // shutdown.
-            complete &= node.shut_down_rollout().await.is_ok();
+            match node.shut_down_rollout().await {
+                Ok(()) => report.closed.push(node.instance()),
+                Err(error) => report.failed.push((node.instance(), error.to_string())),
+            }
             node.release_resources().await;
             node.status.send_replace(AgentStatus::Shutdown);
         }
-        complete
+        report
+    }
+
+    fn live_instances(&self) -> Vec<AgentInstance> {
+        let agents = lock(&self.agents);
+        let reservations = lock(&self.reservations);
+        agents
+            .values()
+            .filter(|node| !node.path.is_root())
+            .map(|node| node.instance())
+            .chain(
+                reservations
+                    .values()
+                    .map(|reservation| reservation.instance()),
+            )
+            .collect()
     }
 }
 
@@ -775,7 +1054,12 @@ impl AgentHandle {
         if tree.close_descendants_on_cancel.load(Ordering::Acquire)
             && !tree.shut_down.load(Ordering::Acquire)
             && !self.node.is_closed()
-            && let Ok(Err(error)) = tree.close_subtree(&self.node, false).await
+            && let Some((_, error)) = tree
+                .close_subtree(&self.node, false)
+                .finished()
+                .await
+                .failed()
+                .first()
         {
             tracing::warn!(
                 path = %self.node.path,
@@ -909,24 +1193,31 @@ impl AgentControlPort for AgentHandle {
                 max_threads: tree.limiter.max_threads,
             });
         }
-        if lock(&tree.agents).contains_key(&path) {
-            return Err(path_taken(&path));
-        }
+        // As Codex reserves a spawn slot before creating the thread: a spawn the tree refuses never
+        // creates anything, and one it accepts is part of the caller's subtree from here on.
+        let session_id = SessionId::generate();
+        let reservation = tree.reserve(&self.node, &path, &session_id)?;
+        let mut guard = SpawnGuard::new(&tree, Arc::clone(&reservation));
         let prepared = tree
-            .prepare_spawned(&path, agent, request.agent_type())
+            .prepare_spawned(
+                &path,
+                agent,
+                request.agent_type(),
+                &session_id,
+                self.node.session_id.get(),
+                request.fork_mode().is_some(),
+            )
             .await?;
         let config = prepared.configure_run(parent.config().clone(), parent.initial_agent());
         let (agent, resources) = prepared.into_parts();
-        let session_id = SessionId::generate();
-        let rollout =
-            match create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await
-            {
-                Ok(rollout) => rollout,
-                Err(error) => {
-                    release(resources.as_ref()).await;
-                    return Err(error);
-                }
-            };
+        guard.resources.clone_from(&resources);
+        let rollout = parent.child_rollout(
+            create_rollout(&tree, &self.node, &session_id, &path, request.agent_type()).await?,
+        );
+        guard.recorder.clone_from(&rollout);
+        if let (Some(resources), Some(rollout)) = (&resources, &rollout) {
+            resources.rollout_created(rollout);
+        }
 
         let environment = ChildEnvironment {
             agent: Arc::clone(&agent),
@@ -935,25 +1226,33 @@ impl AgentControlPort for AgentHandle {
             app_context: parent.app_context().map(Arc::clone),
             services: parent.services().clone(),
             spawned_by: parent.run_id().clone(),
-            rollout: parent.child_rollout(rollout),
+            rollout,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
-            resources: resources.clone(),
+            resources,
         };
         let child = ChildRuntime::new(
             environment,
             tree.cancel.child(ScopeKind::custom("agent")),
             history,
         );
-        let node = Arc::new(AgentNode::new(
+        let node = Arc::new(AgentNode::with_instance(
             path.clone(),
             Some(agent.id().clone()),
             Some(child),
+            reservation.instance,
         ));
         let _ = node.session_id.set(session_id);
-        if let Err(refusal) = tree.admit(&self.node, &node) {
-            let _ = node.shut_down_rollout().await;
-            node.release_resources().await;
-            return Err(refusal);
+        match tree.commit(&reservation, &node) {
+            Commit::Admitted => guard.disarm(),
+            // A close that reached the reservation first now closes the agent: it was admitted
+            // closed, and the close it was frozen by stops it like any other agent of the subtree.
+            Commit::AdmittedClosed(refusal) => {
+                guard.disarm();
+                return Err(refusal);
+            }
+            // The tree shut down meanwhile: the agent is not admitted, and the guard cleans up
+            // what the spawn has of it.
+            Commit::Refused(refusal) => return Err(refusal),
         }
         node.mailbox.push_from(
             InterAgentCommunication::from_agent(
@@ -1094,12 +1393,6 @@ fn spawned_declaration(
 }
 
 /// Releases a spawned agent's own resources, if it was given any.
-async fn release(resources: Option<&Arc<dyn SpawnedAgentResources>>) {
-    if let Some(resources) = resources {
-        resources.shutdown().await;
-    }
-}
-
 fn path_taken(path: &AgentPath) -> AgentControlError {
     AgentControlError::Unsupported(format!("agent path `{path}` already exists"))
 }
@@ -1121,12 +1414,21 @@ async fn create_rollout(
     else {
         return Err(AgentControlError::Unavailable);
     };
-    let mut spawn = RolloutThreadSpawn::new(
-        root_session_id.clone(),
-        parent_session_id.clone(),
-        u32::try_from(depth(path)).unwrap_or(u32::MAX),
-        path.clone(),
-    );
+    let local_depth = u32::try_from(depth(path)).unwrap_or(u32::MAX);
+    let mut spawn = match tree.root_lineage.get() {
+        None => RolloutThreadSpawn::new(
+            root_session_id.clone(),
+            parent_session_id.clone(),
+            local_depth,
+            path.clone(),
+        ),
+        Some(lineage) => RolloutThreadSpawn::new(
+            lineage.root_session_id.clone(),
+            parent_session_id.clone(),
+            lineage.depth.saturating_add(local_depth),
+            below(&lineage.path, path).map_err(AgentControlError::Unsupported)?,
+        ),
+    };
     if let Some(agent_type) = agent_type {
         spawn = spawn.with_agent_type(agent_type.clone());
     }
@@ -1193,13 +1495,34 @@ struct Tree {
     /// How each spawned agent is prepared, once the host has given the tree a factory.
     spawned_agent_factory: OnceLock<Arc<dyn SpawnedAgentFactory>>,
     /// The shared shutdown task; a failed rollout close can replace a completed attempt.
-    shutdown: Mutex<Option<Shared<BoxFuture<'static, bool>>>>,
+    shutdown: Mutex<Option<Shared<BoxFuture<'static, AgentCloseReport>>>>,
     /// Ticks whenever an agent's run pauses for approval.
     paused_activity: watch::Sender<u64>,
+    /// The spawns [`AgentControl::stop_spawning`] returned, kept with their outcome after they
+    /// settle and leave `reservations`, so [`AgentControl::settle_spawns`] reports a spawn the host
+    /// froze as closed even once nothing of it is left in the tree.
+    frozen_spawns: Mutex<Vec<Arc<Reservation>>>,
+    /// Called once a run has stopped for approval and before the tree takes its pause.
+    #[cfg(feature = "test-api")]
+    before_pause: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     /// The host event sequence of every run that has named itself as the origin of another run,
     /// which records that run's completion from it later. Kept for the tree's lifetime: the run
     /// may be continued at any time, and its continuation must draw from the same sequence.
     event_seqs: Mutex<HashMap<RunId, EventSeqAllocator>>,
+    /// Where the root itself sits in a larger tree, for a root that is itself a spawned thread.
+    root_lineage: OnceLock<RootLineage>,
+    /// Paths reserved by spawns that have not yet added their agent, or whose cleanup failed.
+    /// Locked after `agents` whenever both are held.
+    reservations: Mutex<BTreeMap<AgentPath, Arc<Reservation>>>,
+}
+
+/// The spawn record of a root that is itself a spawned thread, resumed on its own: what its
+/// agents' spawn records continue from, as Codex derives a spawned thread's depth and path from its
+/// parent's source.
+struct RootLineage {
+    root_session_id: SessionId,
+    depth: u32,
+    path: AgentPath,
 }
 
 impl Tree {
@@ -1210,12 +1533,22 @@ impl Tree {
         path: &AgentPath,
         agent: Arc<AgentSpec>,
         agent_type: Option<&AgentId>,
+        session_id: &SessionId,
+        parent_session_id: Option<&SessionId>,
+        forked: bool,
     ) -> Result<PreparedSpawnedAgent, AgentControlError> {
         let Some(factory) = self.spawned_agent_factory.get() else {
             return Ok(PreparedSpawnedAgent::new(agent));
         };
         factory
-            .prepare(SpawnedAgentRequest::new(path, &agent, agent_type))
+            .prepare(SpawnedAgentRequest::new(
+                path,
+                &agent,
+                agent_type,
+                session_id,
+                parent_session_id,
+                forked,
+            ))
             .await
             .map_err(|error| {
                 AgentControlError::Unsupported(format!(
@@ -1224,13 +1557,20 @@ impl Tree {
             })
     }
 
-    /// Adds `node` below `caller`, unless the caller or its subtree is being closed or the path is
-    /// taken.
+    /// Reserves `path` below `caller` for the agent of `session_id`, unless the tree is shut down,
+    /// the caller or its subtree is being closed, or the path is taken by an agent or another
+    /// reservation: Codex's `reserve_spawn_slot`, which comes before anything of the agent exists.
     ///
     /// Checked under the lock a close marks its subtree under, so a spawn racing a close cannot
-    /// leave a child below an agent that is going away, or add one to a subtree being emptied.
-    fn admit(&self, caller: &AgentNode, node: &Arc<AgentNode>) -> Result<(), AgentControlError> {
-        let mut agents = lock(&self.agents);
+    /// leave a child below an agent that is going away, or add one to a subtree being emptied; a
+    /// close that comes after the reservation freezes it and waits for it to settle.
+    fn reserve(
+        &self,
+        caller: &AgentNode,
+        path: &AgentPath,
+        session_id: &SessionId,
+    ) -> Result<Arc<Reservation>, AgentControlError> {
+        let agents = lock(&self.agents);
         if self.shut_down.load(Ordering::Acquire) {
             return Err(AgentControlError::Unavailable);
         }
@@ -1240,11 +1580,129 @@ impl Tree {
         if caller.is_closing_subtree() {
             return Err(closing_error(&caller.path));
         }
-        if agents.contains_key(&node.path) {
-            return Err(path_taken(&node.path));
+        let mut reservations = lock(&self.reservations);
+        if agents.contains_key(path) || reservations.contains_key(path) {
+            return Err(path_taken(path));
         }
-        agents.insert(node.path.clone(), Arc::clone(node));
-        Ok(())
+        let reservation = Arc::new(Reservation::new(path.clone(), session_id.clone()));
+        reservations.insert(path.clone(), Arc::clone(&reservation));
+        Ok(reservation)
+    }
+
+    /// Replaces `reservation` with `node`, its agent. Once the tree has shut down the agent is not
+    /// admitted: the spawn is refused and its guard cleans up, as a preparation the shutdown did
+    /// not wait for is refused when it finishes. A reservation a close has frozen is still
+    /// admitted — its rollout exists and belongs to the subtree being closed — but closed, with its
+    /// run scope cancelled, and the close that froze it stops it; the spawn is then refused.
+    fn commit(&self, reservation: &Arc<Reservation>, node: &Arc<AgentNode>) -> Commit {
+        let frozen = {
+            let mut agents = lock(&self.agents);
+            if self.shut_down.load(Ordering::Acquire) {
+                return Commit::Refused(AgentControlError::Unavailable);
+            }
+            let mut reservations = lock(&self.reservations);
+            reservations.remove(&reservation.path);
+            agents.insert(node.path.clone(), Arc::clone(node));
+            let frozen = reservation.frozen.load(Ordering::Acquire);
+            if frozen {
+                node.closed.store(true, Ordering::Release);
+            }
+            frozen
+        };
+        if frozen && let Some(child) = &node.child {
+            child.scope.cancel(CancelReason::Shutdown);
+        }
+        reservation
+            .state
+            .send_replace(ReservationState::Admitted(Arc::clone(node)));
+        if frozen {
+            Commit::AdmittedClosed(closing_error(&node.path))
+        } else {
+            Commit::Admitted
+        }
+    }
+
+    /// Cleans up after a spawn that ended before its agent was admitted — refused by the factory or
+    /// the store, failed, or cancelled — as Codex's `PendingSpawn` cleans up a cancelled child:
+    /// the recorder is discarded, then the resources are released, then the path is freed. A
+    /// recorder that cannot be discarded keeps the reservation, holding it, for a later close to
+    /// try again.
+    async fn settle_reservation(
+        &self,
+        reservation: &Arc<Reservation>,
+        recorder: Option<Arc<dyn RolloutRecorder>>,
+        resources: Option<Arc<dyn SpawnedAgentResources>>,
+    ) {
+        if let Some(resources) = resources {
+            resources.shutdown().await;
+        }
+        if let Some(recorder) = recorder {
+            if let Err(error) = recorder.discard().await {
+                tracing::warn!(
+                    path = %reservation.path,
+                    %error,
+                    "a spawn that never started could not discard its rollout; closing it again \
+                     retries"
+                );
+                *lock(&reservation.undiscarded) = Some(recorder);
+                reservation
+                    .state
+                    .send_replace(ReservationState::CleanupFailed(error.to_string()));
+                return;
+            }
+            self.free_reservation(reservation);
+            reservation.state.send_replace(ReservationState::Discarded);
+        } else {
+            self.free_reservation(reservation);
+            reservation.state.send_replace(ReservationState::Released);
+        }
+    }
+
+    /// Tries again to discard the rollout of a spawn whose cleanup failed. Every caller that
+    /// arrives while a retry runs waits for that one and sees its outcome, so none of them reports
+    /// the path free before the rollout was actually discarded. The retry runs as a task of the
+    /// tree, so a caller that stops waiting does not leave the recorder taken.
+    async fn retry_reservation(self: &Arc<Self>, reservation: &Arc<Reservation>) {
+        let retry = {
+            let mut retrying = lock(&reservation.retrying);
+            if let Some(retry) = retrying.as_ref().filter(|retry| retry.peek().is_none()) {
+                retry.clone()
+            } else {
+                let tree = Arc::clone(self);
+                let target = Arc::clone(reservation);
+                let task = tokio::spawn(async move {
+                    let recorder = lock(&target.undiscarded).take();
+                    if recorder.is_some() {
+                        tree.settle_reservation(&target, recorder, None).await;
+                    }
+                });
+                let retry = async move {
+                    drop(task.await);
+                }
+                .boxed()
+                .shared();
+                *retrying = Some(retry.clone());
+                retry
+            }
+        };
+        retry.await;
+    }
+
+    fn free_reservation(&self, reservation: &Arc<Reservation>) {
+        let mut reservations = lock(&self.reservations);
+        if reservations
+            .get(&reservation.path)
+            .is_some_and(|current| Arc::ptr_eq(current, reservation))
+        {
+            reservations.remove(&reservation.path);
+        }
+    }
+
+    /// Keeps `task` as one of the tree's, which shutting the tree down waits for.
+    fn keep_task(&self, task: JoinHandle<()>) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     /// The authoritative sequence of `allocator`'s run, registering `allocator` as that sequence
@@ -1283,6 +1741,13 @@ impl Tree {
 
     fn node(&self, path: &AgentPath) -> Option<Arc<AgentNode>> {
         lock(&self.agents).get(path).map(Arc::clone)
+    }
+
+    fn node_of_session(&self, session_id: &SessionId) -> Option<Arc<AgentNode>> {
+        lock(&self.agents)
+            .values()
+            .find(|node| !node.path.is_root() && node.session_id.get() == Some(session_id))
+            .map(Arc::clone)
     }
 
     /// Codex's `exceeds_thread_spawn_depth_limit` for an agent `caller` would spawn.
@@ -1329,63 +1794,168 @@ impl Tree {
     /// - The waiting and removal run as a task of the tree rather than in the caller, so a caller
     ///   that stops waiting — a timeout, a `select!` — does not leave closed agents behind.
     ///   [`AgentControl::shutdown`] waits for that task like any other.
-    fn close_subtree(
-        self: &Arc<Self>,
-        node: &Arc<AgentNode>,
-        including_node: bool,
-    ) -> oneshot::Receiver<Result<(), AgentControlError>> {
-        let (doomed, closing) = {
+    fn close_subtree(self: &Arc<Self>, node: &Arc<AgentNode>, including_node: bool) -> AgentClose {
+        let mut targets = self.freeze_subtree(node, including_node);
+        // Segment-wise order is a depth-first walk that visits siblings by name, which is the
+        // order Codex's walk produces; plain string order would put `a-b` before `a/b`.
+        targets.sort_by(|left, right| {
+            left.path()
+                .as_str()
+                .split('/')
+                .cmp(right.path().as_str().split('/'))
+        });
+        let closing = ClosingSubtree::new(Arc::clone(node));
+        let target = including_node.then(|| node.path.clone());
+        self.spawn_close(targets, target, Some(closing))
+    }
+
+    /// Marks every agent below `node` — and `node` itself with `including_node`, unless it is the
+    /// root — closed, and every reservation below it frozen, under the lock spawns take, then
+    /// cancels the agents' runs.
+    fn freeze_subtree(&self, node: &Arc<AgentNode>, including_node: bool) -> Vec<CloseTarget> {
+        let targets = {
             let agents = lock(&self.agents);
-            let mut doomed: Vec<Arc<AgentNode>> = agents
-                .values()
-                .filter(|other| other.path.starts_with(&node.path))
-                .filter(|other| !other.path.is_root())
-                .filter(|other| including_node || other.path != node.path)
-                .map(Arc::clone)
-                .collect();
-            // Segment-wise order is a depth-first walk that visits siblings by name, which is the
-            // order Codex's walk produces; plain string order would put `a-b` before `a/b`.
-            doomed.sort_by(|left, right| {
-                left.path
-                    .as_str()
-                    .split('/')
-                    .cmp(right.path.as_str().split('/'))
-            });
-            for agent in &doomed {
-                agent.closed.store(true, Ordering::Release);
+            // The paths below `node` are its subtree only while `node` is the agent at its path: once
+            // it has gone, a later agent spawned at the same path is another instance with a
+            // subtree of its own, which this close must not reach.
+            if !node.path.is_root()
+                && !agents
+                    .get(&node.path)
+                    .is_some_and(|current| Arc::ptr_eq(current, node))
+            {
+                return Vec::new();
             }
-            (doomed, ClosingSubtree::new(Arc::clone(node)))
+            let reservations = lock(&self.reservations);
+            let below = |path: &AgentPath| {
+                path.starts_with(&node.path)
+                    && !path.is_root()
+                    && (including_node || *path != node.path)
+            };
+            let mut targets: Vec<CloseTarget> = agents
+                .values()
+                .filter(|other| below(&other.path))
+                .map(|agent| {
+                    agent.closed.store(true, Ordering::Release);
+                    CloseTarget::Agent(Arc::clone(agent))
+                })
+                .collect();
+            targets.extend(
+                reservations
+                    .values()
+                    .filter(|reservation| below(&reservation.path))
+                    .map(CloseTarget::freeze),
+            );
+            targets
         };
-        for agent in &doomed {
-            if let Some(child) = &agent.child {
+        for target in &targets {
+            if let CloseTarget::Agent(agent) = target
+                && let Some(child) = &agent.child
+            {
                 child.scope.cancel(CancelReason::Shutdown);
             }
         }
+        targets
+    }
+
+    /// Stops `targets` in order as a task of the tree, and reports how each ended.
+    ///
+    /// As Codex's `shutdown_agent_tree`: the agent named `target` is followed by its descendants
+    /// even when it fails, while a descendant's failure ends the close there. Whatever is left
+    /// stays in the tree, closed, for a later close to finish.
+    fn spawn_close(
+        self: &Arc<Self>,
+        targets: Vec<CloseTarget>,
+        target: Option<AgentPath>,
+        closing: Option<ClosingSubtree>,
+    ) -> AgentClose {
+        let frozen = targets.iter().map(CloseTarget::instance).collect();
         let tree = Arc::clone(self);
         let (done, finished) = oneshot::channel();
-        let target = including_node.then(|| node.path.clone());
         let task = tokio::spawn(async move {
-            // As Codex's `shutdown_agent_tree`: the agent's own failure is reported once its
-            // descendants are stopped, while a descendant's failure ends the close there. Whatever
-            // is left stays in the tree, closed, for a later close to finish.
-            let mut result = Ok(());
-            for agent in doomed {
-                if let Err(error) = tree.stop(&agent).await {
-                    let is_target = target.as_ref() == Some(&agent.path);
-                    result = Err(error);
-                    if !is_target {
-                        break;
+            let mut report = AgentCloseReport::default();
+            let mut remaining = targets.into_iter();
+            while let Some(next) = remaining.next() {
+                let instance = next.instance();
+                let is_target = target.as_ref() == Some(next.path());
+                match tree.close_target(next).await {
+                    Ok(()) => report.closed.push(instance),
+                    Err(error) => {
+                        report.failed.push((instance, error));
+                        if !is_target {
+                            report.failed.extend(remaining.by_ref().map(|left| {
+                                (
+                                    left.instance(),
+                                    "not reached: an earlier agent of the close failed".to_owned(),
+                                )
+                            }));
+                        }
                     }
                 }
             }
             drop(closing);
             // Nobody may be waiting any more; the close is done either way.
-            let _ = done.send(result);
+            let _ = done.send(report);
         });
-        let mut tasks = lock(&self.tasks);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
-        finished
+        self.keep_task(task);
+        AgentClose { frozen, finished }
+    }
+
+    async fn close_target(
+        self: &Arc<Self>,
+        target: CloseTarget,
+    ) -> std::result::Result<(), String> {
+        match target {
+            CloseTarget::Agent(agent) => self.stop_once(&agent).await,
+            CloseTarget::Reservation {
+                reservation,
+                failed_before,
+            } => {
+                if failed_before {
+                    self.retry_reservation(&reservation).await;
+                }
+                match reservation.settled().await {
+                    ReservationState::Admitted(agent) => self.stop_once(&agent).await,
+                    ReservationState::Released
+                    | ReservationState::Discarded
+                    | ReservationState::Pending => Ok(()),
+                    ReservationState::CleanupFailed(error) => Err(format!(
+                        "the spawn of `{}` could not discard its rollout: {error}; close it again \
+                         to retry",
+                        reservation.path
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Stops `node` once: a close that reaches an agent whose stop is in progress waits for it and
+    /// shares its result, and only a stop that has failed is attempted again. The stop runs as a
+    /// task of the tree, so no caller's cancellation abandons it.
+    async fn stop_once(self: &Arc<Self>, node: &Arc<AgentNode>) -> std::result::Result<(), String> {
+        let stopping = {
+            let mut stopping = lock(&node.stopping);
+            let reusable = stopping
+                .as_ref()
+                .filter(|stop| stop.peek().is_none_or(std::result::Result::is_ok));
+            if let Some(stop) = reusable {
+                stop.clone()
+            } else {
+                let tree = Arc::clone(self);
+                let agent = Arc::clone(node);
+                let task = tokio::spawn(async move {
+                    tree.stop(&agent).await.map_err(|error| error.to_string())
+                });
+                let stop = async move {
+                    task.await
+                        .unwrap_or_else(|error| Err(format!("the agent's stop failed: {error}")))
+                }
+                .boxed()
+                .shared();
+                *stopping = Some(stop.clone());
+                stop
+            }
+        };
+        stopping.await
     }
 
     /// Waits for a closed agent's cancelled run to end, shuts down its rollout, and removes the
@@ -1503,14 +2073,20 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
         )
         .await;
         drop(guard);
+        child.running_run.send_replace(None);
 
         let mut state = lock(&child.state);
+        state.run_context = None;
+        let pending = std::mem::take(&mut state.pending_context);
         // A run that started recorded its whole input, and its history follows from what it
         // recorded; one that never started recorded nothing, and its input is still to be.
         if started {
             state.recorded = history.len();
         }
         state.history = history;
+        if !pending.is_empty() {
+            append_context(child, &mut state, pending);
+        }
         let shut_down = tree
             .upgrade()
             .is_none_or(|tree| tree.shut_down.load(Ordering::Acquire));
@@ -1546,6 +2122,8 @@ async fn run_to_end(
         recorded,
         parent_run_id,
     };
+    // The lane the run reads injected context from; see below for how a pause moves it.
+    let mut hook_context = ra_core::hook::HookContextQueue::default();
     loop {
         let (state, history, event_seqs) = match run_once(
             &child.environment,
@@ -1553,6 +2131,7 @@ async fn run_to_end(
             scope.clone(),
             start,
             fallback,
+            &hook_context,
         )
         .await
         {
@@ -1565,12 +2144,25 @@ async fn run_to_end(
             } => (state, history, event_seqs),
         };
         let run_id = state.run_id().clone();
+        #[cfg(feature = "test-api")]
+        if let Some(before_pause) = tree
+            .upgrade()
+            .and_then(|tree| tree.before_pause.get().cloned())
+        {
+            before_pause();
+        }
+        // The context the checkpoint already holds, which a cancelled run writes to its history.
+        let context_on_cancel = state.as_ref().clone().take_hook_context();
         let (resume, answered) = oneshot::channel();
-        lock(&child.state).paused = Some(PausedRun {
-            state: *state,
-            resume,
-            event_seqs,
-        });
+        park_paused_run(
+            child,
+            &mut hook_context,
+            PausedRun {
+                state: *state,
+                resume,
+                event_seqs,
+            },
+        );
         if let Some(tree) = tree.upgrade() {
             tree.paused_activity
                 .send_modify(|count| *count = count.wrapping_add(1));
@@ -1586,6 +2178,13 @@ async fn run_to_end(
         }
         let Some(state) = answered else {
             let mut history = history;
+            record_undelivered_context(
+                tree,
+                child.environment.rollout.as_ref(),
+                &mut history,
+                context_on_cancel,
+                hook_context.close_entries(),
+            );
             if let Err(error) = scope.ensure_not_cancelled() {
                 // The run ends here rather than in the runner, whose last segment ended paused: as
                 // Codex aborts a turn that is waiting for approval, it ends cancelled, after the
@@ -1605,14 +2204,75 @@ async fn run_to_end(
                     history.push(input);
                 }
                 if let Some(rollout) = &child.environment.rollout {
-                    record_cancelled(rollout.as_ref(), run_id, marker).await;
+                    record_cancelled(rollout.as_ref(), run_id.clone(), marker).await;
                 }
                 handle.run_ended(&Err(error)).await;
+                if let Some(resources) = &child.environment.resources {
+                    resources.run_ended(&run_id);
+                }
             }
             return (history, true);
         };
         fallback = history;
         start = RunStart::Resume(Box::new(state));
+    }
+}
+
+/// Keeps `paused` with the agent until the host answers it, as the thread parks a paused turn.
+///
+/// The runner closed the run's lane when the run stopped, so the agent moves to a fresh one, which
+/// the continued run reads: context injected while the host answers is neither lost nor added to
+/// the checkpoint handed out. Context that arrived after the runner closed the old lane went to the
+/// agent's pending context, which the tree reads only once the whole run ends: it moves to the new
+/// lane as well, so the continued run reads it too.
+fn park_paused_run(
+    child: &ChildRuntime,
+    hook_context: &mut ra_core::hook::HookContextQueue,
+    paused: PausedRun,
+) {
+    let mut child_state = lock(&child.state);
+    if hook_context.is_closed() {
+        *hook_context = ra_core::hook::HookContextQueue::default();
+    }
+    let arrived = std::mem::take(&mut child_state.pending_context);
+    if !arrived.is_empty()
+        && let Err(rejected) = hook_context.push(arrived)
+    {
+        child_state.pending_context = rejected;
+    }
+    child_state.run_context = Some(hook_context.clone());
+    child_state.paused = Some(paused);
+}
+
+/// Writes the context a run took in but never delivered to its history and rollout — a run waiting
+/// for approval that is cancelled instead of continued, or a run that fails or is cancelled before
+/// its next step: what its checkpoint held, then what its lane received. As the thread does for
+/// such a turn, background context is dropped once the tree is shutting down.
+fn record_undelivered_context(
+    tree: &Weak<Tree>,
+    rollout: Option<&Arc<dyn RolloutRecorder>>,
+    history: &mut Vec<ModelInputItem>,
+    checkpointed: Vec<Message>,
+    queued: (
+        Vec<(Message, ra_core::hook::HookContextOrigin)>,
+        Vec<String>,
+    ),
+) {
+    let shutting_down = tree
+        .upgrade()
+        .is_none_or(|tree| tree.shut_down.load(Ordering::Acquire));
+    let queued = queued.0.into_iter().filter_map(|(message, origin)| {
+        (!shutting_down || origin == ra_core::hook::HookContextOrigin::Synchronous)
+            .then_some(message)
+    });
+    for message in checkpointed.into_iter().chain(queued) {
+        if let Some(rollout) = rollout {
+            rollout.record(RolloutItem::Item(RunItem::new(
+                ra_core::item::ItemId::new(uuid::Uuid::now_v7().to_string()),
+                ra_core::item::RunItemKind::Message(message.clone()),
+            )));
+        }
+        history.push(ModelInputItem::Message(message));
     }
 }
 
@@ -1662,7 +2322,18 @@ async fn run_once(
     scope: CancelScope,
     start: RunStart,
     fallback: Vec<ModelInputItem>,
+    hook_context: &ra_core::hook::HookContextQueue,
 ) -> RunEnd {
+    let run_id = match &start {
+        RunStart::Fresh { .. } => RunId::generate(),
+        RunStart::Resume(state) => state.run_id().clone(),
+    };
+    let lane = hook_context;
+    let hook_context = hook_context.clone();
+    if let Some(child) = &handle.node.child {
+        child.running_run.send_replace(Some(run_id.clone()));
+        lock(&child.state).run_context = Some(hook_context.clone());
+    }
     let request = match start {
         RunStart::Fresh {
             input,
@@ -1672,7 +2343,7 @@ async fn run_once(
             let request = RunRequest::new(
                 AgentBinding::direct(Arc::clone(&environment.agent)),
                 Arc::clone(&environment.model_resolver),
-                RunId::generate(),
+                run_id.clone(),
                 scope,
                 input,
             )
@@ -1689,7 +2360,7 @@ async fn run_once(
         RunStart::Resume(state) => Ok(RunRequest::new(
             AgentBinding::direct(Arc::clone(&environment.agent)),
             Arc::clone(&environment.model_resolver),
-            state.run_id().clone(),
+            run_id.clone(),
             scope,
             Vec::new(),
         )
@@ -1698,13 +2369,9 @@ async fn run_once(
     let mut request = match request {
         Ok(request) => request
             .with_config(environment.config.clone())
-            .with_services(
-                environment
-                    .services
-                    .clone()
-                    .with_hook_context(ra_core::hook::HookContextQueue::default()),
-            )
-            .with_agent_control(handle.clone()),
+            .with_services(environment.services.clone().with_hook_context(hook_context))
+            .with_agent_control(handle.clone())
+            .leaving_failed_context_queued(),
         Err(error) => {
             handle.run_finished(&Err(error));
             return RunEnd::NotStarted(fallback);
@@ -1728,15 +2395,38 @@ async fn run_once(
             produced.push(item);
         }
     }
-    match stream.finish().await {
-        Ok(result) if !result.outcome().interruptions().is_empty() => RunEnd::Paused {
-            history: result.continuation_input(ContinuationInput::Normalized),
-            state: Box::new(result.state().clone()),
-            event_seqs,
-        },
+    let end = match stream.finish().await {
+        Ok(result) if !result.outcome().interruptions().is_empty() => {
+            return RunEnd::Paused {
+                history: result.continuation_input(ContinuationInput::Normalized),
+                state: Box::new(result.state().clone()),
+                event_seqs,
+            };
+        }
         Ok(result) => RunEnd::Finished(result.continuation_input(ContinuationInput::Normalized)),
-        Err(_) => RunEnd::Finished(partial_history(fallback, &produced)),
+        Err(error) => {
+            // What the run took in and had not delivered is left in its lane, sealed, with where
+            // each entry came from; a checkpoint its error carries may hold context from before
+            // the run continued. As the thread does with a failed turn, both join the history the
+            // agent goes on from, after what the run settled, and its rollout.
+            let mut history = partial_history(fallback, &produced);
+            let checkpointed = error
+                .run_state()
+                .map_or_else(Vec::new, |state| state.clone().take_hook_context());
+            record_undelivered_context(
+                &handle.tree,
+                environment.rollout.as_ref(),
+                &mut history,
+                checkpointed,
+                lane.close_entries(),
+            );
+            RunEnd::Finished(history)
+        }
+    };
+    if let Some(resources) = &environment.resources {
+        resources.run_ended(&run_id);
     }
+    end
 }
 
 /// The history after a run that returned no result: its input and the records of the turns it
@@ -1753,6 +2443,11 @@ pub(crate) fn partial_history(
 
 struct AgentNode {
     path: AgentPath,
+    /// Which agent of its session this is; see [`AgentInstance`].
+    instance: u64,
+    /// The stop in progress, shared by every close that reaches the agent while it runs; a stop
+    /// that failed is replaced by the next close's.
+    stopping: Mutex<Option<SharedStop>>,
     /// The session of the agent's own rollout; the root's once the tree is given a store.
     session_id: OnceLock<SessionId>,
     agent_id: Mutex<Option<AgentId>>,
@@ -1774,8 +2469,19 @@ struct AgentNode {
 
 impl AgentNode {
     fn new(path: AgentPath, agent_id: Option<AgentId>, child: Option<ChildRuntime>) -> Self {
+        Self::with_instance(path, agent_id, child, next_instance())
+    }
+
+    fn with_instance(
+        path: AgentPath,
+        agent_id: Option<AgentId>,
+        child: Option<ChildRuntime>,
+        instance: u64,
+    ) -> Self {
         Self {
             path,
+            instance,
+            stopping: Mutex::new(None),
             session_id: OnceLock::new(),
             agent_id: Mutex::new(agent_id),
             status: watch::Sender::new(AgentStatus::PendingInit),
@@ -1791,6 +2497,17 @@ impl AgentNode {
 
     fn status(&self) -> AgentStatus {
         self.status.borrow().clone()
+    }
+
+    fn instance(&self) -> AgentInstance {
+        AgentInstance {
+            session_id: self
+                .session_id
+                .get()
+                .cloned()
+                .unwrap_or_else(|| SessionId::new(self.path.as_str())),
+            instance: self.instance,
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -1822,7 +2539,9 @@ impl AgentNode {
         if self.rollout_shut_down.load(Ordering::Acquire) {
             return Ok(());
         }
-        match rollout.shutdown().await {
+        // Codex's `shutdown_live_agent` materializes and flushes the thread before shutting it
+        // down, so an agent that recorded nothing still leaves its rollout behind.
+        match rollout.shutdown_materialized().await {
             Ok(()) => {
                 self.rollout_shut_down.store(true, Ordering::Release);
                 Ok(())
@@ -1875,6 +2594,254 @@ impl AgentNode {
 }
 
 /// Holds an agent's subtree closed to new spawns for as long as a close of it is in progress.
+/// A path a spawn holds before its agent exists: Codex's `SpawnReservation`.
+struct Reservation {
+    path: AgentPath,
+    session_id: SessionId,
+    instance: u64,
+    /// Set by a close or the tree's shutdown that reached the reservation; the agent is then
+    /// admitted closed.
+    frozen: AtomicBool,
+    state: watch::Sender<ReservationState>,
+    /// The rollout of a spawn whose cleanup could not discard it, kept for a later close to retry.
+    undiscarded: Mutex<Option<Arc<dyn RolloutRecorder>>>,
+    /// The retry of that cleanup in progress, shared by everyone closing the reservation.
+    retrying: Mutex<Option<Shared<BoxFuture<'static, ()>>>>,
+}
+
+impl Reservation {
+    fn new(path: AgentPath, session_id: SessionId) -> Self {
+        Self {
+            path,
+            session_id,
+            instance: next_instance(),
+            frozen: AtomicBool::new(false),
+            state: watch::Sender::new(ReservationState::Pending),
+            undiscarded: Mutex::new(None),
+            retrying: Mutex::new(None),
+        }
+    }
+
+    fn instance(&self) -> AgentInstance {
+        AgentInstance {
+            session_id: self.session_id.clone(),
+            instance: self.instance,
+        }
+    }
+
+    /// Waits until the spawn holding the reservation has admitted its agent or cleaned up.
+    async fn settled(&self) -> ReservationState {
+        let mut state = self.state.subscribe();
+        let settled = state
+            .wait_for(|state| !matches!(state, ReservationState::Pending))
+            .await
+            .map(|state| state.clone());
+        // The sender lives in the reservation held here, so the wait cannot fail.
+        settled.unwrap_or(ReservationState::Released)
+    }
+}
+
+/// How a spawn's agent was taken into the tree.
+enum Commit {
+    Admitted,
+    AdmittedClosed(AgentControlError),
+    Refused(AgentControlError),
+}
+
+#[derive(Clone)]
+enum ReservationState {
+    /// The spawn is still preparing the agent.
+    Pending,
+    /// The agent was added to the tree.
+    Admitted(Arc<AgentNode>),
+    /// The spawn ended before anything of the agent's rollout existed.
+    Released,
+    /// The spawn ended after creating the agent's rollout, which was discarded.
+    Discarded,
+    /// The spawn ended and its rollout could not be discarded; the reservation still holds it.
+    CleanupFailed(String),
+}
+
+/// Holds what a spawn has of its agent until the agent is admitted, and cleans it up if the spawn
+/// ends first — returning an error, or dropped while it waits: Codex's `SpawnReservation` and
+/// `PendingSpawn` in one, taking each part over as the spawn gets it, so nothing falls between
+/// them.
+struct SpawnGuard {
+    tree: Weak<Tree>,
+    reservation: Arc<Reservation>,
+    resources: Option<Arc<dyn SpawnedAgentResources>>,
+    recorder: Option<Arc<dyn RolloutRecorder>>,
+    armed: bool,
+}
+
+impl SpawnGuard {
+    fn new(tree: &Arc<Tree>, reservation: Arc<Reservation>) -> Self {
+        Self {
+            tree: Arc::downgrade(tree),
+            reservation,
+            resources: None,
+            recorder: None,
+            armed: true,
+        }
+    }
+
+    /// The agent was admitted: it holds everything from here on.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let reservation = Arc::clone(&self.reservation);
+        let recorder = self.recorder.take();
+        let resources = self.resources.take();
+        let Some(tree) = self.tree.upgrade() else {
+            // The tree is gone, and with it every close that could wait for the reservation.
+            reservation.state.send_replace(ReservationState::Released);
+            return;
+        };
+        // The cleanup belongs to the tree, as its closes do, so the caller's cancellation cannot
+        // abandon it, and shutting the tree down waits for it.
+        let cleanup = Arc::clone(&tree);
+        let task = tokio::spawn(async move {
+            cleanup
+                .settle_reservation(&reservation, recorder, resources)
+                .await;
+        });
+        tree.keep_task(task);
+    }
+}
+
+/// One instance of an agent: its session, and which agent with that session it is.
+///
+/// A session names one rollout, but a thread resumed after it was closed is another instance of
+/// the same session; a close's result says which instance it is about, so it is not taken for
+/// that of a later one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgentInstance {
+    session_id: SessionId,
+    instance: u64,
+}
+
+impl AgentInstance {
+    /// The agent's session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// What a close froze, before it waits for anything, and the result once it has finished.
+#[derive(Debug)]
+pub struct AgentClose {
+    frozen: Vec<AgentInstance>,
+    finished: oneshot::Receiver<AgentCloseReport>,
+}
+
+impl AgentClose {
+    /// Every agent the close stopped from spawning or running, including agents a spawn was still
+    /// preparing, in the order they are closed.
+    #[must_use]
+    pub fn frozen(&self) -> &[AgentInstance] {
+        &self.frozen
+    }
+
+    /// Waits for the close to finish. The close itself belongs to the tree: giving up the wait
+    /// does not stop it, and its report can be awaited later.
+    pub async fn finished(self) -> AgentCloseReport {
+        self.finished.await.unwrap_or_else(|_| AgentCloseReport {
+            closed: Vec::new(),
+            failed: self
+                .frozen
+                .into_iter()
+                .map(|agent| (agent, "the agent tree went away".to_owned()))
+                .collect(),
+        })
+    }
+}
+
+/// How a close ended, agent by agent.
+#[derive(Debug, Clone, Default)]
+pub struct AgentCloseReport {
+    closed: Vec<AgentInstance>,
+    failed: Vec<(AgentInstance, String)>,
+}
+
+impl AgentCloseReport {
+    /// The agents that were closed: their runs ended, their rollouts were written out and let go
+    /// of, and they were removed from the tree. A spawn that had not admitted its agent counts once
+    /// it has cleaned up.
+    #[must_use]
+    pub fn closed(&self) -> &[AgentInstance] {
+        &self.closed
+    }
+
+    /// The agents that are not closed yet, with why: they stay in the tree, closed, holding their
+    /// rollouts, and closing them again tries again.
+    #[must_use]
+    pub fn failed(&self) -> &[(AgentInstance, String)] {
+        &self.failed
+    }
+
+    /// Whether every agent was closed.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+fn next_instance() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The stop of one agent, shared by every close that waits for it.
+type SharedStop = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
+
+/// One thing a close stops: an agent, or a spawn that holds its path but has not admitted its
+/// agent yet.
+enum CloseTarget {
+    Agent(Arc<AgentNode>),
+    Reservation {
+        reservation: Arc<Reservation>,
+        /// Whether its cleanup had already failed when the close reached it, so the close retries
+        /// it rather than waiting for the spawn.
+        failed_before: bool,
+    },
+}
+
+impl CloseTarget {
+    /// Freezes `reservation`: its agent will be admitted closed.
+    fn freeze(reservation: &Arc<Reservation>) -> Self {
+        reservation.frozen.store(true, Ordering::Release);
+        Self::Reservation {
+            reservation: Arc::clone(reservation),
+            failed_before: matches!(
+                *reservation.state.borrow(),
+                ReservationState::CleanupFailed(_)
+            ),
+        }
+    }
+
+    fn path(&self) -> &AgentPath {
+        match self {
+            Self::Agent(agent) => &agent.path,
+            Self::Reservation { reservation, .. } => &reservation.path,
+        }
+    }
+
+    fn instance(&self) -> AgentInstance {
+        match self {
+            Self::Agent(agent) => agent.instance(),
+            Self::Reservation { reservation, .. } => reservation.instance(),
+        }
+    }
+}
+
 struct ClosingSubtree(Arc<AgentNode>);
 
 impl ClosingSubtree {
@@ -1914,6 +2881,8 @@ struct ChildRuntime {
     /// Whether no driver is running the agent: cleared when a run is claimed, set when the
     /// driver hands its last run back. A close waits on it.
     idle: watch::Sender<bool>,
+    /// The run the agent is in, from its start until it ends — through any pause for approval.
+    running_run: watch::Sender<Option<RunId>>,
 }
 
 impl ChildRuntime {
@@ -1932,8 +2901,11 @@ impl ChildRuntime {
                 current_run: None,
                 paused: None,
                 run_origin: None,
+                run_context: None,
+                pending_context: Vec::new(),
             }),
             idle: watch::Sender::new(true),
+            running_run: watch::Sender::new(None),
         }
     }
 }
@@ -1950,6 +2922,11 @@ struct ChildState {
     /// The run whose spawn or follow-up started the current run, whose timeline records the run's
     /// completion.
     run_origin: Option<HostEventEmitter>,
+    /// Where context for the run in progress goes, delivered at its next step.
+    run_context: Option<ra_core::hook::HookContextQueue>,
+    /// Context that arrived while the run was ending, after its queue closed: it joins the history
+    /// once the run's own result is written back, as the thread's pending context does.
+    pending_context: Vec<Message>,
 }
 
 struct PausedRun {
@@ -2118,8 +3095,55 @@ impl Drop for ExecutionGuard {
 }
 
 /// How far below the root `path` is: the root is at 0 and an agent it spawns at 1.
+/// Adds context to the history of an agent that runs nothing: recorded into its rollout at once
+/// and kept as recorded, as Codex's `inject_no_new_turn` records into an idle session, when the
+/// rollout already holds the whole history; otherwise its next run records it with the rest.
+fn append_context(child: &ChildRuntime, state: &mut ChildState, messages: Vec<Message>) {
+    let record_now = state.recorded == state.history.len();
+    for message in messages {
+        if record_now && let Some(rollout) = &child.environment.rollout {
+            rollout.record(RolloutItem::Item(RunItem::new(
+                ra_core::item::ItemId::new(uuid::Uuid::now_v7().to_string()),
+                ra_core::item::RunItemKind::Message(message.clone()),
+            )));
+        }
+        state.history.push(ModelInputItem::Message(message));
+    }
+    if record_now && child.environment.rollout.is_some() {
+        state.recorded = state.history.len();
+        if let Some(rollout) = child.environment.rollout.clone() {
+            drop(tokio::spawn(async move {
+                if let Err(error) = rollout
+                    .persist(ra_core::session::rollout::PersistContext::Standard)
+                    .await
+                {
+                    tracing::warn!(%error, "context injected into an idle agent could not be persisted");
+                }
+            }));
+        }
+    }
+}
+
 fn depth(path: &AgentPath) -> usize {
     std::iter::successors(path.parent(), AgentPath::parent).count()
+}
+
+/// `path`, a path of this tree, placed below `base`: the names below this tree's root, joined onto
+/// `base` in order.
+fn below(base: &AgentPath, path: &AgentPath) -> std::result::Result<AgentPath, String> {
+    let mut ancestry = Vec::new();
+    let mut current = path.clone();
+    while !current.is_root() {
+        ancestry.push(current.name().to_owned());
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    ancestry
+        .iter()
+        .rev()
+        .try_fold(base.clone(), |joined, name| joined.join(name))
 }
 
 /// Locks a mutex whose holders never panic while holding it; a poisoned one is still consistent.

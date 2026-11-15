@@ -1139,6 +1139,9 @@ pub struct RunRequest {
     output_schema: Option<OutputSchema>,
     /// What owns the run from above, when anything does.
     owner: Option<RunOwner>,
+    /// Whether a failed run leaves its undelivered context in its lane for the caller, as a
+    /// thread's run does, rather than in a checkpoint its error may not carry.
+    leaves_failed_context_queued: bool,
 }
 
 impl RunRequest {
@@ -1185,12 +1188,21 @@ impl RunRequest {
             turn_hook_metadata: None,
             output_schema: None,
             owner: None,
+            leaves_failed_context_queued: false,
         }
     }
 
     /// Runs on behalf of `owner`; see [`RunOwner`].
     pub(crate) fn with_owner(mut self, owner: RunOwner) -> Self {
         self.owner = Some(owner);
+        self
+    }
+
+    /// Leaves the context of a run that fails or is cancelled in its lane, sealed, with where each
+    /// entry came from, for the caller that injected it to record: a spawned agent's run, whose
+    /// error does not always carry a checkpoint to find it in.
+    pub(crate) const fn leaving_failed_context_queued(mut self) -> Self {
+        self.leaves_failed_context_queued = true;
         self
     }
 
@@ -2153,6 +2165,7 @@ async fn run_loop_inner(
         turn_hook_metadata,
         output_schema,
         owner,
+        leaves_failed_context_queued,
     } = request;
     if let Some(saved) = state.max_turns() {
         config = config.with_max_turns(saved);
@@ -2671,19 +2684,32 @@ async fn run_loop_inner(
             stepped = Err(error);
         }
     }
+    // Whether the run stops softly on its expired wall clock: it fails here, and ends below as a
+    // completed run, so its undelivered context is delivered as a completed run's is rather than
+    // left to an error.
+    let soft_stop = matches!(
+        &stepped,
+        Err(error) if !state.has_session_write_checkpoint()
+            && is_wall_clock_expiry(error, &cancel, budget_deadline)
+    );
     if let Some(queue) = context.services.hook_context() {
-        if stepped.is_err() && matches!(context.owner, Some(RunOwner::Thread(_))) {
+        if stepped.is_err()
+            && !soft_stop
+            && (leaves_failed_context_queued || matches!(context.owner, Some(RunOwner::Thread(_))))
+        {
             // A thread's run that fails or is cancelled leaves its undelivered context to the
             // thread, which knows where each entry came from: a thread shutting down drops
-            // background results that a turn ending any other way records. Any other run keeps it
-            // in the checkpoint its error carries, for whoever resumes from that.
+            // background results that a turn ending any other way records. A spawned agent's run
+            // leaves it to its tree the same way, since its error carries no checkpoint when it
+            // fails outside one. Any other run keeps it in the checkpoint its error carries, for
+            // whoever resumes from that.
             queue.seal();
         } else {
             let (messages, follow_up) = queue.close_with_follow_up();
             state.queue_hook_context_with_follow_up(messages, follow_up);
         }
     }
-    if matches!(&stepped, Ok(RunOutcome::Completed { .. })) {
+    if soft_stop || matches!(&stepped, Ok(RunOutcome::Completed { .. })) {
         deliver_hook_context(&context, &mut state);
     }
 
@@ -2700,16 +2726,14 @@ async fn run_loop_inner(
         )));
     }
 
-    // The one place an expired wall clock is read back as a budget stop. Everything under the run
-    // scope reports expiry the same way any other cancellation is reported, which is what lets the
-    // loop stay free of deadline special cases; translating it here — rather than at each of the
-    // four `?` inside — is why exactly one kind of stop can be a soft one.
+    // The one place an expired wall clock is read back as a budget stop (`soft_stop`, decided
+    // above). Everything under the run scope reports expiry the same way any other cancellation is
+    // reported, which is what lets the loop stay free of deadline special cases; translating it
+    // here — rather than at each of the four `?` inside — is why exactly one kind of stop can be a
+    // soft one.
     let outcome = match stepped {
         Ok(outcome) => outcome,
-        Err(error)
-            if !state.has_session_write_checkpoint()
-                && is_wall_clock_expiry(&error, &cancel, budget_deadline) =>
-        {
+        Err(_) if soft_stop => {
             progress.budget_stop = Some(BudgetKind::WallClock);
             RunOutcome::Completed {
                 reason: FinishReason::BudgetExhausted,

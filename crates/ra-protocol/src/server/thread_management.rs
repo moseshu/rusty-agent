@@ -8,8 +8,11 @@
 //! Product sections, projects and Daybreak settings are not represented by this store and are
 //! refused. Recency sorts use update time because there is no product recency index. Unlike Codex,
 //! this provider-neutral server has no global default provider or interactive session source;
-//! an omitted provider/source filter includes all providers/unknown root sources. Explicit source
-//! filters match the source vocabulary this port records: unknown and spawned threads. Cursors
+//! an omitted provider filter includes all providers, and the default source filter every root
+//! thread. As in Codex, spawned threads are left out of that default — an omitted `sourceKinds`
+//! with no relation filter, or `sourceKinds: []` with or without one — and listed by an omitted
+//! `sourceKinds` with `parentThreadId` or `ancestorThreadId`. Explicit source filters match the
+//! source vocabulary this port records: unknown and spawned threads. Cursors
 //! use the store's timestamp/id ordering, including its tie breaking, rather than Codex's
 //! timestamp-only legacy cursors.
 
@@ -69,18 +72,35 @@ impl ThreadRequestProcessor {
         let store = require_store(history, "thread/archive")?;
         let root = SessionId::new(params.thread_id);
         let subtree = spawn_subtree(store.as_ref(), &root).await?;
-        if let Some(loaded) = self.thread_manager.get_thread(&root)
-            && !loaded.info.ephemeral
-        {
-            loaded
-                .ensure_rollout_materialized()
+        // A loaded root whose close already started — an earlier removal's, or an idle unload's
+        // that failed — is not written to again, as its writer may have stopped, and needs no
+        // check that the store holds it: the removal continues that close.
+        let closing = match self.thread_manager.get_thread(&root) {
+            Some(loaded) => {
+                let resuming = loaded.close_started();
+                if !resuming && !loaded.info.ephemeral {
+                    loaded
+                        .ensure_rollout_materialized()
+                        .await
+                        .map_err(|error| mutation_error("archive", &root, &error))?;
+                }
+                resuming
+            }
+            None => false,
+        };
+        if !closing {
+            store
+                .read_thread(&ReadThreadParams::new(root.clone()))
                 .await
                 .map_err(|error| mutation_error("archive", &root, &error))?;
         }
-        store
-            .read_thread(&ReadThreadParams::new(root.clone()))
+        drop(subtree);
+        self.removal(&root)
+            .close_subtree(store.as_ref())
             .await
-            .map_err(|error| mutation_error("archive", &root, &error))?;
+            .map_err(|error| removal_error("archive", &root, &error))?;
+        // The subtree as the store holds it once nothing in it writes any more.
+        let subtree = spawn_subtree(store.as_ref(), &root).await?;
         let mut archive_order = vec![root.clone()];
         for child in subtree.iter().skip(1).rev() {
             match store
@@ -93,9 +113,6 @@ impl ThreadRequestProcessor {
                     tracing::warn!(%child, %error, "failed to read a spawned descendant before archiving");
                 }
             }
-        }
-        for id in &subtree {
-            self.prepare_thread_for_removal(id).await;
         }
         let archived = store
             .archive_threads(&ArchiveThreadsParams::new(archive_order))
@@ -139,9 +156,11 @@ impl ThreadRequestProcessor {
         {
             return Err(mutation_error("delete", &root, &error));
         }
-        for id in &subtree {
-            self.prepare_thread_for_removal(id).await;
-        }
+        self.removal(&root)
+            .close_subtree(store.as_ref())
+            .await
+            .map_err(|error| removal_error("delete", &root, &error))?;
+        let subtree = spawn_subtree(store.as_ref(), &root).await?;
         let mut delete_order: Vec<_> = subtree.into_iter().skip(1).rev().collect();
         delete_order.push(root.clone());
         store
@@ -295,21 +314,15 @@ impl ThreadRequestProcessor {
         }
     }
 
-    /// Stops the runtime before closing its writer. A bounded shutdown failure is logged, as in
-    /// Codex; storage still enforces writer ownership and reports a conflict rather than moving
-    /// records while a writer is in flight.
-    async fn prepare_thread_for_removal(&self, id: &SessionId) {
-        self.pending_thread_unloads.lock().await.insert(id.clone());
-        if let Some(loaded) = self.thread_manager.get_thread(id) {
-            self.thread_manager.remove_thread_if_matches(&loaded);
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                loaded.shutdown().await;
-                if let Err(error) = loaded.close_rollout().await {
-                    tracing::warn!(%id, %error, "failed to close a thread's rollout before removal");
-                }
-            }).await.is_err() { tracing::warn!(%id, "thread shutdown timed out; proceeding with removal"); }
+    /// The removal of `target`'s stored subtree.
+    fn removal(&self, target: &SessionId) -> Removal {
+        Removal {
+            thread_manager: Arc::clone(&self.thread_manager),
+            outgoing: Arc::clone(&self.outgoing),
+            ledger: Arc::clone(&self.pending_thread_unloads),
+            thread_watch: Arc::clone(&self.thread_watch),
+            target: target.clone(),
         }
-        self.finalize_thread_teardown(id).await;
     }
 
     fn describe_stored_thread(&self, stored: &StoredThread) -> Thread {
@@ -476,12 +489,11 @@ impl ThreadRequestProcessor {
                 {
                     continue;
                 }
-                if params
-                    .source_kinds
-                    .as_ref()
-                    .filter(|kinds| !kinds.is_empty())
-                    .is_some_and(|kinds| !source_kind_matches(thread, kinds))
-                {
+                if !source_filter_admits(
+                    thread,
+                    params.source_kinds.as_deref(),
+                    params.parent_thread_id.is_some() || params.ancestor_thread_id.is_some(),
+                ) {
                     continue;
                 }
                 items.push(thread.clone());
@@ -583,6 +595,236 @@ async fn spawn_subtree(
     Ok(threads)
 }
 
+/// Closes everything of a stored subtree that still writes, before its storage is moved or
+/// removed: Codex's `prepare_thread_for_removal` for each thread of the subtree, extended for the
+/// threads this server's trees and stores hold.
+///
+/// A thread of the subtree may be idle in the store, running as a spawned agent in a loaded
+/// thread's tree, or loaded on its own — resumed, with a tree of its own that may still spawn.
+/// Each running one is held in the ledger before anything is waited for, with everything its close
+/// froze, and then closed; a loaded thread leaves the server only once it closed completely, as
+/// an idle unload does. The subtree is taken again from the store, the trees and the ledger until
+/// nothing new turns up — what a close froze cannot spawn and what is held cannot be resumed, so
+/// that ends — and only then is the storage touched. A close that fails or times out fails the
+/// request; what it could not close stays held, loaded or in its tree, so a retry finds it and
+/// finishes the close.
+#[derive(Clone)]
+struct Removal {
+    thread_manager: Arc<super::thread_manager::ThreadManager>,
+    outgoing: Arc<OutgoingMessageSender>,
+    ledger: Arc<tokio::sync::Mutex<super::unload_ledger::UnloadLedger>>,
+    thread_watch: Arc<super::thread_status::ThreadWatchManager>,
+    target: SessionId,
+}
+
+impl Removal {
+    async fn close_subtree(&self, store: &dyn ThreadStore) -> Result<(), String> {
+        let mut processed = HashSet::new();
+        let mut covered = Vec::new();
+        let mut stored = Vec::new();
+        let mut failures = Vec::new();
+        loop {
+            let mut ids = spawn_subtree(store, &self.target)
+                .await
+                .map_err(|error| error.message().to_owned())?;
+            let known: HashSet<SessionId> = ids
+                .iter()
+                .cloned()
+                .chain(processed.iter().cloned())
+                .chain(std::iter::once(self.target.clone()))
+                .collect();
+            ids.extend(
+                self.ledger
+                    .lock()
+                    .await
+                    .removal_holds_for(&known)
+                    .into_iter()
+                    .map(|(id, _)| id),
+            );
+            processed.extend(covered.drain(..));
+            let mut fresh = Vec::new();
+            for id in ids {
+                if processed.insert(id.clone()) {
+                    fresh.push(id);
+                }
+            }
+            if fresh.is_empty() {
+                break;
+            }
+            for id in fresh {
+                if let Err(error) = self.close_one(&id, &mut covered, &mut stored).await {
+                    failures.push(error);
+                }
+            }
+        }
+        {
+            let mut ledger = self.ledger.lock().await;
+            for id in &stored {
+                ledger.release_removal(id, &super::unload_ledger::HeldInstance::Stored);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    /// Closes what of `id` still writes, adding to `covered` the agents its close took care of.
+    async fn close_one(
+        &self,
+        id: &SessionId,
+        covered: &mut Vec<SessionId>,
+        stored: &mut Vec<SessionId>,
+    ) -> Result<(), String> {
+        use super::unload_ledger::HeldInstance;
+        if let Some(loaded) = self.thread_manager.get_thread(id) {
+            // Frozen first, so nothing of its tree spawns or starts again, and held; its agents
+            // are let go of only after its own `SessionEnd` hooks, within its shared close.
+            let frozen = loaded
+                .thread
+                .agent_control()
+                .map(ra_runtime::agent::control::AgentControl::stop_spawning)
+                .unwrap_or_default();
+            self.hold(
+                id,
+                HeldInstance::Loaded(loaded.generation()),
+                &frozen,
+                covered,
+            )
+            .await;
+            let removal = self.clone();
+            let task = tokio::spawn(async move { removal.finish_loaded(loaded).await });
+            return self.wait(id, task).await;
+        }
+        let control = self
+            .thread_manager
+            .threads()
+            .into_iter()
+            .filter_map(|loaded| loaded.thread.agent_control().cloned())
+            .find(|control| {
+                control
+                    .live_instances()
+                    .iter()
+                    .any(|instance| instance.session_id() == id)
+            });
+        if let Some(close) = control.and_then(|control| control.close_session(id)) {
+            self.hold(id, HeldInstance::Stored, close.frozen(), covered)
+                .await;
+            stored.push(id.clone());
+            let removal = self.clone();
+            let task = tokio::spawn(async move { removal.finish_agents(close).await });
+            return self.wait(id, task).await;
+        }
+        // Nothing runs it: held only so it is not resumed while the request runs. A hold a
+        // removal left on an instance that no longer runs anywhere is let go of.
+        let mut ledger = self.ledger.lock().await;
+        if let Some(instance) = ledger.removal_instance(id) {
+            ledger.release_removal(id, &instance);
+        }
+        ledger.hold_removal(id, HeldInstance::Stored, &self.target);
+        stored.push(id.clone());
+        Ok(())
+    }
+
+    /// Holds `id` as `instance`, and every agent `close` froze, before anything is waited for.
+    async fn hold(
+        &self,
+        id: &SessionId,
+        instance: super::unload_ledger::HeldInstance,
+        frozen: &[ra_runtime::agent::control::AgentInstance],
+        covered: &mut Vec<SessionId>,
+    ) {
+        let mut ledger = self.ledger.lock().await;
+        ledger.hold_removal(id, instance, &self.target);
+        for agent in frozen {
+            ledger.hold_removal(
+                agent.session_id(),
+                super::unload_ledger::HeldInstance::Spawned(agent.clone()),
+                &self.target,
+            );
+            covered.push(agent.session_id().clone());
+        }
+    }
+
+    /// Waits a bounded time for a close running as its own task, which finishes — and lets go of
+    /// what it confirms — whether or not anyone still waits.
+    async fn wait(
+        &self,
+        id: &SessionId,
+        task: tokio::task::JoinHandle<Result<(), String>>,
+    ) -> Result<(), String> {
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("closing thread {id} failed: {error}")),
+            Err(_) => Err(format!(
+                "closing thread {id} timed out; it goes on, and retrying finishes it"
+            )),
+        }
+    }
+
+    /// Lets go of the agents `report` confirms closed, and reports those it could not close.
+    async fn confirm(
+        &self,
+        closed: &[ra_runtime::agent::control::AgentInstance],
+        failures: Vec<String>,
+    ) -> Result<(), String> {
+        let mut ledger = self.ledger.lock().await;
+        for agent in closed {
+            ledger.release_removal(
+                agent.session_id(),
+                &super::unload_ledger::HeldInstance::Spawned(agent.clone()),
+            );
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    async fn finish_agents(
+        self,
+        close: ra_runtime::agent::control::AgentClose,
+    ) -> Result<(), String> {
+        let report = close.finished().await;
+        let failures = report
+            .failed()
+            .iter()
+            .map(|(agent, error)| format!("agent {}: {error}", agent.session_id()))
+            .collect();
+        self.confirm(report.closed(), failures).await
+    }
+
+    /// Closes a loaded thread through the close it shares with idle unloads, then lets go of it
+    /// and lets it leave the server only if everything of it closed, as an idle unload does.
+    async fn finish_loaded(
+        self,
+        loaded: super::thread_manager::LoadedThread,
+    ) -> Result<(), String> {
+        let id = loaded.thread_id().clone();
+        let close = loaded.close().await;
+        self.confirm(&close.closed_agents, close.failures).await?;
+        self.thread_manager.remove_thread_if_matches(&loaded);
+        self.outgoing.cancel_requests_for_thread(&id, None);
+        self.outgoing.thread_state().remove_thread_state(&id).await;
+        self.thread_watch.remove_thread(&id).await;
+        self.ledger.lock().await.release_removal(
+            &id,
+            &super::unload_ledger::HeldInstance::Loaded(loaded.generation()),
+        );
+        Ok(())
+    }
+}
+
+/// The error of a removal whose closes did not all finish: nothing was moved or removed.
+fn removal_error(operation: &str, root: &SessionId, error: &str) -> JsonRpcErrorObject {
+    JsonRpcErrorObject::internal_error(format!(
+        "failed to {operation} thread {root}: not every thread of its subtree could be closed, \
+         so nothing was changed; retry to finish: {error}"
+    ))
+}
+
 fn normalize_git_patch(
     git: ThreadMetadataGitInfoUpdateParams,
 ) -> Result<GitInfoPatch, JsonRpcErrorObject> {
@@ -625,6 +867,23 @@ fn normalize_git_field(
             Ok(Some(Some(value)))
         }
         other => Ok(other),
+    }
+}
+
+/// Codex's source filter (`compute_source_filters`): without `sourceKinds` and without a relation
+/// filter, and with `sourceKinds: []` whatever else is given, only the default sources are listed,
+/// which never include spawned threads; without `sourceKinds` but with `parentThreadId` or
+/// `ancestorThreadId`, every source is; a non-empty list is matched as given. Codex's default is
+/// its interactive sources; this server has none, so its default is every root thread.
+fn source_filter_admits(
+    thread: &StoredThread,
+    source_kinds: Option<&[ThreadSourceKind]>,
+    relation_filter: bool,
+) -> bool {
+    match source_kinds {
+        Some(kinds) if !kinds.is_empty() => source_kind_matches(thread, kinds),
+        None if relation_filter => true,
+        _ => thread.thread_spawn().is_none(),
     }
 }
 

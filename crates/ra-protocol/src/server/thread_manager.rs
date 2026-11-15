@@ -66,6 +66,25 @@ pub(crate) struct LoadedThread {
     pub(crate) settings_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tells this loading of the thread from a later one under the same id.
     generation: u64,
+    /// The thread's close, shared by everyone closing it.
+    closing: Arc<std::sync::Mutex<Option<SharedThreadClose>>>,
+}
+
+type SharedThreadClose = futures::future::Shared<futures::future::BoxFuture<'static, ThreadClose>>;
+
+/// How a loaded thread's close ended.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ThreadClose {
+    /// The agents of its tree confirmed closed.
+    pub(crate) closed_agents: Vec<ra_runtime::agent::control::AgentInstance>,
+    /// What is still open, and why.
+    pub(crate) failures: Vec<String>,
+}
+
+impl ThreadClose {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
 }
 
 impl std::fmt::Debug for LoadedThread {
@@ -84,6 +103,84 @@ impl std::ops::Deref for LoadedThread {
 }
 
 impl LoadedThread {
+    /// Which load of its id this is: a thread loaded again under the same id is another.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Closes the thread completely: shuts it down — its `SessionEnd` hooks first — then lets go
+    /// of every agent of its tree, waits for the spawns its tree froze, and closes its rollout.
+    ///
+    /// Every caller — an idle unload, a reload, an archive or delete and their retries — shares
+    /// one close: a caller that arrives while it runs waits for it and gets its outcome. Only a
+    /// close that ended with something left open is attempted again, continuing where the last
+    /// one stopped; the thread stays loaded until a close succeeds, so a retry can find what is
+    /// still open.
+    pub(crate) async fn close(&self) -> ThreadClose {
+        use futures::FutureExt;
+        let closing = {
+            let mut closing = self
+                .closing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reusable = closing
+                .as_ref()
+                .filter(|close| close.peek().is_none_or(ThreadClose::is_complete));
+            if let Some(close) = reusable {
+                close.clone()
+            } else {
+                let thread = self.clone();
+                let task = tokio::spawn(async move { thread.close_once().await });
+                let close = async move {
+                    task.await.unwrap_or_else(|error| ThreadClose {
+                        closed_agents: Vec::new(),
+                        failures: vec![format!("the thread's close failed: {error}")],
+                    })
+                }
+                .boxed()
+                .shared();
+                *closing = Some(close.clone());
+                close
+            }
+        };
+        closing.await
+    }
+
+    /// Whether a close of the thread has started: its writer may have been let go of already.
+    pub(crate) fn close_started(&self) -> bool {
+        self.closing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    async fn close_once(self) -> ThreadClose {
+        let mut close = ThreadClose::default();
+        self.shutdown().await;
+        if let Some(control) = self.thread.agent_control() {
+            // The tree's shutdown ran within the thread's own; its report is read, not retried, so
+            // what it left open fails this close and a later close tries again.
+            for report in [
+                control.shutdown_report().await,
+                control.settle_spawns().await,
+            ] {
+                close.closed_agents.extend(report.closed().iter().cloned());
+                close.failures.extend(
+                    report
+                        .failed()
+                        .iter()
+                        .map(|(agent, error)| format!("agent {}: {error}", agent.session_id())),
+                );
+            }
+        }
+        if let Err(error) = self.thread.close_rollout().await {
+            close
+                .failures
+                .push(format!("thread {}: {error}", self.thread_id()));
+        }
+        close
+    }
+
     /// Shuts the thread down and stops what its tools left running: Codex's
     /// `shutdown_session_runtime`, which aborts the thread's tasks and then terminates its
     /// unified-exec processes.
@@ -125,6 +222,7 @@ impl ThreadManager {
             dynamic_tool_calls,
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            closing: Arc::default(),
         };
         self.threads
             .write()

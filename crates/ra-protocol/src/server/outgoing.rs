@@ -179,6 +179,22 @@ pub(crate) struct OutgoingMessageSender {
     sender: mpsc::Sender<OutgoingEnvelope>,
     pending: PendingRequests,
     thread_state: ThreadStateManager,
+    /// What a test runs before each request is kept.
+    #[cfg(feature = "test-api")]
+    before_request_kept: std::sync::OnceLock<BeforeRequestKept>,
+}
+
+/// A test's step before a request is kept, which the request waits for.
+#[cfg(feature = "test-api")]
+pub(crate) struct BeforeRequestKept(
+    pub(crate) Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
+);
+
+#[cfg(feature = "test-api")]
+impl std::fmt::Debug for BeforeRequestKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforeRequestKept")
+    }
 }
 
 impl OutgoingMessageSender {
@@ -187,7 +203,15 @@ impl OutgoingMessageSender {
             sender,
             pending: PendingRequests::new(),
             thread_state: ThreadStateManager::default(),
+            #[cfg(feature = "test-api")]
+            before_request_kept: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Runs `step` before each request is kept; a second step is ignored.
+    #[cfg(feature = "test-api")]
+    pub(crate) fn set_before_request_kept(&self, step: BeforeRequestKept) {
+        let _ = self.before_request_kept.set(step);
     }
 
     pub(crate) fn thread_state(&self) -> &ThreadStateManager {
@@ -295,6 +319,19 @@ impl OutgoingMessageSender {
         payload: ServerRequestPayload,
         thread_id: Option<SessionId>,
     ) -> (RequestId, oneshot::Receiver<RequestResult>) {
+        self.send_request_once_kept(|| connection_ids.to_vec(), payload, thread_id)
+            .await
+    }
+
+    /// Keeps `payload` as a waiting request of `thread_id`, then sends it to the connections
+    /// `connections` names at that moment: a connection that attaches afterwards finds the request
+    /// among those it is replayed.
+    async fn send_request_once_kept(
+        &self,
+        connections: impl FnOnce() -> Vec<ConnectionId>,
+        payload: ServerRequestPayload,
+        thread_id: Option<SessionId>,
+    ) -> (RequestId, oneshot::Receiver<RequestResult>) {
         // `PendingRequests` gives the id and keeps the request as JSON-RPC, so the request is
         // written first; Codex keeps the typed request and writes it in its transport.
         let placeholder = payload.clone().request_with_id(RequestId::Integer(0));
@@ -313,11 +350,15 @@ impl OutgoingMessageSender {
                 return (request.id().clone(), answer);
             }
         };
+        #[cfg(feature = "test-api")]
+        if let Some(step) = self.before_request_kept.get() {
+            (step.0)().await;
+        }
         let (registered, answer) = self.pending.register(method, params, thread_id);
         let id = registered.id().clone();
         let request = payload.request_with_id(id.clone());
 
-        for &connection_id in connection_ids {
+        for connection_id in connections() {
             if let Err(error) = self
                 .sender
                 .send(OutgoingEnvelope::ToConnection {
@@ -461,6 +502,30 @@ impl ThreadScopedOutgoingMessageSender {
         self.outgoing
             .send_request_to_connections(
                 &self.connection_ids,
+                payload,
+                Some(self.request_owner.clone()),
+            )
+            .await
+    }
+
+    /// Sends `payload` to the connections subscribed to the thread once it is kept as waiting,
+    /// rather than to those subscribed when this sender was made.
+    ///
+    /// A spawned agent's request is raised by a task of its own at any point of its run, so a
+    /// client may resume the parent between the moment this sender was made and the moment the
+    /// request is kept: sent to the earlier connections, it would reach neither the connection that
+    /// replaced them nor that connection's replay. Kept first, it is either sent to a connection
+    /// already subscribed or found by the replay of one that subscribes later, which may also
+    /// receive it twice under the same id.
+    pub(crate) async fn send_request_to_current_connections(
+        &self,
+        payload: ServerRequestPayload,
+    ) -> (RequestId, oneshot::Receiver<RequestResult>) {
+        let outgoing = &self.outgoing;
+        let thread_id = &self.thread_id;
+        outgoing
+            .send_request_once_kept(
+                || outgoing.thread_state().subscribed_connection_ids(thread_id),
                 payload,
                 Some(self.request_owner.clone()),
             )

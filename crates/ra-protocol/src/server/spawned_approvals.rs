@@ -75,16 +75,34 @@ pub(crate) async fn changed(approvals: &mut Option<SpawnedApprovals>) -> bool {
     }
 }
 
-/// A connection resuming the parent also receives the requests of its still-running children.
+/// A connection resuming the parent also receives the requests its spawned agents still wait on:
+/// those of runs paused for approval, and those a tool asks for while its run goes on — a managed
+/// network approval or a permission request, which keep no paused run to find them by.
 pub(crate) async fn replay(
     loaded: &LoadedThread,
     outgoing: &OutgoingMessageSender,
     connection: ConnectionId,
 ) {
     if let Some(control) = loaded.thread.agent_control() {
-        for paused in control.paused_runs() {
+        let mut sessions = Vec::new();
+        let agents = control
+            .paused_runs()
+            .into_iter()
+            .map(|paused| paused.session_id().clone())
+            .chain(
+                control
+                    .live_instances()
+                    .into_iter()
+                    .map(|agent| agent.session_id().clone()),
+            );
+        for session in agents {
+            if !sessions.contains(&session) {
+                sessions.push(session);
+            }
+        }
+        for session in &sessions {
             outgoing
-                .replay_requests_to_connection_for_thread(connection, paused.session_id())
+                .replay_requests_to_connection_for_thread(connection, session)
                 .await;
         }
     }

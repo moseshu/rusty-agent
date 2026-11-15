@@ -40,7 +40,7 @@
 //! Codex's listener also takes commands that order its goals and warnings with its notifications;
 //! goals are not ported.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use ra_core::model::{ModelStreamDelta, ModelStreamDeltaKind};
 use ra_core::session::SessionId;
@@ -95,7 +95,7 @@ pub(crate) struct ListenerTaskContext {
     pub(crate) history: Arc<HistorySources>,
     pub(crate) thread_manager: Arc<ThreadManager>,
     /// The threads being unloaded, until they are gone or stay.
-    pub(crate) pending_thread_unloads: Arc<Mutex<HashSet<SessionId>>>,
+    pub(crate) pending_thread_unloads: Arc<Mutex<super::unload_ledger::UnloadLedger>>,
     pub(crate) thread_unload_delay: Duration,
     /// The statuses clients are told of.
     pub(crate) thread_watch: Arc<ThreadWatchManager>,
@@ -280,13 +280,13 @@ pub(crate) async fn ensure_listener_task_running(
                     }
                     {
                         let mut pending_thread_unloads = context.pending_thread_unloads.lock().await;
-                        if pending_thread_unloads.contains(&thread_id) {
+                        if pending_thread_unloads.is_held(&thread_id) {
                             continue;
                         }
                         if !unloading_state.should_unload_now() {
                             continue;
                         }
-                        pending_thread_unloads.insert(thread_id.clone());
+                        pending_thread_unloads.hold_idle_unload(&thread_id);
                     }
                     unload_thread_without_subscribers(&context, loaded.clone()).await;
                     break;
@@ -538,17 +538,24 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
 
     let context = context.clone();
     tokio::spawn(async move {
-        let shutdown = tokio::time::timeout(THREAD_SHUTDOWN_TIMEOUT, async {
-            loaded.shutdown().await;
-            loaded.close_rollout().await
-        })
-        .await;
-        if !matches!(shutdown, Ok(Ok(()))) {
+        // The close idle unloads share with removals: the thread leaves only once everything of it,
+        // its tree's agents included, is closed, so a failed close stays for a retry to find.
+        // As Codex's idle unload, a close that outlasts the timeout is waited for still: the
+        // thread leaves when it has closed, rather than staying loaded and shut down.
+        let shutdown = if let Ok(close) =
+            tokio::time::timeout(THREAD_SHUTDOWN_TIMEOUT, loaded.close()).await
+        {
+            close
+        } else {
+            tracing::warn!(%thread_id, "thread shutdown is taking long; still waiting for it");
+            loaded.close().await
+        };
+        if !shutdown.is_complete() {
             context
                 .pending_thread_unloads
                 .lock()
                 .await
-                .remove(&thread_id);
+                .release_idle_unload(&thread_id);
             tracing::warn!(%thread_id, ?shutdown, "thread shutdown failed; leaving thread loaded");
             return;
         }
@@ -560,7 +567,7 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
                 .pending_thread_unloads
                 .lock()
                 .await
-                .remove(&thread_id);
+                .release_idle_unload(&thread_id);
             return;
         }
         context.thread_watch.remove_thread(&thread_id).await;
@@ -568,7 +575,7 @@ async fn unload_thread_without_subscribers(context: &ListenerTaskContext, loaded
             .pending_thread_unloads
             .lock()
             .await
-            .remove(&thread_id);
+            .release_idle_unload(&thread_id);
         broadcast(
             &context.outgoing,
             THREAD_CLOSED_METHOD,
@@ -739,7 +746,7 @@ async fn handle_pending_thread_resume_request(
 
     {
         let pending_thread_unloads = context.pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&thread_id) {
+        if pending_thread_unloads.is_held(&thread_id) {
             drop(pending_thread_unloads);
             context
                 .outgoing
@@ -778,7 +785,8 @@ async fn handle_pending_thread_resume_request(
 
 /// Tells the thread's connections about a product notice: the `HookStarted` and `HookCompleted`
 /// arms of Codex's `apply_bespoke_event_handling`. The product reports a hook run with its record;
-/// the client is told its camelCase form.
+/// the client is told its camelCase form. A notice about a spawned agent's thread names that
+/// thread, as Codex's spawned thread reports its own hook runs.
 async fn send_notice(
     notice: &ra_runtime::thread::ThreadNotice,
     thread_id: &SessionId,
@@ -794,7 +802,7 @@ async fn send_notice(
             Ok(event) => {
                 if let Some(run) = HookRunSummary::from_core(event.run) {
                     let notification = HookStartedNotification {
-                        thread_id: thread_id.to_string(),
+                        thread_id: notice.thread_id().unwrap_or(thread_id).to_string(),
                         turn_id: event.turn_id,
                         run,
                     };
@@ -807,7 +815,7 @@ async fn send_notice(
             Ok(event) => {
                 if let Some(run) = HookRunSummary::from_core(event.run) {
                     let notification = HookCompletedNotification {
-                        thread_id: thread_id.to_string(),
+                        thread_id: notice.thread_id().unwrap_or(thread_id).to_string(),
                         turn_id: event.turn_id,
                         run,
                     };

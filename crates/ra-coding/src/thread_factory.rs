@@ -116,6 +116,33 @@ impl CodingThreadFactory {
     }
 }
 
+impl CodingThreadFactory {
+    /// The thread's agent tree. Its root is the thread: its session is what the agents' hooks and
+    /// spawn records name as their parent's, whether or not the server records them, and a thread
+    /// that was itself spawned continues its lineage.
+    fn thread_tree(
+        &self,
+        host: &CodingHost,
+        request: &ThreadFactoryRequest,
+        services: spawned::ThreadServices,
+    ) -> Result<ra_runtime::agent::control::AgentControl> {
+        let mut control = spawned::agent_control(
+            host,
+            self.agent_id.clone(),
+            self.agent_name.clone(),
+            &self.role,
+            self.profile,
+            Some(crate::prompt_cache_key::session_id(request).clone()),
+            services,
+        )?
+        .with_root_session_id(request.thread_id().clone())?;
+        if let Some(spawn) = request.thread_spawn() {
+            control = control.with_root_lineage(spawn)?;
+        }
+        Ok(control)
+    }
+}
+
 #[async_trait]
 impl ThreadFactory for CodingThreadFactory {
     fn mcp_runtime(&self) -> Option<Arc<dyn ra_protocol::server::McpRuntimeControl>> {
@@ -147,6 +174,7 @@ impl ThreadFactory for CodingThreadFactory {
                 let settings = self
                     .settings
                     .clone()
+                    .for_new_thread()
                     .with_product_config(&config, ProductPermissionSource::new(builder.clone()));
                 settings
                     .start_network_proxy(&config)
@@ -161,6 +189,7 @@ impl ThreadFactory for CodingThreadFactory {
                     request.thread_id().clone(),
                     generation,
                     request.policy().environments(),
+                    hook_role(request),
                 ))
                 .await
                 .map_err(|error| hook_construction_error(&error))?;
@@ -168,7 +197,7 @@ impl ThreadFactory for CodingThreadFactory {
                 hooks = Some(Arc::new(thread_hooks));
                 settings
             }
-            None => self.settings.clone(),
+            None => self.settings.clone().for_new_thread(),
         };
         let assembled = assemble_agent(
             self.agent_id.clone(),
@@ -211,14 +240,11 @@ impl ThreadFactory for CodingThreadFactory {
         // Each thread owns a tree of its own, as each Codex session owns its agents; the thread
         // shuts it down when it closes.
         if assembled.collaborates {
-            builder = builder.with_agent_control(spawned::agent_control(
-                &host,
-                self.agent_id.clone(),
-                self.agent_name.clone(),
-                &self.role,
-                self.profile,
-                Some(crate::prompt_cache_key::session_id(request).clone()),
-            )?);
+            let services = spawned::ThreadServices {
+                hooks: hooks.clone(),
+                network_proxy: Some(Arc::clone(settings.network_proxy())),
+            };
+            builder = builder.with_agent_control(self.thread_tree(&host, request, services)?);
         }
         let mut prepared = PreparedThread::new(builder)
             .with_settings_adapter(Arc::new(settings))
@@ -241,4 +267,26 @@ fn hook_construction_error(error: &anyhow::Error) -> ra_core::error::Error {
     } else {
         ra_core::error::Error::config(error.to_string())
     }
+}
+
+/// Which thread the hooks speak for: a spawned thread loaded on its own keeps its spawned identity,
+/// as Codex's resumed sub-agent session does.
+fn hook_role(request: &ThreadFactoryRequest) -> crate::hooks::HookThreadRole {
+    let Some(spawn) = request.thread_spawn() else {
+        return crate::hooks::HookThreadRole::Root;
+    };
+    let lookup: crate::hooks::ParentTranscriptLookup = match request.parent_transcript() {
+        Some(lookup) => {
+            let lookup = lookup.clone();
+            Arc::new(move || {
+                let lookup = lookup.clone();
+                Box::pin(async move { lookup.path().await })
+            })
+        }
+        None => Arc::new(|| Box::pin(async { None })),
+    };
+    crate::hooks::HookThreadRole::Child(crate::hooks::ChildHookIdentity::resumed(
+        spawn.agent_type().map(ra_core::agent::AgentId::as_str),
+        lookup,
+    ))
 }

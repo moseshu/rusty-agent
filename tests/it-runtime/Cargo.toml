@@ -18,7 +18,7 @@ ra-tools = { path = "../../crates/ra-tools" }
 ra-sandbox = { path = "../../crates/ra-sandbox", features = ["docker"] }
 ra-patch = { path = "../../crates/ra-patch" }
 # A run recorded into a real rollout file.
-ra-session = { path = "../../crates/ra-session", default-features = false }
+ra-session = { path = "../../crates/ra-session", default-features = false, features = ["test-api"] }
 # Typed agent-tool parameters need a derived `ToolInput`.
 ra-macros = { path = "../../crates/ra-macros" }
 schemars = "0.8"

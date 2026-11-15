@@ -1327,3 +1327,365 @@ command = '''printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionRequ
     );
     assert!(!output.contains("proxied status 200"), "{output}");
 }
+
+#[cfg(target_os = "macos")]
+use super::coding_tools::configured_host;
+
+/// Sends a spawned agent's model calls — those carrying its task — to a script of their own.
+#[cfg(target_os = "macos")]
+struct SplitModel {
+    parent: Arc<Script>,
+    child: Arc<Script>,
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait]
+impl Model for SplitModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // The parent's own requests carry the task too, in its spawn call; the child's do not.
+        let input = serde_json::to_string(request.input()).unwrap();
+        let child = input.contains("spawned worker task") && !input.contains("spawn_agent");
+        let script = if child { &self.child } else { &self.parent };
+        ScriptedModel(Arc::clone(script))
+            .get_response(request)
+            .await
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct SplitResolver(Arc<SplitModel>);
+
+#[cfg(target_os = "macos")]
+impl ModelResolver for SplitResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("test-provider"),
+                Some(model_name.unwrap_or("mock-model").to_owned()),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.0) as Arc<dyn Model>,
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+/// A thread whose spawned worker runs a command through the managed proxy and waits for the
+/// client to approve its network access; returned once the client has been asked.
+#[cfg(target_os = "macos")]
+struct SpawnedNetworkRequest {
+    home: ProductHome,
+    server: Server,
+    connection: Connection,
+    thread_id: String,
+    request: Value,
+    child_script: Arc<Script>,
+    _origin: tokio_util::task::AbortOnDropHandle<()>,
+}
+
+#[cfg(target_os = "macos")]
+async fn spawned_network_request() -> SpawnedNetworkRequest {
+    spawned_network_turn(&|_| {}, true).await
+}
+
+/// The thread of [`spawned_network_request`] on a server `configure` has set up, returned once its
+/// turn has started, and once the client has been asked when `wait_for_request` (`request` is
+/// `null` otherwise).
+#[cfg(target_os = "macos")]
+async fn spawned_network_turn(
+    configure: &dyn Fn(&AppServer),
+    wait_for_request: bool,
+) -> SpawnedNetworkRequest {
+    let home = ProductHome::new();
+    home.write_mock_config("on-request", "", "[features]\nnetwork_proxy = true\n");
+    home.write_requirements(
+        r#"
+[experimental_network]
+enabled = true
+allow_local_binding = true
+
+[experimental_network.domains]
+"example.org" = "allow"
+"#,
+    );
+    let child_script = Arc::new(Script::default());
+    let model = Arc::new(SplitModel {
+        parent: Arc::clone(&home.script),
+        child: Arc::clone(&child_script),
+    });
+    let root = home.workspace.path().canonicalize().unwrap();
+    let settings = CodingThreadSettingsAdapter::new(
+        &root,
+        SandboxPolicy::ReadOnly {
+            network_access: false,
+        },
+    )
+    .unwrap()
+    .with_rules_home(home.home.path());
+    let services = Arc::new(configured_host::Services::default());
+    let factory = CodingThreadFactory::new(
+        services.install(CodingHost::open(&root).unwrap()),
+        Arc::new(SplitResolver(model)),
+        settings,
+    )
+    .with_profile(ra_coding::CodingProfile::CodexLike)
+    .with_request_user_input()
+    .with_product_config(home.config_builder());
+    let (server, _) = build_server(
+        Options {
+            store: Some(Arc::clone(&home.store)),
+            factory: Some(Arc::new(factory)),
+            unload_delay: None,
+        },
+        None,
+        None,
+        None,
+        configure,
+    );
+    let mut connection = server.connect(1).await;
+    let started = server
+        .call(&mut connection, "thread/start", json!({}))
+        .await;
+    let thread_id = started["thread"]["id"].as_str().unwrap().to_owned();
+    let (target, origin) = loopback_origin().await;
+    let test_executable = std::env::current_exe().unwrap();
+    let (_, test_module) = module_path!().split_once("::").unwrap();
+    let command = format!(
+        "env 'CODEX_TEST_MANAGED_NETWORK_TARGET={target}' '{}' --exact \
+         {test_module}::managed_network_approval_probe --ignored --nocapture --test-threads=1",
+        test_executable.display()
+    );
+    child_script.push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+        ItemId::new("child-probe"),
+        RunItemKind::ToolCall(ToolCall::new(
+            CallId::new("child-probe"),
+            "exec_command",
+            json!({"cmd": command, "justification": null, "prefix_rule": null,
+                   "sandbox_permissions": null, "workdir": null, "shell": "/bin/sh",
+                   "tty": false, "login": false, "yield_time_ms": 30000, "timeout_ms": null}),
+        )),
+    )])));
+    child_script.answer("child done");
+    home.script.push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+        ItemId::new("spawn"),
+        RunItemKind::ToolCall(
+            ToolCall::new(
+                CallId::new("spawn"),
+                "spawn_agent",
+                json!({"task_name": "worker", "message": "spawned worker task", "fork_turns": "none"}),
+            )
+            .with_namespace("collaboration"),
+        ),
+    )])));
+    home.script.answer("delegated");
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({"threadId": thread_id, "input": [{"type": "text", "text": "delegate"}]}),
+        )
+        .await;
+    let request = if wait_for_request {
+        let request = connection
+            .until(|message| {
+                message["method"] == "item/commandExecution/requestApproval"
+                    && message["params"].get("networkApprovalContext").is_some()
+            })
+            .await;
+        assert_ne!(request["params"]["threadId"], thread_id.as_str());
+        assert_eq!(
+            request["params"]["networkApprovalContext"]["host"],
+            "127.0.0.1"
+        );
+        request
+    } else {
+        Value::Null
+    };
+
+    SpawnedNetworkRequest {
+        home,
+        server,
+        connection,
+        thread_id,
+        request,
+        child_script,
+        _origin: origin,
+    }
+}
+
+/// A spawned agent's network access is reviewed by its own proxy and asked as its own request —
+/// its thread and its run — and interrupting the agent while the client has not answered
+/// withdraws the request, which the client is told is resolved, as Codex's spawned thread
+/// resolves its pending requests when its turn ends.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_spawned_agents_network_request_is_its_own_and_withdrawn_when_interrupted() {
+    let SpawnedNetworkRequest {
+        home,
+        server,
+        mut connection,
+        thread_id,
+        request,
+        _origin,
+        ..
+    } = spawned_network_request().await;
+
+    home.script
+        .push(Step::Respond(ModelResponse::new(vec![RunItem::new(
+            ItemId::new("interrupt"),
+            RunItemKind::ToolCall(
+                ToolCall::new(
+                    CallId::new("interrupt"),
+                    "interrupt_agent",
+                    json!({"target": "worker"}),
+                )
+                .with_namespace("collaboration"),
+            ),
+        )])));
+    home.script.answer("interrupted");
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({"threadId": thread_id, "input": [{"type": "text", "text": "stop it"}]}),
+        )
+        .await;
+    let resolved = connection
+        .until(|message| {
+            message["method"] == "serverRequest/resolved"
+                && message["params"]["requestId"] == request["id"]
+        })
+        .await;
+    assert_eq!(
+        resolved["params"]["threadId"],
+        request["params"]["threadId"]
+    );
+}
+
+/// A client that reconnects to a thread while one of its spawned agents waits on a network
+/// approval is asked again, under the agent's own thread, and its answer reaches the agent's
+/// command: the request belongs to the agent, not to a connection, and no paused run holds it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_reconnecting_client_is_asked_again_for_a_spawned_agents_network_access() {
+    let SpawnedNetworkRequest {
+        server,
+        connection,
+        thread_id,
+        request,
+        child_script,
+        _origin,
+        ..
+    } = spawned_network_request().await;
+    server.disconnect(connection).await;
+
+    let mut connection = server.connect(2).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread_id}),
+        )
+        .await;
+    let replayed = connection
+        .until(|message| {
+            message["method"] == "item/commandExecution/requestApproval"
+                && message["id"] == request["id"]
+        })
+        .await;
+    assert_eq!(replayed["params"], request["params"]);
+    server
+        .send(
+            &connection,
+            ra_protocol::frame::JsonRpcResponse::new(
+                serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
+                    .unwrap(),
+                json!({"decision": "accept"}),
+            ),
+        )
+        .await;
+    child_script.wait_for_calls(2).await;
+    let output = serde_json::to_string(child_script.last_request().input()).unwrap();
+    assert!(
+        output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
+}
+
+/// A client that resumes the thread while a spawned agent's network request is being raised — after
+/// the agent asked, before the request is kept — still receives it: the request goes to the
+/// connections subscribed once it is kept, and a connection subscribing later finds it on replay.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_client_resuming_while_a_spawned_agents_request_is_raised_receives_it() {
+    use futures::FutureExt;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let gated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let step: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> = {
+        let (entered, proceed) = (Arc::clone(&entered), Arc::clone(&proceed));
+        Arc::new(move || {
+            let first = !gated.swap(true, std::sync::atomic::Ordering::SeqCst);
+            let (entered, proceed) = (Arc::clone(&entered), Arc::clone(&proceed));
+            async move {
+                if first {
+                    entered.notify_one();
+                    proceed.notified().await;
+                }
+            }
+            .boxed()
+        })
+    };
+    let SpawnedNetworkRequest {
+        server,
+        connection,
+        thread_id,
+        child_script,
+        _origin,
+        ..
+    } = spawned_network_turn(
+        &|server| {
+            ra_protocol::server::test_api::set_before_request_kept(server, Arc::clone(&step));
+        },
+        false,
+    )
+    .await;
+    timeout(PATIENCE, entered.notified())
+        .await
+        .expect("the spawned agent raises its network request");
+    server.disconnect(connection).await;
+    let mut connection = server.connect(2).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread_id}),
+        )
+        .await;
+    proceed.notify_one();
+
+    let request = connection
+        .until(|message| {
+            message["method"] == "item/commandExecution/requestApproval"
+                && message["params"].get("networkApprovalContext").is_some()
+        })
+        .await;
+    assert_ne!(request["params"]["threadId"], thread_id.as_str());
+    server
+        .send(
+            &connection,
+            ra_protocol::frame::JsonRpcResponse::new(
+                serde_json::from_value::<ra_protocol::frame::RequestId>(request["id"].clone())
+                    .unwrap(),
+                json!({"decision": "accept"}),
+            ),
+        )
+        .await;
+    child_script.wait_for_calls(2).await;
+    let output = serde_json::to_string(child_script.last_request().input()).unwrap();
+    assert!(
+        output.contains("proxied status 200"),
+        "unexpected tool output: {output}"
+    );
+}

@@ -148,6 +148,7 @@ pub use registry::{HookListOutcome, Hooks, HooksConfig, list_hooks};
 pub use types::{
     Hook, HookEvent, HookEventAfterAgent, HookFn, HookPayload, HookResponse, HookResult,
 };
+pub(crate) use user_hook_bridge::{ChildHookIdentity, HookThreadRole, ParentTranscriptLookup};
 pub(crate) use user_hook_bridge::{
     CodingExecCompletionObserver, McpHookResult, ToolHookRecord, ToolHookResults,
 };

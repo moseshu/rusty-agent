@@ -620,3 +620,108 @@ async fn directory_barriers_and_discard_reach_the_writer() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Closing a spawned agent's thread
+// ---------------------------------------------------------------------------------------------
+
+async fn spawned(directory: &RolloutThreadDirectory, id: &str) -> Arc<dyn RolloutRecorder> {
+    let root = SessionId::new("root");
+    RolloutThreadStore::create_thread(
+        directory,
+        &SessionId::new(id),
+        &RolloutThreadSpawn::new(
+            root.clone(),
+            root,
+            1,
+            AgentPath::root().join("worker").unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+/// Codex's `shutdown_live_agent` order leaves a rollout behind for a thread that recorded nothing,
+/// and a closed recorder still reports, through an ordinary flush, that recording has stopped.
+#[tokio::test]
+async fn a_materialized_shutdown_leaves_a_rollout_for_a_thread_that_recorded_nothing() {
+    let directory = directory("materialized_empty");
+    let recorder = spawned(&directory, "empty").await;
+    let path = directory.rollout_path(&SessionId::new("empty")).unwrap();
+    assert!(!path.exists());
+
+    recorder.shutdown_materialized().await.unwrap();
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(RolloutRecord::type_name)
+            .collect::<Vec<_>>(),
+        ["session_meta"]
+    );
+    recorder.shutdown_materialized().await.unwrap();
+    let error = recorder.flush().await.unwrap_err();
+    assert!(is_kind(&error, SessionErrorKind::Io), "{error}");
+}
+
+/// A materialized shutdown that fails while the writer is still open is simply asked again: the
+/// writer persists what is queued the second time, once.
+#[tokio::test]
+async fn a_materialized_shutdown_that_failed_to_persist_is_resumed() {
+    use ra_session::rollout::faults::{RolloutFaultPoint, RolloutFaults};
+    let faults = RolloutFaults::new();
+    let directory = directory("materialized_persist").with_faults(Arc::clone(&faults));
+    let recorder = spawned(&directory, "queued").await;
+    recorder.record(run(vec![user("queued")]));
+    faults.fail(RolloutFaultPoint::Persist, 1);
+
+    recorder.shutdown_materialized().await.unwrap_err();
+    let path = directory.rollout_path(&SessionId::new("queued")).unwrap();
+    assert!(!path.exists(), "nothing reached the writer");
+    recorder.shutdown_materialized().await.unwrap();
+    let records = RolloutReader::open(&path).read_all().await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(RolloutRecord::type_name)
+            .collect::<Vec<_>>(),
+        ["session_meta", "run_started"]
+    );
+    assert_eq!(faults.calls(RolloutFaultPoint::Shutdown), 1);
+}
+
+/// When the writer has stopped but the metadata pending at shutdown could not be written, asking
+/// again writes only the metadata: the stopped writer is not asked again, so no `stopped` error.
+#[tokio::test]
+async fn a_shutdown_whose_writer_stopped_retries_only_the_metadata() {
+    use ra_session::rollout::faults::{RolloutFaultPoint, RolloutFaults};
+    let faults = RolloutFaults::new();
+    let directory = directory("shutdown_metadata").with_faults(Arc::clone(&faults));
+    let recorder = directory
+        .create_thread_with(&CreateThreadParams::new(meta("pending")))
+        .await
+        .unwrap();
+    recorder.record(run(vec![user("first")]));
+    recorder.persist(PersistContext::Standard).await.unwrap();
+    // A touch within the throttle interval stays pending until the next barrier.
+    recorder.record(touch());
+    faults.fail(RolloutFaultPoint::MetadataWrite, 1);
+
+    recorder.shutdown().await.unwrap_err();
+    assert_eq!(faults.calls(RolloutFaultPoint::Shutdown), 1);
+    recorder.shutdown().await.unwrap();
+    assert_eq!(
+        faults.calls(RolloutFaultPoint::Shutdown),
+        1,
+        "the stopped writer was not asked again"
+    );
+    assert_eq!(faults.calls(RolloutFaultPoint::MetadataWrite), 3);
+    // The writer let go of the rollout the first time.
+    directory
+        .resume_thread(&ResumeThreadParams::new(SessionId::new("pending")))
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}

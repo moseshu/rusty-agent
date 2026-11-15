@@ -4,11 +4,14 @@
 use super::*;
 
 #[path = "../../../support/configured_coding_host.rs"]
-mod configured_host;
+pub(super) mod configured_host;
 #[path = "../../../support/marked_sleep.rs"]
 mod marked_sleep;
 
 use marked_sleep::MarkedSleep;
+
+#[path = "coding_tools/spawned_rollouts.rs"]
+mod spawned_rollouts;
 
 /// The namespace the collaboration tools are advertised in by default.
 const COLLABORATION: &str = "collaboration";
@@ -875,4 +878,52 @@ async fn collaboration_tools_are_hooked_under_codexs_flat_names() {
         ]
     );
     assert!(read(&other).is_empty(), "{:?}", read(&other));
+}
+
+/// A command the parent's session approved for the session still asks when its spawned agent runs
+/// it: Codex initializes approvals for every session, so neither session's approvals carry over to
+/// the other.
+#[tokio::test]
+async fn a_session_approval_does_not_carry_over_to_a_spawned_agent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let script = Arc::new(Script::default());
+    let agents = Agents::new(&script);
+    let escalated = || {
+        call(
+            "exec_command",
+            json!({
+                "cmd": "printf shared", "sandbox_permissions": "require_escalated",
+                "justification": "test session approvals", "prefix_rule": null,
+                "workdir": null, "shell": null, "tty": false, "login": null,
+                "yield_time_ms": 1000, "timeout_ms": null
+            }),
+        )
+    };
+    agents.children.lock().unwrap().push_back(escalated());
+    let (server, _) = coding_server(&agents, Arc::new(InMemoryThreadStore::new()), &root);
+    let mut connection = server.connect(1).await;
+    let thread = server
+        .start_thread(&mut connection, ThreadStartParams::new())
+        .await;
+    script.push(Step::Respond(escalated()));
+    script.answer("parent ran it");
+    server
+        .turn_start(&mut connection, thread.id(), "run it here")
+        .await;
+    let parent_request = connection
+        .until(|message| message["method"] == "item/commandExecution/requestApproval")
+        .await;
+    assert_eq!(parent_request["params"]["threadId"], thread.id());
+    answer_approval(&server, &connection, &parent_request, "acceptForSession").await;
+    connection.notification("turn/completed").await;
+
+    spawn_child(&server, &mut connection, &script, thread.id(), "worker").await;
+    let child_request = connection
+        .until(|message| message["method"] == "item/commandExecution/requestApproval")
+        .await;
+    assert_ne!(child_request["params"]["threadId"], thread.id());
+    answer_approval(&server, &connection, &child_request, "accept").await;
+    agents.wait_for_child_calls(2).await;
+    unload(&server, &mut connection, thread.id()).await;
 }

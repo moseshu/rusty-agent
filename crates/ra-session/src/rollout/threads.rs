@@ -87,6 +87,8 @@ pub struct RolloutThreadDirectory {
     state_db: Option<Arc<crate::store::local::StateRuntime>>,
     live_recorders: Arc<Mutex<HashMap<SessionId, Weak<RolloutFileRecorder>>>>,
     metadata_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "test-api")]
+    faults: Option<Arc<super::faults::RolloutFaults>>,
 }
 
 impl RolloutThreadDirectory {
@@ -102,6 +104,34 @@ impl RolloutThreadDirectory {
             state_db: None,
             live_recorders: Arc::default(),
             metadata_lock: Arc::default(),
+            #[cfg(feature = "test-api")]
+            faults: None,
+        }
+    }
+
+    /// Puts `faults` in front of every writer this directory creates or resumes from now on, and
+    /// of the metadata writes it is asked to record. Only for tests.
+    #[cfg(feature = "test-api")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_faults(mut self, faults: Arc<super::faults::RolloutFaults>) -> Self {
+        self.faults = Some(faults);
+        self
+    }
+
+    /// The directory's own recorder, behind the faults a test armed.
+    #[cfg_attr(
+        not(feature = "test-api"),
+        allow(clippy::unused_self, reason = "only the test build holds faults")
+    )]
+    fn faulty(&self, recorder: Arc<dyn RolloutRecorder>) -> Arc<dyn RolloutRecorder> {
+        #[cfg(feature = "test-api")]
+        {
+            super::faults::FaultyRecorder::wrap(recorder, self.faults.as_ref())
+        }
+        #[cfg(not(feature = "test-api"))]
+        {
+            recorder
         }
     }
 
@@ -305,7 +335,7 @@ impl RolloutThreadStore for RolloutThreadDirectory {
             .insert(meta.session_id().clone(), Arc::downgrade(&recorder));
         Ok(LiveThreadRecorder::created(
             Arc::new(self.clone()),
-            recorder,
+            self.faulty(recorder),
             &meta,
             &[],
         ))
@@ -343,7 +373,7 @@ impl ThreadStore for RolloutThreadDirectory {
             .insert(params.session_id().clone(), Arc::downgrade(&recorder));
         Ok(LiveThreadRecorder::created(
             Arc::new(self.clone()),
-            recorder,
+            self.faulty(recorder),
             params.meta(),
             &history,
         ))
@@ -388,7 +418,7 @@ impl ThreadStore for RolloutThreadDirectory {
         };
         Ok(LiveThreadRecorder::resumed(
             Arc::new(self.clone()),
-            recorder,
+            self.faulty(recorder),
             params.session_id().clone(),
             &history,
         ))
@@ -547,6 +577,12 @@ impl ThreadStore for RolloutThreadDirectory {
     /// and otherwise has nothing here to keep, as Codex's local store writes nothing of it without
     /// its state database.
     async fn record_thread_metadata(&self, params: &UpdateThreadMetadataParams) -> Result<()> {
+        #[cfg(feature = "test-api")]
+        if let Some(faults) = &self.faults {
+            faults
+                .enter(super::faults::RolloutFaultPoint::MetadataWrite)
+                .await?;
+        }
         if params.patch().name().is_some() {
             return self.update_thread_metadata(params).await.map(|_| ());
         }

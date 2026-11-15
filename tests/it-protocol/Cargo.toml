@@ -24,7 +24,7 @@ ra-runtime = { path = "../../crates/ra-runtime" }
 ra-model = { path = "../../crates/ra-model" }
 wiremock = "0.6"
 # The thread store `thread/turns/list` reads a thread's rollout from.
-ra-session = { path = "../../crates/ra-session" }
+ra-session = { path = "../../crates/ra-session", features = ["test-api"] }
 # The command tool whose background terminals outlive their turn.
 ra-tools = { path = "../../crates/ra-tools" }
 async-trait = "0.1"

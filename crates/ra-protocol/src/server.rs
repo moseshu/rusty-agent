@@ -93,6 +93,7 @@ mod thread_status;
 mod tool_items;
 mod turn_admission;
 mod turn_processor;
+mod unload_ledger;
 mod user_input_requests;
 
 pub use self::approvals::ReviewDecision;
@@ -106,7 +107,9 @@ pub use self::session_source::{
     InternalSessionSource, SessionSource, SessionSourceArgs, SubAgentSource,
 };
 pub use self::settings_adapter::{PendingApproval, ThreadSettingsAdapter};
-pub use self::thread_factory::{PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin};
+pub use self::thread_factory::{
+    PreparedThread, ThreadFactory, ThreadFactoryRequest, ThreadOrigin, ThreadTranscriptLookup,
+};
 pub use self::tool_items::{ThreadToolItemEvent, ThreadToolItems};
 
 use std::{
@@ -912,6 +915,27 @@ pub mod test_api {
     #[derive(Debug)]
     pub struct ServerNotifier {
         outgoing: Arc<OutgoingMessageSender>,
+    }
+
+    /// Runs `step` before each request the server sends is kept as waiting, and holds the request
+    /// until `step` completes: lets a test attach a connection in the moment a request is raised.
+    pub fn set_before_request_kept(
+        server: &AppServer,
+        step: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
+    ) {
+        server
+            .processor
+            .outgoing()
+            .set_before_request_kept(super::outgoing::BeforeRequestKept(step));
+    }
+
+    /// Sets how long `thread/resume` waits for a loaded thread's close before it fails, ten
+    /// seconds otherwise.
+    pub fn set_thread_close_timeout(server: &AppServer, timeout: std::time::Duration) {
+        server
+            .processor
+            .thread_processor()
+            .set_close_timeout(timeout);
     }
 
     impl ServerNotifier {
