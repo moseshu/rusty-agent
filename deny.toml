@@ -21,26 +21,11 @@ yanked = "deny"
 # Codex 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 的 codex-rs/deny.toml 同样精确忽略
 # RUSTSEC-2024-0449。没有修复版；这只是停止维护告警，不放宽其他依赖或已知漏洞。
 # 2026-10-23 由维护者明确接受本条精确例外；退出 serde_yaml/unsafe-libyaml 后撤销。
-# ra-network-proxy 固定的 rama 0.3.0-alpha.4（rama-dns / rama-tcp）带入 hickory-proto 0.25.2 的两条，
-# 与 Codex 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 的 codex-rs/deny.toml 同样逐条忽略：DNSSEC 特性未开启，
-# 0118 没有修复版，0119 的修复在 0.26.1 而 rama 尚未跟进。2026-10-30 由维护者明确接受；rama 升级到
-# hickory 0.26.1 或 hickory-net 后撤销。
-# 同一 rama 0.3.0-alpha.4 的 rama-core 依赖 tokio-graceful 0.2.2，后者只在 `cfg(loom)` 下依赖
+# rama 0.3.0-alpha.4 的 rama-core 依赖 tokio-graceful 0.2.2，后者只在 `cfg(loom)` 下依赖
 # loom 0.7.2 -> pin-utils 0.1.1；常规构建从不编译它。这是「不再维护」告警，没有修复版。
 # 2026-11-10 由维护者明确接受本条精确例外；rama 升级去掉 tokio-graceful/loom 后撤销。
-# 同一 hickory-proto 0.25.2 的另外四条修复都在 0.26.2，rama-dns 0.3.0-alpha.4 锁在 hickory 0.25。
-# 0487/0489/0490 只影响 zone 文件文本格式的解析，代理解析走 DNS 报文格式，不经过这些路径；
-# 0491 是报文解码按报头计数预分配，恶意 DNS 响应可致内存耗尽，代理解析域名时可达。
-# 固定版 Codex 同样停在 rama alpha.4 + hickory 0.25.2。2026-11-11 由维护者明确接受这四条精确例外；
-# rama 升级到 0.4（hickory-resolver 0.26.1+）或 hickory-proto >=0.26.2 后撤销。
 ignore = [
-    { id = "RUSTSEC-2026-0487", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the panic is in SVCB/HTTPS text (zone file) parsing, which DNS resolution does not use; fixed in 0.26.2, which rama 0.3 cannot take; remove when rama moves to hickory 0.26.2+" },
-    { id = "RUSTSEC-2026-0489", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the panic is in SVCB/HTTPS text (zone file) parameter unquoting, which DNS resolution does not use; fixed in 0.26.2; remove when rama moves to hickory 0.26.2+" },
-    { id = "RUSTSEC-2026-0490", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; the assertion is in the zone file lexer, which DNS resolution does not use; fixed in 0.26.2; remove when rama moves to hickory 0.26.2+" },
-    { id = "RUSTSEC-2026-0491", reason = "Maintainer explicitly accepted this exact exception on 2026-11-11. hickory-proto 0.25.2 via rama-dns 0.3.0-alpha.4 used by ra-network-proxy; message decoding preallocates from header counts, so a malicious DNS response can exhaust memory during proxy resolution; fixed in 0.26.2, which rama 0.3 cannot take; remove when rama moves to hickory 0.26.2+" },
     { id = "RUSTSEC-2026-0441", reason = "Maintainer explicitly accepted this exact exception on 2026-11-10. pin-utils 0.1.1 is unmaintained with no safe upgrade; it is reached only through rama-core 0.3.0-alpha.4 -> tokio-graceful 0.2.2 -> loom 0.7.2, a cfg(loom)-only dependency never compiled in normal builds; remove when rama drops tokio-graceful/loom" },
-    { id = "RUSTSEC-2026-0118", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; DNSSEC features are not enabled; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
-    { id = "RUSTSEC-2026-0119", reason = "Maintainer explicitly accepted this exact exception on 2026-10-30. hickory-proto 0.25.2 is pulled in via rama-dns/rama-tcp 0.3.0-alpha.4 used by ra-network-proxy; no fixed rama release is available yet; Codex deny.toml ignores the same advisory; remove when rama updates to hickory 0.26.1 or hickory-net" },
     { id = "RUSTSEC-2024-0449", reason = "Maintainer explicitly accepted this exact exception on 2026-10-23. Ported Codex skill parser uses serde_yaml 0.9.34 -> unsafe-libyaml 0.2.11; upstream Codex has this same unmaintained advisory exception, with no patched release; remove when the port migrates off this parser" },
     { id = "RUSTSEC-2024-0388", reason = "derivative 不再维护；依赖链 ra-execpolicy -> starlark / starlark_syntax 0.14.2 -> derivative 2.2.0；codex deny.toml 同样忽略；starlark 去掉它后撤销" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash 不再维护；依赖链 ra-execpolicy -> starlark 0.14.2 -> starlark_map 0.14.2 -> fxhash 0.2.1；codex deny.toml 同样忽略；starlark_map 去掉它后撤销" },

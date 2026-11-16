@@ -50,3 +50,7 @@ members = [
 # 只在测试 workspace 关。主 workspace 编的是要交付的库，那边保持默认。
 [profile.dev]
 debug = 0
+
+[patch.crates-io]
+# This test workspace resolves its dependencies independently of the CLI workspace.
+rama-dns = { path = "../third_party/rama-dns" }

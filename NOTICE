@@ -47,6 +47,10 @@ The native lexical absolute-path operations retain Codex's adaptation of
 path-absolutize 3.1.1, Copyright (c) 2018 magiclen.org (Ron Li), under the MIT
 license retained in third_party/path-absolutize.LICENSE.
 
+third_party/rama-dns vendors plabayo/rama's rama-dns 0.3.0-alpha.4 from revision
+4733273a10a791762e2b7727850032b0c9b8536d. The Hickory 0.26 API adaptation
+follows rama-dns 0.3.0. The original MIT and Apache-2.0 licenses are retained there.
+
 The following manifest is checked by `cargo xtask ported-notice`. Revisions identify
 local upstream checkouts used for the port; each file lists its original source.
 

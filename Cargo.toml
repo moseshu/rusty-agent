@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "examples/*", "xtask"]
+exclude = ["third_party/rama-dns"]
+
+[patch.crates-io]
+# Preserve the Codex-pinned Rama API while updating its resolver dependency.
+rama-dns = { path = "third_party/rama-dns" }
 
 [workspace.package]
 version = "0.3.0"
