@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 ra-coding = { path = "../../../../crates/ra-coding" }
 
+[patch.crates-io]
+# Match the test workspace that supplies this fixture's offline lockfile.
+rama-dns = { path = "../../../../third_party/rama-dns" }
