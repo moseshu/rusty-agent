@@ -125,9 +125,9 @@ impl RouteAwareRequestError {
 
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
         while let Some(error) = source {
-            if error.downcast_ref::<rustls::Error>().is_some()
-                || error.downcast_ref::<native_tls::Error>().is_some()
-            {
+            // This workspace enables Rustls for reqwest. Codex also enables reqwest's native
+            // backend and classifies its errors here.
+            if error.is::<rustls::Error>() {
                 return Some(RouteFailureClass::TlsError);
             }
             if error.to_string() == "tunnel error: proxy authorization required" {

@@ -34,7 +34,6 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body = "1"
 httpdate = { workspace = true }
-native-tls = "0.2"
 opentelemetry = "0.31"
 reqwest = { workspace = true, features = ["rustls-tls-native-roots", "http2"] }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
