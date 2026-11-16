@@ -5433,6 +5433,178 @@ async fn failed_spawned_compaction_keeps_follow_up_mail_for_the_next_turn() {
     assert_eq!(summaries(&calls[3]).len(), 1);
 }
 
+#[tokio::test]
+async fn spawned_agent_mid_turn_compaction_leaves_new_mail_for_sampling() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let gate = Arc::new(GateTool::new());
+    scripts.push(
+        "worker",
+        Step::Respond(
+            tool_call("w-1", "w-1-call", "slow_task", json!({}))
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    scripts.push("worker", Step::Respond(worker_summary()));
+    scripts.push("worker", Step::Respond(final_message("w-2", "done")));
+    spawn_compacting_worker(
+        &scripts,
+        &control,
+        worker_agent(vec![gate.clone()]),
+        UserHooks::default(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+        .await
+        .expect("the worker is blocked in its tool");
+    let mail = "Read this message verbatim.";
+    control
+        .root()
+        .send("worker", mail.into(), MessageDeliveryMode::QueueOnly)
+        .await
+        .unwrap();
+    gate.release.notify_one();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("done".into()))
+    })
+    .await;
+
+    let inputs = scripts.inputs("worker");
+    assert_eq!(inputs.len(), 3);
+    assert!(!texts(&inputs[1]).join("\n").contains(mail));
+    assert_eq!(summaries(&inputs[2]).len(), 1);
+    assert_eq!(texts(&inputs[2]).join("\n").matches(mail).count(), 1);
+}
+
+#[rstest::rstest]
+#[case::deadline(true)]
+#[case::shared_tokens(false)]
+#[tokio::test]
+async fn spawned_agent_pre_turn_compaction_exhaustion_stops_before_sampling(
+    #[case] deadline: bool,
+) {
+    use ra_core::{finish::FinishReason, session::rollout::RolloutRunEnd};
+    use ra_session::rollout::{RolloutPayload, RolloutReader, reconstruct_history};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let worker = worker_agent(Vec::new());
+    let control = AgentControl::new()
+        .with_close_descendants_on_cancel(true)
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let control = if deadline {
+        control
+            .with_spawned_agent_factory(Arc::new(DeadlineFactory {
+                worker: worker.clone(),
+                deadline_after: Duration::from_secs(2),
+            }))
+            .unwrap()
+    } else {
+        control
+            .with_rollout_budget(RolloutBudgetConfig::new(3_000, Vec::new()))
+            .unwrap()
+    };
+    scripts.push(
+        "worker",
+        Step::Respond(
+            final_message("w-1", "previous answer")
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    spawn_compacting_worker(&scripts, &control, worker, UserHooks::default()).await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("previous answer".into()))
+    })
+    .await;
+
+    scripts.push(
+        "worker",
+        if deadline {
+            Step::Hang
+        } else {
+            Step::Respond(worker_summary())
+        },
+    );
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-2", "extra sample")),
+    );
+    let mail = "Retain this follow-up even when the budget ends.";
+    follow_up_worker(&control, mail).await;
+    let terminal = eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Interrupted | AgentStatus::Errored(_))
+    })
+    .await;
+    assert!(
+        matches!(&terminal, AgentStatus::Errored(message) if message.contains("budget_exhausted")),
+        "{terminal:?}"
+    );
+    assert_eq!(scripts.inputs("worker").len(), 2);
+
+    let session = control.live_instances()[0].session_id().clone();
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    let records = RolloutReader::open(path).read_all().await.unwrap();
+    assert!(records.iter().any(|record| matches!(
+        record.payload().unwrap(),
+        RolloutPayload::RunEnded(end)
+            if end.end() == RolloutRunEnd::Completed
+                && end.finish_reason() == Some(FinishReason::BudgetExhausted)
+    )));
+    let recovered = reconstruct_history(&records).unwrap();
+    assert_eq!(
+        texts(recovered.history()).join("\n").matches(mail).count(),
+        1
+    );
+    assert_eq!(summaries(recovered.history()).len(), usize::from(!deadline));
+}
+
+struct InvalidWorkerConcurrency(Arc<AgentSpec>);
+
+#[async_trait]
+impl SpawnedAgentFactory for InvalidWorkerConcurrency {
+    async fn prepare(&self, _: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        Ok(PreparedSpawnedAgent::new(Arc::clone(&self.0))
+            .with_run_config(|config| config.with_max_function_tool_concurrency(0)))
+    }
+}
+
+#[tokio::test]
+async fn spawned_agent_validates_configuration_before_compacting_forked_history() {
+    let scripts = Arc::new(Scripts::default());
+    let worker = worker_agent(Vec::new());
+    let control = AgentControl::new()
+        .with_spawned_agent_factory(Arc::new(InvalidWorkerConcurrency(worker.clone())))
+        .unwrap();
+    scripts.push(
+        "lead",
+        Step::Respond(
+            ModelResponse::new(vec![spawn_with_fork("l-spawn", "worker", Some("all"))])
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-done", "spawned")));
+    scripts.push("worker", Step::Respond(worker_summary()));
+    Runner::run(
+        root_request(&scripts, &control, worker.clone())
+            .with_config(worker_compaction_config(worker)),
+    )
+    .await
+    .unwrap();
+
+    let terminal = eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(_))
+    })
+    .await;
+    assert!(
+        matches!(&terminal, AgentStatus::Errored(message) if message.contains("max_function_tool_concurrency")),
+        "{terminal:?}"
+    );
+    assert!(scripts.inputs("worker").is_empty());
+}
+
 /// Context injected while a spawned run waits for approval reaches the run once the host answers
 /// the checkpoint it took before the injection, as the thread hands a paused turn's context to the
 /// continued run rather than to the checkpoint it handed out.

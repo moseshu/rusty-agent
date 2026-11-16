@@ -1815,15 +1815,20 @@ async fn run_loop(
     if spawned && let Some(handle) = &agent_handle {
         handle.run_started(request.agent.public_id());
     }
-    let pre_turn_compaction = history_compaction::compact_spawned_before_turn(&mut request, &spend)
-        .instrument(agent_span.clone())
-        .await;
-    // Record the prompt even after a failed pre-turn compaction, as Codex does. A committed
-    // replacement has already changed which prefix this recorder holds.
-    let rollout = agent_span.in_scope(|| start_recording(&mut request));
+    let rollout = request.rollout.clone();
     let rollout_run_id = request.run_id.clone();
     if let Some(rollout) = &rollout {
-        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
+        if !spawned {
+            record_run_start(&request, rollout.as_ref()).await;
+        }
+        request.services = request
+            .services
+            .clone()
+            .with_event_sink(Arc::new(RecordingSink {
+                run_id: rollout_run_id.clone(),
+                recorder: Arc::clone(rollout),
+                inner: request.services.event_sink().cloned(),
+            }));
     }
     // Installed around the loop so a tool this run dispatches can start a nested run from it; see
     // `agent::tool::parent` for why this is a task-local rather than a field of the tool context.
@@ -1845,24 +1850,16 @@ async fn run_loop(
     if !spawned && let Some(handle) = &agent_handle {
         handle.run_started(request.agent.public_id());
     }
-    let result = match pre_turn_compaction {
-        Ok(()) => {
-            parent
-                .scope(Box::pin(run_loop_inner(
-                    request,
-                    events,
-                    &agent_span,
-                    &sandbox,
-                    &spend,
-                )))
-                .instrument(agent_span.clone())
-                .await
-        }
-        Err(error) => {
-            record_terminal_error(&agent_span, &error, &request.cancel);
-            Err(error)
-        }
-    };
+    let result = parent
+        .scope(Box::pin(run_loop_inner(
+            request,
+            events,
+            &agent_span,
+            &sandbox,
+            &spend,
+        )))
+        .instrument(agent_span.clone())
+        .await;
     let result = settle_sandbox(&sandbox, result)
         .instrument(agent_span.clone())
         .await;
@@ -1918,10 +1915,8 @@ fn agent_trace_span(request: &RunRequest, trace_group_id: Option<&str>) -> traci
     )
 }
 
-/// Records that a run given a rollout recorder started, and routes the run's host events to the
-/// recorder as well as to the sink the host installed. Returns the recorder, if there is one.
-fn start_recording(request: &mut RunRequest) -> Option<Arc<dyn RolloutRecorder>> {
-    let rollout = request.rollout.clone()?;
+/// Records the opening input and waits for the rollout to persist it.
+async fn record_run_start(request: &RunRequest, rollout: &dyn RolloutRecorder) {
     let started = RolloutRunStarted::new(request.run_id.clone(), request.agent.public_id().clone());
     let mut started = if input_is_continuation_base(&request.state, &request.input) {
         started.with_continuation_base(request.input.clone())
@@ -1933,15 +1928,7 @@ fn start_recording(request: &mut RunRequest) -> Option<Arc<dyn RolloutRecorder>>
         started = started.with_parent_run_id(parent.clone());
     }
     rollout.record(RolloutItem::RunStarted(started));
-    request.services = request
-        .services
-        .clone()
-        .with_event_sink(Arc::new(RecordingSink {
-            run_id: request.run_id.clone(),
-            recorder: Arc::clone(&rollout),
-            inner: request.services.event_sink().cloned(),
-        }));
-    Some(rollout)
+    persist_rollout(rollout, &request.run_id, PersistContext::TurnStart).await;
 }
 
 /// The event sink of a run that is recorded: every event reaches the sink the host installed, and
@@ -2156,21 +2143,94 @@ impl InterruptNotice {
 /// an `Error` and would have to guess the level a cancellation came from.
 #[allow(clippy::too_many_lines)]
 async fn run_loop_inner(
-    request: RunRequest,
+    mut request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
     span: &tracing::Span,
     sandbox: &SandboxRuntime,
     spend: &RunSpend,
 ) -> Result<RunResult> {
+    if let Some(saved) = request.state.max_turns() {
+        request.config = request.config.with_max_turns(saved);
+    } else {
+        request.state.set_max_turns(request.config.max_turns());
+    }
+    // Pre-turn compaction and normal sampling share one deadline and its cancellation cause.
+    let budget_deadline = request.config.budget.deadline();
+    let closeout_cancel = request.cancel.child(ScopeKind::Run);
+    let cancel = request.cancel.child(ScopeKind::Run);
+    let cancel = match budget_deadline {
+        Some(deadline) => cancel.with_deadline(deadline),
+        None => cancel,
+    };
+    let _deadline = arm_deadline(&cancel);
+
+    let startup = async {
+        validate_config(&request.config)?;
+        sandbox.assert_agent_supported(request.agent.public())?;
+        let capabilities = RunCapabilities {
+            owner: initial_capability_agent(
+                request.agent.public(),
+                &request.config,
+                &request.state,
+            ),
+            plan: CapabilityPlan::resolve(request.config.capabilities().iter().map(Arc::clone))?,
+            prepared: tokio::sync::Mutex::new(None),
+        };
+        // A spawned turn can call the provider during compaction. Assemble and validate its
+        // initial surface first, then reuse that preparation in the normal run.
+        let mut prepared = None;
+        let mut pre_turn_compaction = Ok(false);
+        if let Some(history_len) = history_compaction::spawned_history_len(&request) {
+            prepared = Some(
+                prepare_initial_agent(
+                    &capabilities,
+                    CapabilityAssemblyRequest {
+                        agent: &request.agent,
+                        run_id: &request.run_id,
+                        app_context: request
+                            .config
+                            .app_context()
+                            .or(request.app_context.as_ref()),
+                        tool_input: request.tool_input.as_ref(),
+                        state: &request.state,
+                        event_seqs: &request.event_seqs,
+                        models: request.model_resolver.as_ref(),
+                        config: &request.config,
+                    },
+                    &cancel,
+                )
+                .await?,
+            );
+            pre_turn_compaction = history_compaction::compact_spawned_before_turn(
+                &mut request,
+                &cancel,
+                spend,
+                history_len,
+            )
+            .await;
+        }
+        Ok((capabilities, prepared, pre_turn_compaction))
+    }
+    .await;
+    // Preserve the new input even when validation or compaction ends a spawned turn early.
+    if matches!(request.owner, Some(RunOwner::Spawned(_)))
+        && let Some(rollout) = &request.rollout
+    {
+        record_run_start(&request, rollout.as_ref()).await;
+    }
+    let (capabilities, prepared, pre_turn_compaction) = startup.inspect_err(|error| {
+        record_terminal_error(span, error, &cancel);
+    })?;
+
     let RunRequest {
         model_stream_sink,
         mut agent,
         model_resolver,
         run_id,
         app_context,
-        cancel,
+        cancel: _,
         input: requested_input,
-        mut config,
+        config,
         mut state,
         services,
         event_seqs,
@@ -2188,11 +2248,6 @@ async fn run_loop_inner(
         owner,
         leaves_failed_context_queued,
     } = request;
-    if let Some(saved) = state.max_turns() {
-        config = config.with_max_turns(saved);
-    } else {
-        state.set_max_turns(config.max_turns());
-    }
     let services = if services
         .hook_context()
         .is_some_and(|queue| !queue.is_closed())
@@ -2210,15 +2265,6 @@ async fn run_loop_inner(
     // Codex drains pending input before the first model call only when the turn brought none of
     // its own, so new input is answered before anything that was waiting.
     let deliver_mail_first = requested_input.is_empty();
-
-    if let Err(error) =
-        validate_config(&config).and_then(|()| sandbox.assert_agent_supported(agent.public()))
-    {
-        // Ahead of the run scope, so there is no cancellation to attribute and no aggregate to
-        // report — but the span still has to say the run ended and why.
-        ra_core::trace::record_error(span, &error);
-        return Err(error);
-    }
 
     // Merged here, beside the rest of the configuration: two guardrails declared under one
     // identity is a configuration mistake, and the only thing worse than refusing it is refusing it
@@ -2246,19 +2292,6 @@ async fn run_loop_inner(
     let mut lifecycle =
         LifecycleHooks::installed(config.lifecycle_hooks(), agent.public().lifecycle_hooks());
 
-    // Checked here, beside the rest of the configuration and ahead of the segment: whether the
-    // installed capabilities can be assembled at all is a property of the configuration, and a
-    // missing dependency reported after a model has been paid to read a half-assembled surface is
-    // reported too late. Binding them is a separate step below, because that needs the run.
-    let capability_plan =
-        match CapabilityPlan::resolve(config.capabilities().iter().map(Arc::clone)) {
-            Ok(plan) => plan,
-            Err(error) => {
-                ra_core::trace::record_error(span, &error);
-                return Err(error);
-            }
-        };
-
     // An explicit input remains the caller's continuation base. An empty resumed request chooses
     // the checkpoint projection, so hosts that persist only state do not have to rebuild it.
     if state.terminal_unrecoverable() {
@@ -2267,20 +2300,6 @@ async fn run_loop_inner(
         )
         .with_run_state(state));
     }
-    // The run gets its own scope, so either its configured deadline or an inherited caller
-    // deadline stops this run without cancelling the caller's tree. An armed timer turns the
-    // effective deadline — pure data in `ra-core` — into a real cancellation. Every descendant
-    // sees it at the same instant: the model call in flight, the tools running under settlement,
-    // and the loop's own checkpoint alike.
-    let budget_deadline = config.budget.deadline();
-    let closeout_cancel = cancel.child(ScopeKind::Run);
-    let cancel = cancel.child(ScopeKind::Run);
-    let cancel = match budget_deadline {
-        Some(deadline) => cancel.with_deadline(deadline),
-        None => cancel,
-    };
-    let _deadline = arm_deadline(&cancel);
-
     let resuming = state.current_agent().is_some();
     let mut new_turn_input = if resuming {
         Vec::new()
@@ -2357,55 +2376,32 @@ async fn run_loop_inner(
     // here would have to be kept true by hand across resume paths that never meet.
     let authoritative_history_complete = state.input_history_is_complete();
     let input_base = segment_input_base(&state, resuming, requested_input);
-    let capabilities = RunCapabilities {
-        owner: initial_capability_agent(agent.public(), &config, &state),
-        plan: capability_plan,
-        prepared: tokio::sync::Mutex::new(None),
-    };
-    // Under the run scope rather than ahead of it: a capability resolves its prompt fragment with
-    // third-party asynchronous code, and a run whose assembly reads a slow source is one the
-    // deadline and the caller's interrupt still have to reach.
-    let assembly = capabilities.prepare(CapabilityAssemblyRequest {
-        agent: &agent,
-        run_id: &run_id,
-        app_context: config.app_context().or(app_context.as_ref()),
-        tool_input: tool_input.as_ref(),
-        state: &state,
-        event_seqs: &event_seqs,
-        models: model_resolver.as_ref(),
-        config: &config,
-    });
-    let prepared_capabilities = match cancel.run(assembly).await.and_then(|result| result) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            record_terminal_error(span, &error, &cancel);
-            return Err(error);
+    let prepared = match prepared {
+        Some(prepared) => Ok(prepared),
+        None => {
+            prepare_initial_agent(
+                &capabilities,
+                CapabilityAssemblyRequest {
+                    agent: &agent,
+                    run_id: &run_id,
+                    app_context: config.app_context().or(app_context.as_ref()),
+                    tool_input: tool_input.as_ref(),
+                    state: &state,
+                    event_seqs: &event_seqs,
+                    models: model_resolver.as_ref(),
+                    config: &config,
+                },
+                &cancel,
+            )
+            .await
         }
     };
+    let (prepared_capabilities, tool_guardrails) = prepared.inspect_err(|error| {
+        record_terminal_error(span, error, &cancel);
+    })?;
     if let Some(prepared) = &prepared_capabilities {
         agent = prepared.agent.clone();
     }
-
-    // Indexed and checked after assembly, because a capability contributes tools of its own and a
-    // declaration on one of them has to resolve like any other. Before the first model call, which
-    // is the point: a run that names a check nobody installed is misconfigured, and finding that
-    // out after a model has been paid to choose a tool is finding it out too late.
-    let tool_guardrails = match ToolGuardrails::install(
-        config.tool_input_guardrails().iter().map(Arc::clone),
-        config.tool_output_guardrails().iter().map(Arc::clone),
-        config.pre_approval_tool_input_guardrails(),
-    )
-    .and_then(|guardrails| {
-        guardrails
-            .preflight(agent.execution().tools())
-            .map(|()| guardrails)
-    }) {
-        Ok(guardrails) => guardrails,
-        Err(error) => {
-            record_terminal_error(span, &error, &cancel);
-            return Err(error);
-        }
-    };
 
     let mut progress = TurnLoopProgress {
         first_item: state.generated_items().len(),
@@ -2524,6 +2520,12 @@ async fn run_loop_inner(
     // rather than three copies to keep in step — a deadline that expired while a blocking check
     // was still thinking is the same budget stop it would have been one line later.
     let mut stepped = async {
+        if pre_turn_compaction? {
+            progress.budget_stop = Some(BudgetKind::Tokens);
+            return Ok(RunOutcome::Completed {
+                reason: FinishReason::BudgetExhausted,
+            });
+        }
         state.snapshot_event_seq(&event_seqs);
         session_persistence::resume_pending_session_write(
             context.session,
@@ -3126,6 +3128,25 @@ struct CapabilityAssemblyRequest<'a> {
     event_seqs: &'a EventSeqAllocator,
     models: &'a dyn ModelResolver,
     config: &'a RunConfig,
+}
+
+/// Prepares the initial capability surface under the run scope and checks its tool guardrails.
+async fn prepare_initial_agent(
+    capabilities: &RunCapabilities,
+    request: CapabilityAssemblyRequest<'_>,
+    cancel: &CancelScope,
+) -> Result<(Option<Arc<PreparedRunCapabilities>>, ToolGuardrails)> {
+    let config = request.config;
+    let agent = request.agent;
+    let prepared = cancel.run(capabilities.prepare(request)).await??;
+    let execution = prepared.as_ref().map_or(agent, |prepared| &prepared.agent);
+    let guardrails = ToolGuardrails::install(
+        config.tool_input_guardrails().iter().map(Arc::clone),
+        config.tool_output_guardrails().iter().map(Arc::clone),
+        config.pre_approval_tool_input_guardrails(),
+    )?;
+    guardrails.preflight(execution.execution().tools())?;
+    Ok((prepared, guardrails))
 }
 
 /// Binds every contribution to the same public declaration and caches them together.
@@ -5179,6 +5200,15 @@ async fn run_one_turn(
         ))
         .await
         .and_then(|prepared| prepared)?;
+    // Compact settled history before draining new input, so mail and steering that arrived
+    // during the previous step reach the next sampling request verbatim.
+    if history_compaction::due_mid_turn(context, state, progress)
+        && let Some(outcome) =
+            history_compaction::compact_mid_turn(context, agent, state, progress, turn_scope)
+                .await?
+    {
+        return Ok(Some(outcome));
+    }
     // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
     // request that also carries the tool result which earned it.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
@@ -5204,15 +5234,6 @@ async fn run_one_turn(
         persist_rollout(rollout, context.run_id, PersistContext::SteeredUserInput).await;
     }
     deliver_rollout_budget_reminder(context, state, progress);
-    // Between steps of a turn that continues, before this step's request is built from the base,
-    // as Codex compacts mid-turn once a step that needs a follow-up has reached the token limit.
-    if history_compaction::due_mid_turn(context, state, progress)
-        && let Some(outcome) =
-            history_compaction::compact_mid_turn(context, agent, state, progress, turn_scope)
-                .await?
-    {
-        return Ok(Some(outcome));
-    }
     let reminder = budget_reminder(context.spend, config.budget());
     // What this turn's request is built from: the base the run continues on, and the records
     // appended since. The two ways of decomposing that are equivalent until a transfer of control

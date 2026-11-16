@@ -23,7 +23,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use ra_core::{
-    cancel::{CancelScope, ScopeKind},
+    cancel::CancelScope,
     capability::{
         CapabilityFamily, ContextProcessorRequest, ContextSummarizer, ContextSummaryRequest,
         ContextSummaryResponse,
@@ -391,34 +391,35 @@ impl SpawnedRunHistory {
     }
 }
 
+/// The settled prefix of a spawned turn that has an automatic compaction processor.
+pub(super) fn spawned_history_len(request: &RunRequest) -> Option<usize> {
+    let Some(RunOwner::Spawned(history)) = &request.owner else {
+        return None;
+    };
+    history.before_turn_len.filter(|len| {
+        *len > 0
+            && request.config.capabilities().iter().any(|capability| {
+                capability.kind() == CapabilityFamily::COMPACTION
+                    && capability.context_processor().is_some()
+            })
+    })
+}
+
 /// Checks a spawned thread's history before recording the mail that started its turn.
+/// Returns whether the summary left the token budget exhausted.
 pub(super) async fn compact_spawned_before_turn(
     request: &mut RunRequest,
+    cancel: &CancelScope,
     spend: &RunSpend,
-) -> Result<()> {
-    let Some(RunOwner::Spawned(history)) = request.owner.as_ref() else {
-        return Ok(());
-    };
-    let Some(history_len) = history.before_turn_len.filter(|len| *len > 0) else {
-        return Ok(());
-    };
-    if spend.rollout_budget_exhausted()
-        || request.cancel.is_cancelled()
-        || !request.config.capabilities().iter().any(|capability| {
-            capability.kind() == CapabilityFamily::COMPACTION
-                && capability.context_processor().is_some()
-        })
-    {
-        return Ok(());
+    history_len: usize,
+) -> Result<bool> {
+    if spend.rollout_budget_exhausted() {
+        return Ok(false);
     }
-    let owned = Arc::clone(history);
-    let cancel = request.cancel.child(ScopeKind::Run);
-    let cancel = if let Some(deadline) = request.config.budget().deadline() {
-        cancel.with_deadline(deadline)
-    } else {
-        cancel
+    cancel.ensure_not_cancelled()?;
+    let Some(RunOwner::Spawned(owned)) = request.owner.as_ref() else {
+        return Ok(false);
     };
-    let _deadline = super::arm_deadline(&cancel);
     let mut run = RunContext::new(request.run_id.clone(), request.agent.public())
         .with_budget(request.state.budget().clone())
         .with_usage_totals(spend.shared_usage())
@@ -452,7 +453,7 @@ pub(super) async fn compact_spawned_before_turn(
         models: request.model_resolver.as_ref(),
         config: &request.config,
         services: &request.services,
-        cancel: &cancel,
+        cancel,
         run_cancel: &request.cancel,
         rollout: request.rollout.as_deref(),
         sink: None,
@@ -479,7 +480,8 @@ pub(super) async fn compact_spawned_before_turn(
     let usage = summary_usage
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if usage.requests() > 0 {
+    let billed = usage.requests() > 0;
+    if billed {
         request.state.record_usage(&usage);
         spend.record_own(&usage);
         if let Some(rollout) = &request.rollout {
@@ -488,7 +490,8 @@ pub(super) async fn compact_spawned_before_turn(
             ));
         }
     }
-    result.map(drop)
+    result?;
+    Ok(billed && compaction_exhausted_tokens(&request.config, spend))
 }
 
 /// Whether the run's whole history belongs to a thread that compacts it between steps.
@@ -613,17 +616,19 @@ pub(super) async fn compact_mid_turn(
     // The summary was paid for after the loop last checked the budget, and the next sampling would
     // be paid for on top of it: a spent token budget ends the run here, once the context Codex
     // re-establishes at once is in and before that request.
-    let tokens_spent = context
-        .config
-        .budget()
-        .max_tokens()
-        .is_some_and(|maximum| context.spend.budget_tokens() >= maximum)
-        || context.spend.rollout_budget_exhausted();
-    if tokens_spent {
+    if compaction_exhausted_tokens(context.config, context.spend) {
         progress.budget_stop = Some(ra_core::error::BudgetKind::Tokens);
         return Ok(Some(RunOutcome::Completed {
             reason: ra_core::finish::FinishReason::BudgetExhausted,
         }));
     }
     Ok(None)
+}
+
+fn compaction_exhausted_tokens(config: &RunConfig, spend: &RunSpend) -> bool {
+    config
+        .budget()
+        .max_tokens()
+        .is_some_and(|maximum| spend.budget_tokens() >= maximum)
+        || spend.rollout_budget_exhausted()
 }
