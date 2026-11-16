@@ -1789,38 +1789,7 @@ async fn run_loop(
     }
     let (parent_run_id, trace_group_id, starts_trace) = resolve_trace_group(&mut request);
     let interruption = Interruption::new(&request, agent_tree.is_some(), events.as_ref());
-    // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
-    // this span keeps the original name because it is the whole run's span. Per-agent attribution
-    // is what the turn spans underneath carry, each recording the agent that ran it; a span that
-    // renamed itself on a transfer would leave one run reported under two names.
-    let agent_name = request.agent.public().name().to_owned();
-    let agent_span = info_span!(
-        "agent",
-        span.kind = SpanKind::Agent.label(),
-        agent.name = %agent_name,
-        run.id = %request.run_id,
-        // Only a run that starts its own trace names a group; a nested run's span belongs to its
-        // parent's trace.
-        group_id = trace_group_id.as_deref().filter(|_| starts_trace),
-        outcome = tracing::field::Empty,
-        error.code = tracing::field::Empty,
-        cancel.reason = tracing::field::Empty,
-        cancel.scope = tracing::field::Empty,
-        duration.ms = tracing::field::Empty,
-        finish.reason = tracing::field::Empty,
-        budget.kind = tracing::field::Empty,
-        usage.requests = tracing::field::Empty,
-        usage.input_tokens = tracing::field::Empty,
-        usage.cached_input_tokens = tracing::field::Empty,
-        usage.cache_write_tokens = tracing::field::Empty,
-        usage.output_tokens = tracing::field::Empty,
-        usage.reasoning_tokens = tracing::field::Empty,
-    );
-    let rollout = agent_span.in_scope(|| start_recording(&mut request));
-    let rollout_run_id = request.run_id.clone();
-    if let Some(rollout) = &rollout {
-        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
-    }
+    let agent_span = agent_trace_span(&request, trace_group_id.as_deref().filter(|_| starts_trace));
     let started = Instant::now();
     // Everything a cancellation notification needs, captured before the loop consumes the request
     // — and only when someone is listening, so the default run pays nothing for it. A thread runs
@@ -1842,6 +1811,20 @@ async fn run_loop(
         request.nested_spend.clone(),
         agent_handle.as_ref().and_then(AgentHandle::rollout_budget),
     );
+    let spawned = matches!(request.owner, Some(RunOwner::Spawned(_)));
+    if spawned && let Some(handle) = &agent_handle {
+        handle.run_started(request.agent.public_id());
+    }
+    let pre_turn_compaction = history_compaction::compact_spawned_before_turn(&mut request, &spend)
+        .instrument(agent_span.clone())
+        .await;
+    // Record the prompt even after a failed pre-turn compaction, as Codex does. A committed
+    // replacement has already changed which prefix this recorder holds.
+    let rollout = agent_span.in_scope(|| start_recording(&mut request));
+    let rollout_run_id = request.run_id.clone();
+    if let Some(rollout) = &rollout {
+        persist_rollout(rollout.as_ref(), &rollout_run_id, PersistContext::TurnStart).await;
+    }
     // Installed around the loop so a tool this run dispatches can start a nested run from it; see
     // `agent::tool::parent` for why this is a task-local rather than a field of the tool context.
     let parent = ParentRun::new(
@@ -1859,19 +1842,27 @@ async fn run_loop(
         agent_tree,
         Arc::clone(&spend),
     );
-    if let Some(handle) = &agent_handle {
+    if !spawned && let Some(handle) = &agent_handle {
         handle.run_started(request.agent.public_id());
     }
-    let result = parent
-        .scope(Box::pin(run_loop_inner(
-            request,
-            events,
-            &agent_span,
-            &sandbox,
-            &spend,
-        )))
-        .instrument(agent_span.clone())
-        .await;
+    let result = match pre_turn_compaction {
+        Ok(()) => {
+            parent
+                .scope(Box::pin(run_loop_inner(
+                    request,
+                    events,
+                    &agent_span,
+                    &sandbox,
+                    &spend,
+                )))
+                .instrument(agent_span.clone())
+                .await
+        }
+        Err(error) => {
+            record_terminal_error(&agent_span, &error, &request.cancel);
+            Err(error)
+        }
+    };
     let result = settle_sandbox(&sandbox, result)
         .instrument(agent_span.clone())
         .await;
@@ -1895,6 +1886,36 @@ async fn run_loop(
         duration_ms(started.elapsed()),
     );
     result
+}
+
+fn agent_trace_span(request: &RunRequest, trace_group_id: Option<&str>) -> tracing::Span {
+    // The name is the one the run starts with. A handoff replaces the running agent mid-loop, and
+    // this span keeps the original name because it is the whole run's span. Per-agent attribution
+    // is what the turn spans underneath carry, each recording the agent that ran it; a span that
+    // renamed itself on a transfer would leave one run reported under two names.
+    let agent_name = request.agent.public().name().to_owned();
+    info_span!(
+        "agent",
+        span.kind = SpanKind::Agent.label(),
+        agent.name = %agent_name,
+        run.id = %request.run_id,
+        // Only a run that starts its own trace names a group; a nested run's span belongs to its
+        // parent's trace.
+        group_id = trace_group_id,
+        outcome = tracing::field::Empty,
+        error.code = tracing::field::Empty,
+        cancel.reason = tracing::field::Empty,
+        cancel.scope = tracing::field::Empty,
+        duration.ms = tracing::field::Empty,
+        finish.reason = tracing::field::Empty,
+        budget.kind = tracing::field::Empty,
+        usage.requests = tracing::field::Empty,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
+        usage.cache_write_tokens = tracing::field::Empty,
+        usage.output_tokens = tracing::field::Empty,
+        usage.reasoning_tokens = tracing::field::Empty,
+    )
 }
 
 /// Records that a run given a rollout recorder started, and routes the run's host events to the
@@ -2407,11 +2428,19 @@ async fn run_loop_inner(
         turn_context_recorded: false,
         stop_processing: false,
         // A segment finishing a turn that paused for approval continues after the sampling it
-        // paused on, which the checkpoint keeps; the first step of a new turn has none before it.
-        last_response_tokens: continues_turn
-            .then(|| state.model_responses().last())
-            .flatten()
-            .and_then(|response| history_compaction::reported_tokens(response.usage())),
+        // paused on. A fresh session turn can also supply its previous sampling total for forks.
+        last_response_tokens: if continues_turn {
+            state
+                .model_responses()
+                .last()
+                .and_then(|response| history_compaction::reported_tokens(response.usage()))
+        } else {
+            match &owner {
+                Some(RunOwner::Thread(turn)) => turn.reported_tokens(),
+                Some(RunOwner::Spawned(history)) => history.reported_tokens(),
+                _ => None,
+            }
+        },
     };
     let permission = config
         .permission()
@@ -5202,7 +5231,7 @@ async fn run_one_turn(
                 .iter()
                 .filter_map(RunItem::to_model_input),
         );
-        parent.enter_turn(agent.public(), history);
+        parent.enter_turn(agent.public(), history, progress.last_response_tokens);
     }
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
@@ -5396,8 +5425,14 @@ async fn run_one_turn(
         true,
     );
     progress.last_response_tokens = history_compaction::reported_tokens(response.usage());
+    if let Some(parent) = ParentRun::current() {
+        parent.record_sampling_tokens(progress.last_response_tokens);
+    }
     if let Some(sink) = context.events.model_stream_sink {
         sink.response_usage(response.usage());
+    }
+    if let Some(RunOwner::Spawned(history)) = context.owner {
+        history.set_reported_tokens(progress.last_response_tokens);
     }
     state.record_model_response(response.clone());
     if let Some(compaction) = compaction {
@@ -6368,6 +6403,8 @@ const HOOK_STOPPED_COMPACTION: &str = "hook_stopped_compaction";
 pub(crate) enum RunOwner {
     /// The thread turn the run belongs to.
     Thread(Arc<crate::thread::TurnAbort>),
+    /// A turn in a spawned thread, with an independent history and cancellation scope.
+    Spawned(Arc<history_compaction::SpawnedRunHistory>),
     /// The agent-tool call that started the run.
     AgentTool(Arc<NestedCompactionStop>),
 }
@@ -6437,7 +6474,7 @@ impl CompactionHookDispatcher {
                 nested.record(&self.run_id);
                 self.run_cancel.cancel(reason);
             }
-            None => self.run_cancel.cancel(reason),
+            Some(RunOwner::Spawned(_)) | None => self.run_cancel.cancel(reason),
         }
     }
 

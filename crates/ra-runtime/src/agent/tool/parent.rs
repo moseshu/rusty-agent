@@ -25,7 +25,10 @@ use std::{
 };
 
 use ra_core::{
-    agent::AgentSpec,
+    agent::{
+        AgentSpec,
+        control::{SpawnAgentForkMode, fork_history},
+    },
     cancel::CancelScope,
     item::ModelInputItem,
     model::ModelResolver,
@@ -75,6 +78,7 @@ struct ParentRunEnvironment {
 struct TurnView {
     agent: Arc<AgentSpec>,
     history: Arc<Vec<ModelInputItem>>,
+    reported_tokens: Option<u64>,
 }
 
 impl ParentRun {
@@ -124,6 +128,7 @@ impl ParentRun {
                 turn: Mutex::new(TurnView {
                     agent,
                     history: Arc::new(Vec::new()),
+                    reported_tokens: None,
                 }),
             }),
             call_scope: None,
@@ -189,10 +194,16 @@ impl ParentRun {
     }
 
     /// Records the agent running this turn and the history its request was built from.
-    pub(crate) fn enter_turn(&self, agent: &Arc<AgentSpec>, history: Vec<ModelInputItem>) {
+    pub(crate) fn enter_turn(
+        &self,
+        agent: &Arc<AgentSpec>,
+        history: Vec<ModelInputItem>,
+        reported_tokens: Option<u64>,
+    ) {
         *self.run.turn.lock().unwrap_or_else(PoisonError::into_inner) = TurnView {
             agent: Arc::clone(agent),
             history: Arc::new(history),
+            reported_tokens,
         };
     }
 
@@ -201,9 +212,30 @@ impl ParentRun {
         Arc::clone(&self.turn_view().agent)
     }
 
-    /// The history the current turn's request was built from.
-    pub(crate) fn current_history(&self) -> Arc<Vec<ModelInputItem>> {
-        self.turn_view().history
+    /// Projects the current turn's history. A full fork also carries Codex's last sampling total.
+    pub(crate) fn fork_history(
+        &self,
+        mode: Option<SpawnAgentForkMode>,
+    ) -> (Vec<ModelInputItem>, Option<u64>) {
+        let Some(mode) = mode else {
+            return (Vec::new(), None);
+        };
+        let turn = self.turn_view();
+        let reported_tokens = if mode == SpawnAgentForkMode::FullHistory {
+            turn.reported_tokens
+        } else {
+            None
+        };
+        (fork_history(&turn.history, mode), reported_tokens)
+    }
+
+    /// A tool dispatched after sampling can fork with the new response's reported total.
+    pub(crate) fn record_sampling_tokens(&self, tokens: Option<u64>) {
+        self.run
+            .turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reported_tokens = tokens;
     }
 
     fn turn_view(&self) -> TurnView {

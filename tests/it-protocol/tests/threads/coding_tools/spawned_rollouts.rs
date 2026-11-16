@@ -186,9 +186,17 @@ async fn hooked_unloading_after(
 /// Starts a thread whose turn spawns the worker with `spawn`'s extra arguments, waits for it and
 /// ends; returns the thread's id once the worker has answered.
 async fn delegate(fixture: &mut Hooked, spawn: Value) -> String {
+    delegate_with_params(fixture, spawn, ThreadStartParams::new()).await
+}
+
+async fn delegate_with_params(
+    fixture: &mut Hooked,
+    spawn: Value,
+    params: ThreadStartParams,
+) -> String {
     let thread = fixture
         .server
-        .start_thread(&mut fixture.connection, ThreadStartParams::new())
+        .start_thread(&mut fixture.connection, params)
         .await;
     let mut arguments =
         json!({"task_name": "worker", "message": "worker task", "fork_turns": "none"});
@@ -567,6 +575,76 @@ async fn a_resumed_spawned_thread_keeps_its_spawned_identity() {
     let ends_before = read_log(&fixture.log("SessionEnd")).len();
     unload(&fixture.server, &mut fixture.connection, &child).await;
     assert_eq!(read_log(&fixture.log("SessionEnd")).len(), ends_before);
+}
+
+/// Codex restores the last sampling total from a sub-agent session's rollout after a restart.
+#[tokio::test]
+async fn a_resumed_spawned_thread_compacts_before_sampling_when_its_rollout_is_over_limit() {
+    const MODEL: &str = "gpt-5.4";
+    let mut fixture = hooked(&[]).await;
+    fixture.agents.children.lock().unwrap().push_back(
+        final_message("obsolete worker answer").with_usage(ra_core::usage::Usage::from_request(
+            ra_core::usage::RequestUsage::new(5_000_000, 100),
+        )),
+    );
+    let parent = delegate_with_params(
+        &mut fixture,
+        json!({}),
+        ThreadStartParams::new().with_model(MODEL),
+    )
+    .await;
+    unload(&fixture.server, &mut fixture.connection, &parent).await;
+    let child = spawned_children(&fixture.store, &parent).await[0]
+        .session_id()
+        .as_str()
+        .to_owned();
+    let starts = read_log(&fixture.log("SessionStart")).len();
+
+    fixture
+        .server
+        .call(
+            &mut fixture.connection,
+            "thread/resume",
+            json!({"threadId": child, "model": MODEL}),
+        )
+        .await;
+    // The old task identifies the child to the mock during compaction. The new task identifies it
+    // again once the compacted history replaces the old mail with a summary.
+    fixture.agents.children.lock().unwrap().extend([
+        final_message(
+            &json!({
+                "primary_request_and_intent": "intent",
+                "key_technical_concepts": "concepts",
+                "files_and_code_sections": "files",
+                "errors_and_fixes": "errors",
+                "problem_solving": "solutions",
+                "pending_tasks": "tasks",
+                "current_work": "cold worker summary",
+                "optional_next_step": "continue"
+            })
+            .to_string(),
+        ),
+        final_message("cold worker answer"),
+    ]);
+    fixture
+        .server
+        .run_turn(
+            &mut fixture.connection,
+            &child,
+            "continue worker task alone",
+        )
+        .await;
+
+    let requests = fixture.agents.child_requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let before_compaction = serde_json::to_string(requests[1].input()).unwrap();
+    assert!(before_compaction.contains("obsolete worker answer"));
+    assert!(!before_compaction.contains("continue worker task alone"));
+    let after_compaction = serde_json::to_string(requests[2].input()).unwrap();
+    assert!(after_compaction.contains("cold worker summary"));
+    assert!(after_compaction.contains("continue worker task alone"));
+    assert!(!after_compaction.contains("obsolete worker answer"));
+    assert_eq!(read_log(&fixture.log("SessionStart")).len(), starts);
 }
 
 /// When a spawned agent's rollout cannot be let go of, archiving its parent fails without moving

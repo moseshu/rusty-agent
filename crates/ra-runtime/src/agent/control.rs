@@ -46,7 +46,7 @@
 //! A spawned agent runs the declaration of the agent running the caller's current turn — after a
 //! handoff, the agent handed to — or the registered declaration named by `agent_type`. It starts
 //! from the caller's history projected as Codex forks it (see
-//! [`fork_history`]), followed by its task.
+//! [`fork_history`](ra_core::agent::control::fork_history)), followed by its task.
 //!
 //! Codex builds each spawned agent as a session of its own, with its own services and tool plan.
 //! A host whose tools hold per-thread resources, such as a process manager, gives the tree a
@@ -108,6 +108,8 @@
 //! rollout does not hold yet — the history it was forked with, on its first run, and its mail. A
 //! run waiting for approval when it is interrupted or shut down is recorded as cancelled, as Codex
 //! aborts the turn. The root's runs are the host's, which records them into the root's session.
+//! With the compaction capability installed, the agent checks this history before a fresh turn's
+//! mail and between steps that need another model call. Its replacement belongs to that agent.
 //!
 //! Closing an agent, or shutting the tree down, shuts down the agent's rollout once its run has
 //! ended, as Codex's session shutdown shuts down its thread's live writer: what is still queued is
@@ -149,7 +151,6 @@ use ra_core::{
         control::{
             AgentControlError, AgentControlPort, AgentPath, AgentStatus, InterAgentCommunication,
             LiveAgent, MessageDeliveryMode, SpawnAgentRequest, WaitOutcome, completion_message,
-            fork_history,
         },
     },
     cancel::{CancelReason, CancelScope, ScopeKind},
@@ -159,7 +160,7 @@ use ra_core::{
         SubAgentActivityKind,
     },
     finish::FinishReason,
-    item::{InputItemNormalizer, Message, ModelInputItem, NormalizedInput, RunItem},
+    item::{Message, ModelInputItem, RunItem},
     model::ModelResolver,
     session::{
         InterruptedTurnHistoryMarker, SessionId,
@@ -185,7 +186,8 @@ pub use spawn::{
 
 use super::{AgentBinding, tool::ParentRun};
 use crate::runner::{
-    ContinuationInput, RunConfig, RunOutcome, RunRequest, RunResult, RunStreamEvent, Runner,
+    ContinuationInput, RunConfig, RunOutcome, RunOwner, RunRequest, RunResult, RunStreamEvent,
+    Runner, history_compaction::SpawnedRunHistory,
 };
 
 /// Codex's default ceiling on concurrently running spawned agents in one tree.
@@ -1185,9 +1187,7 @@ impl AgentControlPort for AgentHandle {
             .join(request.task_name())
             .map_err(AgentControlError::Unsupported)?;
         let agent = spawned_declaration(&parent, request.agent_type())?;
-        let history = request.fork_mode().map_or_else(Vec::new, |mode| {
-            fork_history(&parent.current_history(), *mode)
-        });
+        let (history, reported_tokens) = parent.fork_history(request.fork_mode().copied());
         if !tree.limiter.has_capacity() {
             return Err(AgentControlError::AgentLimitReached {
                 max_threads: tree.limiter.max_threads,
@@ -1234,6 +1234,7 @@ impl AgentControlPort for AgentHandle {
             environment,
             tree.cancel.child(ScopeKind::custom("agent")),
             history,
+            reported_tokens,
         );
         let node = Arc::new(AgentNode::with_instance(
             path.clone(),
@@ -2058,6 +2059,7 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
             state.run_origin = origin;
             (state.history.clone(), state.recorded)
         };
+        let history_len = input.len();
         input.extend(
             mail.iter()
                 .map(|mail| ModelInputItem::Message(mail.to_message())),
@@ -2067,9 +2069,12 @@ async fn drive(tree: Weak<Tree>, node: Arc<AgentNode>, mut scope: CancelScope) {
             child,
             &handle,
             &scope,
-            input,
-            recorded,
-            parent_run_id,
+            FreshRun {
+                input,
+                recorded,
+                history_len,
+                parent_run_id,
+            },
         )
         .await;
         drop(guard);
@@ -2112,21 +2117,15 @@ async fn run_to_end(
     child: &ChildRuntime,
     handle: &AgentHandle,
     scope: &CancelScope,
-    input: Vec<ModelInputItem>,
-    recorded: usize,
-    parent_run_id: Option<RunId>,
+    fresh: FreshRun,
 ) -> (Vec<ModelInputItem>, bool) {
-    let mut fallback = input.clone();
-    let mut start = RunStart::Fresh {
-        input,
-        recorded,
-        parent_run_id,
-    };
+    let mut fallback = fresh.input.clone();
+    let mut start = RunStart::Fresh(fresh);
     // The lane the run reads injected context from; see below for how a pause moves it.
     let mut hook_context = ra_core::hook::HookContextQueue::default();
     loop {
         let (state, history, event_seqs) = match run_once(
-            &child.environment,
+            child,
             handle.clone(),
             scope.clone(),
             start,
@@ -2294,13 +2293,61 @@ async fn record_cancelled(rollout: &dyn RolloutRecorder, run_id: RunId, marker: 
 /// How a run starts: on the agent's history and its mail, of which the agent's rollout already
 /// holds the first `recorded` items, or from a checkpoint the host has answered.
 enum RunStart {
-    Fresh {
-        input: Vec<ModelInputItem>,
-        recorded: usize,
-        /// The run every trigger mail it starts on came from, if they agree on one.
-        parent_run_id: Option<RunId>,
-    },
+    Fresh(FreshRun),
     Resume(Box<RunState>),
+}
+
+struct FreshRun {
+    input: Vec<ModelInputItem>,
+    recorded: usize,
+    /// Where the mail that triggered this turn begins.
+    history_len: usize,
+    /// The run every trigger mail it starts on came from, if they agree on one.
+    parent_run_id: Option<RunId>,
+}
+
+impl RunStart {
+    fn request(
+        self,
+        environment: &ChildEnvironment,
+        run_id: RunId,
+        scope: CancelScope,
+    ) -> Result<RunRequest> {
+        match self {
+            Self::Fresh(FreshRun {
+                input,
+                recorded,
+                parent_run_id,
+                ..
+            }) => {
+                let request = RunRequest::new(
+                    AgentBinding::direct(Arc::clone(&environment.agent)),
+                    Arc::clone(&environment.model_resolver),
+                    run_id,
+                    scope,
+                    input,
+                )
+                .with_recorded_input(recorded);
+                // Every run of a spawned agent has a parent, which makes it a sub-agent run to its
+                // hooks: Codex runs `SubagentStop` for every turn of a spawned thread, whether or not
+                // the turn has a parent turn. The run whose trigger mail started this one is that
+                // parent; when the mail names no single run — the host sent it, or several runs did —
+                // the run that spawned the agent is.
+                request.with_parent_run_id(
+                    parent_run_id.unwrap_or_else(|| environment.spawned_by.clone()),
+                )
+            }
+            // The checkpoint carries the parent and the history; empty input projects it.
+            Self::Resume(state) => Ok(RunRequest::new(
+                AgentBinding::direct(Arc::clone(&environment.agent)),
+                Arc::clone(&environment.model_resolver),
+                run_id,
+                scope,
+                Vec::new(),
+            )
+            .with_state(*state)),
+        }
+    }
 }
 
 /// How a run ended: done with the agent's new history, paused for approval, or never started.
@@ -2317,55 +2364,31 @@ enum RunEnd {
 /// Runs one segment of an agent's run. `fallback` is the history to keep if the segment returns no
 /// result.
 async fn run_once(
-    environment: &ChildEnvironment,
+    child: &ChildRuntime,
     handle: AgentHandle,
     scope: CancelScope,
     start: RunStart,
     fallback: Vec<ModelInputItem>,
     hook_context: &ra_core::hook::HookContextQueue,
 ) -> RunEnd {
+    let environment = &child.environment;
     let run_id = match &start {
-        RunStart::Fresh { .. } => RunId::generate(),
+        RunStart::Fresh(_) => RunId::generate(),
         RunStart::Resume(state) => state.run_id().clone(),
     };
     let lane = hook_context;
     let hook_context = hook_context.clone();
-    if let Some(child) = &handle.node.child {
-        child.running_run.send_replace(Some(run_id.clone()));
-        lock(&child.state).run_context = Some(hook_context.clone());
-    }
-    let request = match start {
-        RunStart::Fresh {
-            input,
-            recorded,
-            parent_run_id,
-        } => {
-            let request = RunRequest::new(
-                AgentBinding::direct(Arc::clone(&environment.agent)),
-                Arc::clone(&environment.model_resolver),
-                run_id.clone(),
-                scope,
-                input,
-            )
-            .with_recorded_input(recorded);
-            // Every run of a spawned agent has a parent, which makes it a sub-agent run to its
-            // hooks: Codex runs `SubagentStop` for every turn of a spawned thread, whether or not
-            // the turn has a parent turn. The run whose trigger mail started this one is that
-            // parent; when the mail names no single run — the host sent it, or several runs did —
-            // the run that spawned the agent is.
-            request
-                .with_parent_run_id(parent_run_id.unwrap_or_else(|| environment.spawned_by.clone()))
-        }
-        // The checkpoint carries the parent and the history; empty input projects it.
-        RunStart::Resume(state) => Ok(RunRequest::new(
-            AgentBinding::direct(Arc::clone(&environment.agent)),
-            Arc::clone(&environment.model_resolver),
-            run_id.clone(),
-            scope,
-            Vec::new(),
-        )
-        .with_state(*state)),
+    child.running_run.send_replace(Some(run_id.clone()));
+    lock(&child.state).run_context = Some(hook_context.clone());
+    let history_len = match &start {
+        RunStart::Fresh(fresh) => Some(fresh.history_len),
+        RunStart::Resume(_) => None,
     };
+    let history = Arc::new(SpawnedRunHistory::new(
+        history_len,
+        lock(&child.state).reported_tokens,
+    ));
+    let request = start.request(environment, run_id.clone(), scope);
     let mut request = match request {
         Ok(request) => request
             .with_config(environment.config.clone())
@@ -2383,6 +2406,7 @@ async fn run_once(
     if let Some(rollout) = &environment.rollout {
         request = request.with_rollout_recorder(Arc::clone(rollout));
     }
+    request = request.with_owner(RunOwner::Spawned(Arc::clone(&history)));
 
     let event_seqs = handle.tree().map_or_else(
         |_| request.event_seq_allocator().clone(),
@@ -2395,7 +2419,9 @@ async fn run_once(
             produced.push(item);
         }
     }
-    let end = match stream.finish().await {
+    let result = stream.finish().await;
+    lock(&child.state).reported_tokens = history.reported_tokens();
+    let end = match result {
         Ok(result) if !result.outcome().interruptions().is_empty() => {
             return RunEnd::Paused {
                 history: result.continuation_input(ContinuationInput::Normalized),
@@ -2409,7 +2435,7 @@ async fn run_once(
             // each entry came from; a checkpoint its error carries may hold context from before
             // the run continued. As the thread does with a failed turn, both join the history the
             // agent goes on from, after what the run settled, and its rollout.
-            let mut history = partial_history(fallback, &produced);
+            let mut history = history.recover(fallback, &produced);
             let checkpointed = error
                 .run_state()
                 .map_or_else(Vec::new, |state| state.clone().take_hook_context());
@@ -2427,18 +2453,6 @@ async fn run_once(
         resources.run_ended(&run_id);
     }
     end
-}
-
-/// The history after a run that returned no result: its input and the records of the turns it
-/// settled, normalized so any call left without an output is dropped from the next request.
-pub(crate) fn partial_history(
-    mut input: Vec<ModelInputItem>,
-    produced: &[RunItem],
-) -> Vec<ModelInputItem> {
-    input.extend(produced.iter().filter_map(RunItem::to_model_input));
-    InputItemNormalizer::new()
-        .normalize_model_items(&input)
-        .map_or(input, NormalizedInput::into_items)
 }
 
 struct AgentNode {
@@ -2891,6 +2905,7 @@ impl ChildRuntime {
         environment: ChildEnvironment,
         scope: CancelScope,
         history: Vec<ModelInputItem>,
+        reported_tokens: Option<u64>,
     ) -> Self {
         Self {
             environment,
@@ -2898,6 +2913,7 @@ impl ChildRuntime {
             state: Mutex::new(ChildState {
                 history,
                 recorded: 0,
+                reported_tokens,
                 current_run: None,
                 paused: None,
                 run_origin: None,
@@ -2915,6 +2931,8 @@ struct ChildState {
     /// How many leading items of `history` the agent's rollout holds: none of the history it was
     /// forked with, and all of it once a run has started on it.
     recorded: usize,
+    /// The last sampling's usage, reset whenever the agent installs a replacement history.
+    reported_tokens: Option<u64>,
     /// The scope of the run in progress, or of the one about to start.
     current_run: Option<CancelScope>,
     /// The run's checkpoint while it waits for the host to answer an approval.

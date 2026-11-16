@@ -112,13 +112,10 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::{
-    agent::{
-        AgentBinding,
-        control::{AgentControl, partial_history},
-    },
+    agent::{AgentBinding, control::AgentControl},
     runner::{
         ContinuationInput, LiveRunSettings, PendingInput, RunConfig, RunOutcome, RunRequest,
-        RunStreamEvent, Runner,
+        RunStreamEvent, Runner, history_compaction::partial_history,
     },
 };
 
@@ -1682,6 +1679,12 @@ pub(crate) struct TurnAbort {
 }
 
 impl TurnAbort {
+    pub(crate) fn reported_tokens(&self) -> Option<u64> {
+        self.thread
+            .upgrade()
+            .and_then(|inner| inner.lock().reported_tokens)
+    }
+
     pub(crate) fn install_compaction(&self, history: &[ModelInputItem]) {
         if let Some(inner) = self.thread.upgrade() {
             let mut state = inner.lock();
@@ -1760,13 +1763,7 @@ pub(crate) struct ThreadRecorder {
     ending: Mutex<Option<RolloutItem>>,
     /// The history a compaction during the current run segment replaced the thread's with, and
     /// the records it folded in; see [`Self::take_compacted`].
-    compacted: Mutex<Option<CompactedHistory>>,
-}
-
-/// A replacement installed during a run, with the records generated before it.
-struct CompactedHistory {
-    history: Vec<ModelInputItem>,
-    superseded: std::collections::HashSet<ItemId>,
+    compacted: Mutex<Option<crate::runner::history_compaction::CompactedHistory>>,
 }
 
 impl ThreadRecorder {
@@ -1790,21 +1787,14 @@ impl ThreadRecorder {
         produced: &[RunItem],
     ) -> Vec<ModelInputItem> {
         match self.take_compacted() {
-            Some(compacted) => {
-                let after: Vec<RunItem> = produced
-                    .iter()
-                    .filter(|item| !compacted.superseded.contains(item.id()))
-                    .cloned()
-                    .collect();
-                partial_history(compacted.history, &after)
-            }
+            Some(compacted) => compacted.recover(produced),
             None => partial_history(fallback, produced),
         }
     }
 
     /// Forgets the replacement installed during the segment that just ended, which a successful
     /// segment's own continuation already starts from.
-    fn take_compacted(&self) -> Option<CompactedHistory> {
+    fn take_compacted(&self) -> Option<crate::runner::history_compaction::CompactedHistory> {
         self.compacted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1872,10 +1862,9 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
         *self
             .compacted
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(CompactedHistory {
-            history: history.to_vec(),
-            superseded: superseded.iter().cloned().collect(),
-        });
+            .unwrap_or_else(PoisonError::into_inner) = Some(
+            crate::runner::history_compaction::CompactedHistory::new(history, superseded),
+        );
         if let Some(thread) = self.thread.upgrade() {
             thread.lock().reported_tokens = None;
         }

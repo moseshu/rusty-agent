@@ -28,6 +28,7 @@ use ra_core::{
     error::{Error, Result},
     event::{AgentEvent, HostEventBody, InMemoryHostEventSink, SubAgentActivityKind},
     finish::FinishReason,
+    hook::{HookDecision, HookEvent, HookEventName, SessionStartSource, UserHook, UserHookContext},
     item::{
         CallId, ContentBlock, ItemId, Message, MessageRole, ModelInputItem, ModelResponse,
         OutputPhase, RunItem, RunItemKind, ToolCall,
@@ -52,6 +53,7 @@ use ra_runtime::{
         },
         tool::AgentAsTool,
     },
+    hook::{UserHookRegistration, UserHooks},
     runner::{
         ContinuationInput, RunConfig, RunRequest, RunStreamEvent, Runner,
         result::{RunErrorHandler, RunErrorHandlerInput, RunErrorHandlerResult},
@@ -5008,6 +5010,427 @@ async fn context_injected_into_an_idle_agent_is_recorded_at_once() {
             .unwrap()
             .contains("saved network rule")
     );
+}
+
+fn worker_compaction_config(worker: Arc<AgentSpec>) -> RunConfig {
+    let compaction = ra_context::compaction::CompactionCapability::default().with_context_windows(
+        ra_context::window::ContextWindowConfig::new(
+            std::collections::BTreeMap::from([("canonical-model".to_owned(), 1_000)]),
+            ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO,
+        )
+        .unwrap(),
+    );
+    let registry = AgentRegistry::builder().register(worker).build().unwrap();
+    RunConfig::new()
+        .with_agent_registry(registry)
+        .with_capability(Arc::new(compaction))
+}
+
+async fn spawn_compacting_worker(
+    scripts: &Arc<Scripts>,
+    control: &AgentControl,
+    worker: Arc<AgentSpec>,
+    hooks: UserHooks,
+) {
+    let config = worker_compaction_config(worker.clone()).with_user_hooks(hooks);
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "first task")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    Runner::run(root_request(scripts, control, worker).with_config(config))
+        .await
+        .unwrap();
+}
+
+#[derive(Default)]
+struct WorkerCompactionHooks {
+    stop_at: Option<HookEventName>,
+    events: Mutex<Vec<HookEventName>>,
+}
+
+impl WorkerCompactionHooks {
+    fn hooks(self: &Arc<Self>) -> UserHooks {
+        [
+            HookEventName::PreCompact,
+            HookEventName::PostCompact,
+            HookEventName::SessionStart,
+        ]
+        .into_iter()
+        .fold(
+            UserHooks::default().with_session_id(ra_core::session::SessionId::new("worker")),
+            |hooks, event| hooks.with_hook(UserHookRegistration::new(event, self.clone())),
+        )
+    }
+}
+
+#[async_trait]
+impl UserHook for WorkerCompactionHooks {
+    fn name(&self) -> &str {
+        "observe worker compaction"
+    }
+
+    async fn call(
+        &self,
+        context: &UserHookContext<'_>,
+        event: &HookEvent<'_>,
+    ) -> Result<HookDecision> {
+        if context.run().agent_id() != &AgentId::new("worker") {
+            return Ok(HookDecision::Continue);
+        }
+        if matches!(event, HookEvent::SessionStart { source, .. } if *source != SessionStartSource::Compact)
+        {
+            return Ok(HookDecision::Continue);
+        }
+        self.events.lock().unwrap().push(event.name());
+        if self.stop_at == Some(event.name()) {
+            return Ok(HookDecision::Deny {
+                message: "stop compaction turn".into(),
+            });
+        }
+        Ok(HookDecision::Continue)
+    }
+}
+
+fn worker_summary() -> ModelResponse {
+    final_message(
+        "summary",
+        r#"{"primary_request_and_intent":"intent","key_technical_concepts":"concepts","files_and_code_sections":"files","errors_and_fixes":"errors","problem_solving":"solving","pending_tasks":"tasks","current_work":"worker summary","optional_next_step":"next"}"#,
+    )
+    .with_usage(Usage::from_request(RequestUsage::new(3_000, 80)))
+}
+
+fn summaries(input: &[ModelInputItem]) -> Vec<&str> {
+    input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Compaction(compaction) => Some(compaction.summary()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn follow_up_worker(control: &AgentControl, message: &str) {
+    control
+        .root()
+        .send(
+            "worker",
+            message.to_owned(),
+            MessageDeliveryMode::TriggerTurn,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn spawned_agent_compacts_its_session_before_recording_follow_up_mail() {
+    use ra_session::rollout::{RolloutPayload, RolloutReader, reconstruct_history};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    scripts.push(
+        "worker",
+        Step::Respond(
+            final_message("w-1", "previous answer")
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    spawn_compacting_worker(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+        UserHooks::default(),
+    )
+    .await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("previous answer".into()))
+    })
+    .await;
+
+    scripts.push("worker", Step::Respond(worker_summary()));
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-2", "follow-up answer")),
+    );
+    follow_up_worker(&control, "second task").await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("follow-up answer".into()))
+    })
+    .await;
+    let inputs = scripts.inputs("worker");
+    assert_eq!(inputs.len(), 3);
+    let summary_input = texts(&inputs[1]).join("\n");
+    assert!(summary_input.contains("previous answer"));
+    assert!(!summary_input.contains("second task"));
+    let sampling_input = texts(&inputs[2]).join("\n");
+    assert!(summaries(&inputs[2])[0].contains("worker summary"));
+    assert!(sampling_input.contains("second task"));
+    assert!(!sampling_input.contains("previous answer"));
+
+    let session = control.live_instances()[0].session_id().clone();
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    let records = RolloutReader::open(path).read_all().await.unwrap();
+    let payloads: Vec<_> = records
+        .iter()
+        .map(|record| record.payload().unwrap())
+        .collect();
+    let (index, compacted) = payloads
+        .iter()
+        .enumerate()
+        .find_map(|(index, payload)| match payload {
+            RolloutPayload::Compacted(compacted) => Some((index, compacted)),
+            _ => None,
+        })
+        .expect("the child owns a persisted replacement");
+    assert!(payloads[..index].iter().any(|payload| matches!(payload,
+        RolloutPayload::RunStarted(start) if start.run_id() == compacted.run_id()
+    )));
+    assert!(payloads[index + 1..].iter().any(|payload| matches!(payload,
+        RolloutPayload::RunStarted(start) if start.run_id() == compacted.run_id()
+            && texts(start.input()).join("\n").contains("second task")
+    )));
+    let reconstructed = reconstruct_history(&records).unwrap();
+    let recovered = texts(reconstructed.history()).join("\n");
+    assert_eq!(summaries(reconstructed.history()), summaries(&inputs[2]));
+    assert!(!recovered.contains("previous answer"));
+    assert_eq!(recovered.matches("second task").count(), 1);
+    assert!(recovered.contains("follow-up answer"));
+    assert_eq!(reconstructed.reported_tokens(), None);
+}
+
+#[tokio::test]
+async fn spawned_agent_keeps_a_mid_turn_replacement_when_its_next_sampling_is_interrupted() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push(
+        "worker",
+        Step::Respond(
+            tool_call("w-1", "w-1-call", "deploy", json!({}))
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    let hooks = Arc::new(WorkerCompactionHooks::default());
+    spawn_compacting_worker(
+        &scripts,
+        &control,
+        worker_agent(vec![Arc::new(GuardedTool::new())]),
+        hooks.hooks(),
+    )
+    .await;
+    let paused = tokio::time::timeout(Duration::from_secs(10), control.wait_for_paused_run())
+        .await
+        .expect("the worker pauses for approval");
+    let mut state = paused.state().clone();
+    let pending: Vec<_> = state.pending_interruption_items().cloned().collect();
+    state.approve(&pending[0], false).unwrap();
+    scripts.push("worker", Step::Respond(worker_summary()));
+    scripts.push("worker", Step::Hang);
+    control.resume(&worker_path(), state).unwrap();
+    until("the worker sampled from its replacement", || {
+        scripts.inputs("worker").len() == 3
+    })
+    .await;
+    let inputs = scripts.inputs("worker");
+    assert!(summaries(&inputs[2])[0].contains("worker summary"));
+    assert_eq!(
+        *hooks.events.lock().unwrap(),
+        [HookEventName::PreCompact, HookEventName::PostCompact],
+    );
+    control.root().interrupt("worker").await.unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Interrupted
+    })
+    .await;
+    scripts.push("worker", Step::Respond(final_message("w-done", "finished")));
+    follow_up_worker(&control, "continue after interrupt").await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("finished".into()))
+    })
+    .await;
+    let next = &scripts.inputs("worker")[3];
+    assert_eq!(summaries(next), summaries(&inputs[2]));
+    assert!(texts(next).join("\n").contains("continue after interrupt"));
+    assert!(!next.iter().any(|item| {
+        matches!(
+            item,
+            ModelInputItem::ToolCall(_) | ModelInputItem::ToolCallOutput(_)
+        )
+    }));
+}
+
+#[rstest::rstest]
+#[case::pre(HookEventName::PreCompact, &[HookEventName::PreCompact], false)]
+#[case::post(HookEventName::PostCompact, &[HookEventName::PreCompact, HookEventName::PostCompact], true)]
+#[tokio::test]
+async fn spawned_agent_compaction_hook_deny_cancels_and_preserves_follow_up_mail(
+    #[case] stop_at: HookEventName,
+    #[case] expected_hooks: &[HookEventName],
+    #[case] committed: bool,
+) {
+    use ra_core::session::rollout::RolloutRunEnd;
+    use ra_session::rollout::{RolloutPayload, RolloutReader, reconstruct_history};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(ra_session::RolloutThreadDirectory::new(directory.path()));
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new()
+        .with_rollout_store(store.clone(), ra_core::session::SessionId::new("root"))
+        .unwrap();
+    let hooks = Arc::new(WorkerCompactionHooks {
+        stop_at: Some(stop_at),
+        ..WorkerCompactionHooks::default()
+    });
+    scripts.push(
+        "worker",
+        Step::Respond(
+            final_message("w-1", "before stop")
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    spawn_compacting_worker(&scripts, &control, worker_agent(Vec::new()), hooks.hooks()).await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("before stop".into()))
+    })
+    .await;
+
+    if committed {
+        scripts.push("worker", Step::Respond(worker_summary()));
+    }
+    let preserved = "mail preserved after a compaction hook stops";
+    follow_up_worker(&control, preserved).await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Interrupted
+    })
+    .await;
+    assert_eq!(scripts.inputs("worker").len(), 1 + usize::from(committed));
+    assert_eq!(*hooks.events.lock().unwrap(), expected_hooks);
+
+    let session = control.live_instances()[0].session_id().clone();
+    let path = store.rollout_path(&session).unwrap();
+    control.shutdown().await;
+    let records = RolloutReader::open(path).read_all().await.unwrap();
+    let payloads: Vec<_> = records
+        .iter()
+        .map(|record| record.payload().unwrap())
+        .collect();
+    let run_id = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            RolloutPayload::RunStarted(start)
+                if texts(start.input())
+                    .iter()
+                    .any(|text| text.contains(preserved)) =>
+            {
+                Some(start.run_id())
+            }
+            _ => None,
+        })
+        .expect("the cancelled run records its mail");
+    assert!(payloads.iter().any(|payload| matches!(payload,
+        RolloutPayload::RunEnded(end) if end.run_id() == run_id && end.end() == RolloutRunEnd::Cancelled
+    )));
+    assert_eq!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, RolloutPayload::Compacted(_))),
+        committed,
+    );
+    let recovered = reconstruct_history(&records).unwrap();
+    assert!(
+        texts(recovered.history())
+            .iter()
+            .any(|text| text.contains(preserved))
+    );
+}
+
+#[tokio::test]
+async fn full_fork_inherits_the_parents_latest_sampling_total_for_its_first_compaction() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    let worker = worker_agent(Vec::new());
+    scripts.push(
+        "lead",
+        Step::Respond(
+            ModelResponse::new(vec![spawn_with_fork("l-spawn", "worker", Some("all"))])
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    scripts.push("lead", Step::Respond(final_message("l-done", "spawned")));
+    scripts.push("worker", Step::Respond(worker_summary()));
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("w-1", "after fork compaction")),
+    );
+    Runner::run(
+        root_request(&scripts, &control, worker.clone())
+            .with_config(worker_compaction_config(worker)),
+    )
+    .await
+    .unwrap();
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("after fork compaction".into()))
+    })
+    .await;
+
+    let inputs = scripts.inputs("worker");
+    assert_eq!(inputs.len(), 2);
+    let summary = texts(&inputs[0]).join("\n");
+    assert!(summary.contains("do the work"));
+    assert!(!summary.contains(NEW_TASK));
+    assert!(summaries(&inputs[1])[0].contains("worker summary"));
+    assert!(texts(&inputs[1]).join("\n").contains(NEW_TASK));
+}
+
+#[tokio::test]
+async fn failed_spawned_compaction_keeps_follow_up_mail_for_the_next_turn() {
+    let scripts = Arc::new(Scripts::default());
+    let control = AgentControl::new();
+    scripts.push(
+        "worker",
+        Step::Respond(
+            final_message("w-1", "previous answer")
+                .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
+        ),
+    );
+    spawn_compacting_worker(
+        &scripts,
+        &control,
+        worker_agent(Vec::new()),
+        UserHooks::default(),
+    )
+    .await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("previous answer".into()))
+    })
+    .await;
+
+    scripts.push(
+        "worker",
+        Step::Respond(final_message("bad-summary", "invalid JSON")),
+    );
+    follow_up_worker(&control, "keep this mail").await;
+    eventually_status(&control, &worker_path(), |status| {
+        matches!(status, AgentStatus::Errored(_))
+    })
+    .await;
+    assert_eq!(scripts.inputs("worker").len(), 2);
+
+    scripts.push("worker", Step::Respond(worker_summary()));
+    scripts.push("worker", Step::Respond(final_message("w-2", "recovered")));
+    follow_up_worker(&control, "try again").await;
+    eventually_status(&control, &worker_path(), |status| {
+        *status == AgentStatus::Completed(Some("recovered".into()))
+    })
+    .await;
+    let calls = scripts.inputs("worker");
+    assert_eq!(calls.len(), 4);
+    let prior = texts(&calls[2]).join("\n");
+    assert!(prior.contains("previous answer"));
+    assert!(prior.contains("keep this mail"));
+    assert!(!prior.contains("try again"));
+    assert_eq!(summaries(&calls[3]).len(), 1);
 }
 
 /// Context injected while a spawned run waits for approval reaches the run once the host answers

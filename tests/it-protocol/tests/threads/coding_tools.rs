@@ -93,11 +93,11 @@ impl Model for Agents {
 struct AgentsResolver(Arc<Agents>);
 
 impl ModelResolver for AgentsResolver {
-    fn resolve_model(&self, _: Option<&str>) -> Result<ResolvedModel> {
+    fn resolve_model(&self, model: Option<&str>) -> Result<ResolvedModel> {
         Ok(ResolvedModel::new(
             ModelSelector::new(
                 ProviderKey::new("test-provider"),
-                Some("mock-model".to_owned()),
+                Some(model.unwrap_or("mock-model").to_owned()),
                 ApiProtocol::OpenAiResponses,
             ),
             Arc::clone(&self.0) as Arc<dyn Model>,

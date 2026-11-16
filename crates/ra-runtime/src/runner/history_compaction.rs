@@ -15,6 +15,7 @@
 //! the session's ([`ContextProcessorRequest::with_session_history`]), and a capability that finds
 //! nothing to do answers with no record.
 
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -22,7 +23,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use ra_core::{
-    cancel::CancelScope,
+    cancel::{CancelScope, ScopeKind},
     capability::{
         CapabilityFamily, ContextProcessorRequest, ContextSummarizer, ContextSummaryRequest,
         ContextSummaryResponse,
@@ -30,18 +31,23 @@ use ra_core::{
     context::RunContext,
     error::{Error, Result},
     hook::{CompactTrigger, HookEvent, SessionStartSource, UserHookDispatcher},
-    item::{Compaction, ItemId, ModelInputItem, RunItem, RunItemKind},
+    item::{
+        Compaction, InputItemNormalizer, ItemId, ModelInputItem, NormalizedInput, RunItem,
+        RunItemKind,
+    },
     model::ModelResolver,
-    session::rollout::{RolloutCompacted, RolloutRecorder},
+    session::rollout::{
+        RolloutCompacted, RolloutItem, RolloutModelUsage, RolloutRecorder, RolloutRunStarted,
+    },
     state::{RunId, RunState},
     tool::ToolServices,
     usage::Usage,
 };
 
 use super::{
-    AttemptStart, CompactionHookDispatcher, RunConfig, RunOutcome, RunOwner, RunStreamEvent,
-    RunnerContextSummarizer, SummaryUsage, TurnInput, TurnLoopContext, TurnLoopProgress, emit,
-    record_spend, reestablish_compact_context, turn_hook_context,
+    AttemptStart, CompactionHookDispatcher, RunConfig, RunOutcome, RunOwner, RunRequest, RunSpend,
+    RunStreamEvent, RunnerContextSummarizer, SummaryUsage, TurnInput, TurnLoopContext,
+    TurnLoopProgress, emit, record_spend, reestablish_compact_context, turn_hook_context,
 };
 use crate::{
     agent::AgentBinding, runner::stream::ModelStreamSink, turn::prepare::prepare_compaction,
@@ -49,6 +55,43 @@ use crate::{
 
 /// Codex's warning after every compaction.
 const COMPACTION_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+
+/// The installed replacement and the records already folded into it.
+pub(crate) struct CompactedHistory {
+    history: Vec<ModelInputItem>,
+    superseded: HashSet<ItemId>,
+}
+
+impl CompactedHistory {
+    pub(crate) fn new(history: &[ModelInputItem], superseded: &[ItemId]) -> Self {
+        Self {
+            history: history.to_vec(),
+            superseded: superseded.iter().cloned().collect(),
+        }
+    }
+
+    /// Rebuilds the owner's history after a segment that returned no continuation.
+    pub(crate) fn recover(self, produced: &[RunItem]) -> Vec<ModelInputItem> {
+        let after: Vec<_> = produced
+            .iter()
+            .filter(|item| !self.superseded.contains(item.id()))
+            .cloned()
+            .collect();
+        partial_history(self.history, &after)
+    }
+}
+
+/// The history after a run that returned no result: its input and the records of the turns it
+/// settled, normalized so any call left without an output is dropped from the next request.
+pub(crate) fn partial_history(
+    mut input: Vec<ModelInputItem>,
+    produced: &[RunItem],
+) -> Vec<ModelInputItem> {
+    input.extend(produced.iter().filter_map(RunItem::to_model_input));
+    InputItemNormalizer::new()
+        .normalize_model_items(&input)
+        .map_or(input, NormalizedInput::into_items)
+}
 
 /// One run of Codex's `run_compact_task_inner` over a thread's history.
 pub(crate) struct HistoryCompaction<'a> {
@@ -293,13 +336,171 @@ pub(crate) fn reported_tokens(usage: &Usage) -> Option<u64> {
         .filter(|tokens| *tokens > 0)
 }
 
+/// What a spawned session's driver needs from one run segment, including a segment that fails.
+pub(crate) struct SpawnedRunHistory {
+    pub(super) before_turn_len: Option<usize>,
+    reported_tokens: std::sync::Mutex<Option<u64>>,
+    compacted: std::sync::Mutex<Option<CompactedHistory>>,
+}
+
+impl SpawnedRunHistory {
+    pub(crate) fn new(before_turn_len: Option<usize>, reported_tokens: Option<u64>) -> Self {
+        Self {
+            before_turn_len,
+            reported_tokens: std::sync::Mutex::new(reported_tokens),
+            compacted: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn reported_tokens(&self) -> Option<u64> {
+        *self
+            .reported_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn recover(
+        &self,
+        fallback: Vec<ModelInputItem>,
+        produced: &[RunItem],
+    ) -> Vec<ModelInputItem> {
+        self.compacted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map_or_else(
+                || partial_history(fallback, produced),
+                |compacted| compacted.recover(produced),
+            )
+    }
+
+    pub(super) fn set_reported_tokens(&self, tokens: Option<u64>) {
+        *self
+            .reported_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tokens;
+    }
+
+    fn history_compacted(&self, history: &[ModelInputItem], superseded: &[ItemId]) {
+        *self
+            .compacted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(CompactedHistory::new(history, superseded));
+        self.set_reported_tokens(None);
+    }
+}
+
+/// Checks a spawned thread's history before recording the mail that started its turn.
+pub(super) async fn compact_spawned_before_turn(
+    request: &mut RunRequest,
+    spend: &RunSpend,
+) -> Result<()> {
+    let Some(RunOwner::Spawned(history)) = request.owner.as_ref() else {
+        return Ok(());
+    };
+    let Some(history_len) = history.before_turn_len.filter(|len| *len > 0) else {
+        return Ok(());
+    };
+    if spend.rollout_budget_exhausted()
+        || request.cancel.is_cancelled()
+        || !request.config.capabilities().iter().any(|capability| {
+            capability.kind() == CapabilityFamily::COMPACTION
+                && capability.context_processor().is_some()
+        })
+    {
+        return Ok(());
+    }
+    let owned = Arc::clone(history);
+    let cancel = request.cancel.child(ScopeKind::Run);
+    let cancel = if let Some(deadline) = request.config.budget().deadline() {
+        cancel.with_deadline(deadline)
+    } else {
+        cancel
+    };
+    let _deadline = super::arm_deadline(&cancel);
+    let mut run = RunContext::new(request.run_id.clone(), request.agent.public())
+        .with_budget(request.state.budget().clone())
+        .with_usage_totals(spend.shared_usage())
+        .with_event_seq_allocator(request.event_seqs.clone());
+    let mut started =
+        RolloutRunStarted::new(request.run_id.clone(), request.agent.public_id().clone());
+    if let Some(parent) = request.state.parent_run_id() {
+        run = run.with_parent_run_id(parent.clone());
+        started = started.with_parent_run_id(parent.clone());
+    }
+    let model = super::hook_model_name(
+        request.model_resolver.as_ref(),
+        &request.config,
+        &request.agent,
+    );
+    let run = super::hook_context_metadata(
+        run,
+        model.as_deref(),
+        request
+            .config
+            .app_context()
+            .or(request.app_context.as_ref()),
+    );
+    let turn_start = request.rollout.clone().map(|rollout| {
+        Box::new(move || rollout.record(RolloutItem::RunStarted(started))) as AttemptStart
+    });
+    let summary_usage = std::sync::Mutex::new(Usage::default());
+    let mut installed = None;
+    let result = HistoryCompaction {
+        agent: &request.agent,
+        models: request.model_resolver.as_ref(),
+        config: &request.config,
+        services: &request.services,
+        cancel: &cancel,
+        run_cancel: &request.cancel,
+        rollout: request.rollout.as_deref(),
+        sink: None,
+        owner: request.owner.clone(),
+        run_id: request.run_id.clone(),
+        run: Arc::new(run),
+        trigger: CompactTrigger::Automatic,
+        turn: 1,
+        reported_tokens: owned.reported_tokens(),
+        session_start_on_stop: None,
+        spent: Some(&summary_usage),
+        turn_start,
+    }
+    .run(&request.input[..history_len], |replacement, _| {
+        installed = Some(replacement.to_vec());
+    })
+    .await;
+    if let Some(mut replacement) = installed {
+        request.recorded_input = replacement.len();
+        replacement.extend(request.input.drain(history_len..));
+        owned.history_compacted(&replacement, &[]);
+        request.input = replacement;
+    }
+    let usage = summary_usage
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if usage.requests() > 0 {
+        request.state.record_usage(&usage);
+        spend.record_own(&usage);
+        if let Some(rollout) = &request.rollout {
+            rollout.record(RolloutItem::ModelUsage(
+                RolloutModelUsage::new(request.run_id.clone(), usage).with_turn_index(1),
+            ));
+        }
+    }
+    result.map(drop)
+}
+
 /// Whether the run's whole history belongs to a thread that compacts it between steps.
 ///
 /// Only a thread's own run, and only while its history is wholly reconstructible: a caller-managed
 /// continuation holds a projection the run never recorded, which a replacement could not stand for.
 /// A run with no thread above it keeps the capability's run-scoped projection.
 pub(super) fn compacts_session(context: &TurnLoopContext<'_>) -> bool {
-    matches!(context.owner, Some(RunOwner::Thread(_))) && context.authoritative_history_complete
+    matches!(
+        context.owner,
+        Some(RunOwner::Thread(_) | RunOwner::Spawned(_))
+    ) && context.authoritative_history_complete
 }
 
 /// Whether this step follows one that needed a follow-up, which is where Codex checks the limit
@@ -310,7 +511,7 @@ pub(super) fn due_mid_turn(
     progress: &TurnLoopProgress,
 ) -> bool {
     compacts_session(context)
-        && state.parent_run_id().is_none()
+        && (matches!(context.owner, Some(RunOwner::Spawned(_))) || state.parent_run_id().is_none())
         && (progress.turns > 1 || context.continues_turn)
 }
 
@@ -335,6 +536,7 @@ pub(super) async fn compact_mid_turn(
             .filter_map(RunItem::to_model_input),
     );
     let spent = std::sync::Mutex::new(Usage::default());
+    let reestablish_session = !matches!(context.owner, Some(RunOwner::Spawned(_)));
     let compaction = HistoryCompaction {
         agent,
         models: context.model_resolver.as_ref(),
@@ -351,7 +553,7 @@ pub(super) async fn compact_mid_turn(
         turn: progress.reference_turn(),
         reported_tokens: progress.last_response_tokens,
         // A stop leaves the context this turn would have re-established to the next one.
-        session_start_on_stop: Some(SessionStartSource::Compact),
+        session_start_on_stop: reestablish_session.then_some(SessionStartSource::Compact),
         spent: Some(&spent),
         turn_start: None,
     };
@@ -368,6 +570,9 @@ pub(super) async fn compact_mid_turn(
             if let Some(sink) = sink {
                 sink.history_compacted(replacement, &superseded);
             }
+            if let Some(RunOwner::Spawned(history)) = context.owner {
+                history.history_compacted(replacement, &superseded);
+            }
         })
         .await;
     // Paid for whether or not the compaction succeeded, and recorded once, with the run's spend.
@@ -380,28 +585,30 @@ pub(super) async fn compact_mid_turn(
     if compacted?.is_none() {
         return Ok(None);
     }
-    let hooks = context.config.user_hooks().bind(
-        Arc::new(turn_hook_context(context, agent, state)),
-        turn_scope.clone(),
-        context.services.clone(),
-    );
-    let (items, stopped) = reestablish_compact_context(
-        context,
-        Some(&hooks),
-        &format!("compact-hook-{}-history", progress.reference_turn()),
-    )
-    .await?;
-    if !items.is_empty() {
-        for item in &items {
-            emit(context.events, RunStreamEvent::Item(item.clone()));
+    if reestablish_session {
+        let hooks = context.config.user_hooks().bind(
+            Arc::new(turn_hook_context(context, agent, state)),
+            turn_scope.clone(),
+            context.services.clone(),
+        );
+        let (items, stopped) = reestablish_compact_context(
+            context,
+            Some(&hooks),
+            &format!("compact-hook-{}-history", progress.reference_turn()),
+        )
+        .await?;
+        if !items.is_empty() {
+            for item in &items {
+                emit(context.events, RunStreamEvent::Item(item.clone()));
+            }
+            state.record_generated_items(items);
         }
-        state.record_generated_items(items);
-    }
-    if stopped {
-        progress.stop_processing = true;
-        return Ok(Some(RunOutcome::Completed {
-            reason: ra_core::finish::FinishReason::Final,
-        }));
+        if stopped {
+            progress.stop_processing = true;
+            return Ok(Some(RunOutcome::Completed {
+                reason: ra_core::finish::FinishReason::Final,
+            }));
+        }
     }
     // The summary was paid for after the loop last checked the budget, and the next sampling would
     // be paid for on top of it: a spent token budget ends the run here, once the context Codex
