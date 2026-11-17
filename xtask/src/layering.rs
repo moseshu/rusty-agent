@@ -143,7 +143,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-session",
         ],
     ),
-    ("ra-model", &["ra-core"]),
+    ("ra-model", &["ra-core", "ra-http"]),
     ("ra-prompt", &["ra-core"]),
     ("ra-context", &["ra-core"]),
     // Socket location is shared with transports so every sandbox hides the same directory.

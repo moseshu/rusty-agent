@@ -5324,8 +5324,17 @@ async fn run_one_turn(
     // The filter chain runs last, on whatever the coarse transforms produced. A context processor
     // reprojects whole regions of history; running a filter before it would only trim items the
     // processor's own output then replaced with the untouched originals.
-    let (prepared, context_filter_reports) =
-        apply_context_filters(config, state, progress.reference_turn(), prepared)?;
+    let session_id = config
+        .user_hooks()
+        .session_id()
+        .or_else(|| context.session.map(Session::session_id));
+    let (prepared, context_filter_reports) = apply_context_filters(
+        config,
+        state,
+        progress.reference_turn(),
+        session_id,
+        prepared,
+    )?;
     let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
     let sampled_input = [HookEventName::Stop, HookEventName::SubagentStop]
         .into_iter()
@@ -6849,6 +6858,7 @@ fn apply_context_filters(
     config: &RunConfig,
     state: &RunState,
     turn: u64,
+    session_id: Option<&ra_core::session::SessionId>,
     prepared: PreparedTurn,
 ) -> Result<(PreparedTurn, Vec<ContextFilterReport>)> {
     let filters = config.context_filters();
@@ -6856,7 +6866,9 @@ fn apply_context_filters(
         return Ok((prepared, Vec::new()));
     }
 
-    let request = ContextFilterRequest::new(state.run_id(), turn, state.tool_output_references());
+    let request = ContextFilterRequest::new(state.run_id(), turn, state.tool_output_references())
+        .with_model(prepared.selector().model())
+        .with_session_id(session_id);
     let before_instructions = prepared.request().system_instructions().map(str::to_owned);
     let data = ModelInputData::new(
         prepared.request().input().to_vec(),

@@ -75,18 +75,24 @@ pub(crate) async fn build_request_body(
         );
     }
     merge_effort(&mut body, request.model_settings().effort())?;
+    if body.get("service_tier").is_some_and(Value::is_null) {
+        body.remove("service_tier");
+    }
     if let Some(output_schema) = request.output_schema() {
-        body.insert(
-            "text".to_owned(),
+        let mut text = match body.remove("text") {
+            Some(Value::Object(text)) => text,
+            _ => Map::new(),
+        };
+        text.insert(
+            "format".to_owned(),
             json!({
-                "format": {
-                    "type": "json_schema",
-                    "name": output_schema.name(),
-                    "schema": output_schema.schema(),
-                    "strict": output_schema.strict()
-                }
+                "type": "json_schema",
+                "name": output_schema.name(),
+                "schema": output_schema.schema(),
+                "strict": output_schema.strict()
             }),
         );
+        body.insert("text".to_owned(), Value::Object(text));
     }
 
     validate_tool_search_configuration(&body, request.tools())?;
@@ -512,6 +518,16 @@ async fn lower_message(message: &Message) -> Result<Value> {
         "role": message.role().label(),
         "content": content
     });
+    if message.role() == MessageRole::Developer
+        && let [ContentBlock::Text(text)] = message.content()
+        && let Some(id) = text
+            .provider_metadata()
+            .get(crate::openai::prompt_cache::OPENAI_METADATA_NAMESPACE)
+            .and_then(|metadata| metadata.get(super::PREFIX_ITEM_ID))
+            .and_then(Value::as_str)
+    {
+        value["id"] = Value::String(id.to_owned());
+    }
     if let Some(phase) = message.phase() {
         let phase = match phase {
             OutputPhase::Commentary => "commentary",

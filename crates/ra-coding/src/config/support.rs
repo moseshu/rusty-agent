@@ -276,6 +276,9 @@ pub(super) fn validate_extra_metadata<'a>(
     }
     Ok(())
 }
+pub(super) fn forwards_configured_response_metadata(key: &str) -> bool {
+    !RESERVED_METADATA_KEYS.contains(&key) && key != "misalignment_override"
+}
 fn valid_extra_metadata_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())

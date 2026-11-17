@@ -17,7 +17,7 @@ use ra_runtime::{agent::AgentBinding, thread::AgentThread};
 
 use crate::{
     agent::{HOST_BACKED_PROFILE, assemble_agent},
-    config::ConfigBuilder,
+    config::{ConfigBuilder, model_runtime::ProductModelRuntime},
     host::CodingHost,
     profile::CodingProfile,
     spawned,
@@ -29,7 +29,7 @@ use crate::{
 #[derive(Clone)]
 pub struct CodingThreadFactory {
     host: CodingHost,
-    models: Arc<dyn ModelResolver>,
+    models: Option<Arc<dyn ModelResolver>>,
     settings: CodingThreadSettingsAdapter,
     product_config: Option<ConfigBuilder>,
     role: PromptRole,
@@ -61,9 +61,28 @@ impl CodingThreadFactory {
     ) -> Self {
         Self {
             host,
-            models,
+            models: Some(models),
             settings,
             product_config: None,
+            role: PromptRole::Main,
+            profile: HOST_BACKED_PROFILE,
+            agent_id: AgentId::new("coding"),
+            agent_name: "Coding agent".to_owned(),
+        }
+    }
+
+    /// Uses a thread's effective product configuration to resolve its models and Responses endpoint.
+    #[must_use]
+    pub fn from_product_config(
+        host: CodingHost,
+        settings: CodingThreadSettingsAdapter,
+        builder: ConfigBuilder,
+    ) -> Self {
+        Self {
+            host,
+            models: None,
+            settings,
+            product_config: Some(builder),
             role: PromptRole::Main,
             profile: HOST_BACKED_PROFILE,
             agent_id: AgentId::new("coding"),
@@ -76,6 +95,8 @@ impl CodingThreadFactory {
     /// reviewer and permissions — the canonical profile and its requirement constraints — come
     /// from it, with the host workspace as its working directory, and named permission profiles
     /// are later resolved through it. Without it the settings adapter's own policy applies.
+    ///
+    /// The resolver passed to [`Self::new`] retains ownership of provider and settings resolution.
     ///
     /// Each thread's product hooks are built from that configuration too, as Codex builds a
     /// session's: a thread without a product configuration has none.
@@ -117,6 +138,61 @@ impl CodingThreadFactory {
 }
 
 impl CodingThreadFactory {
+    async fn load_product_configuration(
+        &self,
+        mut builder: ConfigBuilder,
+        host: &CodingHost,
+        request: &ThreadFactoryRequest,
+    ) -> Result<(
+        CodingThreadSettingsAdapter,
+        Arc<ProductModelRuntime>,
+        Arc<CodingThreadHooks>,
+    )> {
+        let generation = host
+            .plugin_services()
+            .map_or(0, |plugins| plugins.hook_generation());
+        builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
+        ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())
+            .map_err(ra_core::error::Error::config)?;
+        let config = Arc::new(builder.clone().build().await.map_err(|error| {
+            ra_core::error::Error::config(format!(
+                "failed to load the product configuration: {error}"
+            ))
+        })?);
+        let models = Arc::new(ProductModelRuntime::new(
+            Arc::clone(&config),
+            self.models.clone(),
+        )?);
+
+        // A named profile requirements disallow falls back with a startup warning. A settings or
+        // turn update refuses the same selection.
+        let settings = self
+            .settings
+            .clone()
+            .for_new_thread()
+            .with_product_config(&config, ProductPermissionSource::new(builder.clone()));
+        settings
+            .start_network_proxy(&config)
+            .await
+            .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
+        // A required managed hook that fails to load fails the thread.
+        let hooks = Arc::new(
+            Box::pin(CodingThreadHooks::build_refreshing(
+                (*config).clone(),
+                builder,
+                host,
+                request.thread_id().clone(),
+                generation,
+                request.policy().environments(),
+                hook_role(request),
+            ))
+            .await
+            .map_err(|error| hook_construction_error(&error))?,
+        );
+        settings.attach_hook_runtime(Arc::clone(hooks.runtime()));
+        Ok((settings, models, hooks))
+    }
+
     /// The thread's agent tree. Its root is the thread: its session is what the agents' hooks and
     /// spawn records name as their parent's, whether or not the server records them, and a thread
     /// that was itself spawned continues its lineage.
@@ -153,51 +229,14 @@ impl ThreadFactory for CodingThreadFactory {
 
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
         let host = self.host.with_new_process_manager();
-        let mut hooks = None;
-        let settings = match &self.product_config {
+        let (settings, model_runtime, hooks) = match &self.product_config {
             Some(builder) => {
-                let generation = host
-                    .plugin_services()
-                    .map_or(0, |plugins| plugins.hook_generation());
-                let mut builder = builder.clone();
-                builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
-                ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())
-                    .map_err(ra_core::error::Error::config)?;
-                let config = builder.clone().build().await.map_err(|error| {
-                    ra_core::error::Error::config(format!(
-                        "failed to load the product configuration: {error}"
-                    ))
-                })?;
-                // As in Codex's thread start, resume and fork, a named profile requirements
-                // disallow falls back to the required value with a startup warning; only a
-                // settings or turn update refuses it.
-                let settings = self
-                    .settings
-                    .clone()
-                    .for_new_thread()
-                    .with_product_config(&config, ProductPermissionSource::new(builder.clone()));
-                settings
-                    .start_network_proxy(&config)
-                    .await
-                    .map_err(|error| ra_core::error::Error::config(error.to_string()))?;
-                // As Codex's session creation, a required managed hook that fails to load fails
-                // the thread.
-                let thread_hooks = Box::pin(CodingThreadHooks::build_refreshing(
-                    config,
-                    builder,
-                    &host,
-                    request.thread_id().clone(),
-                    generation,
-                    request.policy().environments(),
-                    hook_role(request),
-                ))
-                .await
-                .map_err(|error| hook_construction_error(&error))?;
-                settings.attach_hook_runtime(Arc::clone(thread_hooks.runtime()));
-                hooks = Some(Arc::new(thread_hooks));
-                settings
+                let (settings, runtime, hooks) = self
+                    .load_product_configuration(builder.clone(), &host, request)
+                    .await?;
+                (settings, Some(runtime), Some(hooks))
             }
-            None => self.settings.clone().for_new_thread(),
+            None => (self.settings.clone().for_new_thread(), None, None),
         };
         let assembled = assemble_agent(
             self.agent_id.clone(),
@@ -207,8 +246,23 @@ impl ThreadFactory for CodingThreadFactory {
             self.profile,
         )
         .await?;
+        let (run_config, models): (_, Arc<dyn ModelResolver>) = match model_runtime {
+            Some(runtime) => (
+                CodingHost::build_run_config_with_compaction(runtime.clone())
+                    .with_context_filter(runtime.clone()),
+                runtime,
+            ),
+            None => (
+                host.build_run_config(),
+                self.models.clone().ok_or_else(|| {
+                    ra_core::error::Error::config(
+                        "a coding thread requires a model resolver or product configuration",
+                    )
+                })?,
+            ),
+        };
         let mut config = settings.initialize(
-            host.build_run_config()
+            run_config
                 .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
                 .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
         );
@@ -233,7 +287,7 @@ impl ThreadFactory for CodingThreadFactory {
         let mut builder = AgentThread::builder(
             request.thread_id().clone(),
             AgentBinding::direct(assembled.agent),
-            Arc::clone(&self.models),
+            models,
         )
         .with_config(config)
         .with_services(host.build_tool_services());

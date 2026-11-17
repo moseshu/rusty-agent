@@ -27,6 +27,8 @@ pub use ra_config::{
 
 mod agent_role_config;
 pub mod catalog;
+mod model_auth;
+pub(crate) mod model_runtime;
 mod otel;
 mod product;
 mod requirements;

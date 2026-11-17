@@ -20,7 +20,7 @@ use ra_core::{
 };
 use serde_json::Value;
 
-use super::error::{ResponseFacts, behavior_error, response_failure, transport_error};
+use super::error::{ResponseFacts, behavior_error, response_failure};
 
 /// The terminator both `OpenAI` protocols send before closing the connection.
 const DONE_MARKER: &str = "[DONE]";
@@ -127,7 +127,7 @@ pub(crate) fn ensure_event_stream(response: &reqwest::Response, protocol: &str) 
 /// that makes a replay safe is still not this function's call — a request continuing server-managed
 /// state can have advanced it before the refusal — so the caller supplies the verdict.
 pub(crate) async fn failed_stream(
-    response: reqwest::Response,
+    response: ra_http::HttpResponse,
     unstarted: ReplaySafety,
 ) -> Result<ModelStreamEvent> {
     let facts = ResponseFacts::read(&response);
@@ -171,13 +171,18 @@ struct SseReader {
 /// not a byte-level one — but [`SseFrame::Done`] is surfaced so the decoder above can tell the two
 /// endings apart instead of assuming the good one.
 pub(crate) fn frames(
-    response: reqwest::Response,
+    response: ra_http::HttpResponse,
     terminator: Terminator,
+    idle_timeout: Option<std::time::Duration>,
 ) -> impl Stream<Item = Result<SseFrame>> {
     let reader = SseReader {
         bytes: response
             .bytes_stream()
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(transport_error))
+            .map(|chunk| {
+                chunk
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(super::error::http_transport_error)
+            })
             .boxed(),
         terminator,
         partial: Vec::new(),
@@ -185,7 +190,7 @@ pub(crate) fn frames(
         ready: VecDeque::new(),
         done: false,
     };
-    stream::unfold(reader, |mut reader| async move {
+    stream::unfold(reader, move |mut reader| async move {
         loop {
             if let Some(frame) = reader.ready.pop_front() {
                 return Some((frame, reader));
@@ -193,7 +198,18 @@ pub(crate) fn frames(
             if reader.done {
                 return None;
             }
-            match reader.bytes.next().await {
+            let next = match idle_timeout {
+                Some(timeout) => tokio::time::timeout(timeout, reader.bytes.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Some(Err(Error::provider(
+                            ProviderErrorKind::Timeout,
+                            "OpenAI response stream became idle",
+                        )))
+                    }),
+                None => reader.bytes.next().await,
+            };
+            match next {
                 Some(Ok(chunk)) => reader.push(&chunk),
                 Some(Err(error)) => {
                     reader.done = true;

@@ -681,18 +681,22 @@ impl CodingHost {
     /// without asking for approval, as Codex's handlers parse their arguments before any approval.
     /// This is a product choice: the framework default asks first, as the reference SDK does.
     pub fn build_run_config(&self) -> RunConfig {
+        Self::build_run_config_with_compaction(Arc::new(
+            CompactionCapability::default().with_context_windows(
+                ContextWindowConfig::default()
+                    .with_compaction_threshold_ratio(CODEX_AUTO_COMPACT_RATIO),
+            ),
+        ))
+    }
+
+    pub(crate) fn build_run_config_with_compaction(compaction: Arc<dyn Capability>) -> RunConfig {
         RunConfig::new()
             .with_unparsed_arguments_reported_before_approval(true)
             .with_max_turns(None)
             .with_max_function_tool_concurrency(8)
             .with_context_filter(Arc::new(ToolOutputReferenceTrimmer::default()))
             .with_compaction_retry(compaction_retry())
-            .with_capability(Arc::new(
-                CompactionCapability::default().with_context_windows(
-                    ContextWindowConfig::default()
-                        .with_compaction_threshold_ratio(CODEX_AUTO_COMPACT_RATIO),
-                ),
-            ))
+            .with_capability(compaction)
     }
 
     /// Creates the workspace-confined editing capability.

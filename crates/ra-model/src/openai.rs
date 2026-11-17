@@ -32,6 +32,13 @@ pub(crate) fn apply_transport_headers(
     auth: &OpenAiAuth,
     request_headers: &BTreeMap<String, String>,
 ) -> Result<RequestBuilder> {
+    Ok(request.headers(transport_headers(auth, request_headers)?))
+}
+
+fn transport_headers(
+    auth: &OpenAiAuth,
+    request_headers: &BTreeMap<String, String>,
+) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     if let Some(organization) = auth.organization() {
         insert_header(&mut headers, "openai-organization", organization)?;
@@ -49,7 +56,7 @@ pub(crate) fn apply_transport_headers(
             insert_header(&mut headers, name, value)?;
         }
     }
-    Ok(request.headers(headers))
+    Ok(headers)
 }
 
 /// Inserts one header, replacing an earlier value with the same case-insensitive name.

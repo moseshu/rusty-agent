@@ -39,6 +39,11 @@ The bundled system skills in crates/ra-coding/src/skills/assets/samples/ are cop
 openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
 codex-rs/skills/src/assets/samples/ (Apache-2.0), together with any license files they carry.
 
+The bundled model catalog and fallback instructions in
+crates/ra-coding/src/config/{models.json,model_prompt.md} are copied from
+openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
+codex-rs/models-manager/{models.json,prompt.md} (Apache-2.0).
+
 The patch scenarios in tests/it-tools/fixtures/codex_apply_patch_scenarios/ are copied from
 openai/codex, revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
 codex-rs/apply-patch/tests/fixtures/scenarios/ (Apache-2.0).
@@ -56,6 +61,8 @@ local upstream checkouts used for the port; each file lists its original source.
 
 | File | Upstream | Revision | Original source |
 | --- | --- | --- | --- |
+| `crates/ra-coding/src/config/model_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/auth/external_bearer.rs (command-backed provider token and cache) |
+| `crates/ra-coding/src/config/model_runtime.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{core/src/client.rs,model-provider-info/src/lib.rs,models-manager/src/{manager,model_info}.rs,protocol/src/openai_models/reasoning_effort.rs,utils/output-truncation/src/lib.rs} |
 | `crates/ra-config/src/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
 | `crates/ra-config/src/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |
 | `crates/ra-config/src/key_aliases.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/key_aliases.rs |

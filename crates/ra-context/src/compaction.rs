@@ -398,6 +398,7 @@ pub struct CompactionCapability {
     retention: AnchorRetention,
     max_items: Option<usize>,
     max_single_item_tokens: Option<usize>,
+    total_token_limit: Option<usize>,
 }
 
 impl CompactionCapability {
@@ -421,6 +422,7 @@ impl CompactionCapability {
             retention,
             max_items,
             max_single_item_tokens,
+            total_token_limit: None,
         })
     }
 
@@ -431,6 +433,13 @@ impl CompactionCapability {
     #[must_use]
     pub fn with_context_windows(mut self, context_windows: ContextWindowConfig) -> Self {
         self.context_windows = context_windows;
+        self
+    }
+
+    /// Sets an absolute compaction threshold supplied by a model catalog.
+    #[must_use]
+    pub const fn with_total_token_limit(mut self, limit: usize) -> Self {
+        self.total_token_limit = Some(limit);
         self
     }
 
@@ -459,6 +468,14 @@ impl CompactionCapability {
     }
 
     fn limits_for_model(&self, model: Option<&str>) -> Result<Option<CompactionLimits>> {
+        if self.total_token_limit.is_some() {
+            return CompactionLimits::new(
+                self.max_items,
+                self.max_single_item_tokens,
+                self.total_token_limit,
+            )
+            .map(Some);
+        }
         let Some(model) = model else {
             if self.max_items.is_none() && self.max_single_item_tokens.is_none() {
                 return Ok(None);
@@ -483,6 +500,7 @@ impl Default for CompactionCapability {
             retention: AnchorRetention::default(),
             max_items: None,
             max_single_item_tokens: None,
+            total_token_limit: None,
         }
     }
 }

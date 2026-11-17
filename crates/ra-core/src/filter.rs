@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Result,
     item::{ModelInputItem, estimate},
+    session::SessionId,
     state::{RunId, ToolOutputReferenceTracker},
 };
 
@@ -142,6 +143,8 @@ impl ModelInputData {
 pub struct ContextFilterRequest<'a> {
     run_id: &'a RunId,
     current_turn: u64,
+    model: Option<&'a str>,
+    session_id: Option<&'a SessionId>,
     tool_output_references: &'a ToolOutputReferenceTracker,
 }
 
@@ -156,6 +159,8 @@ impl<'a> ContextFilterRequest<'a> {
         Self {
             run_id,
             current_turn,
+            model: None,
+            session_id: None,
             tool_output_references,
         }
     }
@@ -174,6 +179,32 @@ impl<'a> ContextFilterRequest<'a> {
     #[must_use]
     pub const fn current_turn(&self) -> u64 {
         self.current_turn
+    }
+
+    /// Attaches the resolved provider-facing model for model-specific projections.
+    #[must_use]
+    pub const fn with_model(mut self, model: Option<&'a str>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Provider-facing model selected for this request.
+    #[must_use]
+    pub const fn model(&self) -> Option<&str> {
+        self.model
+    }
+
+    /// Attaches the owning session identity for projections that persist across runs.
+    #[must_use]
+    pub const fn with_session_id(mut self, session_id: Option<&'a SessionId>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// Session that owns this request, when the runner is acting for a session.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id
     }
 
     /// Persisted record of which tool outputs later turns still referenced.

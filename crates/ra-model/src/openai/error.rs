@@ -67,6 +67,30 @@ pub(crate) fn decode_error(error: reqwest::Error) -> Error {
     .into_error()
 }
 
+pub(crate) fn http_transport_error(error: ra_http::HttpError) -> Error {
+    let kind = if matches!(
+        error,
+        ra_http::HttpError::Policy(_) | ra_http::HttpError::Build(_)
+    ) || error.is_builder()
+    {
+        ProviderErrorKind::BadRequest
+    } else if error.is_timeout() {
+        ProviderErrorKind::Timeout
+    } else {
+        ProviderErrorKind::Network
+    };
+    NormalizedProviderError::new(kind, "OpenAI request transport failed")
+        .with_source(error.without_url())
+        .into_error()
+}
+
+pub(crate) fn http_decode_error(error: ra_http::HttpError) -> Error {
+    if let ra_http::HttpError::Request(error) = error {
+        return decode_error(error.without_url());
+    }
+    http_transport_error(error)
+}
+
 /// Maps a failed HTTP response into the neutral taxonomy.
 ///
 /// The record is returned rather than the error so a caller that also holds the failure which

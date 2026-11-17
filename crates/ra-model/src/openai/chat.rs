@@ -469,7 +469,11 @@ impl Model for OpenAiChatModel {
                     match super::sse::ensure_event_stream(&response, "Chat Completions") {
                         Ok(()) => stream::events(
                             model.codec.clone(),
-                            super::sse::frames(response, model.codec.terminator.clone()),
+                            super::sse::frames(
+                                response.into(),
+                                model.codec.terminator.clone(),
+                                None,
+                            ),
                             provider,
                             stream::CallTargets {
                                 handoffs,
@@ -483,7 +487,8 @@ impl Model for OpenAiChatModel {
                     }
                 }
                 Ok(response) => {
-                    futures_stream::once(super::sse::failed_stream(response, unstarted)).boxed()
+                    futures_stream::once(super::sse::failed_stream(response.into(), unstarted))
+                        .boxed()
                 }
                 Err(error) => super::sse::error_stream(error, unstarted),
             }
