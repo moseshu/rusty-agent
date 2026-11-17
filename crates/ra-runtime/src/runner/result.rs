@@ -41,6 +41,8 @@ use ra_core::{
 use serde_json::Value;
 use std::{ops::Range, sync::Arc};
 
+use super::{compacted_record_ids, project_model_input};
+
 /// Immutable metadata about the agent-tool call a nested run answered.
 // The field names are the reference's `AgentToolInvocation` fields.
 #[allow(clippy::struct_field_names)]
@@ -322,18 +324,19 @@ impl RunOutcome {
     }
 }
 
-/// Which history to build the next call's input from.
+/// How to normalize the history for the next call.
 ///
-/// The two policies differ in who is allowed to reinterpret the records, which is why the choice
-/// belongs to the caller rather than to a default. R9-7 and R12-2 both consume this.
+/// Both policies use the checkpoint's model-visible history so a continuation respects handoff
+/// and compaction boundaries. The `OpenAI` Agents SDK's `to_input_list(mode="preserve_all")`
+/// exposes the full converted history. For the equivalent record view here, use
+/// [`RunResult::new_items`] or [`RunState::generated_items`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContinuationInput {
-    /// Every record, projected verbatim.
+    /// Every record in the continuation history, projected verbatim.
     ///
-    /// Use it when something downstream owns reconciliation and must see exactly what happened —
-    /// a resume that has to line up with stored history, or a nested run whose parent will do the
-    /// pruning.
+    /// Use it when the caller owns normalization. Handoff and compaction projections apply
+    /// before this policy.
     PreserveAll,
     /// Run through [`InputItemNormalizer`]: deduplicated, call/output paired, dangling reasoning
     /// removed.
@@ -794,48 +797,39 @@ impl RunResult {
 
     /// Builds the input for a call that continues from this run.
     ///
-    /// A projection, not a stored list. Storing it would let the "what to send next" copy drift
-    /// from the "what happened" one, and the drift shows up as a duplicated or missing turn a
-    /// session later.
+    /// With complete checkpoint history, the base is the run's opening input and the records
+    /// span every segment. An explicit resume uses the caller's input and this segment's records.
     ///
-    /// It extends this result's continuation base with the records this segment produced. For an
-    /// automatic checkpoint resume that base already contains the prior recorded history; for an
-    /// explicit resume it remains the caller-provided input.
+    /// A handoff's [`HistoryProjection`](ra_core::agent::HistoryProjection) or a thread's
+    /// [compacted history](ra_core::state::RunState::compacted_history) supplies a replacement
+    /// base that is extended with the records generated after it. In-run compaction omits the
+    /// generated records covered by its summary, including superseded summaries.
     ///
-    /// **A transfer of control replaces both halves.** Once a handoff has narrowed what the agent
-    /// now holding the run may see, this segment's own records are no longer what to send it — and
-    /// handing them over through a convenience projection is the same silent expansion the handoff's
-    /// [`HistoryProjection`](ra_core::agent::HistoryProjection) exists to prevent, with the host
-    /// given no way to notice. A caller that wants the unprojected history reads
-    /// [`RunState::generated_items`](ra_core::state::RunState::generated_items), which says what it
-    /// is. **So does a compaction of a thread's whole history**: the turn continues from the
-    /// replacement Codex's `replace_compacted_history` installed and the records generated after
-    /// it ([`RunState::compacted_history`](ra_core::state::RunState::compacted_history)).
+    /// Both policies use this projection. For the full recorded history, see
+    /// [`RunState::generated_items`](ra_core::state::RunState::generated_items).
     #[must_use]
     pub fn continuation_input(&self, policy: ContinuationInput) -> Vec<ModelInputItem> {
-        let items = if self.state.has_model_input_base() {
-            // A projection naming a boundary the history does not hold is a broken checkpoint, and
-            // the infallible answer to it has to be the narrow one: sending the projection alone
-            // loses work, while falling back to the records loses the restriction.
-            match self.state.model_input_base() {
-                Ok((base, carried)) => {
-                    let mut items = base.to_vec();
-                    items.extend(carried.iter().filter_map(RunItem::to_model_input));
-                    items
+        // The segment's flattened base has lost the IDs of records from earlier segments.
+        // Use the run's records so a compaction can replace them across checkpoint resumes.
+        let (base, carried): (&[ModelInputItem], &[RunItem]) =
+            if self.state.has_model_input_base() || self.state.input_history_is_complete() {
+                // A broken checkpoint boundary still permits the installed base. Using it alone
+                // preserves the projection's restrictions.
+                match self.state.model_input_base() {
+                    Ok(parts) => parts,
+                    Err(_) => (
+                        self.state
+                            .handoff_projection()
+                            .map(ra_core::state::HandoffProjection::input)
+                            .or_else(|| self.state.compacted_history())
+                            .unwrap_or_default(),
+                        &[],
+                    ),
                 }
-                Err(_) => self
-                    .state
-                    .handoff_projection()
-                    .map(ra_core::state::HandoffProjection::input)
-                    .or_else(|| self.state.compacted_history())
-                    .unwrap_or_default()
-                    .to_vec(),
-            }
-        } else {
-            let mut items = self.original_input.clone();
-            items.extend(self.new_items.iter().filter_map(RunItem::to_model_input));
-            items
-        };
+            } else {
+                (self.original_input.as_slice(), self.new_items.as_slice())
+            };
+        let items = project_model_input(base, carried, &compacted_record_ids(carried));
         match policy {
             ContinuationInput::PreserveAll => items,
             // A normalization failure means an item could not be rendered as JSON, which cannot

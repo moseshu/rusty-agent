@@ -1519,12 +1519,25 @@ async fn compaction_capability_summarizes_and_replaces_generated_history_before_
         ],
         "the compaction request must not advertise the ordinary tool surface or inherit a server continuation"
     );
-    assert!(
+    assert_eq!(
         result
             .new_items()
             .iter()
-            .any(|item| matches!(item.kind(), RunItemKind::Compaction(_)))
+            .filter(|item| matches!(item.kind(), RunItemKind::ToolCall(_)))
+            .count(),
+        2,
+        "the replaced calls remain in the run's records"
     );
+    let mut expected = model.input_items.lock().unwrap()[2].clone();
+    expected.push(ModelInputItem::Message(
+        result.final_message().unwrap().clone(),
+    ));
+    for policy in [
+        ContinuationInput::PreserveAll,
+        ContinuationInput::Normalized,
+    ] {
+        assert_eq!(result.continuation_input(policy), expected);
+    }
     assert_eq!(result.model_responses().len(), 3);
     assert_eq!(result.usage().requests(), 3);
     assert_eq!(result.usage().input_tokens(), 33);
@@ -1588,6 +1601,14 @@ async fn a_compacted_history_is_not_summarized_again_on_the_following_turn() {
         "exactly one structured-output call may appear: a second is a second summary request"
     );
     assert_eq!(result.usage().requests(), 4);
+    let mut expected = model.input_items.lock().unwrap()[3].clone();
+    expected.push(ModelInputItem::Message(
+        result.final_message().unwrap().clone(),
+    ));
+    assert_eq!(
+        result.continuation_input(ContinuationInput::Normalized),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -1635,6 +1656,112 @@ async fn a_later_compaction_summarizes_the_current_projected_view() {
             .count(),
         2
     );
+    let mut expected = model.input_items.lock().unwrap()[4].clone();
+    expected.push(ModelInputItem::Message(
+        result.final_message().unwrap().clone(),
+    ));
+    assert_eq!(
+        result.continuation_input(ContinuationInput::PreserveAll),
+        expected
+    );
+
+    let resumed_model = ScriptedModel::new(vec![ModelResponse::new(vec![message(
+        "msg-2",
+        "confirmed",
+    )])]);
+    let resumed = Runner::run(resume_request(
+        Vec::new(),
+        &resumed_model,
+        &cancel,
+        result.state().clone(),
+    ))
+    .await
+    .expect("the run resumes from its checkpoint");
+    assert_eq!(
+        resumed_model.input_items.lock().unwrap().as_slice(),
+        std::slice::from_ref(&expected)
+    );
+    assert_eq!(resumed.original_input(), expected);
+    expected.push(ModelInputItem::Message(
+        resumed.final_message().unwrap().clone(),
+    ));
+    assert_eq!(
+        resumed.continuation_input(ContinuationInput::PreserveAll),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn approval_resume_sends_compacted_history_and_the_approved_tool_output() {
+    let tool = Arc::new(ScriptedTool::new("write_file"));
+    let gated = Arc::new(
+        ScriptedTool::new("publish_file")
+            .with_options(ToolOptions::new().with_approval(ToolApprovalPolicy::Always)),
+    );
+    let model = ScriptedModel::new(vec![
+        ModelResponse::new(vec![
+            tool_call("c-1", "call-1", "write_file"),
+            tool_call("c-2", "call-2", "write_file"),
+        ]),
+        ModelResponse::new(vec![message("summary-1", COMPACTION_SUMMARY_JSON)]),
+        ModelResponse::new(vec![tool_call("c-3", "call-3", "publish_file")]),
+    ]);
+    let cancel = CancelScope::root();
+    let compaction = CompactionCapability::new(
+        ContextWindowConfig::default(),
+        AnchorRetention::new(0, 0, 1).unwrap(),
+        Some(3),
+        None,
+    )
+    .unwrap();
+    let config = RunConfig::new().with_context_processor(Arc::new(compaction));
+    let interrupted = Runner::run(
+        request(vec![tool.clone(), gated.clone()], &model, &cancel).with_config(config),
+    )
+    .await
+    .expect("the compacted run pauses for approval");
+    let [approval] = interrupted.outcome().interruptions() else {
+        panic!("expected one approval interruption");
+    };
+    let mut checkpoint: RunState =
+        serde_json::from_str(&serde_json::to_string(interrupted.state()).unwrap()).unwrap();
+    checkpoint.approve(approval, true).unwrap();
+
+    let resumed_model =
+        ScriptedModel::new(vec![ModelResponse::new(vec![message("msg-1", "done")])]);
+    let resumed = Runner::run(resume_request(
+        vec![tool, gated.clone()],
+        &resumed_model,
+        &cancel,
+        checkpoint,
+    ))
+    .await
+    .expect("the approved tool runs and the model continues");
+    let mut expected = interrupted.continuation_input(ContinuationInput::PreserveAll);
+    assert!(matches!(
+        expected.as_slice(),
+        [
+            ModelInputItem::Message(_),
+            ModelInputItem::Compaction(_),
+            ModelInputItem::ToolCall(_),
+        ]
+    ));
+    let output = resumed
+        .new_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            RunItemKind::ToolCallOutput(output) if output.call_id().as_str() == "call-3" => {
+                item.to_model_input()
+            }
+            _ => None,
+        })
+        .expect("the resumed tool call produces its output");
+    expected.push(output);
+    assert_eq!(
+        resumed_model.input_items.lock().unwrap().as_slice(),
+        &[expected]
+    );
+    assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
 }
 
 /// A window that cannot be resolved must leave the request alone rather than invent a capacity.

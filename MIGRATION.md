@@ -7,6 +7,17 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Continuation input after in-run compaction
+
+`RunResult::continuation_input` and automatic checkpoint resume now omit generated records
+covered by a run's compaction summaries, including superseded summaries.
+
+Both `PreserveAll` and `Normalized` use the model-visible history so a continuation respects
+handoff and compaction boundaries. `PreserveAll` skips normalization. The OpenAI Agents SDK's
+`to_input_list(mode="preserve_all")` exposes the full converted history, including records outside
+the handoff projection. In rusty-agent, the full record view is available through
+`RunResult::new_items` for the segment and `RunState::generated_items` for the entire run.
+
 ### Spawned agents are threads of their own
 
 A coding thread's spawned agents now behave as Codex's spawned threads: each has a rollout, hooks,

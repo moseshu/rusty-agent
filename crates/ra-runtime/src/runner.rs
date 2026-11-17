@@ -2377,7 +2377,8 @@ async fn run_loop_inner(
     // `begin_segment` above is what decides it, it survives a checkpoint, and a second encoding
     // here would have to be kept true by hand across resume paths that never meet.
     let authoritative_history_complete = state.input_history_is_complete();
-    let input_base = segment_input_base(&state, resuming, requested_input);
+    let input_base = segment_input_base(&state, resuming, requested_input)
+        .inspect_err(|error| ra_core::trace::record_error(span, error))?;
     let prepared = match prepared {
         Some(prepared) => Ok(prepared),
         None => {
@@ -4521,19 +4522,17 @@ fn segment_input_base(
     state: &RunState,
     resuming: bool,
     requested_input: Vec<ModelInputItem>,
-) -> Vec<ModelInputItem> {
+) -> Result<Vec<ModelInputItem>> {
     if !resuming || !requested_input.is_empty() {
-        return requested_input;
+        return Ok(requested_input);
     }
 
-    let mut input = state.original_input().to_vec();
-    input.extend(
-        state
-            .generated_items()
-            .iter()
-            .filter_map(RunItem::to_model_input),
-    );
-    input
+    let (base, records) = state.model_input_base()?;
+    Ok(project_model_input(
+        base,
+        records,
+        &compacted_record_ids(records),
+    ))
 }
 
 /// Copies the checkpoint records created by one segment for its result.
@@ -4948,7 +4947,7 @@ async fn continue_from_stop_hook(
         input
     } else {
         reconstructed = TurnInput::resolve(context, state, progress)
-            .map(|input| next_input(input.base(), input.carried(), None))
+            .map(|input| input.model_input())
             .unwrap_or_default();
         &reconstructed
     };
@@ -5241,21 +5240,16 @@ async fn run_one_turn(
     // appended since. The two ways of decomposing that are equivalent until a transfer of control
     // narrows the base — after which only the state knows what the receiving agent may see.
     let turn_input = TurnInput::resolve(context, state, progress)?;
-    let input = next_input(turn_input.base(), turn_input.carried(), reminder);
+    let mut input = turn_input.model_input();
     // What an agent spawned during this turn starts from: the agent running it, and the history
     // its request is built from. Only a run that takes part in an agent tree pays for the copy.
     if context.services.agent_control().is_some()
         && let Some(parent) = ParentRun::current()
     {
-        let mut history = turn_input.base().to_vec();
-        history.extend(
-            turn_input
-                .carried()
-                .iter()
-                .filter_map(RunItem::to_model_input),
-        );
-        parent.enter_turn(agent.public(), history, progress.last_response_tokens);
+        parent.enter_turn(agent.public(), input.clone(), progress.last_response_tokens);
     }
+    // The budget reminder goes last so the preceding history stays eligible for prefix caching.
+    input.extend(reminder.map(ModelInputItem::Message));
     let preparation_context = live_context(context, agent, state);
     let mut preparation = TurnPreparationRequest::new(
         agent,
@@ -6600,6 +6594,8 @@ async fn reestablish_compact_context(
 struct TurnInput {
     base: Vec<ModelInputItem>,
     carried: Vec<RunItem>,
+    /// Processors receive the full records, including records omitted from sampling.
+    compacted: BTreeSet<ItemId>,
     /// `None` when this segment's input is not reconstructible from state, which is what makes a
     /// positional split of the assembled request unsafe — see [`HistorySpan`].
     history_span: Option<HistorySpan>,
@@ -6611,19 +6607,23 @@ impl TurnInput {
         state: &RunState,
         progress: &TurnLoopProgress,
     ) -> Result<Self> {
-        let (base, carried) = if state.has_model_input_base() {
-            state.model_input_base()?
-        } else if context.authoritative_history_complete {
-            (state.original_input(), state.generated_items())
-        } else {
-            (context.input_base, progress.segment_items(state))
-        };
+        let (base, carried) =
+            if state.has_model_input_base() || context.authoritative_history_complete {
+                state.model_input_base()?
+            } else {
+                (context.input_base, progress.segment_items(state))
+            };
+        let compacted = compacted_record_ids(carried);
         let history_span = context.authoritative_history_complete.then(|| HistorySpan {
-            history_len: carried.iter().filter(|item| item.is_model_input()).count(),
+            history_len: carried
+                .iter()
+                .filter(|item| item.is_model_input() && !compacted.contains(item.id()))
+                .count(),
         });
         Ok(Self {
             base: base.to_vec(),
             carried: carried.to_vec(),
+            compacted,
             history_span,
         })
     }
@@ -6636,7 +6636,13 @@ impl TurnInput {
         &self.carried
     }
 
-    fn into_parts(self) -> (Vec<ModelInputItem>, Vec<RunItem>) {
+    fn model_input(&self) -> Vec<ModelInputItem> {
+        project_model_input(&self.base, &self.carried, &self.compacted)
+    }
+
+    fn into_parts(mut self) -> (Vec<ModelInputItem>, Vec<RunItem>) {
+        self.carried
+            .retain(|item| !self.compacted.contains(item.id()));
         (self.base, self.carried)
     }
 }
@@ -7750,24 +7756,32 @@ fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Builds the next call's input: what was asked, then everything produced since, then `reminder`.
-///
-/// Projection happens here rather than being accumulated as the run goes, so the model-facing view
-/// is always derived from the authoritative records. Adapters normalize it again before sending
-/// (R1-17); this stage only decides *which* records go.
-///
-/// A reminder goes **last and is not a record**: it never enters `generated`, so it is regenerated
-/// from the current allowance each turn and leaves no trace in session history. Last is also the
-/// only position that costs nothing, since everything ahead of it stays byte-identical between
-/// turns and remains eligible for the provider's prefix cache.
-fn next_input(
-    original_input: &[ModelInputItem],
-    generated: &[RunItem],
-    reminder: Option<Message>,
+/// Identifies records that are represented by compaction summaries.
+fn compacted_record_ids(records: &[RunItem]) -> BTreeSet<ItemId> {
+    records
+        .iter()
+        .filter_map(|item| match item.kind() {
+            RunItemKind::Compaction(compaction) => Some(compaction.compacted_items()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// Builds model input from the opening or replacement base and its surviving records.
+fn project_model_input(
+    base: &[ModelInputItem],
+    records: &[RunItem],
+    compacted: &BTreeSet<ItemId>,
 ) -> Vec<ModelInputItem> {
-    let mut input = original_input.to_vec();
-    input.extend(generated.iter().filter_map(RunItem::to_model_input));
-    input.extend(reminder.map(ModelInputItem::Message));
+    let mut input = base.to_vec();
+    input.extend(
+        records
+            .iter()
+            .filter(|item| !compacted.contains(item.id()))
+            .filter_map(RunItem::to_model_input),
+    );
     input
 }
 
