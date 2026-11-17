@@ -39,6 +39,7 @@ globset = { workspace = true }
 url = { workspace = true }
 ra-core = { workspace = true }
 ra-model = { workspace = true }
+rand = { workspace = true }
 ra-runtime = { workspace = true }
 ra-prompt = { workspace = true }
 ra-context = { workspace = true }
@@ -52,7 +53,7 @@ ra-paths = { workspace = true }
 shlex = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 toml = { workspace = true, features = ["preserve_order"] }
 toml_edit = { workspace = true }

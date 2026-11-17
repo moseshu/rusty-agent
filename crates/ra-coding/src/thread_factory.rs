@@ -17,7 +17,10 @@ use ra_runtime::{agent::AgentBinding, thread::AgentThread};
 
 use crate::{
     agent::{HOST_BACKED_PROFILE, assemble_agent},
-    config::{ConfigBuilder, model_runtime::ProductModelRuntime},
+    config::{
+        ConfigBuilder, model_catalog_remote::RemoteModelCatalogs,
+        model_runtime::ProductModelRuntime,
+    },
     host::CodingHost,
     profile::CodingProfile,
     spawned,
@@ -32,6 +35,7 @@ pub struct CodingThreadFactory {
     models: Option<Arc<dyn ModelResolver>>,
     settings: CodingThreadSettingsAdapter,
     product_config: Option<ConfigBuilder>,
+    model_catalogs: Arc<RemoteModelCatalogs>,
     role: PromptRole,
     profile: CodingProfile,
     agent_id: AgentId,
@@ -64,6 +68,7 @@ impl CodingThreadFactory {
             models: Some(models),
             settings,
             product_config: None,
+            model_catalogs: Arc::default(),
             role: PromptRole::Main,
             profile: HOST_BACKED_PROFILE,
             agent_id: AgentId::new("coding"),
@@ -83,6 +88,7 @@ impl CodingThreadFactory {
             models: None,
             settings,
             product_config: Some(builder),
+            model_catalogs: Arc::default(),
             role: PromptRole::Main,
             profile: HOST_BACKED_PROFILE,
             agent_id: AgentId::new("coding"),
@@ -159,10 +165,16 @@ impl CodingThreadFactory {
                 "failed to load the product configuration: {error}"
             ))
         })?);
-        let models = Arc::new(ProductModelRuntime::new(
-            Arc::clone(&config),
-            self.models.clone(),
-        )?);
+        let models = Arc::new(
+            ProductModelRuntime::new(
+                Arc::clone(&config),
+                self.models.clone(),
+                request.initial_model(),
+                request.session_source().is_non_root_agent(),
+                &self.model_catalogs,
+            )
+            .await?,
+        );
 
         // A named profile requirements disallow falls back with a startup warning. A settings or
         // turn update refuses the same selection.
@@ -248,8 +260,10 @@ impl ThreadFactory for CodingThreadFactory {
         .await?;
         let (run_config, models): (_, Arc<dyn ModelResolver>) = match model_runtime {
             Some(runtime) => (
-                CodingHost::build_run_config_with_compaction(runtime.clone())
-                    .with_context_filter(runtime.clone()),
+                runtime.configure_run(
+                    CodingHost::build_run_config_with_compaction(runtime.clone())
+                        .with_context_filter(runtime.clone()),
+                ),
                 runtime,
             ),
             None => (

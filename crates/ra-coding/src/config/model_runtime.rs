@@ -37,12 +37,14 @@ use ra_model::{
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
+use ra_runtime::runner::RunConfig;
 use serde_json::{Map, json};
 
 use super::{
     Config, ModelInfo, ModelsResponse,
     catalog::{ModelVisibility, TruncationMode, find_model_by_slug},
     model_auth::CommandBearerToken,
+    model_catalog_remote::{RemoteModelCatalog, RemoteModelCatalogs},
     support::forwards_configured_response_metadata,
 };
 
@@ -58,22 +60,78 @@ pub(crate) struct ProductModelRuntime {
     registry: Option<ProviderRegistry>,
     explicit: Option<Arc<dyn ModelResolver>>,
     default_model: Option<String>,
+    remote: Option<Arc<RemoteModelCatalog>>,
+}
+
+struct TurnCatalog {
+    source: Arc<RemoteModelCatalog>,
+    models: Option<Arc<ModelsResponse>>,
 }
 
 impl ProductModelRuntime {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         config: Arc<Config>,
         explicit: Option<Arc<dyn ModelResolver>>,
+        initial_model: Option<&str>,
+        offline: bool,
+        catalogs: &RemoteModelCatalogs,
     ) -> Result<Self> {
         let bundled = BUNDLED_MODELS
             .as_ref()
             .map_err(|error| Error::config(format!("invalid bundled model catalog: {error}")))?;
-        let models = config.model_catalog.as_ref().unwrap_or(bundled);
-        let default_model = config.model.clone().or_else(|| {
+        let mut prepared_auth = None;
+        let remote = if explicit.is_none()
+            && config.model_catalog.is_none()
+            && let Some(url) = &config.model_provider.model_catalog_url
+        {
+            let (auth, key) = provider_auth(
+                &config.model_provider,
+                config.model_provider_id == ra_config::model_provider::OPENAI_PROVIDER_ID,
+                config.enforce_residency.value(),
+            )?;
+            let command = config
+                .model_provider
+                .auth
+                .clone()
+                .map(CommandBearerToken::new)
+                .map(Arc::new);
+            let api_key_disabled = command.is_none()
+                && key.is_some()
+                && !config
+                    .features
+                    .enabled(ra_config::Feature::ApiKeyModelDiscovery);
+            let directory = catalogs.share(
+                RemoteModelCatalog::new(
+                    &config,
+                    url.as_str(),
+                    &auth,
+                    key,
+                    command,
+                    api_key_disabled,
+                )
+                .map_err(Error::config)?,
+            );
+            directory.load(offline).await;
+            prepared_auth = Some((auth, directory.command()));
+            Some(directory)
+        } else {
+            None
+        };
+        let remote_snapshot = remote.as_ref().and_then(|catalog| catalog.snapshot());
+        let models = match &remote {
+            Some(_) => remote_snapshot.as_deref(),
+            None => Some(config.model_catalog.as_ref().unwrap_or(bundled)),
+        };
+        let requested = remote
+            .as_ref()
+            .and(initial_model)
+            .map(str::to_owned)
+            .or_else(|| config.model.clone());
+        let default_model = requested.or_else(|| {
             if explicit.is_some() {
                 return None;
             }
-            models
+            models?
                 .models
                 .iter()
                 .filter(|model| model.supported_in_api)
@@ -81,11 +139,16 @@ impl ProductModelRuntime {
                 .map(|model| model.slug.clone())
         });
         let registry = if explicit.is_none() {
-            let default_model = default_model
-                .as_deref()
-                .ok_or_else(|| Error::config("the product model catalog has no default model"))?
-                .to_owned();
-            Some(build_registry(&config, default_model)?)
+            let default_model = default_model.as_deref().filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| Error::config(
+                    "No models are available. Set `model` explicitly or check your model catalog configuration."
+                ))?.to_owned();
+            Some(build_registry(
+                &config,
+                default_model,
+                remote.clone(),
+                prepared_auth,
+            )?)
         } else {
             None
         };
@@ -95,10 +158,37 @@ impl ProductModelRuntime {
             registry,
             explicit,
             default_model,
+            remote,
         })
     }
 
-    fn model_info(&self, model: &str) -> Option<&ModelInfo> {
+    pub(crate) fn configure_run(&self, config: RunConfig) -> RunConfig {
+        let Some(source) = &self.remote else {
+            return config;
+        };
+        let source = Arc::clone(source);
+        config.with_run_snapshot(move || {
+            let source = Arc::clone(&source);
+            async move {
+                source.refresh_after_auth_change().await;
+                let models = source.snapshot();
+                TurnCatalog { source, models }
+            }
+        })
+    }
+
+    fn model_info(&self, model: &str) -> Option<ModelInfo> {
+        if let Some(remote) = &self.remote {
+            let models = match RunConfig::current_run_snapshot::<TurnCatalog>() {
+                Some(snapshot) if Arc::ptr_eq(&snapshot.source, remote) => snapshot.models.clone(),
+                _ => remote.snapshot(),
+            };
+            return models?
+                .models
+                .iter()
+                .find(|candidate| candidate.slug == model)
+                .cloned();
+        }
         let catalog = self
             .config
             .model_catalog
@@ -109,11 +199,12 @@ impl ProductModelRuntime {
             .iter()
             .map(|info| (info.slug.as_str(), info))
             .collect::<Vec<_>>();
-        find_model_by_slug(model, &candidates)
+        find_model_by_slug(model, &candidates).cloned()
     }
 
     fn product_settings(&self, model: &str, provider: &ProviderKey) -> ModelSettings {
         let info = self.model_info(model);
+        let info = info.as_ref();
         let mut settings = ModelSettings::new();
         let mut reasoning = Map::new();
         if let Some(effort) = self
@@ -183,8 +274,9 @@ impl ProductModelRuntime {
         }
         // An injected SDK resolver owns its model-specific prompt behavior.
         self.registry.as_ref()?;
-        let template = model
-            .and_then(|model| self.model_info(model))
+        let info = model.and_then(|model| self.model_info(model));
+        let template = info
+            .as_ref()
             .and_then(|info| info.model_messages.as_ref())
             .and_then(|messages| messages.instructions_template.as_deref())
             .unwrap_or(BASE_INSTRUCTIONS);
@@ -197,6 +289,7 @@ impl ProductModelRuntime {
 
     fn compaction_limit(&self, model: &str) -> Option<u64> {
         let info = self.model_info(model);
+        let info = info.as_ref();
         let max_window = info
             .and_then(|info| info.max_context_window)
             .or_else(|| info.is_none().then_some(272_000));
@@ -314,7 +407,12 @@ fn resolve_reasoning_effort(info: Option<&ModelInfo>, effort: &ReasoningEffort) 
     }
 }
 
-fn build_registry(config: &Config, default_model: String) -> Result<ProviderRegistry> {
+fn build_registry(
+    config: &Config,
+    default_model: String,
+    remote: Option<Arc<RemoteModelCatalog>>,
+    prepared_auth: Option<(OpenAiAuth, Option<Arc<CommandBearerToken>>)>,
+) -> Result<ProviderRegistry> {
     let provider = ProviderKey::new(&config.model_provider_id);
     let description = &config.model_provider;
     let protocol = match description.wire_api {
@@ -333,7 +431,17 @@ fn build_registry(config: &Config, default_model: String) -> Result<ProviderRegi
     )
     .into_client();
     let registration = ProviderRegistration::new(provider.clone(), protocol, move |quirks| {
-        let auth = provider_auth(&description, builtin_openai, residency)?;
+        let (auth, command) = match &prepared_auth {
+            Some(prepared) => prepared.clone(),
+            None => (
+                provider_auth(&description, builtin_openai, residency)?.0,
+                description
+                    .auth
+                    .clone()
+                    .map(CommandBearerToken::new)
+                    .map(Arc::new),
+            ),
+        };
         let idle = Duration::from_millis(description.stream_idle_timeout_ms.unwrap_or(300_000));
         let mut responses = OpenAiResponsesProvider::with_http_client(
             auth,
@@ -361,9 +469,11 @@ fn build_registry(config: &Config, default_model: String) -> Result<ProviderRegi
                     .collect(),
             );
         }
-        if let Some(command) = &description.auth {
-            responses =
-                responses.with_bearer_token(Arc::new(CommandBearerToken::new(command.clone())));
+        if let Some(command) = command {
+            responses = responses.with_bearer_token(command);
+        }
+        if let Some(remote) = &remote {
+            responses = responses.with_catalog_observer(remote.clone());
         }
         Ok(Arc::new(responses) as Arc<dyn ModelProvider>)
     })
@@ -378,7 +488,7 @@ fn provider_auth(
     description: &ModelProviderInfo,
     builtin_openai: bool,
     residency: Option<ra_config::ResidencyRequirement>,
-) -> Result<OpenAiAuth> {
+) -> Result<(OpenAiAuth, Option<String>)> {
     if description.gateway_oauth.is_some() || description.aws.is_some() {
         return Err(Error::config(
             "this model provider requires gateway OAuth or AWS authentication unavailable on the Responses HTTP adapter",
@@ -410,7 +520,7 @@ fn provider_auth(
     };
     let base_url = description.base_url.as_deref().unwrap_or(OPENAI_BASE_URL);
     let mut auth = OpenAiAuth::keyless(base_url);
-    if let Some(key) = key {
+    if let Some(key) = &key {
         auth = auth.with_api_key(key);
     }
     let mut headers = HeaderMap::new();
@@ -439,7 +549,7 @@ fn provider_auth(
             auth = auth.with_default_header(name.as_str(), value);
         }
     }
-    Ok(auth)
+    Ok((auth, key))
 }
 
 fn strip_personality_section(instructions: &str) -> String {

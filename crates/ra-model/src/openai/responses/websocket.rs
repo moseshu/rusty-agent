@@ -690,3 +690,31 @@ fn retry_delay(attempt: u32) -> Duration {
     let jitter = rand::rng().random_range(900..1100);
     Duration::from_millis(u64::try_from(base.saturating_mul(jitter) / 1000).unwrap_or(u64::MAX))
 }
+
+pub(super) fn observe_catalog_etags(
+    frames: Frames,
+    observer: Option<Arc<dyn super::ResponsesCatalogObserver>>,
+) -> Frames {
+    let Some(observer) = observer else {
+        return frames;
+    };
+    frames
+        .then(move |frame| {
+            let observer = Arc::clone(&observer);
+            async move {
+                if let Ok(SseFrame::Data(event)) = &frame
+                    && event["type"] == "codex.response.metadata"
+                    && let Some(headers) = event["headers"].as_object()
+                    && let Some(etag) = headers.iter().find_map(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-models-etag")
+                            .then(|| value.as_str())
+                            .flatten()
+                    })
+                {
+                    observer.observe_models_etag(etag).await;
+                }
+                frame
+            }
+        })
+        .boxed()
+}

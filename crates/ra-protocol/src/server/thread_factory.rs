@@ -93,6 +93,7 @@ pub struct ThreadFactoryRequest {
     session_source: SessionSource,
     thread_spawn: Option<RolloutThreadSpawn>,
     ephemeral: bool,
+    initial_model: Option<String>,
     policy: super::protocol::ThreadPolicyOverrides,
     fork_session_id: Option<SessionId>,
     parent_transcript: Option<ThreadTranscriptLookup>,
@@ -106,6 +107,7 @@ impl ThreadFactoryRequest {
             session_source: SessionSource::Unknown,
             thread_spawn: None,
             ephemeral: false,
+            initial_model: None,
             policy: super::protocol::ThreadPolicyOverrides::new(),
             fork_session_id: None,
             parent_transcript: None,
@@ -135,6 +137,17 @@ impl ThreadFactoryRequest {
         self.ephemeral = ephemeral;
         self.fork_session_id = fork_session_id;
         self
+    }
+
+    pub(crate) fn with_initial_model(mut self, model: Option<String>) -> Self {
+        self.initial_model = model;
+        self
+    }
+
+    /// Model requested for thread creation, or the recorded model during a cold resume.
+    #[must_use]
+    pub fn initial_model(&self) -> Option<&str> {
+        self.initial_model.as_deref()
     }
 
     pub(crate) fn with_policy(mut self, policy: super::protocol::ThreadPolicyOverrides) -> Self {

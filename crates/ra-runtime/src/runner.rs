@@ -127,6 +127,7 @@ pub mod prompt_cache_key_test_api {
 pub mod result;
 #[doc(hidden)]
 pub mod session_persistence;
+pub(crate) mod snapshot;
 pub mod stream;
 mod trace;
 pub(crate) use trace::{carry_subscriber, with_dispatch};
@@ -241,6 +242,7 @@ pub trait StepExecutionObserver: Send + Sync {
 #[derive(Clone)]
 pub struct RunConfig {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
+    snapshot_factory: Option<snapshot::Factory>,
     budget: BudgetLimit,
     max_function_tool_concurrency: Option<usize>,
     model: Option<String>,
@@ -288,6 +290,7 @@ impl RunConfig {
     pub fn new() -> Self {
         Self {
             app_context: None,
+            snapshot_factory: None,
             budget: BudgetLimit::new().with_max_turns(DEFAULT_MAX_TURNS),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             model: None,
@@ -323,6 +326,28 @@ impl RunConfig {
             session_settings: None,
             interrupt_message: true,
         }
+    }
+
+    /// Sets the host callback that captures immutable state before model resolution and context
+    /// processing. A thread keeps its snapshot across pre-sampling compaction and approval pauses.
+    /// The callback replaces any snapshot callback already configured for this run.
+    pub fn with_run_snapshot<T, F, Fut>(mut self, capture: F) -> Self
+    where
+        T: Any + Send + Sync,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        self.snapshot_factory = Some(Arc::new(move || {
+            let capture = capture();
+            Box::pin(async move { Arc::new(capture.await) as snapshot::Value })
+        }));
+        self
+    }
+
+    /// Reads a snapshot in the current run or thread turn, including during model resolution.
+    #[must_use]
+    pub fn current_run_snapshot<T: Any + Send + Sync>() -> Option<Arc<T>> {
+        snapshot::current()?.downcast().ok()
     }
 
     /// Gives steps an immutable host context snapshot. Live settings can publish a different
@@ -1006,6 +1031,7 @@ impl std::fmt::Debug for RunConfig {
         formatter
             .debug_struct("RunConfig")
             .field("has_app_context", &self.app_context.is_some())
+            .field("has_snapshot_factory", &self.snapshot_factory.is_some())
             .field("has_step_observer", &self.step_observer.is_some())
             .field("compaction_retry", &self.compaction_retry)
             .field("budget", &self.budget)
@@ -1549,9 +1575,10 @@ impl Runner {
         let guard = scope.cancel_on_drop(CancelReason::UserInterrupt);
         let sandbox = sandbox_runtime(&request);
         let supervised = sandbox.enabled().then(|| Arc::clone(&sandbox));
+        let snapshot = request.thread_owned().then(snapshot::current).flatten();
         let task = tokio::spawn(carry_subscriber(Box::pin(
             crate::agent::tool::parent::carry(async move {
-                Box::pin(run_loop(request, Some(sender), sandbox)).await
+                snapshot::scope(snapshot, Box::pin(run_loop(request, Some(sender), sandbox))).await
             })
             .instrument(span),
         )));
@@ -1772,6 +1799,22 @@ fn resolve_trace_group(request: &mut RunRequest) -> (Option<RunId>, Option<Strin
 ///
 /// `events` is the only difference between them.
 async fn run_loop(
+    request: RunRequest,
+    events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
+    sandbox: Arc<SandboxRuntime>,
+) -> Result<RunResult> {
+    if request.thread_owned() {
+        return Box::pin(run_loop_scoped(request, events, sandbox)).await;
+    }
+    let snapshot = snapshot::capture(&request.config, &request.cancel).await;
+    snapshot::scope(
+        snapshot,
+        Box::pin(run_loop_scoped(request, events, sandbox)),
+    )
+    .await
+}
+
+async fn run_loop_scoped(
     mut request: RunRequest,
     events: Option<mpsc::UnboundedSender<RunStreamEvent>>,
     sandbox: Arc<SandboxRuntime>,

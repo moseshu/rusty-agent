@@ -59,6 +59,13 @@ pub trait ResponsesBearerToken: Send + Sync {
     async fn token(&self, rejected: Option<&str>) -> Result<String>;
 }
 
+/// Receives a Responses provider's advertised model-catalog revision.
+#[async_trait]
+pub trait ResponsesCatalogObserver: Send + Sync {
+    /// Revalidates the catalog against the revision advertised by the provider.
+    async fn observe_models_etag(&self, etag: &str);
+}
+
 #[derive(Clone)]
 struct ResponsesTransport {
     auth: OpenAiAuth,
@@ -67,6 +74,7 @@ struct ResponsesTransport {
     request_max_retries: u32,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
+    catalog_observer: Option<Arc<dyn ResponsesCatalogObserver>>,
     websocket: Option<Arc<websocket::WebSocketTransport>>,
 }
 
@@ -129,6 +137,7 @@ impl OpenAiResponsesProvider {
                 request_max_retries,
                 query: BTreeMap::new(),
                 bearer: None,
+                catalog_observer: None,
                 websocket: None,
             }),
             default_model,
@@ -154,6 +163,13 @@ impl OpenAiResponsesProvider {
     #[must_use]
     pub fn with_default_query(mut self, query: BTreeMap<String, String>) -> Self {
         Arc::make_mut(&mut self.transport).query = query;
+        self
+    }
+
+    /// Installs a consumer for model-catalog revision notices from Responses.
+    #[must_use]
+    pub fn with_catalog_observer(mut self, observer: Arc<dyn ResponsesCatalogObserver>) -> Self {
+        Arc::make_mut(&mut self.transport).catalog_observer = Some(observer);
         self
     }
 
@@ -368,10 +384,24 @@ impl OpenAiResponsesModel {
         query
     }
 
+    async fn observe_catalog_header(&self, response: &HttpResponse) {
+        if let Some(observer) = &self.transport.catalog_observer
+            && let Some(etag) = response
+                .headers()
+                .get("x-models-etag")
+                .and_then(|value| value.to_str().ok())
+        {
+            observer.observe_models_etag(etag).await;
+        }
+    }
+
     async fn fetch(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
         let response = self.send(&request, false).await?;
         let facts = ResponseFacts::read(&response);
         let status = facts.status();
+        if status.is_success() {
+            self.observe_catalog_header(&response).await;
+        }
         let payload = match response.json::<serde_json::Value>().await {
             Ok(payload) => payload,
             Err(error) if !status.is_success() => {
@@ -436,7 +466,10 @@ impl Model for OpenAiResponsesModel {
                 match websocket.start(&model, &request).await {
                     Ok(Some(frames)) => {
                         return stream::events(
-                            frames,
+                            websocket::observe_catalog_etags(
+                                frames,
+                                model.transport.catalog_observer.clone(),
+                            ),
                             provider,
                             model.model.clone(),
                             handoffs,
@@ -459,6 +492,7 @@ impl Model for OpenAiResponsesModel {
             }
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
+                    model.observe_catalog_header(&response).await;
                     // Read before the body is consumed: the terminal response carries it, and no
                     // frame in the stream mentions it.
                     let request_id = ResponseFacts::read(&response).into_request_id();

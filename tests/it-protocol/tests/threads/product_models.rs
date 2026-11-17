@@ -849,3 +849,6 @@ fn websocket_completion(step: u32) -> Value {
         }
     })
 }
+
+#[path = "product_models/remote_catalog.rs"]
+mod remote_catalog;

@@ -63,6 +63,7 @@ local upstream checkouts used for the port; each file lists its original source.
 | --- | --- | --- | --- |
 | `crates/ra-model/src/openai/responses/websocket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{codex-api/src/endpoint/responses_websocket.rs,core/src/{client,responses_retry}.rs} |
 | `crates/ra-coding/src/config/model_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/auth/external_bearer.rs (command-backed provider token and cache) |
+| `crates/ra-coding/src/config/model_catalog_remote.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{models-manager/src/{manager,cache}.rs,model-provider/src/{models_endpoint,models_identity}.rs,codex-api/src/endpoint/models.rs} |
 | `crates/ra-coding/src/config/model_runtime.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{core/src/client.rs,model-provider-info/src/lib.rs,models-manager/src/{manager,model_info}.rs,protocol/src/openai_models/reasoning_effort.rs,utils/output-truncation/src/lib.rs} |
 | `crates/ra-config/src/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
 | `crates/ra-config/src/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |

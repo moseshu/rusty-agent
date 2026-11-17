@@ -1953,13 +1953,18 @@ impl RolloutRecorder for ThreadRecorder {
     }
 }
 
+async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
+    let started = Instant::now();
+    let snapshot = crate::runner::snapshot::capture(&turn.config, &turn.cancel).await;
+    crate::runner::snapshot::scope(snapshot, Box::pin(run_turn_scoped(inner, turn, started))).await;
+}
+
 /// Runs a turn to its end and reports how it ended.
 #[allow(
     clippy::too_many_lines,
     reason = "Keep turn acceptance, persistence and terminal event ordering together."
 )]
-async fn run_turn(inner: Arc<ThreadInner>, turn: StartedTurn) {
-    let started = Instant::now();
+async fn run_turn_scoped(inner: Arc<ThreadInner>, turn: StartedTurn, started: Instant) {
     let StartedTurn {
         compact,
         turn_id,

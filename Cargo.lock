@@ -3582,6 +3582,7 @@ dependencies = [
  "ra-protocol",
  "ra-runtime",
  "ra-tools",
+ "rand 0.9.5",
  "regex",
  "regex-lite",
  "rustix",

@@ -1,7 +1,12 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Command-backed bearer credentials for product model providers.
 
-use std::{path::Path, process::Stdio, time::Instant};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::{PoisonError, RwLock},
+    time::Instant,
+};
 
 use ra_config::ModelProviderAuthInfo;
 use ra_core::error::{Error, ProviderErrorKind, Result};
@@ -10,7 +15,8 @@ use tokio::{process::Command, sync::Mutex};
 
 pub(super) struct CommandBearerToken {
     config: ModelProviderAuthInfo,
-    cached: Mutex<Option<CachedToken>>,
+    cached: RwLock<Option<CachedToken>>,
+    refresh: Mutex<()>,
 }
 
 struct CachedToken {
@@ -22,8 +28,22 @@ impl CommandBearerToken {
     pub(super) const fn new(config: ModelProviderAuthInfo) -> Self {
         Self {
             config,
-            cached: Mutex::const_new(None),
+            cached: RwLock::new(None),
+            refresh: Mutex::const_new(()),
         }
+    }
+
+    /// The last successful credential identifies the catalog while a refresh is pending.
+    pub(super) fn last_resolved_token(&self) -> Option<String> {
+        self.cached
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|token| token.value.clone())
+    }
+
+    pub(super) const fn config(&self) -> &ModelProviderAuthInfo {
+        &self.config
     }
 
     async fn run(&self) -> Result<String> {
@@ -85,8 +105,12 @@ impl CommandBearerToken {
 impl ResponsesBearerToken for CommandBearerToken {
     async fn token(&self, rejected: Option<&str>) -> Result<String> {
         // Keep concurrent requests on the same provider from running duplicate refresh commands.
-        let mut cache = self.cached.lock().await;
-        if let Some(cached) = cache.as_ref()
+        let _refresh = self.refresh.lock().await;
+        if let Some(cached) = self
+            .cached
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
             && rejected != Some(cached.value.as_str())
             && self
                 .config
@@ -96,7 +120,7 @@ impl ResponsesBearerToken for CommandBearerToken {
             return Ok(cached.value.clone());
         }
         let value = self.run().await?;
-        *cache = Some(CachedToken {
+        *self.cached.write().unwrap_or_else(PoisonError::into_inner) = Some(CachedToken {
             value: value.clone(),
             fetched_at: Instant::now(),
         });

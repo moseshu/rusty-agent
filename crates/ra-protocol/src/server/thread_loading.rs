@@ -182,7 +182,8 @@ impl ThreadRequestProcessor {
             .prepare_thread(
                 &ThreadFactoryRequest::new(thread_id.clone(), ThreadOrigin::Start)
                     .with_session_context(context.session_source.clone(), None, ephemeral, None)
-                    .with_policy(selection_policy.clone()),
+                    .with_policy(selection_policy.clone())
+                    .with_initial_model(params.model.clone()),
             )
             .await
             .map_err(|error| factory_error("creating", &error))?;
@@ -372,7 +373,13 @@ impl ThreadRequestProcessor {
                     to_policy_overrides(&params.policy),
                     &records,
                     true,
-                ));
+                ))
+                .with_initial_model(
+                    params
+                        .model
+                        .clone()
+                        .or_else(|| stored.model().map(str::to_owned)),
+                );
         if let Some(spawn) = stored.thread_spawn() {
             factory_request =
                 factory_request.with_parent_transcript(parent_transcript_lookup(&store, spawn));
@@ -557,7 +564,8 @@ impl ThreadRequestProcessor {
                         |spawn| spawn.root_session_id().clone(),
                     )),
                 )
-                .with_policy(persisted_policy.clone()),
+                .with_policy(persisted_policy.clone())
+                .with_initial_model(params.model.clone()),
             )
             .await
             .map_err(|error| factory_error("forking", &error))?;
