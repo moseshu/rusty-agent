@@ -1819,7 +1819,9 @@ async fn run_loop(
     let rollout_run_id = request.run_id.clone();
     if let Some(rollout) = &rollout {
         if !spawned {
-            record_run_start(&request, rollout.as_ref()).await;
+            record_run_start(&request, rollout.as_ref())
+                .instrument(agent_span.clone())
+                .await;
         }
         request.services = request
             .services
