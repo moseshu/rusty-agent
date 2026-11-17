@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["openai"]
-openai = ["dep:reqwest", "dep:base64", "dep:ra-http", "dep:rand"]
+openai = ["dep:reqwest", "dep:base64", "dep:ra-http", "dep:rand", "dep:tokio-tungstenite"]
 anthropic = ["dep:reqwest", "dep:base64"]
 # 兼容端点复用 OpenAI Chat codec；这是加法依赖，不与其他 provider 互斥。
 compat = ["openai"]
@@ -23,6 +23,7 @@ ra-core = { workspace = true }
 ra-http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

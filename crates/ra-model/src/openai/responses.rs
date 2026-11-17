@@ -31,6 +31,7 @@ pub(crate) mod mcp;
 pub(crate) mod request;
 pub(crate) mod stream;
 pub mod web_search;
+mod websocket;
 
 const PREFIX_ITEM_ID: &str = "prefix_item_id";
 
@@ -66,6 +67,7 @@ struct ResponsesTransport {
     request_max_retries: u32,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
+    websocket: Option<Arc<websocket::WebSocketTransport>>,
 }
 
 /// `OpenAI` Responses provider with a shared HTTP client and per-model instance cache.
@@ -127,11 +129,25 @@ impl OpenAiResponsesProvider {
                 request_max_retries,
                 query: BTreeMap::new(),
                 bearer: None,
+                websocket: None,
             }),
             default_model,
             quirks: ProviderQuirks::new(),
             models: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Prefers Responses over WebSocket for streamed calls, with HTTP/SSE fallback.
+    #[must_use]
+    pub fn with_websocket(
+        mut self,
+        connector: ra_http::websocket::WebSocketConnector,
+        connect_timeout: Duration,
+    ) -> Self {
+        Arc::make_mut(&mut self.transport).websocket = Some(Arc::new(
+            websocket::WebSocketTransport::new(connector, connect_timeout),
+        ));
+        self
     }
 
     /// Sets endpoint query parameters. Request settings can override individual keys.
@@ -201,6 +217,13 @@ impl ModelProvider for OpenAiResponsesProvider {
         });
         models.insert(model_name.to_owned(), Arc::clone(&model));
         Ok(model)
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.transport
+            .websocket
+            .as_ref()
+            .map_or(Ok(()), |websocket| websocket.close())
     }
 }
 
@@ -318,6 +341,17 @@ impl OpenAiResponsesModel {
         if let Some(api_key) = key {
             http_request = http_request.bearer_auth(api_key);
         }
+        let query = self.query(request);
+        if !query.is_empty() {
+            http_request = http_request.query(&query);
+        }
+        if let Some(timeout) = request.model_settings().timeout() {
+            http_request = http_request.timeout(timeout);
+        }
+        http_request.json(body).send().await
+    }
+
+    fn query(&self, request: &ModelRequest) -> BTreeMap<String, String> {
         let mut query = self.transport.query.clone();
         query.extend(
             request
@@ -331,13 +365,7 @@ impl OpenAiResponsesModel {
                     (key.clone(), value)
                 }),
         );
-        if !query.is_empty() {
-            http_request = http_request.query(&query);
-        }
-        if let Some(timeout) = request.model_settings().timeout() {
-            http_request = http_request.timeout(timeout);
-        }
-        http_request.json(body).send().await
+        query
     }
 
     async fn fetch(&self, request: ModelRequest) -> Result<ra_core::item::ModelResponse> {
@@ -404,6 +432,31 @@ impl Model for OpenAiResponsesModel {
             let provider = request.model_settings().provider().clone();
             let handoffs = request.handoffs().to_vec();
             let unstarted = unstarted_replay_safety(request.continuation());
+            if let Some(websocket) = &model.transport.websocket {
+                match websocket.start(&model, &request).await {
+                    Ok(Some(frames)) => {
+                        return stream::events(
+                            frames,
+                            provider,
+                            model.model.clone(),
+                            handoffs,
+                            None,
+                            unstarted,
+                        )
+                        .map(|event| {
+                            event.map_err(|error| {
+                                stamp_replay_safety(error, ra_core::model::ReplaySafety::Unsafe)
+                            })
+                        })
+                        .boxed();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let safety = ra_core::model::replay_safety_of(&error);
+                        return super::sse::error_stream(error, safety);
+                    }
+                }
+            }
             match model.send(&request, true).await {
                 Ok(response) if response.status().is_success() => {
                     // Read before the body is consumed: the terminal response carries it, and no

@@ -834,6 +834,7 @@ pub struct ModelRequest {
     continuation: ConversationContinuation,
     cache_plan: Option<CachePlan>,
     prompt_cache_key: Option<String>,
+    session_id: Option<crate::session::SessionId>,
 }
 
 impl ModelRequest {
@@ -851,7 +852,21 @@ impl ModelRequest {
             continuation: ConversationContinuation::None,
             cache_plan: None,
             prompt_cache_key: None,
+            session_id: None,
         }
+    }
+
+    /// Associates the call with its local session for transport reuse.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: crate::session::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Local session identity, separate from provider continuation identifiers.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&crate::session::SessionId> {
+        self.session_id.as_ref()
     }
 
     /// Sets stable system instructions.

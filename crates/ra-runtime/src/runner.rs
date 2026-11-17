@@ -5336,6 +5336,10 @@ async fn run_one_turn(
         prepared,
     )?;
     let prepared = prompt_cache_key::attach(prepared, config, state, context.session);
+    let prepared = match session_id {
+        Some(id) => prepared.map_request(|request| request.with_session_id(id.clone())),
+        None => prepared,
+    };
     let sampled_input = [HookEventName::Stop, HookEventName::SubagentStop]
         .into_iter()
         .any(|event| config.user_hooks().has_event(event))

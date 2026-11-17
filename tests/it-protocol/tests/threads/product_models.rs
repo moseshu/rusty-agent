@@ -353,6 +353,31 @@ env_key = "RUSTY_AGENT_TEST_MISSING_PRODUCT_CREDENTIAL"
 }
 
 #[cfg(unix)]
+fn command_bearer_fixture(product: &ProductModels) -> String {
+    product.write(
+        "token.sh",
+        r#"
+if test -f issued; then
+    printf 'refreshed\n'
+else
+    touch issued
+    printf 'expired\n'
+fi
+"#,
+    );
+    format!(
+        r#"
+[model_providers.gateway.auth]
+command = "sh"
+args = ["token.sh"]
+cwd = {:?}
+refresh_interval_ms = 0
+"#,
+        product.home.path().canonicalize().unwrap()
+    )
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn product_model_refreshes_command_auth_and_retries_http_server_errors() {
     use wiremock::matchers::header;
@@ -375,17 +400,6 @@ async fn product_model_refreshes_command_auth_and_retries_http_server_errors() {
 
     let product = ProductModels::new();
     product.write(
-        "token.sh",
-        r#"
-if test -f issued; then
-    printf 'refreshed\n'
-else
-    touch issued
-    printf 'expired\n'
-fi
-"#,
-    );
-    product.write(
         "config.toml",
         &format!(
             r#"
@@ -398,14 +412,10 @@ name = "Gateway"
 base_url = "{}/product/v1"
 request_max_retries = 1
 stream_max_retries = 0
-[model_providers.gateway.auth]
-command = "sh"
-args = ["token.sh"]
-cwd = {:?}
-refresh_interval_ms = 0
+{}
 "#,
             endpoint.uri(),
-            product.home.path().canonicalize().unwrap()
+            command_bearer_fixture(&product)
         ),
     );
     let server = product.server(None);
@@ -477,4 +487,365 @@ model_auto_compact_token_limit = 80
             _ => false,
         }
     }));
+}
+
+fn configure_websocket(product: &ProductModels, base_url: &str, options: &str) {
+    product.write(
+        "config.toml",
+        &format!(
+            r#"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model = "local-model"
+model_provider = "gateway"
+instructions = "Configured base instructions"
+[model_providers.gateway]
+name = "Gateway"
+base_url = "{base_url}"
+supports_websockets = true
+request_max_retries = 0
+{options}
+[model_providers.gateway.query_params]
+route = "product"
+"#
+        ),
+    );
+}
+
+#[tokio::test]
+async fn product_responses_websocket_reuses_connection_and_sends_only_incremental_input() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            Message as Frame,
+            handshake::server::{Request, Response},
+        },
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("http://{}/product/v1", listener.local_addr().unwrap()),
+        "stream_max_retries = 0\nexperimental_bearer_token = 'test-ws-key'",
+    );
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_hdr_async(socket, |request: &Request, response: Response| {
+            assert_eq!(
+                request.uri().path_and_query().unwrap().as_str(),
+                "/product/v1/responses?route=product"
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer test-ws-key");
+            assert_eq!(
+                request.headers()["openai-beta"],
+                "responses_websockets=2026-02-06"
+            );
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        let mut requests = Vec::new();
+        for step in 1..=3 {
+            let frame = ws.next().await.unwrap().unwrap();
+            requests.push(serde_json::from_str::<Value>(frame.to_text().unwrap()).unwrap());
+            ws.send(Frame::Text(websocket_completion(step).to_string().into()))
+                .await
+                .unwrap();
+        }
+        requests
+    });
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    for prompt in ["first prompt", "second prompt"] {
+        let completed = completed_turn(&server, &mut connection, &thread, prompt).await;
+        assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    }
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({
+                "threadId": thread,
+                "model": "other-model",
+                "input": [{"type": "text", "text": "switch models", "text_elements": []}]
+            }),
+        )
+        .await;
+    let completed = connection.notification("turn/completed").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    let requests = timeout(PATIENCE, peer).await.unwrap().unwrap();
+    assert_eq!(requests[0]["type"], "response.create");
+    assert_eq!(requests[0]["model"], "local-model");
+    assert_eq!(requests[0]["stream"], true);
+    assert_eq!(requests[0]["store"], false);
+    assert_developer_prefix(&requests[0], "Configured base instructions");
+    assert!(requests[0].get("previous_response_id").is_none());
+    assert_eq!(requests[1]["previous_response_id"], "resp_1");
+    let input = requests[1]["input"].as_array().unwrap();
+    assert_eq!(input.last().unwrap()["content"][0]["text"], "second prompt");
+    assert!(
+        !input
+            .iter()
+            .any(|item| item["content"][0]["text"] == "first prompt")
+    );
+    assert_eq!(requests[2]["model"], "other-model");
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_developer_prefix(&requests[2], "Configured base instructions");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn product_responses_websocket_refreshes_command_bearer_after_upgrade_401() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            Error as WebSocketError, Message as Frame,
+            handshake::server::{ErrorResponse, Request, Response},
+        },
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("http://{}/product/v1", listener.local_addr().unwrap()),
+        &format!(
+            "stream_max_retries = 0\n{}",
+            command_bearer_fixture(&product)
+        ),
+    );
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let rejected = accept_hdr_async(socket, |request: &Request, _: Response| {
+            assert_eq!(request.headers()["authorization"], "Bearer expired");
+            let mut refusal = ErrorResponse::new(None);
+            *refusal.status_mut() = http::StatusCode::UNAUTHORIZED;
+            Err(refusal)
+        })
+        .await;
+        assert!(
+            matches!(rejected, Err(WebSocketError::Http(response)) if response.status() == 401)
+        );
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_hdr_async(socket, |request: &Request, response: Response| {
+            assert_eq!(request.headers()["authorization"], "Bearer refreshed");
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        let frame = ws.next().await.unwrap().unwrap();
+        let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(request["type"], "response.create");
+        assert!(request.get("previous_response_id").is_none());
+        ws.send(Frame::Text(websocket_completion(1).to_string().into()))
+            .await
+            .unwrap();
+    });
+
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let completed = completed_turn(&server, &mut connection, &thread, "Refresh credentials").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn product_responses_websocket_fallback_is_sticky_after_upgrade_required() {
+    websocket_fallback(426, 2, None, 1).await;
+}
+
+#[tokio::test]
+async fn product_responses_websocket_falls_back_after_exhausting_stream_retries() {
+    websocket_fallback(503, 2, None, 3).await;
+}
+
+#[tokio::test]
+async fn product_responses_websocket_retries_unexpected_upgrade_statuses_before_falling_back() {
+    for status in [403, 410, 412, 451] {
+        websocket_fallback(status, 1, None, 2).await;
+    }
+}
+
+#[tokio::test]
+async fn product_responses_websocket_honors_configured_connect_timeout() {
+    websocket_fallback(503, 0, Some(Duration::from_secs(5)), 1).await;
+}
+
+async fn websocket_fallback(status: u16, retries: u32, delay: Option<Duration>, upgrades: usize) {
+    let endpoint = responses_endpoint().await;
+    let template = ResponseTemplate::new(status).insert_header("retry-after", "0");
+    let template = if let Some(delay) = delay {
+        template.set_delay(delay)
+    } else {
+        template
+    };
+    Mock::given(method("GET"))
+        .and(path("/product/v1/responses"))
+        .respond_with(template)
+        .expect(upgrades as u64)
+        .mount(&endpoint)
+        .await;
+
+    let product = ProductModels::new();
+    let connect_timeout = if delay.is_some() { 200 } else { 15_000 };
+    configure_websocket(
+        &product,
+        &format!("{}/product/v1", endpoint.uri()),
+        &format!(
+            "stream_max_retries = {retries}\nwebsocket_connect_timeout_ms = {connect_timeout}"
+        ),
+    );
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let budget = if delay.is_some() {
+        Duration::from_secs(3)
+    } else {
+        PATIENCE
+    };
+    for prompt in ["fall back", "stay on SSE"] {
+        let completed = timeout(
+            budget,
+            completed_turn(&server, &mut connection, &thread, prompt),
+        )
+        .await
+        .expect("fallback should complete before the delayed upgrade");
+        assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    }
+    let requests = endpoint.received_requests().await.unwrap();
+    assert_eq!(requests.len(), upgrades + 2);
+    for request in requests.iter().skip(upgrades) {
+        assert_eq!(request.method.as_str(), "POST");
+        let body: Value = request.body_json().unwrap();
+        assert!(body.get("type").is_none(), "{body}");
+        assert!(body.get("previous_response_id").is_none(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn product_responses_websocket_reconnects_after_a_connection_limit_error() {
+    websocket_reconnects_after(json!({
+        "code": "websocket_connection_limit_reached", "headers": {"retry-after": "0"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn product_responses_websocket_retries_statusless_server_errors() {
+    for body in [
+        json!({"code": "server_is_overloaded", "headers": {"retry-after": "0"}}),
+        json!({"type": "server_error", "headers": {"retry-after": "0"}}),
+    ] {
+        websocket_reconnects_after(body).await;
+    }
+}
+
+async fn websocket_reconnects_after(error: Value) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message as Frame};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("http://{}/product/v1", listener.local_addr().unwrap()),
+        "stream_max_retries = 1",
+    );
+    let peer = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for frame in [
+            json!({"type": "error", "error": error}),
+            websocket_completion(1),
+        ] {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap();
+            requests.push(serde_json::from_str::<Value>(request.to_text().unwrap()).unwrap());
+            ws.send(Frame::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+        }
+        requests
+    });
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let completed = completed_turn(&server, &mut connection, &thread, "reconnect").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    let requests = timeout(PATIENCE, peer).await.unwrap().unwrap();
+    assert_eq!(requests[0], requests[1]);
+    assert!(requests[1].get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn product_responses_websocket_does_not_replay_a_partial_response() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message as Frame};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("http://{}/product/v1", listener.local_addr().unwrap()),
+        "stream_max_retries = 2",
+    );
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+        for event in [
+            json!({"type":"response.created","response":{"id":"resp_partial"}}),
+            json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"partial"}),
+        ] {
+            ws.send(Frame::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        ws.close(None).await.unwrap();
+        drop(ws);
+        listener
+    });
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let completed =
+        completed_turn(&server, &mut connection, &thread, "stream partial output").await;
+    assert_eq!(completed["turn"]["status"], "failed", "{completed}");
+    let listener = timeout(PATIENCE, peer).await.unwrap().unwrap();
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+async fn completed_turn(
+    server: &Server,
+    connection: &mut Connection,
+    thread: &str,
+    prompt: &str,
+) -> Value {
+    server.turn_start(connection, thread, prompt).await;
+    connection.notification("turn/completed").await
+}
+
+fn websocket_completion(step: u32) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": format!("resp_{step}"), "status": "completed",
+            "output": [{
+                "id": format!("msg_{step}"), "type": "message", "role": "assistant",
+                "status": "completed", "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Done"}]
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }
+    })
 }

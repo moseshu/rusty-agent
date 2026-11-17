@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 ra-session = { path = "../../crates/ra-session" }
 ra-core = { path = "../../crates/ra-core" }
+ra-http = { path = "../../crates/ra-http" }
 ra-model = { path = "../../crates/ra-model", features = ["compat", "anthropic"] }
 # The conversation session driven by the runner.
 ra-runtime = { path = "../../crates/ra-runtime" }
@@ -18,7 +19,8 @@ async-trait = "0.1"
 futures = "0.3"
 insta = { version = "1", features = ["json", "redactions"] }
 rstest = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio-tungstenite = "0.29"
 serde_json = "1"
 wiremock = "0.6"
 tracing = "0.1"

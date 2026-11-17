@@ -326,8 +326,9 @@ fn build_registry(config: &Config, default_model: String) -> Result<ProviderRegi
     let description = description.clone();
     let builtin_openai = config.model_provider_id == ra_config::model_provider::OPENAI_PROVIDER_ID;
     let residency = config.enforce_residency.value();
+    let http_factory = config.http_client_factory();
     let client = RouteAwareClientPool::new_without_redirects_or_request_logging(
-        config.http_client_factory(),
+        http_factory.clone(),
         ClientRouteClass::Api,
     )
     .into_client();
@@ -342,6 +343,16 @@ fn build_registry(config: &Config, default_model: String) -> Result<ProviderRegi
             u32::try_from(description.request_max_retries.unwrap_or(4).min(100)).unwrap_or(100),
         )?
         .with_quirks(quirks);
+        if description.supports_websockets {
+            let connector =
+                ra_http::websocket::WebSocketConnector::new(&http_factory).map_err(|error| {
+                    Error::config("failed to initialize Responses WebSocket TLS").with_source(error)
+                })?;
+            responses = responses.with_websocket(
+                connector,
+                Duration::from_millis(description.websocket_connect_timeout_ms.unwrap_or(15_000)),
+            );
+        }
         if let Some(query) = &description.query_params {
             responses = responses.with_default_query(
                 query

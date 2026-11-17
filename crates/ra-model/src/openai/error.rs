@@ -28,13 +28,33 @@ pub(crate) struct ResponseFacts {
 
 impl ResponseFacts {
     pub(crate) fn read(response: &reqwest::Response) -> Self {
-        let headers = response.headers();
+        Self::from_headers(response.status(), response.headers())
+    }
+
+    pub(crate) fn from_headers(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Self {
         let lookup = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
         Self {
-            status: response.status(),
+            status,
             request_id: lookup(REQUEST_ID_HEADER).map(str::to_owned),
             hints: RetryHints::from_headers(lookup),
         }
+    }
+
+    pub(crate) fn failure_as(
+        &self,
+        payload: &Value,
+        kind: ProviderErrorKind,
+    ) -> NormalizedProviderError {
+        response_failure_as(
+            Some(self.status),
+            self.request_id.as_deref(),
+            &self.hints,
+            payload,
+            kind,
+        )
     }
 
     pub(crate) const fn status(&self) -> reqwest::StatusCode {
@@ -103,27 +123,13 @@ pub(crate) fn http_decode_error(error: ra_http::HttpError) -> Error {
 /// arrive as 429 and mean opposite things about whether waiting helps, but resolving that is a
 /// policy question about who is willing to pay, not a classification this layer can settle.
 pub(crate) fn response_failure(facts: &ResponseFacts, payload: &Value) -> NormalizedProviderError {
-    let error = payload.get("error").unwrap_or(payload);
-    let code = error
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("type").and_then(Value::as_str));
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("OpenAI request failed");
-    let status = facts.status;
-    let quoted_request_id = facts
-        .request_id
-        .as_ref()
-        .map_or_else(String::new, |id| format!(" (request_id {id})"));
     let kind = if matches!(
-        code,
+        error_code(payload),
         Some("context_length_exceeded" | "context_window_exceeded")
     ) {
         ProviderErrorKind::ContextOverflow
     } else {
-        match status.as_u16() {
+        match facts.status.as_u16() {
             401 | 403 => ProviderErrorKind::Auth,
             408 => ProviderErrorKind::Timeout,
             // A well-formed request that lost a race with a concurrent change. The reference
@@ -135,24 +141,56 @@ pub(crate) fn response_failure(facts: &ResponseFacts, payload: &Value) -> Normal
         }
     };
 
-    let mut normalized = NormalizedProviderError::new(
-        kind,
-        format!("OpenAI HTTP {status}{quoted_request_id}: {message}"),
-    )
-    .with_status_code(status.as_u16());
-    if let Some(code) = code {
+    facts.failure_as(payload, kind)
+}
+
+pub(crate) fn response_failure_as(
+    status: Option<reqwest::StatusCode>,
+    request_id: Option<&str>,
+    hints: &RetryHints,
+    payload: &Value,
+    kind: ProviderErrorKind,
+) -> NormalizedProviderError {
+    let message = payload
+        .get("error")
+        .unwrap_or(payload)
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenAI request failed");
+    let quoted_request_id = request_id.map_or_else(String::new, |id| format!(" (request_id {id})"));
+    let mut normalized = if let Some(status) = status {
+        NormalizedProviderError::new(
+            kind,
+            format!("OpenAI HTTP {status}{quoted_request_id}: {message}"),
+        )
+        .with_status_code(status.as_u16())
+    } else {
+        NormalizedProviderError::new(
+            kind,
+            format!("OpenAI Responses WebSocket{quoted_request_id}: {message}"),
+        )
+    };
+    if let Some(code) = error_code(payload) {
         normalized = normalized.with_error_code(code);
     }
-    if let Some(request_id) = &facts.request_id {
+    if let Some(request_id) = request_id {
         normalized = normalized.with_request_id(request_id);
     }
-    if let Some(retry_after) = facts.hints.retry_after() {
+    if let Some(retry_after) = hints.retry_after() {
         normalized = normalized.with_retry_after(retry_after);
     }
-    if let Some(should_retry) = facts.hints.should_retry() {
+    if let Some(should_retry) = hints.should_retry() {
         normalized = normalized.with_should_retry(should_retry);
     }
     normalized
+}
+
+fn error_code(payload: &Value) -> Option<&str> {
+    let error = payload.get("error").unwrap_or(payload);
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
 }
 
 pub(crate) fn behavior_error(message: impl Into<String>) -> Error {
