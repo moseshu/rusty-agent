@@ -5209,8 +5209,8 @@ async fn run_one_turn(
     {
         return Ok(Some(outcome));
     }
-    // Ahead of everything that reads history, so a fragment earned by the previous turn is in the
-    // request that also carries the tool result which earned it.
+    // Add newly triggered fragments after compaction and before building the next model request.
+    // The tool result that triggered a fragment may already be part of the summary.
     deliver_deferred_prompts(context, agent, state, progress.reference_turn());
     // Both before the model call, so whatever arrived during the last one is answered by this
     // one; either delivery is persisted once it is recorded.
@@ -5832,18 +5832,15 @@ async fn run_one_turn(
 ///
 /// # Why history rather than the turn's tail
 ///
-/// A fragment is delivered once and then stays. The alternative — rebuilding it into the tail of
-/// every subsequent turn — puts it after the cached span on every call, which costs more per turn
-/// than leaving the text resident in the prefix would have; deferring would then be a way to make
-/// long runs more expensive rather than less. Written into history it is paid for once, and every
-/// later turn carries it inside the span a cache read already covers.
+/// Writing the fragment into history places it in the cacheable prefix of later requests.
+/// Appending it to each request's tail would put that text after the cached prefix each time.
 ///
 /// # Why "delivered already" is read back from history
 ///
-/// The record ID comes from the family, so a history that holds it is the record of the delivery.
-/// Keeping a flag beside the prompts instead would be a second copy of that fact, and the two would
-/// first disagree on a resume: the history survives a checkpoint, an in-memory flag does not, and
-/// the run would re-deliver a fragment it can see in its own transcript.
+/// The fragment's record ID in `RunState::generated_items` tracks delivery across checkpoints.
+/// Mid-turn compaction replaces the history projected to the model and preserves the run's
+/// generated records. A delivered fragment therefore stays delivered for the rest of that run,
+/// even if the replacement omits its text. A new run tracks delivery in its own records.
 fn deliver_deferred_prompts(
     context: &TurnLoopContext<'_>,
     agent: &AgentBinding,

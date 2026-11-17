@@ -5012,18 +5012,21 @@ async fn context_injected_into_an_idle_agent_is_recorded_at_once() {
     );
 }
 
-fn worker_compaction_config(worker: Arc<AgentSpec>) -> RunConfig {
-    let compaction = ra_context::compaction::CompactionCapability::default().with_context_windows(
+fn worker_compaction_capability() -> ra_context::compaction::CompactionCapability {
+    ra_context::compaction::CompactionCapability::default().with_context_windows(
         ra_context::window::ContextWindowConfig::new(
             std::collections::BTreeMap::from([("canonical-model".to_owned(), 1_000)]),
             ra_context::window::DEFAULT_COMPACTION_THRESHOLD_RATIO,
         )
         .unwrap(),
-    );
+    )
+}
+
+fn worker_compaction_config(worker: Arc<AgentSpec>) -> RunConfig {
     let registry = AgentRegistry::builder().register(worker).build().unwrap();
     RunConfig::new()
         .with_agent_registry(registry)
-        .with_capability(Arc::new(compaction))
+        .with_capability(Arc::new(worker_compaction_capability()))
 }
 
 async fn spawn_compacting_worker(
@@ -5345,10 +5348,37 @@ async fn spawned_agent_compaction_hook_deny_cancels_and_preserves_follow_up_mail
     );
 }
 
+struct WorkerCompactionFactory;
+
+#[async_trait]
+impl SpawnedAgentFactory for WorkerCompactionFactory {
+    async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        Ok(
+            PreparedSpawnedAgent::new(Arc::clone(request.agent())).with_prepared_capabilities(
+                [Arc::new(worker_compaction_capability())
+                    as Arc<dyn ra_core::capability::Capability>],
+                [],
+            ),
+        )
+    }
+}
+
+#[rstest::rstest]
+#[case::inherited(false)]
+#[case::spawned_factory(true)]
 #[tokio::test]
-async fn full_fork_inherits_the_parents_latest_sampling_total_for_its_first_compaction() {
+async fn full_fork_inherits_the_parents_latest_sampling_total_for_its_first_compaction(
+    #[case] factory_only: bool,
+) {
     let scripts = Arc::new(Scripts::default());
     let control = AgentControl::new();
+    let control = if factory_only {
+        control
+            .with_spawned_agent_factory(Arc::new(WorkerCompactionFactory))
+            .unwrap()
+    } else {
+        control
+    };
     let worker = worker_agent(Vec::new());
     scripts.push(
         "lead",
@@ -5363,12 +5393,13 @@ async fn full_fork_inherits_the_parents_latest_sampling_total_for_its_first_comp
         "worker",
         Step::Respond(final_message("w-1", "after fork compaction")),
     );
-    Runner::run(
-        root_request(&scripts, &control, worker.clone())
-            .with_config(worker_compaction_config(worker)),
-    )
-    .await
-    .unwrap();
+    let request = root_request(&scripts, &control, worker.clone());
+    let request = if factory_only {
+        request
+    } else {
+        request.with_config(worker_compaction_config(worker))
+    };
+    Runner::run(request).await.unwrap();
     eventually_status(&control, &worker_path(), |status| {
         *status == AgentStatus::Completed(Some("after fork compaction".into()))
     })
@@ -5376,6 +5407,7 @@ async fn full_fork_inherits_the_parents_latest_sampling_total_for_its_first_comp
 
     let inputs = scripts.inputs("worker");
     assert_eq!(inputs.len(), 2);
+    assert_eq!(scripts.inputs("lead").len(), 2);
     let summary = texts(&inputs[0]).join("\n");
     assert!(summary.contains("do the work"));
     assert!(!summary.contains(NEW_TASK));
@@ -5506,6 +5538,13 @@ async fn spawned_agent_pre_turn_compaction_exhaustion_stops_before_sampling(
             .with_rollout_budget(RolloutBudgetConfig::new(3_000, Vec::new()))
             .unwrap()
     };
+    if deadline {
+        scripts.push(
+            "worker",
+            Step::Respond(spawn_call("w-spawn", "helper", "helper", "Stay available")),
+        );
+        scripts.push("helper", Step::Hang);
+    }
     scripts.push(
         "worker",
         Step::Respond(
@@ -5513,11 +5552,29 @@ async fn spawned_agent_pre_turn_compaction_exhaustion_stops_before_sampling(
                 .with_usage(Usage::from_request(RequestUsage::new(1_100, 5))),
         ),
     );
-    spawn_compacting_worker(&scripts, &control, worker, UserHooks::default()).await;
+    let registry = AgentRegistry::builder()
+        .register(worker.clone())
+        .register(helper_agent(Vec::new()))
+        .build()
+        .unwrap();
+    let config = RunConfig::new()
+        .with_agent_registry(registry)
+        .with_capability(Arc::new(worker_compaction_capability()));
+    scripts.push("lead", Step::Respond(spawn_worker("l-1", "first task")));
+    scripts.push("lead", Step::Respond(final_message("l-2", "spawned")));
+    Runner::run(root_request(&scripts, &control, worker).with_config(config))
+        .await
+        .unwrap();
     eventually_status(&control, &worker_path(), |status| {
         *status == AgentStatus::Completed(Some("previous answer".into()))
     })
     .await;
+    if deadline {
+        until("the helper started sampling", || {
+            scripts.inputs("helper").len() == 1
+        })
+        .await;
+    }
 
     scripts.push(
         "worker",
@@ -5541,9 +5598,19 @@ async fn spawned_agent_pre_turn_compaction_exhaustion_stops_before_sampling(
         matches!(&terminal, AgentStatus::Errored(message) if message.contains("budget_exhausted")),
         "{terminal:?}"
     );
-    assert_eq!(scripts.inputs("worker").len(), 2);
+    assert_eq!(scripts.inputs("worker").len(), 2 + usize::from(deadline));
+    if deadline {
+        assert_eq!(control.status(&helper_path()), Some(AgentStatus::Running));
+    }
 
-    let session = control.live_instances()[0].session_id().clone();
+    let session = control
+        .agents()
+        .into_iter()
+        .find(|agent| agent.agent_path() == &worker_path())
+        .unwrap()
+        .session_id()
+        .unwrap()
+        .clone();
     let path = store.rollout_path(&session).unwrap();
     control.shutdown().await;
     let records = RolloutReader::open(path).read_all().await.unwrap();
@@ -5962,8 +6029,7 @@ async fn context_a_continued_run_had_not_delivered_survives_an_error_without_a_c
     );
 }
 
-/// Prepares every spawn as `worker`, whose runs stop on a wall clock `deadline_after` from when it
-/// is spawned.
+/// Prepares the worker with its own wall-clock deadline and leaves its descendants unbounded.
 struct DeadlineFactory {
     worker: Arc<AgentSpec>,
     deadline_after: Duration,
@@ -5971,7 +6037,14 @@ struct DeadlineFactory {
 
 #[async_trait]
 impl SpawnedAgentFactory for DeadlineFactory {
-    async fn prepare(&self, _request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+    async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
+        if request.path() != &worker_path() {
+            return Ok(
+                PreparedSpawnedAgent::new(Arc::clone(request.agent())).with_run_config(|config| {
+                    config.with_budget(ra_core::budget::BudgetLimit::default())
+                }),
+            );
+        }
         let deadline = ra_core::cancel::Deadline::after(self.deadline_after);
         Ok(PreparedSpawnedAgent::new(Arc::clone(&self.worker))
             .with_run_config(move |config| config.with_deadline(deadline)))
