@@ -14,6 +14,7 @@ use ra_config::ConfigEdit;
 use ra_config::ConfigLayerStack;
 use ra_config::CredentialProviderConfig;
 use ra_config::merge_toml_values;
+use ra_network_proxy::CredentialProviderConfigExt;
 use ra_protocol::server::protocol::ConfigWriteErrorCode;
 use ra_protocol::server::protocol::MergeStrategy;
 use std::collections::BTreeMap;
@@ -212,14 +213,11 @@ impl CredentialProviderEdits {
                     if current == old {
                         continue;
                     }
-                    let Ok(_old): Result<CredentialProviderConfig, _> = old.clone().try_into()
+                    let Ok(old): Result<CredentialProviderConfig, _> = old.clone().try_into()
                     else {
                         continue;
                     };
-                    // The source validates the current definition only when the previous one
-                    // compiled. Without the broker that cannot be decided, so the current
-                    // definition is always checked and therefore rejected.
-                    {
+                    if old.validate(id).is_ok() {
                         to_validate.insert(id.clone(), current.clone());
                     }
                 }
@@ -259,7 +257,7 @@ impl CredentialProviderEdits {
         }
         for (id, definition) in to_validate {
             let provider: CredentialProviderConfig = definition.try_into()?;
-            validate_provider(&provider, &id)?;
+            provider.validate(&id)?;
         }
         Ok(())
     }
@@ -296,13 +294,4 @@ fn providers(config: &TomlValue) -> Option<&TomlValue> {
     PROVIDERS_PATH
         .iter()
         .try_fold(config, |value, key| value.get(*key))
-}
-
-/// Stands in for the source `CredentialProviderConfig::validate`, which compiles the provider
-/// with the network proxy credential broker. That broker is not part of this product yet, so a
-/// remapping that the source would validate is rejected rather than persisted unchecked.
-fn validate_provider(_provider: &CredentialProviderConfig, id: &str) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "credential provider `{id}` cannot be validated because the network proxy credential broker is not available"
-    )
 }

@@ -174,7 +174,6 @@ fn provider_batch_remapping_preserves_ordered_edits() {
 }
 
 #[tokio::test]
-#[ignore = "requires the network proxy credential broker to validate provider definitions"]
 async fn provider_edits_preserve_another_writers_sibling_update() -> Result<()> {
     let initial: TomlValue = toml::from_str(
         r#"
@@ -245,7 +244,6 @@ auth = ['bearer']
 }
 
 #[test]
-#[ignore = "requires the network proxy credential broker to validate provider definitions"]
 fn provider_remapping_respects_lower_layer_eviction() -> Result<()> {
     let tmp = tempdir()?;
     let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
@@ -397,7 +395,6 @@ fn provider_remapping_respects_lower_layer_eviction() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires the network proxy credential broker to validate provider definitions"]
 fn provider_updates_preserve_working_definitions_and_drafts() -> Result<()> {
     let tmp = tempdir()?;
     let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
@@ -521,7 +518,6 @@ fn provider_updates_preserve_working_definitions_and_drafts() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires the network proxy credential broker to validate provider definitions"]
 fn provider_draft_remapping_uses_final_source_ownership() -> Result<()> {
     let tmp = tempdir()?;
     let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
@@ -1230,7 +1226,6 @@ async fn write_value_defaults_to_selected_user_config_path() {
 }
 
 #[tokio::test]
-#[ignore = "requires the network proxy credential broker to validate provider definitions"]
 async fn provider_remapping_validates_fragments_even_when_source_is_overridden() -> Result<()> {
     for (managed_provider, strategy) in [
         (None, MergeStrategy::Upsert),
@@ -2494,40 +2489,6 @@ exclude = ["AWS_*"]
             .await?;
     }
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn provider_remapping_fails_closed_without_credential_broker() -> Result<()> {
-    let tmp = tempdir()?;
-    let initial = r#"[features.network_proxy.credentials.a_working]
-env = ["VENDOR_PASSWORD"]
-patterns = ["^pin_[a-z]{8}$"]
-url_prefixes = ["https://old.example"]
-"#;
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), initial)?;
-    let service = manager_without_managed_config(tmp.path().to_path_buf());
-
-    let error = service
-        .write_value(ConfigValueWriteParams {
-            file_path: None,
-            key_path: "features.network_proxy.credentials.z_new.env".to_string(),
-            value: serde_json::json!(["VENDOR_PASSWORD"]),
-            merge_strategy: MergeStrategy::Upsert,
-            expected_version: None,
-        })
-        .await
-        .expect_err("an unvalidated provider remapping must not be persisted");
-
-    assert_eq!(
-        error.write_error_code(),
-        Some(ConfigWriteErrorCode::ConfigValidationError)
-    );
-    assert!(error.to_string().contains("credential broker"), "{error}");
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?,
-        initial
-    );
     Ok(())
 }
 
