@@ -34,7 +34,7 @@ use ra_model::{
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
-use ra_runtime::runner::RunConfig;
+use ra_runtime::runner::{ModelRetryRecovery, RunConfig};
 use serde_json::{Map, json};
 
 use super::{
@@ -160,7 +160,11 @@ impl ProductModelRuntime {
         })
     }
 
-    pub(crate) fn configure_run(&self, config: RunConfig) -> RunConfig {
+    pub(crate) fn configure_run(self: &Arc<Self>, mut config: RunConfig) -> RunConfig {
+        if self.explicit.is_none() {
+            config =
+                config.with_model_retry_recovery(Arc::clone(self) as Arc<dyn ModelRetryRecovery>);
+        }
         let Some(source) = &self.remote else {
             return config;
         };
@@ -769,3 +773,36 @@ fn truncate_tool_output(
         Error::caller("failed to project model-facing tool output").with_source(error)
     })
 }
+
+impl ModelRetryRecovery for ProductModelRuntime {
+    fn recovery_message(&self, error: &Error, model: Option<&str>) -> Option<Message> {
+        if ra_model::openai::response_failure_event(error) != Some("response.incomplete")
+            || ra_model::openai::response_incomplete_reason(error) != Some("content_filter")
+        {
+            return None;
+        }
+        let info = model.and_then(|model| self.model_info(model));
+        let text = info
+            .as_ref()
+            .and_then(|info| info.model_messages.as_ref())
+            .and_then(|messages| messages.content_filter_guidance.as_deref())
+            .filter(|text| !text.trim().is_empty() && text.len() <= 512)
+            .unwrap_or(CONTENT_FILTER_GUIDANCE);
+        Some(Message::developer(format!(
+            "<content_filter_guidance>\n{text}\n</content_filter_guidance>"
+        )))
+    }
+
+    fn report_retry(&self, retry: u32) -> bool {
+        responses_retry::report_retry(
+            retry,
+            cfg!(debug_assertions),
+            self.config.model_provider.supports_websockets
+                && !self.config.model_provider.is_amazon_bedrock(),
+        )
+    }
+}
+
+// Codex's bundled guidance is a permitted-alternative recovery instruction, never an invitation
+// to reproduce the blocked content. Catalog overrides use the same nonblank, 512-byte bound.
+const CONTENT_FILTER_GUIDANCE: &str = "Your previous response was blocked by a content filter. Do not treat this as a transient failure or try to reproduce or work around the blocked content through repeated attempts, altered formatting, splitting, encoding, tools, subagents, or later wakes. Briefly explain the limitation and offer a permitted alternative. Continue unrelated authorized work.";

@@ -342,9 +342,9 @@ fn failure(event_type: &str, frame: &Value) -> Error {
     {
         Some("max_output_tokens") => ProviderErrorKind::OutputLimit,
         Some("content_filter") => ProviderErrorKind::Refusal,
-        _ => return behavior_error(message),
+        _ => ProviderErrorKind::Behavior,
     };
-    Error::provider(kind, message)
+    crate::openai::error::stream_failure(event_type, frame, kind, message)
 }
 
 /// Reads an `error` or `response.error` frame, which reports a call that will produce nothing
@@ -371,7 +371,12 @@ fn stream_error(event_type: &str, frame: &Value) -> Error {
             })
         })
         .collect();
-    behavior_error(terminal_message(event_type, &details))
+    crate::openai::error::stream_failure(
+        event_type,
+        frame,
+        ProviderErrorKind::Behavior,
+        terminal_message(event_type, &details),
+    )
 }
 
 /// The reference's wording for a stream that ended on a failure event.

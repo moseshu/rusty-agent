@@ -1,9 +1,12 @@
 //! The runtime policy that decides whether a failed model call is worth another attempt.
 //!
 //! Provider adapters report facts through [`RetryAdvice`]; this module keeps
-//! the application decision separate from those facts. In particular, a retry policy can choose
-//! a narrower class of transient failures than an adapter recognizes, but it cannot bypass the
-//! runtime's attempt cap, cancellation, or a stream event that was already published.
+//! the application decision separate from those facts. As in the `OpenAI` Agents SDK, the runtime
+//! asks the policy about every failure except a cancellation, whatever its
+//! [`Recoverability`](crate::error::Recoverability), so a policy filters the failures it accepts:
+//! check [`Error::is_retryable`] to retry transient failures only. A policy cannot bypass the
+//! runtime's attempt cap, cancellation, a stream event that was already published, or an adapter
+//! that marked the replay unsafe.
 
 use std::time::Duration;
 
@@ -167,6 +170,9 @@ impl RetryDecision {
 #[async_trait]
 pub trait ModelRetryPolicy: Send + Sync {
     /// Decides whether the failed attempt merits another call.
+    ///
+    /// It is called for non-transient failures too, such as a rejected request or an invalid
+    /// credential; a policy that accepts everything retries those.
     async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision;
 }
 

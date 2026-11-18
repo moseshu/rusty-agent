@@ -24,9 +24,8 @@ const CODEX_COMPACTION_MAX_RETRIES: u32 = 5;
 /// Codex retries a failed compaction request with backoff up to the provider's retry limit, except
 /// for the failures it treats as final, and waits as long as the server's `Retry-After` asks
 /// (`d3147716e0`, after the pinned baseline, narrows the retried failures to those). The runner
-/// already refuses to retry what is not transient — an incomplete response, a window overflow,
-/// a rejected request — and what could replay accepted output, so this policy accepts every
-/// failure that reaches it and adopts the delay a provider asked for.
+/// refuses replays that could duplicate accepted output. This policy keeps the existing
+/// compaction classification explicitly, and adopts the delay a provider asked for.
 fn compaction_retry() -> ModelRetrySettings {
     ModelRetrySettings::new()
         .with_max_retries(CODEX_COMPACTION_MAX_RETRIES)
@@ -39,6 +38,9 @@ struct CompactionRetryPolicy;
 #[async_trait::async_trait]
 impl ModelRetryPolicy for CompactionRetryPolicy {
     async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
+        if !context.error().is_retryable() {
+            return RetryDecision::no_retry();
+        }
         let delay = context
             .provider_advice()
             .and_then(RetryAdvice::retry_after)

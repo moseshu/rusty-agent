@@ -176,7 +176,7 @@ async fn bedrock_expired_token_reexports_credentials_and_retries_once() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn bedrock_command_bearer_refreshes_once_and_explains_an_expired_signature() {
+async fn bedrock_command_bearer_refreshes_once_per_attempt_and_explains_expired_signature() {
     let endpoint = MockServer::start().await;
     let product = ProductModels::new();
     product.write(
@@ -208,7 +208,7 @@ refresh_interval_ms = 0
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({
             "error": {"message": "Signature expired: 20260609T133205Z is now earlier than 20260614T062525Z"}
         })))
-        .expect(2)
+        .expect(12)
         .mount(&endpoint)
         .await;
 
@@ -224,7 +224,11 @@ refresh_interval_ms = 0
             .contains("Amazon Bedrock rejected the request because its AWS signature has expired."),
         "{message}"
     );
-    assert_eq!(invocations(&product), 2);
+    // Codex keeps the final 401 as UnexpectedStatus, so a turn retry has its own
+    // single authentication recovery in addition to the initial attempt's recovery.
+    // The native provider uses five turn retries: six attempts, each with one 401
+    // recovery, reuse the cached bearer and refresh it once per rejected attempt.
+    assert_eq!(invocations(&product), 7);
     endpoint.verify().await;
 }
 

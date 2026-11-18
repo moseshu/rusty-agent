@@ -4,8 +4,8 @@
 //! Codex retries a failed sampling stream from its turn loop, up to the provider's
 //! `stream_max_retries`, when the error yields a retry delay: the server's advised delay when one
 //! was sent, or an exponential backoff otherwise. Some failures are retried only on the server's
-//! advice and some never. The runner already holds the retry budget, refuses failures that are not
-//! transient, and refuses replays that could duplicate accepted output; this policy supplies
+//! advice and some never. The runner holds the retry budget and refuses replays that could
+//! duplicate accepted output; this policy supplies
 //! Codex's per-error decision and delay on top of it.
 //!
 //! Codex also retries failed connections without limit, on a separate counter with a 5 to 60
@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ra_core::error::{Error, ProviderErrorKind};
 use ra_core::model::{
     ModelRetryPolicy, ModelRetrySettings, NormalizedProviderError, RetryAdvice, RetryDecision,
     RetryPolicyContext,
@@ -24,16 +25,27 @@ use rand::Rng;
 const INITIAL_DELAY_MS: f64 = 200.0;
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// Error codes Codex maps to failures that waiting does not fix: usage and quota limits, and
-/// unavailable flex processing.
-const NON_RETRYABLE_CODES: &[&str] = &[
-    "usage_limit_reached",
-    "usage_not_included",
+/// Quota codes recognized on HTTP 429, independently of the error type.
+const HTTP_QUOTA_CODES: &[&str] = &[
     "insufficient_quota",
     "credit_balance_exhausted",
     "organization_spend_limit_exceeded",
     "project_spend_limit_exceeded",
     "organization_usage_limit_exceeded",
+];
+
+/// Terminal codes recognized by Codex's `parse_failed_response`, rather than its HTTP mapper.
+const FAILED_RESPONSE_TERMINAL_CODES: &[&str] = &[
+    "context_length_exceeded",
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "usage_not_included",
+    "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
+    "invalid_prompt",
     "flex_unavailable",
 ];
 
@@ -62,24 +74,64 @@ impl ModelRetryPolicy for SamplingRetryPolicy {
 /// Codex's `CodexErr::retry_delay` for the failures that reach a retry policy.
 fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
     let normalized = context.normalized();
-    let code = normalized.and_then(NormalizedProviderError::error_code);
-    if code.is_some_and(|code| NON_RETRYABLE_CODES.contains(&code))
-        || matches!(
-            ra_model::openai::error_type(context.error()),
-            Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
-        )
-    {
-        return None;
-    }
+    let error = context.error();
+    let status = normalized.and_then(NormalizedProviderError::status_code);
+    let code = if status.is_some() {
+        ra_model::openai::error_code(error)
+    } else {
+        normalized.and_then(NormalizedProviderError::error_code)
+    };
+    let event = ra_model::openai::response_failure_event(error);
     let server_delay = normalized
         .and_then(NormalizedProviderError::retry_after)
         .or_else(|| context.provider_advice().and_then(RetryAdvice::retry_after));
-    // An overloaded server, and a 429 that is not a usage limit (Codex's `RetryLimit`), are
-    // retried only when the server says when to come back.
-    let server_only = code == Some("server_is_overloaded")
-        || normalized.and_then(NormalizedProviderError::status_code) == Some(429);
-    if server_only {
-        return server_delay;
+    match status {
+        Some(400) => return None,
+        Some(429) => {
+            if code
+                .is_some_and(|code| HTTP_QUOTA_CODES.contains(&code) || code == "flex_unavailable")
+                || matches!(
+                    ra_model::openai::error_type(error),
+                    Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
+                )
+            {
+                return None;
+            }
+            return server_delay;
+        }
+        Some(503) if code == Some("server_is_overloaded") => return server_delay,
+        Some(403) if code == Some("misalignment_policy_violation") => return None,
+        Some(_) => {}
+        None if event == Some("response.failed") => {
+            if code.is_some_and(|code| FAILED_RESPONSE_TERMINAL_CODES.contains(&code)) {
+                return None;
+            }
+            if code == Some("server_is_overloaded") {
+                return server_delay;
+            }
+        }
+        None if event == Some("response.incomplete") => {
+            if ra_model::openai::response_incomplete_reason(error) != Some("content_filter") {
+                return None;
+            }
+        }
+        None => {
+            // Local caller/configuration failures and gateway sign-in cannot be repaired by
+            // replay. Transport and stream decoder failures can, even when classified Behavior.
+            match error {
+                Error::Provider {
+                    kind:
+                        ProviderErrorKind::Network
+                        | ProviderErrorKind::Timeout
+                        | ProviderErrorKind::ServerError
+                        | ProviderErrorKind::RateLimit
+                        | ProviderErrorKind::Conflict
+                        | ProviderErrorKind::Behavior,
+                    ..
+                } => {}
+                _ => return None,
+            }
+        }
     }
     Some(server_delay.unwrap_or_else(|| backoff(u64::from(context.attempt()) + 1)))
 }
@@ -91,4 +143,28 @@ fn backoff(retry: u64) -> Duration {
     let base = INITIAL_DELAY_MS * BACKOFF_FACTOR.powi(exponent);
     let jitter = rand::rng().random_range(0.9..1.1);
     Duration::from_secs_f64((base * jitter / 1000.0).min(Duration::MAX.as_secs_f64()))
+}
+
+/// Codex hides the first WebSocket reconnect notification only in release builds.
+pub(super) const fn report_retry(retry: u32, debug: bool, websocket: bool) -> bool {
+    retry > 1 || debug || !websocket
+}
+
+/// External tests exercise the actual product policy and its jittered backoff.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod test_api {
+    /// The product delay for one failed attempt, before the runtime enforces replay safety.
+    #[must_use]
+    pub fn delay(error: &ra_core::error::Error, attempt: u32) -> Option<std::time::Duration> {
+        super::retry_delay(&ra_core::model::RetryPolicyContext::new(
+            error, attempt, 5, true, None,
+        ))
+    }
+
+    /// Whether Codex would surface a reconnect notification for these build and transport flags.
+    #[must_use]
+    pub const fn reports_retry(retry: u32, debug: bool, websocket: bool) -> bool {
+        super::report_retry(retry, debug, websocket)
+    }
 }

@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["openai"]
-openai = ["dep:reqwest", "dep:base64", "dep:ra-http", "dep:rand", "dep:tokio-tungstenite"]
+openai = ["dep:reqwest", "dep:base64", "dep:ra-http", "dep:rand", "dep:tokio-tungstenite", "dep:regex-lite"]
 anthropic = ["dep:reqwest", "dep:base64"]
 # 兼容端点复用 OpenAI Chat codec；这是加法依赖，不与其他 provider 互斥。
 compat = ["openai"]
@@ -33,3 +33,4 @@ base64 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 httpdate = { workspace = true }
+regex-lite = { version = "0.1", optional = true }

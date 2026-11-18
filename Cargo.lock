@@ -5531,6 +5531,7 @@ dependencies = [
  "ra-core",
  "ra-http",
  "rand 0.9.5",
+ "regex-lite",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

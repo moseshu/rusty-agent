@@ -472,3 +472,46 @@ async fn streamed_and_non_streamed_failures_normalize_the_same_way() {
         assert_eq!(error.recoverability(), Recoverability::NeedsIntervention);
     }
 }
+
+#[tokio::test]
+async fn response_stream_metadata_keeps_status_scopes_and_server_delay() {
+    for (headers, message, expected) in [
+        (json!({"Retry-After": "0"}), "retry later", Duration::ZERO),
+        (
+            json!({"retry-after-ms": "125"}),
+            "retry later",
+            Duration::from_millis(125),
+        ),
+        (json!({}), "Try again in 250ms", Duration::from_millis(250)),
+        (
+            json!({}),
+            "Try again in 0.5 seconds",
+            Duration::from_millis(500),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let frame = json!({"type": "response.failed", "response": {"error": {
+            "code": "rate_limit_exceeded", "message": message, "headers": headers,
+        }}});
+        let model = responses_model(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {frame}\n\n"), "text/event-stream"),
+        )
+        .await;
+        let error = failed_stream(&model).await;
+        assert_eq!(error.code(), "provider.behavior");
+        assert_eq!(facts(&error).status_code(), None);
+        assert_eq!(facts(&error).error_code(), Some("rate_limit_exceeded"));
+        assert_eq!(facts(&error).retry_after(), Some(expected));
+        assert_eq!(
+            ra_model::openai::response_failure_event(&error),
+            Some("response.failed")
+        );
+        let wrapped = Error::caller("wrapped").with_source(error);
+        assert_eq!(
+            ra_model::openai::response_failure_event(&wrapped),
+            Some("response.failed")
+        );
+    }
+}

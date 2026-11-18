@@ -1,3 +1,4 @@
+// Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! `OpenAI` HTTP and transport errors mapped into the provider-neutral taxonomy.
 //!
 //! Every failure here is built as a [`NormalizedProviderError`] and converted, so the status, the
@@ -15,7 +16,7 @@ use crate::retry::RetryHints;
 
 #[derive(Debug, thiserror::Error)]
 #[error("OpenAI error type {0}")]
-struct ErrorType(String);
+struct ErrorType(String, Option<String>);
 
 /// Returns the provider's error `type`, independently of its error `code`.
 ///
@@ -31,6 +32,20 @@ pub fn error_type(error: &Error) -> Option<&str> {
         source = current.source();
     }
     None
+}
+
+/// Returns the provider's explicit error `code`, without falling back to its `type`.
+/// The normalized framework field retains its existing code-or-type fallback.
+#[must_use]
+pub fn error_code(error: &Error) -> Option<&str> {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(metadata) = current.downcast_ref::<ErrorType>() {
+            return metadata.1.as_deref();
+        }
+        source = current.source();
+    }
+    NormalizedProviderError::from_error(error).and_then(NormalizedProviderError::error_code)
 }
 
 /// Header carrying the endpoint's diagnostic identifier for one request.
@@ -144,7 +159,7 @@ pub(crate) fn http_decode_error(error: ra_http::HttpError) -> Error {
 /// policy question about who is willing to pay, not a classification this layer can settle.
 pub(crate) fn response_failure(facts: &ResponseFacts, payload: &Value) -> NormalizedProviderError {
     let kind = if matches!(
-        error_code(payload),
+        payload_error_code(payload),
         Some("context_length_exceeded" | "context_window_exceeded")
     ) {
         ProviderErrorKind::ContextOverflow
@@ -190,7 +205,7 @@ pub(crate) fn response_failure_as(
             format!("OpenAI Responses WebSocket{quoted_request_id}: {message}"),
         )
     };
-    if let Some(code) = error_code(payload) {
+    if let Some(code) = payload_error_code(payload) {
         normalized = normalized.with_error_code(code);
     }
     if let Some(error_type) = payload
@@ -199,7 +214,15 @@ pub(crate) fn response_failure_as(
         .get("type")
         .and_then(Value::as_str)
     {
-        normalized = normalized.with_source(ErrorType(error_type.to_owned()));
+        normalized = normalized.with_source(ErrorType(
+            error_type.to_owned(),
+            payload
+                .get("error")
+                .unwrap_or(payload)
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ));
     }
     if let Some(request_id) = request_id {
         normalized = normalized.with_request_id(request_id);
@@ -213,7 +236,7 @@ pub(crate) fn response_failure_as(
     normalized
 }
 
-fn error_code(payload: &Value) -> Option<&str> {
+fn payload_error_code(payload: &Value) -> Option<&str> {
     let error = payload.get("error").unwrap_or(payload);
     error
         .get("code")
@@ -223,4 +246,95 @@ fn error_code(payload: &Value) -> Option<&str> {
 
 pub(crate) fn behavior_error(message: impl Into<String>) -> Error {
     Error::provider(ProviderErrorKind::Behavior, message)
+}
+
+// Provider event identity is kept in the adapter, so product retry policies can distinguish an
+// HTTP refusal from a terminal stream frame without changing the framework error taxonomy.
+#[derive(Debug, thiserror::Error)]
+#[error("OpenAI stream failure {event}")]
+struct ResponseStreamFailure {
+    event: String,
+    incomplete_reason: Option<String>,
+}
+
+fn stream_failure_metadata(error: &Error) -> Option<&ResponseStreamFailure> {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(metadata) = current.downcast_ref::<ResponseStreamFailure>() {
+            return Some(metadata);
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// The Responses event that terminated a failed stream, if the adapter received one.
+#[must_use]
+pub fn response_failure_event(error: &Error) -> Option<&str> {
+    stream_failure_metadata(error).map(|metadata| metadata.event.as_str())
+}
+
+/// The provider's incomplete-response reason, independently of its error code.
+#[must_use]
+pub fn response_incomplete_reason(error: &Error) -> Option<&str> {
+    stream_failure_metadata(error).and_then(|metadata| metadata.incomplete_reason.as_deref())
+}
+
+static RATE_LIMIT_DELAY: std::sync::LazyLock<Option<regex_lite::Regex>> =
+    std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)").ok()
+    });
+
+pub(crate) fn stream_failure(
+    event: &str,
+    frame: &Value,
+    kind: ProviderErrorKind,
+    message: String,
+) -> Error {
+    let response = frame.get("response").unwrap_or(frame);
+    let error = response.get("error").unwrap_or(response);
+    let mut normalized = NormalizedProviderError::new(kind, message);
+    if let Some(code) = error.get("code").and_then(Value::as_str) {
+        normalized = normalized.with_error_code(code);
+    }
+    let hints = RetryHints::from_headers(|name| {
+        error
+            .get("headers")?
+            .as_object()?
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))?
+            .1
+            .as_str()
+    });
+    let retry_after = hints.retry_after().or_else(|| {
+        if !matches!(
+            error.get("code").and_then(Value::as_str),
+            Some("rate_limit_exceeded" | "slow_down")
+        ) {
+            return None;
+        }
+        // Codex's Responses rate-limit parser also accepts the delay embedded in its message.
+        let captures = RATE_LIMIT_DELAY
+            .as_ref()?
+            .captures(error.get("message")?.as_str()?)?;
+        let value = captures.get(1)?.as_str().parse::<f64>().ok()?;
+        if captures.get(2)?.as_str().eq_ignore_ascii_case("ms") {
+            std::time::Duration::try_from_secs_f64(value.trunc() / 1000.0).ok()
+        } else {
+            std::time::Duration::try_from_secs_f64(value).ok()
+        }
+    });
+    if let Some(delay) = retry_after {
+        normalized = normalized.with_retry_after(delay);
+    }
+    normalized
+        .with_source(ResponseStreamFailure {
+            event: event.to_owned(),
+            incomplete_reason: response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+        .into_error()
 }

@@ -43,6 +43,9 @@ mod product;
 mod requirements;
 mod resolved_permission_profile;
 mod responses_retry;
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub use responses_retry::test_api as responses_retry_test_api;
 mod roles_discovery;
 mod roles_loader;
 mod support;

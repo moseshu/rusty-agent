@@ -7,6 +7,23 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Retry policies see every non-cancelled model failure
+
+The runner used to reject any model failure whose `Recoverability` was not `Retryable` before it
+asked the retry policy. It now asks the policy about every failure except a cancellation, as the
+OpenAI Agents SDK does: a rejected request, an invalid credential, a model behavior or refusal
+error, and caller or configuration errors reach `ModelRetryPolicy::evaluate` too. The attempt cap,
+cancellation, already-published stream events, dispatched tools and adapter-reported unsafe replays
+still stop a retry before the policy is consulted.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| A policy is asked about non-transient failures | Hosts with a custom `ModelRetryPolicy` that retries whatever reaches it | Return `RetryDecision::no_retry()` unless `context.error().is_retryable()` to keep the previous behavior |
+| `RetryAfterPolicy` retries any failure that carries a server delay, and `ProviderSuggestedRetryPolicy` any failure the adapter positively suggests | Hosts using those built-in policies | Wrap them in a policy that checks `is_retryable()` first if only transient failures should be retried |
+
+`NeverRetryPolicy` and `NetworkErrorRetryPolicy` behave as before. `RunConfig::with_model_retry_recovery`
+is new and optional; runs without it are unaffected.
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

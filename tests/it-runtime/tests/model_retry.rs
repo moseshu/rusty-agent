@@ -47,6 +47,7 @@ struct RetryingModel {
     responses: Mutex<Vec<Result<ModelResponse>>>,
     calls: AtomicUsize,
     advice: Option<RetryAdvice>,
+    inputs: Mutex<Vec<Vec<ModelInputItem>>>,
 }
 
 impl RetryingModel {
@@ -55,6 +56,7 @@ impl RetryingModel {
             responses: Mutex::new(responses),
             calls: AtomicUsize::new(0),
             advice,
+            inputs: Mutex::default(),
         })
     }
 }
@@ -66,7 +68,8 @@ impl Model for RetryingModel {
         self.responses.lock().unwrap().remove(0)
     }
 
-    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        self.inputs.lock().unwrap().push(request.input().to_vec());
         self.calls.fetch_add(1, Ordering::SeqCst);
         let event = self
             .responses
@@ -383,5 +386,191 @@ async fn retries_reuse_the_same_generated_cache_key() {
             .unwrap();
         let key = result.state().generated_prompt_cache_key().unwrap();
         assert_eq!(*model.keys.lock().unwrap(), vec![Some(key.to_owned()); 2]);
+    }
+}
+
+struct AcceptFailure {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ra_core::model::ModelRetryPolicy for AcceptFailure {
+    async fn evaluate(
+        &self,
+        _context: &ra_core::model::RetryPolicyContext<'_>,
+    ) -> ra_core::model::RetryDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ra_core::model::RetryDecision::retry().with_delay(std::time::Duration::ZERO)
+    }
+}
+
+#[tokio::test]
+async fn a_custom_policy_sees_nontransient_failures_but_cannot_override_cancellation() {
+    for error in [
+        Error::caller("rebuild request"),
+        Error::provider(ProviderErrorKind::Behavior, "invalid frame"),
+        Error::provider(ProviderErrorKind::Auth, "request refused"),
+        Error::cancelled("stop"),
+    ] {
+        let cancelled = error.is_cancelled();
+        let policy = Arc::new(AcceptFailure {
+            calls: AtomicUsize::new(0),
+        });
+        let model = RetryingModel::new(vec![Err(error), Ok(answer())], None);
+        let request = request(model.clone(), &CancelScope::root(), false, 1).with_config(
+            RunConfig::new().with_model_settings(
+                ModelSettings::new().with_retry(
+                    ModelRetrySettings::new()
+                        .with_max_retries(1)
+                        .with_policy(policy.clone()),
+                ),
+            ),
+        );
+        let result = Runner::run(request).await;
+        assert_eq!(result.is_ok(), !cancelled);
+        assert_eq!(policy.calls.load(Ordering::SeqCst), usize::from(!cancelled));
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            if cancelled { 1 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn builtin_policies_decide_nontransient_failures_without_a_runner_classification_gate() {
+    use ra_core::model::{
+        ModelRetryPolicy, NeverRetryPolicy, ProviderSuggestedRetryPolicy, RetryAfterPolicy,
+    };
+    for (policy, advice, retried) in [
+        (
+            Arc::new(NeverRetryPolicy) as Arc<dyn ModelRetryPolicy>,
+            None,
+            false,
+        ),
+        (Arc::new(NetworkErrorRetryPolicy), None, false),
+        (Arc::new(RetryAfterPolicy), None, false),
+        (Arc::new(ProviderSuggestedRetryPolicy), None, false),
+        (
+            Arc::new(ProviderSuggestedRetryPolicy),
+            Some(
+                RetryAdvice::new()
+                    .with_suggested(true)
+                    .with_retry_after(std::time::Duration::ZERO),
+            ),
+            true,
+        ),
+        (
+            Arc::new(RetryAfterPolicy),
+            Some(RetryAdvice::new().with_retry_after(std::time::Duration::ZERO)),
+            true,
+        ),
+    ] {
+        let model = RetryingModel::new(
+            vec![
+                Err(Error::provider(
+                    ProviderErrorKind::Behavior,
+                    "malformed response",
+                )),
+                Ok(answer()),
+            ],
+            advice,
+        );
+        let request = request(model.clone(), &CancelScope::root(), false, 1).with_config(
+            RunConfig::new().with_model_settings(
+                ModelSettings::new().with_retry(
+                    ModelRetrySettings::new()
+                        .with_max_retries(1)
+                        .with_policy(policy),
+                ),
+            ),
+        );
+        assert_eq!(Runner::run(request).await.is_ok(), retried);
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            if retried { 2 } else { 1 }
+        );
+    }
+}
+
+struct GuidanceRecovery;
+
+impl ra_runtime::runner::ModelRetryRecovery for GuidanceRecovery {
+    fn recovery_message(&self, _error: &Error, _model: Option<&str>) -> Option<Message> {
+        Some(Message::developer("offer a permitted alternative"))
+    }
+
+    fn report_retry(&self, retry: u32) -> bool {
+        retry > 1
+    }
+}
+
+#[tokio::test]
+async fn recovery_is_recorded_before_the_budget_check_and_retry_notices_can_be_suppressed() {
+    use ra_core::session::SessionId;
+    use ra_runtime::thread::{AgentThread, ThreadEvent, TurnInputRequest, TurnInputSubmission};
+    for budget in [0, 2] {
+        let model = RetryingModel::new(
+            vec![Err(network_error()), Err(network_error()), Ok(answer())],
+            None,
+        );
+        let thread = AgentThread::builder(
+            SessionId::new("retry-observer"),
+            AgentBinding::direct(
+                AgentSpec::builder()
+                    .id(AgentId::new("lead"))
+                    .name("Lead")
+                    .instructions("answer")
+                    .build()
+                    .unwrap(),
+            ),
+            Arc::new(Resolver {
+                model: model.clone(),
+            }),
+        )
+        .with_config(
+            retry_config(false, budget, std::time::Duration::ZERO)
+                .with_model_retry_recovery(Arc::new(GuidanceRecovery)),
+        )
+        .build();
+        assert!(matches!(
+            thread
+                .start_or_steer_turn(TurnInputRequest::new(vec![
+                    ra_core::item::ContentBlock::text("hello")
+                ]))
+                .await,
+            TurnInputSubmission::Started { .. }
+        ));
+        let mut notices = Vec::new();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), thread.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            match event {
+                ThreadEvent::StreamError { message, .. } => notices.push(message),
+                ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            notices,
+            if budget == 0 {
+                vec![]
+            } else {
+                vec!["Reconnecting... 2/2".to_owned()]
+            }
+        );
+        let history = serde_json::to_string(&thread.history()).unwrap();
+        assert!(history.contains("offer a permitted alternative"));
+        let inputs = model.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), if budget == 0 { 1 } else { 3 });
+        if budget > 0 {
+            assert!(
+                serde_json::to_string(&inputs[1])
+                    .unwrap()
+                    .contains("offer a permitted alternative")
+            );
+        }
     }
 }

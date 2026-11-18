@@ -106,6 +106,26 @@ mod output;
 mod pending_input;
 mod prompt_cache_key;
 
+/// Product-specific recovery around a failed sampling request, as Codex records contextual
+/// guidance before deciding whether to retry.
+///
+/// A recovery message is appended to the retried request and recorded in the run's history, so
+/// this is an intervention rather than an observer. It is an explicitly selected runtime
+/// extension: it does not change the framework retry policy contract or its cancellation and
+/// replay boundaries.
+pub trait ModelRetryRecovery: Send + Sync {
+    /// Context to record before deciding whether the failed request can be retried.
+    fn recovery_message(&self, _error: &Error, _model: Option<&str>) -> Option<Message> {
+        None
+    }
+
+    /// Whether a retry should produce a frontend notification. Attempts remain counted and
+    /// traced when the notification is suppressed.
+    fn report_retry(&self, _retry: u32) -> bool {
+        true
+    }
+}
+
 /// Pure upstream grouping calculation for the external parity-test workspace.
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
@@ -249,6 +269,7 @@ pub struct RunConfig {
     model_settings: ModelSettings,
     tracing: ModelTracing,
     error_handler: Option<Arc<dyn RunErrorHandler>>,
+    model_retry_recovery: Option<Arc<dyn ModelRetryRecovery>>,
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
@@ -297,6 +318,7 @@ impl RunConfig {
             model_settings: ModelSettings::new(),
             tracing: ModelTracing::Disabled,
             error_handler: None,
+            model_retry_recovery: None,
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
@@ -918,6 +940,12 @@ impl RunConfig {
         self
     }
 
+    /// Installs product recovery context and notification choices for sampling retries.
+    pub fn with_model_retry_recovery(mut self, recovery: Arc<dyn ModelRetryRecovery>) -> Self {
+        self.model_retry_recovery = Some(recovery);
+        self
+    }
+
     /// Retries for a thread's compaction summary request; see [`Self::with_compaction_retry`].
     #[must_use]
     pub const fn compaction_retry(&self) -> Option<&ra_core::model::ModelRetrySettings> {
@@ -1033,6 +1061,7 @@ impl std::fmt::Debug for RunConfig {
             .field("has_app_context", &self.app_context.is_some())
             .field("has_snapshot_factory", &self.snapshot_factory.is_some())
             .field("has_step_observer", &self.step_observer.is_some())
+            .field("has_retry_recovery", &self.model_retry_recovery.is_some())
             .field("compaction_retry", &self.compaction_retry)
             .field("budget", &self.budget)
             .field(
@@ -5473,6 +5502,7 @@ async fn run_one_turn(
         context,
         streaming_dispatch,
         &mut early,
+        state,
     )
     .await?;
     state.record_memory_exposures(memory_exposures);
@@ -7190,10 +7220,11 @@ async fn call_model(
     context: &TurnLoopContext<'_>,
     streaming_dispatch: StreamedDispatchInput,
     early: &mut EarlyRecords<'_>,
+    state: &mut RunState,
 ) -> Result<(TurnActionSurface, ModelResponse, StreamedFunctionDispatches)> {
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
-    let (surface, model_request) = prepared.into_call();
+    let (surface, mut model_request) = prepared.into_call();
 
     // Checked here rather than left to each adapter. A cache plan names a prefix by hash, and an
     // adapter that forgets to check would send one naming text the request no longer carries —
@@ -7253,6 +7284,14 @@ async fn call_model(
                 return Ok((surface, response, streamed_dispatches));
             }
             Err(error) => {
+                record_retry_recovery(
+                    context,
+                    &selector,
+                    state,
+                    &mut model_request,
+                    &error,
+                    attempt,
+                );
                 let Some((decision, delay)) = evaluate_retry(RetryEvaluation {
                     turn_scope,
                     model: &model,
@@ -7276,7 +7315,13 @@ async fn call_model(
                     retry.reason = decision.reason().unwrap_or(""),
                     "retrying failed model request"
                 );
-                if let Some(sink) = narration.model_stream_sink {
+                if let Some(sink) = narration.model_stream_sink
+                    && context
+                        .config
+                        .model_retry_recovery
+                        .as_ref()
+                        .is_none_or(|observer| observer.report_retry(attempt.saturating_add(1)))
+                {
                     sink.retrying(attempt.saturating_add(1), max_retries, &error);
                 }
                 turn_scope.run(tokio::time::sleep(delay)).await?;
@@ -7289,6 +7334,38 @@ async fn call_model(
             }
         }
     }
+}
+
+/// Records product recovery context even when the retry budget has been exhausted, as Codex
+/// records content-filter guidance before consulting the retry policy.
+fn record_retry_recovery(
+    context: &TurnLoopContext<'_>,
+    selector: &ra_core::model::ModelSelector,
+    state: &mut RunState,
+    request: &mut ModelRequest,
+    error: &Error,
+    attempt: u32,
+) {
+    let Some(message) = context
+        .config
+        .model_retry_recovery
+        .as_ref()
+        .and_then(|observer| observer.recovery_message(error, selector.model()))
+    else {
+        return;
+    };
+    let mut input = request.input().to_vec();
+    input.push(ModelInputItem::Message(message.clone()));
+    *request = request.clone().with_input(input);
+    let item = RunItem::new(
+        ItemId::new(format!(
+            "model-recovery-{}-{attempt}",
+            state.generated_items().len()
+        )),
+        RunItemKind::Message(message),
+    );
+    emit(context.events, RunStreamEvent::Item(item.clone()));
+    state.record_generated_items([item]);
 }
 
 /// Executes one physical model request and gives it its own generation span.
@@ -7400,10 +7477,7 @@ async fn evaluate_retry(
     // provider-facing values because they describe the transport a policy is reasoning about.
     const STREAMED: bool = true;
 
-    if input.attempt >= input.max_retries
-        || input.error.is_cancelled()
-        || !input.error.is_retryable()
-    {
+    if input.attempt >= input.max_retries || input.error.is_cancelled() {
         return Ok(None);
     }
     let Some(settings) = input.retry_settings else {
