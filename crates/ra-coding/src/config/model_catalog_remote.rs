@@ -281,9 +281,14 @@ impl RemoteModelCatalog {
 
     async fn fetch_and_update(&self, identity: String, key: Option<&str>) {
         let started_at = Utc::now();
-        let result = timeout(REFRESH_TIMEOUT, self.fetch(key))
-            .await
-            .unwrap_or(Err("catalog request timed out"));
+        // Codex composes the gateway credential before its catalog deadline, which bounds only the
+        // request: a token refresh or browser sign-in may take longer and must not be cut off.
+        let result = match self.request_headers().await {
+            Ok(headers) => timeout(REFRESH_TIMEOUT, self.fetch(headers, key))
+                .await
+                .unwrap_or(Err("catalog request timed out")),
+            Err(reason) => Err(reason),
+        };
         match result {
             Ok((catalog, etag)) => {
                 let entry = CacheEntry {
@@ -354,18 +359,24 @@ impl RemoteModelCatalog {
         }
     }
 
-    async fn fetch(
-        &self,
-        key: Option<&str>,
-    ) -> Result<(ModelsResponse, Option<String>), &'static str> {
+    /// The catalog request headers with the gateway credential, resolved once per discovery
+    /// request as Codex composes it once per catalog fetch.
+    async fn request_headers(&self) -> Result<HeaderMap, &'static str> {
         let mut headers = self.headers.clone();
         if let Some(gateway) = &self.gateway {
-            // Resolved once per discovery request, as Codex composes it once per catalog fetch.
             gateway
                 .apply_auth_headers(&mut headers)
                 .await
                 .map_err(|_| "gateway OAuth authentication failed")?;
         }
+        Ok(headers)
+    }
+
+    async fn fetch(
+        &self,
+        headers: HeaderMap,
+        key: Option<&str>,
+    ) -> Result<(ModelsResponse, Option<String>), &'static str> {
         for attempt in 0.. {
             let mut request = self.client.get(self.url.as_str()).headers(headers.clone());
             if let Some(key) = key {

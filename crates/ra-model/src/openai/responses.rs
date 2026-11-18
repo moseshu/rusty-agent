@@ -65,7 +65,8 @@ pub trait ResponsesBearerToken: Send + Sync {
 /// Codex composes these onto the primary credential when it builds a request's authentication:
 /// the primary bearer stays in `Authorization` and the extra credential travels in its own header
 /// or cookie. The source is applied once per request, to HTTP requests and to the WebSocket
-/// handshake alike, so a changed credential also selects a new WebSocket connection.
+/// handshake alike. As in Codex, an open WebSocket connection stays in use when only this
+/// credential changes; a new connection's handshake carries the current value.
 #[async_trait]
 pub trait ResponsesAuthHeaders: Send + Sync {
     /// Adds this source's credentials to the request headers. Fails, without sending anything,

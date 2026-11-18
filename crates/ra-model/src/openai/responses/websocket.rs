@@ -94,11 +94,44 @@ impl SessionCache {
     }
 }
 
-#[derive(PartialEq, Eq)]
+/// The credentials `model`'s accompanying source adds to `headers`, kept apart from them.
+async fn accompanying_headers(
+    model: &OpenAiResponsesModel,
+    headers: &HeaderMap,
+) -> Result<HeaderMap> {
+    let mut accompanying = HeaderMap::new();
+    if let Some(source) = &model.transport.auth_headers {
+        let mut composed = headers.clone();
+        // Nothing has been sent yet, so a failure to obtain the credential is safe to replay.
+        source
+            .apply_auth_headers(&mut composed)
+            .await
+            .map_err(|error| stamp_replay_safety(error, ReplaySafety::Safe))?;
+        for (name, value) in &composed {
+            if !headers.contains_key(name) {
+                accompanying.append(name.clone(), value.clone());
+            }
+        }
+    }
+    Ok(accompanying)
+}
+
 struct ConnectionKey {
     url: Url,
     headers: HeaderMap,
+    /// Credentials that accompany the primary authentication. They are sent with the handshake
+    /// but do not decide reuse: Codex keys a connection on the provider and the primary
+    /// credential's revision, so an open connection outlives a rotated accompanying credential.
+    accompanying: HeaderMap,
 }
+
+impl PartialEq for ConnectionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url && self.headers == other.headers
+    }
+}
+
+impl Eq for ConnectionKey {}
 
 struct Connection {
     socket: WebSocketConnection,
@@ -206,17 +239,11 @@ impl WebSocketTransport {
             return Ok(None);
         }
         let call = Call::new(model, request).await?;
-        let mut headers = crate::openai::transport_headers(
+        let headers = crate::openai::transport_headers(
             &model.transport.auth,
             request.model_settings().extra_headers(),
         )?;
-        if let Some(source) = &model.transport.auth_headers {
-            // Nothing has been sent yet, so a failure to obtain the credential is safe to replay.
-            source
-                .apply_auth_headers(&mut headers)
-                .await
-                .map_err(|error| stamp_replay_safety(error, ReplaySafety::Safe))?;
-        }
+        let accompanying = accompanying_headers(model, &headers).await?;
         let bearer = model.transport.bearer.as_ref();
         let mut token = match bearer {
             Some(bearer) => Some(bearer.token(None).await?),
@@ -232,6 +259,7 @@ impl WebSocketTransport {
         loop {
             let key = call.connection_key(
                 headers.clone(),
+                accompanying.clone(),
                 token.as_deref().or(model.transport.auth.api_key()),
             )?;
             // A cancelled or failed request drops its socket. Only a completed response returns it.
@@ -357,6 +385,7 @@ impl WebSocketTransport {
             .into_client_request()
             .map_err(|_| Error::config("invalid Responses WebSocket handshake request"))?;
         upgrade.headers_mut().extend(key.headers.clone());
+        upgrade.headers_mut().extend(key.accompanying.clone());
         let limit = call
             .request
             .model_settings()
@@ -410,7 +439,12 @@ impl Call {
         })
     }
 
-    fn connection_key(&self, mut headers: HeaderMap, token: Option<&str>) -> Result<ConnectionKey> {
+    fn connection_key(
+        &self,
+        mut headers: HeaderMap,
+        accompanying: HeaderMap,
+        token: Option<&str>,
+    ) -> Result<ConnectionKey> {
         let mut url = Url::parse(&format!(
             "{}/responses",
             self.model.transport.auth.base_url()
@@ -443,7 +477,16 @@ impl Call {
             authorization.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, authorization);
         }
-        Ok(ConnectionKey { url, headers })
+        if accompanying.keys().any(|name| headers.contains_key(name)) {
+            return Err(Error::config(
+                "accompanying credentials conflict with Responses WebSocket handshake headers",
+            ));
+        }
+        Ok(ConnectionKey {
+            url,
+            headers,
+            accompanying,
+        })
     }
 
     fn create_frame(&self, previous: Option<&PreviousResponse>) -> Value {

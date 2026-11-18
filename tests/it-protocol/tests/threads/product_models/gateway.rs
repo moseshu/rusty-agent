@@ -6,8 +6,9 @@
 //! `codex-rs/core/tests/suite/gateway_auth.rs`. Codex drives its provider factory and models
 //! manager directly and seeds a manager into its provider registry; here a product thread drives
 //! both, and the stored credential sits behind an in-memory keyring that every gateway manager for
-//! the product home uses. The WebSocket case is local: it covers the handshake path of the
-//! Responses adapter's accompanying-credential hook.
+//! the product home uses. The WebSocket cases are local: they cover the handshake path of the
+//! Responses adapter's accompanying-credential hook and, as Codex's connection reuse keys on the
+//! primary credential only, an open connection kept across a rotated gateway token.
 
 use std::path::PathBuf;
 
@@ -324,6 +325,67 @@ async fn catalog_cache_is_reused_only_for_matching_gateway_configuration() {
 }
 
 #[tokio::test]
+async fn catalog_waits_for_a_gateway_refresh_beyond_its_request_deadline() {
+    let endpoint = MockServer::start().await;
+    let gateway = GatewayProduct::new();
+    let config = gateway_config(&endpoint.uri(), header_delivery());
+    configure(
+        &gateway.product,
+        &format!("{}/product/v1", endpoint.uri()),
+        &config,
+        &format!("model_catalog_url = \"{}/models\"", endpoint.uri()),
+    );
+    gateway.seed(&config, token("expired", Some("refresh-secret"), 0));
+    // Codex composes the credential before its five-second catalog deadline, which bounds only
+    // the catalog request, so a slower refresh still yields a fetched catalog.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": "rotated-token", "expires_in": 3600}))
+                .set_delay(std::time::Duration::from_secs(6)),
+        )
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("x-gateway-auth", "Bearer rotated-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models": [catalog_model("local-model")]})),
+        )
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let server = gateway.product.server(None);
+    let mut connection = server.connect(1).await;
+    // The start itself outlasts the harness's usual patience, so wait on the catalog request.
+    server
+        .request(&mut connection, "thread/start", json!({}))
+        .await;
+    let paths = timeout(Duration::from_secs(30), async {
+        loop {
+            let paths: Vec<_> = endpoint
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect();
+            if paths.iter().any(|path| path == "/models") {
+                return paths;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the catalog is fetched once the gateway token is refreshed");
+    assert_eq!(paths, ["/token", "/models"]);
+}
+
+#[tokio::test]
 async fn requests_and_catalog_observe_gateway_rotation() {
     let endpoint = MockServer::start().await;
     let gateway = GatewayProduct::new();
@@ -510,5 +572,72 @@ async fn websocket_handshake_carries_primary_and_gateway_credentials() {
     let (thread, _) = start(&server, &mut connection, json!({})).await;
     let completed = completed_turn(&server, &mut connection, &thread, "hello").await;
     assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn websocket_connection_outlives_a_rotated_gateway_token() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            Message as Frame,
+            handshake::server::{Request, Response},
+        },
+    };
+
+    let issuer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": "second", "expires_in": 3600})),
+        )
+        .expect(1)
+        .mount(&issuer)
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let gateway = GatewayProduct::new();
+    let config = gateway_config(&issuer.uri(), header_delivery());
+    configure(
+        &gateway.product,
+        &format!("http://{address}/product/v1"),
+        &config,
+        "supports_websockets = true\nstream_max_retries = 0",
+    );
+    gateway.seed(&config, token("first", Some("refresh-secret"), i64::MAX));
+    // Only one connection is accepted: Codex keys reuse on the primary credential, so the
+    // rotated gateway token must not open a second one.
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_hdr_async(socket, |request: &Request, response: Response| {
+            assert_eq!(request.headers()["x-gateway-auth"], "Bearer first");
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        for step in 1..=2 {
+            let frame = ws.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(request["type"], "response.create");
+            ws.send(Frame::Text(websocket_completion(step).to_string().into()))
+                .await
+                .unwrap();
+        }
+    });
+
+    let server = gateway.product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let first = completed_turn(&server, &mut connection, &thread, "hello").await;
+    assert_eq!(first["turn"]["status"], "completed", "{first}");
+    let manager = shared_manager(&config, &gateway.home).expect("thread shares the gateway");
+    assert_eq!(
+        manager.refresh_access_token("first").await.unwrap(),
+        "second"
+    );
+    let second = completed_turn(&server, &mut connection, &thread, "again").await;
+    assert_eq!(second["turn"]["status"], "completed", "{second}");
     timeout(PATIENCE, peer).await.unwrap().unwrap();
 }
