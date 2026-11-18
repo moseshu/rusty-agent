@@ -78,6 +78,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-executor-protocol", Layer::Service),
     ("ra-executor", Layer::Service),
     ("ra-http", Layer::Service),
+    ("ra-aws-auth", Layer::Service),
     ("ra-tls", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
@@ -173,6 +174,9 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     ),
     ("ra-filesystem", &["ra-paths"]),
     ("ra-http", &["ra-tls"]),
+    // Codex's aws-auth: AWS SDK credentials and SigV4 signing, with SDK HTTP routed through the
+    // application client so network policy applies to metadata and STS traffic.
+    ("ra-aws-auth", &["ra-http"]),
     ("ra-tls", &[]),
     ("ra-executor-protocol", &["ra-paths", "ra-filesystem"]),
     (
@@ -263,6 +267,7 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-network-proxy",
             "ra-config",
             "ra-http",
+            "ra-aws-auth",
             "ra-filesystem",
             "ra-executor",
             "ra-core",

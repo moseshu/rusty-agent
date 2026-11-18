@@ -29,6 +29,7 @@ members = [
     "it-filesystem",
     "it-executor-protocol",
     "it-http",
+    "it-aws-auth",
     "it-tls",
     "it-sandbox",
     "it-mcp",

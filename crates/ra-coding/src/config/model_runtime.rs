@@ -33,7 +33,7 @@ use ra_http::{ClientRouteClass, RouteAwareClientPool};
 use ra_model::{
     openai::{
         auth::OpenAiAuth,
-        responses::{OpenAiResponsesProvider, developer_prefix},
+        responses::{OpenAiResponsesProvider, ResponsesRequestSigner, developer_prefix},
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
@@ -41,7 +41,7 @@ use ra_runtime::runner::RunConfig;
 use serde_json::{Map, json};
 
 use super::{
-    Config, ModelInfo, ModelsResponse,
+    Config, ModelInfo, ModelsResponse, amazon_bedrock,
     catalog::{ModelVisibility, TruncationMode, find_model_by_slug},
     model_auth::CommandBearerToken,
     model_catalog_remote::{RemoteModelCatalog, RemoteModelCatalogs},
@@ -55,12 +55,20 @@ const BASE_INSTRUCTIONS: &str = include_str!("model_prompt.md");
 static BUNDLED_MODELS: LazyLock<std::result::Result<ModelsResponse, serde_json::Error>> =
     LazyLock::new(|| serde_json::from_str(include_str!("models.json")));
 
+/// The bundled `OpenAI` catalog that provider catalogs derive from.
+#[cfg(feature = "test-api")]
+pub(super) fn bundled_models() -> Option<&'static ModelsResponse> {
+    BUNDLED_MODELS.as_ref().ok()
+}
+
 pub(crate) struct ProductModelRuntime {
     config: Arc<Config>,
     registry: Option<ProviderRegistry>,
     explicit: Option<Arc<dyn ModelResolver>>,
     default_model: Option<String>,
     remote: Option<Arc<RemoteModelCatalog>>,
+    /// Provider-owned static catalog, such as Bedrock's, used in place of the bundled one.
+    provider_catalog: Option<Arc<ModelsResponse>>,
 }
 
 struct TurnCatalog {
@@ -80,6 +88,14 @@ impl ProductModelRuntime {
             .as_ref()
             .map_err(|error| Error::config(format!("invalid bundled model catalog: {error}")))?;
         let mut prepared_auth = None;
+        let mut signer: Option<Arc<dyn ResponsesRequestSigner>> = None;
+        let mut provider_catalog = None;
+        if explicit.is_none() && config.model_provider.is_amazon_bedrock() {
+            let (auth, bedrock_signer, catalog) = prepare_bedrock(&config, bundled).await?;
+            prepared_auth = Some((auth, None));
+            signer = Some(bedrock_signer);
+            provider_catalog = Some(catalog);
+        }
         let remote = if explicit.is_none()
             && config.model_catalog.is_none()
             && let Some(url) = &config.model_provider.model_catalog_url
@@ -120,7 +136,12 @@ impl ProductModelRuntime {
         let remote_snapshot = remote.as_ref().and_then(|catalog| catalog.snapshot());
         let models = match &remote {
             Some(_) => remote_snapshot.as_deref(),
-            None => Some(config.model_catalog.as_ref().unwrap_or(bundled)),
+            None => Some(
+                provider_catalog
+                    .as_deref()
+                    .or(config.model_catalog.as_ref())
+                    .unwrap_or(bundled),
+            ),
         };
         let requested = remote
             .as_ref()
@@ -148,6 +169,7 @@ impl ProductModelRuntime {
                 default_model,
                 remote.clone(),
                 prepared_auth,
+                signer,
             )?)
         } else {
             None
@@ -159,6 +181,7 @@ impl ProductModelRuntime {
             explicit,
             default_model,
             remote,
+            provider_catalog,
         })
     }
 
@@ -190,9 +213,9 @@ impl ProductModelRuntime {
                 .cloned();
         }
         let catalog = self
-            .config
-            .model_catalog
-            .as_ref()
+            .provider_catalog
+            .as_deref()
+            .or(self.config.model_catalog.as_ref())
             .or_else(|| BUNDLED_MODELS.as_ref().ok())?;
         let candidates = catalog
             .models
@@ -407,11 +430,43 @@ fn resolve_reasoning_effort(info: Option<&ModelInfo>, effort: &ReasoningEffort) 
     }
 }
 
+/// Resolves Bedrock's endpoint, request signer, and catalog for one thread.
+async fn prepare_bedrock(
+    config: &Config,
+    bundled: &ModelsResponse,
+) -> Result<(
+    OpenAiAuth,
+    Arc<dyn ResponsesRequestSigner>,
+    Arc<ModelsResponse>,
+)> {
+    let command = config
+        .model_provider
+        .auth
+        .clone()
+        .map(CommandBearerToken::new)
+        .map(Arc::new);
+    let prepared = amazon_bedrock::prepare(config, command).await?;
+    let catalog = amazon_bedrock::model_catalog(
+        &config.model_provider,
+        Some(&prepared.base_url),
+        config.model_catalog.as_ref(),
+        bundled,
+    );
+    // Bedrock authenticates through the signer; the endpoint keeps only routing and headers.
+    let mut description = config.model_provider.clone();
+    description.aws = None;
+    description.auth = None;
+    description.base_url = Some(prepared.base_url);
+    let (auth, _) = provider_auth(&description, false, None)?;
+    Ok((auth, prepared.signer, Arc::new(catalog)))
+}
+
 fn build_registry(
     config: &Config,
     default_model: String,
     remote: Option<Arc<RemoteModelCatalog>>,
     prepared_auth: Option<(OpenAiAuth, Option<Arc<CommandBearerToken>>)>,
+    signer: Option<Arc<dyn ResponsesRequestSigner>>,
 ) -> Result<ProviderRegistry> {
     let provider = ProviderKey::new(&config.model_provider_id);
     let description = &config.model_provider;
@@ -474,6 +529,9 @@ fn build_registry(
         }
         if let Some(remote) = &remote {
             responses = responses.with_catalog_observer(remote.clone());
+        }
+        if let Some(signer) = &signer {
+            responses = responses.with_request_signer(Arc::clone(signer));
         }
         Ok(Arc::new(responses) as Arc<dyn ModelProvider>)
     })

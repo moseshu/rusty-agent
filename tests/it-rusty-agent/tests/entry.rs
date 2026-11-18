@@ -180,11 +180,20 @@ async fn convenient_and_explicit_requests_match_input_settings_usage_and_session
     assert_eq!(convenient.usage(), explicit.usage());
     assert_eq!(convenient.usage().input_tokens(), 11);
     let requests = model.requests.lock().unwrap();
-    // Independent runs intentionally have distinct cache scopes. Compare every other field.
+    // Independent runs intentionally have distinct cache scopes, and each request carries its own
+    // run's session for transport reuse. Compare every other field.
     let normalized_cache = requests[0].cache_plan().unwrap().clone();
+    let normalized_session = requests[0].session_id().unwrap().clone();
+    assert_eq!(
+        requests[1].session_id().map(|id| id.as_str()),
+        Some("second")
+    );
     assert_eq!(
         requests[0],
-        requests[1].clone().with_cache_plan(normalized_cache)
+        requests[1]
+            .clone()
+            .with_cache_plan(normalized_cache)
+            .with_session_id(normalized_session)
     );
     assert_eq!(requests[0].model_settings().temperature(), Some(0.8));
     drop(requests);

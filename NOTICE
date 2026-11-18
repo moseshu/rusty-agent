@@ -64,6 +64,20 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-model/src/openai/responses/websocket.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{codex-api/src/endpoint/responses_websocket.rs,core/src/{client,responses_retry}.rs} |
 | `crates/ra-coding/src/config/model_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/auth/external_bearer.rs (command-backed provider token and cache) |
 | `crates/ra-coding/src/config/model_catalog_remote.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{models-manager/src/{manager,cache}.rs,model-provider/src/{models_endpoint,models_identity}.rs,codex-api/src/endpoint/models.rs} |
+| `crates/ra-aws-auth/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/lib.rs |
+| `crates/ra-aws-auth/src/config.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/config.rs |
+| `crates/ra-aws-auth/src/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/discovery.rs |
+| `crates/ra-aws-auth/src/signing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/signing.rs |
+| `crates/ra-aws-auth/src/transport.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/transport.rs |
+| `crates/ra-coding/src/config/amazon_bedrock.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/mod.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/auth_refresh.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth_refresh.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/catalog.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/{catalog,runtime_catalog}.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/credential_export.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/credential_export.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/error.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/error.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/mantle.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/mantle.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/runtime.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/runtime.rs |
+| `crates/ra-coding/src/config/amazon_bedrock/shared_state.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/shared_state.rs |
 | `crates/ra-coding/src/config/model_runtime.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/{core/src/client.rs,model-provider-info/src/lib.rs,models-manager/src/{manager,model_info}.rs,protocol/src/openai_models/reasoning_effort.rs,utils/output-truncation/src/lib.rs} |
 | `crates/ra-config/src/source.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/config_layer_source.rs |
 | `crates/ra-config/src/merge.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/config/src/merge.rs |

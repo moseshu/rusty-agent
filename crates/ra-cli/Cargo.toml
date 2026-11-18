@@ -3,7 +3,8 @@ name = "ra-cli"
 description = "rusty-agent 命令行入口：REPL、单命令执行、doctor。"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# aws-config 1.13.1, required to avoid RUSTSEC-2026-0387, needs Rust 1.94.1.
+rust-version = "1.94.1"
 license.workspace = true
 repository.workspace = true
 

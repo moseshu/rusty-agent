@@ -852,3 +852,6 @@ fn websocket_completion(step: u32) -> Value {
 
 #[path = "product_models/remote_catalog.rs"]
 mod remote_catalog;
+
+#[path = "product_models/bedrock.rs"]
+mod bedrock;

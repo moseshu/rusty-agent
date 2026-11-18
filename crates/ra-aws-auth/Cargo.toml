@@ -1,0 +1,44 @@
+[package]
+name = "ra-aws-auth"
+description = "AWS credential loading and SigV4 request signing over route-aware HTTP."
+version.workspace = true
+edition.workspace = true
+# aws-config 1.13.1, required to avoid RUSTSEC-2026-0387, needs Rust 1.94.1.
+rust-version = "1.94.1"
+license.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[features]
+# Exposes deterministic signing and SDK transport hooks to the separate test workspace.
+test-api = []
+
+[dependencies]
+ra-http = { workspace = true }
+aws-config = { workspace = true, features = ["credentials-login"] }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+aws-types = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = "1"
+http-body-util = "0.1"
+url = { workspace = true }
+thiserror = { workspace = true }

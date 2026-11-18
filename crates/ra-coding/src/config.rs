@@ -1,6 +1,9 @@
 //! Effective product configuration and compatibility exports from the shared schema owner.
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
+pub use amazon_bedrock::test_api as amazon_bedrock_test_api;
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
 pub use ra_config::mcp_requirements_test_api;
 pub use ra_config::{
     AppToolApproval, ConfigLayer, ConfigLayerMetadata, ConfigLayerSource, Constrained,
@@ -26,6 +29,7 @@ pub use ra_config::{
 };
 
 mod agent_role_config;
+mod amazon_bedrock;
 pub mod catalog;
 mod model_auth;
 pub(crate) mod model_catalog_remote;

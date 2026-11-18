@@ -12,7 +12,8 @@ version = "0.3.0"
 edition = "2024"
 # 跟着锁文件里真实需要的最低版本走：ra-network-proxy 精确锁定的 rama 0.3.0-alpha.4（与 Codex
 # 同版本）声明 rust-version 1.91.0，经 ra-coding 传到 ra-cli。工具链固定在 1.97.1，这个下限只对
-# 下游消费者有意义。
+# 下游消费者有意义。依赖 ra-aws-auth 的 crate（ra-aws-auth、ra-coding、ra-cli）因 aws-config
+# 1.13.1 另行声明 1.94.1。
 rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/moseshu/rusty-agent"
@@ -37,6 +38,7 @@ missing_panics_doc = "allow"
 [workspace.dependencies]
 ra-tls = { path = "crates/ra-tls", version = "0.3.0" }
 ra-http = { path = "crates/ra-http", version = "0.3.0" }
+ra-aws-auth = { path = "crates/ra-aws-auth", version = "0.3.0" }
 ra-executor = { path = "crates/ra-executor", version = "0.3.0" }
 ra-executor-protocol = { path = "crates/ra-executor-protocol", version = "0.3.0" }
 ra-filesystem = { path = "crates/ra-filesystem", version = "0.3.0" }
@@ -178,6 +180,15 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# AWS SDK crates used by Codex aws-auth for credential loading and SigV4 signing.
+# 1.13.1 is the first release on p256 0.14, whose crypto-bigint fixes RUSTSEC-2026-0387; it
+# requires Rust 1.94.1, which the crates that depend on ra-aws-auth declare.
+aws-config = "1.13.1"
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+aws-types = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

@@ -59,6 +59,126 @@ pub trait ResponsesBearerToken: Send + Sync {
     async fn token(&self, rejected: Option<&str>) -> Result<String>;
 }
 
+/// The final HTTP request a [`ResponsesRequestSigner`] authenticates.
+///
+/// The body is the exact byte sequence that will be sent and the URL already carries the query.
+#[derive(Clone, Debug)]
+pub struct ResponsesSignableRequest {
+    method: reqwest::Method,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+}
+
+impl ResponsesSignableRequest {
+    /// Creates the parts of one request attempt.
+    #[must_use]
+    pub const fn new(
+        method: reqwest::Method,
+        url: String,
+        headers: reqwest::header::HeaderMap,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body,
+        }
+    }
+
+    /// Request method.
+    #[must_use]
+    pub const fn method(&self) -> &reqwest::Method {
+        &self.method
+    }
+
+    /// Absolute URL including the query string.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Headers that would be sent without signing.
+    #[must_use]
+    pub const fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.headers
+    }
+
+    /// Request body bytes.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Takes the method, URL, headers, and body.
+    #[must_use]
+    pub fn into_parts(self) -> (reqwest::Method, String, reqwest::header::HeaderMap, Vec<u8>) {
+        (self.method, self.url, self.headers, self.body)
+    }
+}
+
+/// A signed request: these exact headers replace the unsigned ones.
+#[derive(Clone, Debug)]
+pub struct ResponsesSignedRequest {
+    url: String,
+    headers: reqwest::header::HeaderMap,
+}
+
+impl ResponsesSignedRequest {
+    /// Creates signed request parts.
+    #[must_use]
+    pub const fn new(url: String, headers: reqwest::header::HeaderMap) -> Self {
+        Self { url, headers }
+    }
+
+    /// URL to send to.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Complete header set to send.
+    #[must_use]
+    pub const fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.headers
+    }
+}
+
+/// An authentication failure a [`ResponsesRequestSigner`] may recover from.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ResponsesAuthFailure<'a> {
+    /// Signing the request failed.
+    Signing(&'a Error),
+    /// The endpoint rejected the signed request with 401 or 403.
+    Response {
+        /// The signed request the endpoint rejected, including the credential it carried.
+        request: &'a ResponsesSignedRequest,
+        /// Response status.
+        status: reqwest::StatusCode,
+        /// Response body text.
+        body: &'a str,
+    },
+}
+
+/// Authenticates each Responses HTTP request from its final bytes, such as AWS `SigV4`.
+///
+/// A signer replaces bearer authentication for the provider it is installed on.
+#[async_trait]
+pub trait ResponsesRequestSigner: Send + Sync {
+    /// Signs one request attempt.
+    async fn sign(&self, request: ResponsesSignableRequest) -> Result<ResponsesSignedRequest>;
+
+    /// Attempts credential recovery after `failure`; `Ok(true)` retries the request once.
+    async fn recover(&self, failure: ResponsesAuthFailure<'_>) -> Result<bool>;
+
+    /// Replaces the provider message of an auth failure the user can act on.
+    fn failure_message(&self, _status: reqwest::StatusCode, _body: &str) -> Option<String> {
+        None
+    }
+}
+
 /// Receives a Responses provider's advertised model-catalog revision.
 #[async_trait]
 pub trait ResponsesCatalogObserver: Send + Sync {
@@ -74,6 +194,7 @@ struct ResponsesTransport {
     request_max_retries: u32,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
+    signer: Option<Arc<dyn ResponsesRequestSigner>>,
     catalog_observer: Option<Arc<dyn ResponsesCatalogObserver>>,
     websocket: Option<Arc<websocket::WebSocketTransport>>,
 }
@@ -137,6 +258,7 @@ impl OpenAiResponsesProvider {
                 request_max_retries,
                 query: BTreeMap::new(),
                 bearer: None,
+                signer: None,
                 catalog_observer: None,
                 websocket: None,
             }),
@@ -153,6 +275,9 @@ impl OpenAiResponsesProvider {
         connector: ra_http::websocket::WebSocketConnector,
         connect_timeout: Duration,
     ) -> Self {
+        if self.transport.signer.is_some() {
+            return self;
+        }
         Arc::make_mut(&mut self.transport).websocket = Some(Arc::new(
             websocket::WebSocketTransport::new(connector, connect_timeout),
         ));
@@ -177,6 +302,18 @@ impl OpenAiResponsesProvider {
     #[must_use]
     pub fn with_bearer_token(mut self, bearer: Arc<dyn ResponsesBearerToken>) -> Self {
         Arc::make_mut(&mut self.transport).bearer = Some(bearer);
+        self
+    }
+
+    /// Authenticates HTTP requests by signing their final bytes instead of with a bearer token.
+    ///
+    /// Signed providers do not use Responses over WebSocket, whose upgrade request cannot carry a
+    /// body signature.
+    #[must_use]
+    pub fn with_request_signer(mut self, signer: Arc<dyn ResponsesRequestSigner>) -> Self {
+        let transport = Arc::make_mut(&mut self.transport);
+        transport.signer = Some(signer);
+        transport.websocket = None;
         self
     }
 
@@ -292,6 +429,11 @@ impl OpenAiResponsesModel {
             &self.transport.auth,
             request.model_settings().extra_headers(),
         )?;
+        if let Some(signer) = &self.transport.signer {
+            return self
+                .send_signed(signer.as_ref(), request, &body, headers, retries)
+                .await;
+        }
         let mut token = match &self.transport.bearer {
             Some(bearer) => Some(bearer.token(None).await?),
             None => None,
@@ -324,17 +466,144 @@ impl OpenAiResponsesModel {
                 return response.map_err(super::error::http_transport_error);
             }
             drop(response);
-            if let Some(retry_after) = server_delay {
-                tokio::time::sleep_until(retry_after.deadline()).await;
-            } else {
-                // Codex HTTP retries use a 200 ms exponential backoff with ten percent jitter.
-                let delay = 200u128.saturating_mul(2u128.saturating_pow(attempt));
-                let jitter = rand::rng().random_range(900..1100);
-                let millis = u64::try_from(delay.saturating_mul(jitter) / 1000).unwrap_or(u64::MAX);
-                tokio::time::sleep(Duration::from_millis(millis)).await;
-            }
+            backoff(attempt, server_delay).await;
             attempt += 1;
         }
+    }
+
+    /// Sends with a request signer, following Codex's per-attempt `apply_auth` and its single
+    /// provider recovery after a refreshable auth failure.
+    async fn send_signed(
+        &self,
+        signer: &dyn ResponsesRequestSigner,
+        request: &ModelRequest,
+        body: &serde_json::Value,
+        headers: reqwest::header::HeaderMap,
+        retries: u32,
+    ) -> Result<HttpResponse> {
+        let body = serde_json::to_vec(body).map_err(|error| {
+            Error::config("failed to encode the Responses request").with_source(error)
+        })?;
+        let (url, unsigned) = self.signable_target(request, headers)?;
+        let mut attempt = 0;
+        let mut recovered = false;
+        loop {
+            let authorized = signer
+                .sign(ResponsesSignableRequest::new(
+                    reqwest::Method::POST,
+                    url.clone(),
+                    unsigned.clone(),
+                    body.clone(),
+                ))
+                .await;
+            let authorized = match authorized {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    if !recovered
+                        && signer
+                            .recover(ResponsesAuthFailure::Signing(&error))
+                            .await?
+                    {
+                        recovered = true;
+                        continue;
+                    }
+                    if error.is_retryable() && attempt < retries {
+                        backoff(attempt, None).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut http_request = self
+                .transport
+                .client
+                .post(authorized.url.clone())
+                .headers(authorized.headers.clone())
+                .body(body.clone());
+            if let Some(timeout) = request.model_settings().timeout() {
+                http_request = http_request.timeout(timeout);
+            }
+            let response = match http_request.send().await {
+                Ok(response)
+                    if matches!(
+                        response.status(),
+                        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                    ) =>
+                {
+                    let facts = ResponseFacts::from_headers(response.status(), response.headers());
+                    let status = facts.status();
+                    let text = match response.bytes().await {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        Err(error) => {
+                            return Err(super::error::response_failure(
+                                &facts,
+                                &serde_json::Value::Null,
+                            )
+                            .with_source(error.without_url())
+                            .into_error());
+                        }
+                    };
+                    if !recovered
+                        && signer
+                            .recover(ResponsesAuthFailure::Response {
+                                request: &authorized,
+                                status,
+                                body: &text,
+                            })
+                            .await?
+                    {
+                        recovered = true;
+                        continue;
+                    }
+                    return Err(signed_auth_failure(signer, &facts, &text));
+                }
+                response => response,
+            };
+            let server_delay = match &response {
+                Ok(response) if response.status().is_server_error() => {
+                    RetryAfter::from_headers(response.headers())
+                }
+                Err(HttpError::Request(error)) if !error.is_builder() => None,
+                Err(HttpError::Timeout) => None,
+                _ => return response.map_err(super::error::http_transport_error),
+            };
+            if attempt >= retries {
+                return response.map_err(super::error::http_transport_error);
+            }
+            drop(response);
+            backoff(attempt, server_delay).await;
+            attempt += 1;
+        }
+    }
+
+    /// Builds the URL with its query and the headers a signer authenticates.
+    fn signable_target(
+        &self,
+        request: &ModelRequest,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<(String, reqwest::header::HeaderMap)> {
+        let mut url = reqwest::Url::parse(&format!("{}/responses", self.transport.auth.base_url()))
+            .map_err(|error| Error::config("invalid Responses endpoint URL").with_source(error))?;
+        let query = self.query(request);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&query);
+        }
+        let mut unsigned = reqwest::header::HeaderMap::new();
+        unsigned.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        unsigned.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(concat!(
+                "rusty-agent/",
+                env!("CARGO_PKG_VERSION")
+            )),
+        );
+        // Like the unsigned path, configured and per-request headers replace the defaults.
+        unsigned.extend(headers);
+        Ok((url.to_string(), unsigned))
     }
 
     async fn send_http(
@@ -525,4 +794,37 @@ impl Model for OpenAiResponsesModel {
     fn get_retry_advice(&self, request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
         crate::retry::retry_advice(request)
     }
+}
+
+async fn backoff(attempt: u32, server_delay: Option<RetryAfter>) {
+    if let Some(retry_after) = server_delay {
+        tokio::time::sleep_until(retry_after.deadline()).await;
+    } else {
+        // Codex HTTP retries use a 200 ms exponential backoff with ten percent jitter.
+        let delay = 200u128.saturating_mul(2u128.saturating_pow(attempt));
+        let jitter = rand::rng().random_range(900..1100);
+        let millis = u64::try_from(delay.saturating_mul(jitter) / 1000).unwrap_or(u64::MAX);
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
+}
+
+fn signed_auth_failure(
+    signer: &dyn ResponsesRequestSigner,
+    facts: &ResponseFacts,
+    text: &str,
+) -> Error {
+    let mut payload =
+        serde_json::from_str::<serde_json::Value>(text).unwrap_or(serde_json::Value::Null);
+    if let Some(message) = signer.failure_message(facts.status(), text) {
+        match payload
+            .get_mut("error")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(error) => {
+                error.insert("message".to_owned(), serde_json::Value::String(message));
+            }
+            None => payload = serde_json::json!({"error": {"message": message}}),
+        }
+    }
+    super::error::response_failure(facts, &payload).into_error()
 }
