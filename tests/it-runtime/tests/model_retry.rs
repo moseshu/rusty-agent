@@ -514,7 +514,7 @@ async fn recovery_is_recorded_before_the_budget_check_and_retry_notices_can_be_s
             None,
         );
         let thread = AgentThread::builder(
-            SessionId::new("retry-observer"),
+            SessionId::new("retry-recovery"),
             AgentBinding::direct(
                 AgentSpec::builder()
                     .id(AgentId::new("lead"))

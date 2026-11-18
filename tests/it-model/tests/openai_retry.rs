@@ -515,3 +515,56 @@ async fn response_stream_metadata_keeps_status_scopes_and_server_delay() {
         );
     }
 }
+
+#[tokio::test]
+async fn stream_wait_advice_is_read_only_from_a_failed_response_error() {
+    let advice = json!({"retry-after": "60"});
+    for (frame, expected) in [
+        // Codex's `parse_failed_response` reads `response.error.headers` whatever the code.
+        (
+            json!({"type": "response.failed", "response": {"error": {
+                "code": "server_error", "message": "boom", "headers": advice,
+            }}}),
+            Some(Duration::from_secs(60)),
+        ),
+        // Nothing outside that object, and no other failure frame, carries advice there.
+        (
+            json!({"type": "response.failed", "response": {"headers": advice}}),
+            None,
+        ),
+        (
+            json!({"type": "response.failed", "response": {
+                "code": "rate_limit_exceeded", "message": "Please try again in 60s",
+            }}),
+            None,
+        ),
+        (
+            json!({"type": "error", "error": {
+                "code": "server_error", "message": "boom", "headers": advice,
+            }}),
+            None,
+        ),
+        (
+            json!({"type": "response.error", "error": {
+                "code": "rate_limit_exceeded", "message": "Please try again in 60s",
+                "headers": advice,
+            }}),
+            None,
+        ),
+        (
+            json!({"type": "error", "code": "rate_limit_exceeded",
+                "message": "Please try again in 60s"}),
+            None,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let model = responses_model(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {frame}\n\n"), "text/event-stream"),
+        )
+        .await;
+        let error = failed_stream(&model).await;
+        assert_eq!(facts(&error).retry_after(), expected, "{frame}");
+    }
+}

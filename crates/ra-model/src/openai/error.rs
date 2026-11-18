@@ -255,6 +255,8 @@ pub(crate) fn behavior_error(message: impl Into<String>) -> Error {
 struct ResponseStreamFailure {
     event: String,
     incomplete_reason: Option<String>,
+    /// The `code` of the frame's nested `error` object, which Codex's stream parsers read.
+    error_code: Option<String>,
 }
 
 fn stream_failure_metadata(error: &Error) -> Option<&ResponseStreamFailure> {
@@ -280,6 +282,16 @@ pub fn response_incomplete_reason(error: &Error) -> Option<&str> {
     stream_failure_metadata(error).and_then(|metadata| metadata.incomplete_reason.as_deref())
 }
 
+/// The `code` of a failed stream frame's nested `error` object: `response.error.code` for a
+/// terminal response event, `error.code` for an `error` frame.
+///
+/// Unlike the normalized error code, this does not fall back to a code outside an `error`
+/// object, as Codex's stream parsers do not.
+#[must_use]
+pub fn response_stream_error_code(error: &Error) -> Option<&str> {
+    stream_failure_metadata(error).and_then(|metadata| metadata.error_code.as_deref())
+}
+
 static RATE_LIMIT_DELAY: std::sync::LazyLock<Option<regex_lite::Regex>> =
     std::sync::LazyLock::new(|| {
         regex_lite::Regex::new(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)").ok()
@@ -297,6 +309,37 @@ pub(crate) fn stream_failure(
     if let Some(code) = error.get("code").and_then(Value::as_str) {
         normalized = normalized.with_error_code(code);
     }
+    // Codex reads a stream failure's wait advice only from a `response.failed` frame's nested
+    // `response.error`; every other failure frame, and a failed response without that object,
+    // ends without advice and backs off.
+    let retry_after = (event == "response.failed")
+        .then(|| frame.get("response")?.get("error"))
+        .flatten()
+        .filter(|error| error.is_object())
+        .and_then(failed_response_retry_after);
+    if let Some(delay) = retry_after {
+        normalized = normalized.with_retry_after(delay);
+    }
+    normalized
+        .with_source(ResponseStreamFailure {
+            event: event.to_owned(),
+            incomplete_reason: response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            error_code: response
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+        .into_error()
+}
+
+/// The wait advice of a failed response's `error` object: its `headers`, or for a rate limit the
+/// delay its message names, as Codex's `parse_failed_response` reads them.
+fn failed_response_retry_after(error: &Value) -> Option<std::time::Duration> {
     let hints = RetryHints::from_headers(|name| {
         error
             .get("headers")?
@@ -306,7 +349,7 @@ pub(crate) fn stream_failure(
             .1
             .as_str()
     });
-    let retry_after = hints.retry_after().or_else(|| {
+    hints.retry_after().or_else(|| {
         if !matches!(
             error.get("code").and_then(Value::as_str),
             Some("rate_limit_exceeded" | "slow_down")
@@ -323,18 +366,5 @@ pub(crate) fn stream_failure(
         } else {
             std::time::Duration::try_from_secs_f64(value).ok()
         }
-    });
-    if let Some(delay) = retry_after {
-        normalized = normalized.with_retry_after(delay);
-    }
-    normalized
-        .with_source(ResponseStreamFailure {
-            event: event.to_owned(),
-            incomplete_reason: response
-                .get("incomplete_details")
-                .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
-        .into_error()
+    })
 }

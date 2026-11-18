@@ -76,12 +76,15 @@ fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
     let normalized = context.normalized();
     let error = context.error();
     let status = normalized.and_then(NormalizedProviderError::status_code);
+    let event = ra_model::openai::response_failure_event(error);
+    // Codex reads a stream frame's code only from its nested `error` object.
     let code = if status.is_some() {
         ra_model::openai::error_code(error)
+    } else if event.is_some() {
+        ra_model::openai::response_stream_error_code(error)
     } else {
         normalized.and_then(NormalizedProviderError::error_code)
     };
-    let event = ra_model::openai::response_failure_event(error);
     let server_delay = normalized
         .and_then(NormalizedProviderError::retry_after)
         .or_else(|| context.provider_advice().and_then(RetryAdvice::retry_after));
@@ -110,6 +113,9 @@ fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
                 return server_delay;
             }
         }
+        // Codex's `process_responses_event` stops on an `error` frame's flex refusal. It does not
+        // inspect `response.error`, whose stream then ends and is retried.
+        None if event == Some("error") && code == Some("flex_unavailable") => return None,
         None if event == Some("response.incomplete") => {
             if ra_model::openai::response_incomplete_reason(error) != Some("content_filter") {
                 return None;

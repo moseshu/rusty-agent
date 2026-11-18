@@ -33,4 +33,4 @@ base64 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 httpdate = { workspace = true }
-regex-lite = { version = "0.1", optional = true }
+regex-lite = { workspace = true, optional = true }

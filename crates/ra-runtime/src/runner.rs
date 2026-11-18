@@ -7320,7 +7320,7 @@ async fn call_model(
                         .config
                         .model_retry_recovery
                         .as_ref()
-                        .is_none_or(|observer| observer.report_retry(attempt.saturating_add(1)))
+                        .is_none_or(|recovery| recovery.report_retry(attempt.saturating_add(1)))
                 {
                     sink.retrying(attempt.saturating_add(1), max_retries, &error);
                 }
@@ -7350,7 +7350,7 @@ fn record_retry_recovery(
         .config
         .model_retry_recovery
         .as_ref()
-        .and_then(|observer| observer.recovery_message(error, selector.model()))
+        .and_then(|recovery| recovery.recovery_message(error, selector.model()))
     else {
         return;
     };

@@ -375,6 +375,44 @@ async fn stream_failures_reach_the_product_retry_policy_and_filter_guidance_is_p
             false,
         ));
     }
+    // Codex ends on an `error` frame only for a flex refusal in its nested `error.code`. It does
+    // not inspect `response.error` or a code outside the `error` object, so those streams end
+    // without a response and are retried, as are other error frames.
+    for (frame, retried) in [
+        (
+            json!({"type": "error", "error": {"code": "flex_unavailable", "message": "failed"}}),
+            false,
+        ),
+        (
+            json!({"type": "response.error", "error": {"code": "flex_unavailable", "message": "failed"}}),
+            true,
+        ),
+        (
+            json!({"type": "error", "code": "flex_unavailable", "message": "failed"}),
+            true,
+        ),
+        (
+            json!({"type": "error", "error": {"code": "server_error", "message": "failed"}}),
+            true,
+        ),
+        // Wait advice outside a failed response's `error` object is not adopted either: these
+        // retry on the local backoff instead of waiting a minute.
+        (
+            json!({"type": "response.failed", "response": {"status": "failed", "headers": {"retry-after": "60"}}}),
+            true,
+        ),
+        (
+            json!({"type": "error", "error": {"code": "server_error", "message": "failed", "headers": {"retry-after": "60"}}}),
+            true,
+        ),
+        // The same rule for a terminal response: only `response.error.code` is classified.
+        (
+            json!({"type": "response.failed", "response": {"status": "failed", "code": "insufficient_quota"}}),
+            true,
+        ),
+    ] {
+        cases.push((format!("data: {frame}\n\n"), retried, false));
+    }
     for (reason, retried) in [
         ("content_filter", true),
         ("max_output_tokens", false),
