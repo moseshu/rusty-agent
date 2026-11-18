@@ -4,6 +4,9 @@
 pub use amazon_bedrock::test_api as amazon_bedrock_test_api;
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
+pub use gateway_auth::test_api as gateway_auth_test_api;
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
 pub use ra_config::mcp_requirements_test_api;
 pub use ra_config::{
     AppToolApproval, ConfigLayer, ConfigLayerMetadata, ConfigLayerSource, Constrained,
@@ -31,6 +34,7 @@ pub use ra_config::{
 mod agent_role_config;
 mod amazon_bedrock;
 pub mod catalog;
+mod gateway_auth;
 mod model_auth;
 pub(crate) mod model_catalog_remote;
 pub(crate) mod model_runtime;

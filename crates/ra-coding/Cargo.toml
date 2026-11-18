@@ -12,7 +12,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-test-api = ["ra-config/test-api"]
+test-api = ["ra-config/test-api", "ra-login/test-api"]
 
 [dependencies]
 ra-network-proxy.workspace = true
@@ -41,6 +41,8 @@ url = { workspace = true }
 ra-core = { workspace = true }
 ra-model = { workspace = true }
 ra-aws-auth = { workspace = true }
+ra-keyring-store = { workspace = true }
+ra-login = { workspace = true }
 rand = { workspace = true }
 ra-runtime = { workspace = true }
 ra-prompt = { workspace = true }

@@ -13,7 +13,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, header};
 use ra_http::{ClientRouteClass, HttpClient, HttpClientFactory, RouteAwareClientPool};
 use ra_model::openai::{
     auth::OpenAiAuth,
-    responses::{ResponsesBearerToken, ResponsesCatalogObserver},
+    responses::{ResponsesAuthHeaders, ResponsesBearerToken, ResponsesCatalogObserver},
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::Mutex, time::timeout};
 use url::Url;
 
-use super::{Config, ModelsResponse, model_auth::CommandBearerToken};
+use super::{
+    Config, ModelsResponse, gateway_auth::GatewayAuthHeaders, model_auth::CommandBearerToken,
+};
 
 const CACHE_FILE: &str = "models_cache.json";
 const CACHE_TTL_SECONDS: i64 = 300;
@@ -45,6 +47,7 @@ pub(super) struct RemoteModelCatalog {
     headers: HeaderMap,
     static_key: Option<String>,
     command: Option<Arc<CommandBearerToken>>,
+    gateway: Option<Arc<GatewayAuthHeaders>>,
     disabled: bool,
     client: HttpClient,
     client_factory: HttpClientFactory,
@@ -93,6 +96,7 @@ impl RemoteModelCatalog {
         auth: &OpenAiAuth,
         static_key: Option<String>,
         command: Option<Arc<CommandBearerToken>>,
+        gateway: Option<Arc<GatewayAuthHeaders>>,
         disabled: bool,
     ) -> Result<Self, &'static str> {
         let mut url = Url::parse(url).map_err(|_| "model_catalog_url must be an absolute URL")?;
@@ -129,6 +133,14 @@ impl RemoteModelCatalog {
                 headers.insert(name, value);
             }
         }
+        // Codex adds the gateway OAuth configuration, not its token, so catalogs for different
+        // gateway accounts never share a cache entry. Providers without a gateway keep their
+        // existing identity.
+        if let Some(gateway) = &gateway {
+            let config = serde_json::to_vec(gateway.config())
+                .map_err(|_| "gateway_oauth configuration cannot be encoded")?;
+            hash_field(&mut identity_seed, &config);
+        }
         let client_factory = config.http_client_factory();
         Ok(Self {
             path: config.codex_home.join(CACHE_FILE).to_path_buf(),
@@ -136,6 +148,7 @@ impl RemoteModelCatalog {
             headers,
             static_key,
             command,
+            gateway,
             disabled,
             client: RouteAwareClientPool::new_without_redirects_or_request_logging(
                 client_factory.clone(),
@@ -345,11 +358,16 @@ impl RemoteModelCatalog {
         &self,
         key: Option<&str>,
     ) -> Result<(ModelsResponse, Option<String>), &'static str> {
+        let mut headers = self.headers.clone();
+        if let Some(gateway) = &self.gateway {
+            // Resolved once per discovery request, as Codex composes it once per catalog fetch.
+            gateway
+                .apply_auth_headers(&mut headers)
+                .await
+                .map_err(|_| "gateway OAuth authentication failed")?;
+        }
         for attempt in 0.. {
-            let mut request = self
-                .client
-                .get(self.url.as_str())
-                .headers(self.headers.clone());
+            let mut request = self.client.get(self.url.as_str()).headers(headers.clone());
             if let Some(key) = key {
                 request = request.bearer_auth(key);
             }

@@ -855,3 +855,6 @@ mod remote_catalog;
 
 #[path = "product_models/bedrock.rs"]
 mod bedrock;
+
+#[path = "product_models/gateway.rs"]
+mod gateway;

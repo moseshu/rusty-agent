@@ -279,6 +279,8 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
             "ra-config",
             "ra-http",
             "ra-aws-auth",
+            "ra-keyring-store",
+            "ra-login",
             "ra-filesystem",
             "ra-executor",
             "ra-core",

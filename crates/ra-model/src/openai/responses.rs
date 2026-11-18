@@ -59,6 +59,20 @@ pub trait ResponsesBearerToken: Send + Sync {
     async fn token(&self, rejected: Option<&str>) -> Result<String>;
 }
 
+/// Adds credentials that accompany the provider's primary authentication, such as a gateway's
+/// OAuth token, to each Responses request.
+///
+/// Codex composes these onto the primary credential when it builds a request's authentication:
+/// the primary bearer stays in `Authorization` and the extra credential travels in its own header
+/// or cookie. The source is applied once per request, to HTTP requests and to the WebSocket
+/// handshake alike, so a changed credential also selects a new WebSocket connection.
+#[async_trait]
+pub trait ResponsesAuthHeaders: Send + Sync {
+    /// Adds this source's credentials to the request headers. Fails, without sending anything,
+    /// when a header it owns is already present or the credential cannot be obtained.
+    async fn apply_auth_headers(&self, headers: &mut reqwest::header::HeaderMap) -> Result<()>;
+}
+
 /// The final HTTP request a [`ResponsesRequestSigner`] authenticates.
 ///
 /// The body is the exact byte sequence that will be sent and the URL already carries the query.
@@ -194,6 +208,7 @@ struct ResponsesTransport {
     request_max_retries: u32,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
+    auth_headers: Option<Arc<dyn ResponsesAuthHeaders>>,
     signer: Option<Arc<dyn ResponsesRequestSigner>>,
     catalog_observer: Option<Arc<dyn ResponsesCatalogObserver>>,
     websocket: Option<Arc<websocket::WebSocketTransport>>,
@@ -258,6 +273,7 @@ impl OpenAiResponsesProvider {
                 request_max_retries,
                 query: BTreeMap::new(),
                 bearer: None,
+                auth_headers: None,
                 signer: None,
                 catalog_observer: None,
                 websocket: None,
@@ -302,6 +318,13 @@ impl OpenAiResponsesProvider {
     #[must_use]
     pub fn with_bearer_token(mut self, bearer: Arc<dyn ResponsesBearerToken>) -> Self {
         Arc::make_mut(&mut self.transport).bearer = Some(bearer);
+        self
+    }
+
+    /// Adds credentials that accompany the primary authentication to every request.
+    #[must_use]
+    pub fn with_auth_headers(mut self, source: Arc<dyn ResponsesAuthHeaders>) -> Self {
+        Arc::make_mut(&mut self.transport).auth_headers = Some(source);
         self
     }
 
@@ -425,10 +448,13 @@ impl OpenAiResponsesModel {
         } else {
             0
         };
-        let headers = super::transport_headers(
+        let mut headers = super::transport_headers(
             &self.transport.auth,
             request.model_settings().extra_headers(),
         )?;
+        if let Some(source) = &self.transport.auth_headers {
+            source.apply_auth_headers(&mut headers).await?;
+        }
         if let Some(signer) = &self.transport.signer {
             return self
                 .send_signed(signer.as_ref(), request, &body, headers, retries)

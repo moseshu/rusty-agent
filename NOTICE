@@ -94,6 +94,8 @@ local upstream checkouts used for the port; each file lists its original source.
 | `tests/it-login/tests/gateway_auth/main.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_tests.rs (internals reached through ra_login::test_api; account credential file check replaced by the managed-secrets file) |
 | `tests/it-login/tests/gateway_auth/login.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_login_tests.rs |
 | `tests/it-login/tests/gateway_auth/storage.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_storage_tests.rs |
+| `crates/ra-coding/src/config/gateway_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/{combined_auth,shared_state}.rs (gateway credential composition and the process-wide manager registry) |
+| `tests/it-protocol/tests/threads/product_models/gateway.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/shared_state_tests.rs; codex-rs/core/tests/suite/gateway_auth.rs (driven through product threads; WebSocket handshake case added) |
 | `crates/ra-coding/src/config/amazon_bedrock.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/mod.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth_refresh.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth_refresh.rs |

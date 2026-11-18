@@ -43,6 +43,7 @@ use serde_json::{Map, json};
 use super::{
     Config, ModelInfo, ModelsResponse, amazon_bedrock,
     catalog::{ModelVisibility, TruncationMode, find_model_by_slug},
+    gateway_auth::GatewayAuthHeaders,
     model_auth::CommandBearerToken,
     model_catalog_remote::{RemoteModelCatalog, RemoteModelCatalogs},
     support::forwards_configured_response_metadata,
@@ -90,6 +91,7 @@ impl ProductModelRuntime {
         let mut prepared_auth = None;
         let mut signer: Option<Arc<dyn ResponsesRequestSigner>> = None;
         let mut provider_catalog = None;
+        let gateway = product_gateway(&config, explicit.is_some());
         if explicit.is_none() && config.model_provider.is_amazon_bedrock() {
             let (auth, bedrock_signer, catalog) = prepare_bedrock(&config, bundled).await?;
             prepared_auth = Some((auth, None));
@@ -100,34 +102,8 @@ impl ProductModelRuntime {
             && config.model_catalog.is_none()
             && let Some(url) = &config.model_provider.model_catalog_url
         {
-            let (auth, key) = provider_auth(
-                &config.model_provider,
-                config.model_provider_id == ra_config::model_provider::OPENAI_PROVIDER_ID,
-                config.enforce_residency.value(),
-            )?;
-            let command = config
-                .model_provider
-                .auth
-                .clone()
-                .map(CommandBearerToken::new)
-                .map(Arc::new);
-            let api_key_disabled = command.is_none()
-                && key.is_some()
-                && !config
-                    .features
-                    .enabled(ra_config::Feature::ApiKeyModelDiscovery);
-            let directory = catalogs.share(
-                RemoteModelCatalog::new(
-                    &config,
-                    url.as_str(),
-                    &auth,
-                    key,
-                    command,
-                    api_key_disabled,
-                )
-                .map_err(Error::config)?,
-            );
-            directory.load(offline).await;
+            let (auth, directory) =
+                remote_catalog(&config, url, catalogs, gateway.clone(), offline).await?;
             prepared_auth = Some((auth, directory.command()));
             Some(directory)
         } else {
@@ -170,6 +146,7 @@ impl ProductModelRuntime {
                 remote.clone(),
                 prepared_auth,
                 signer,
+                gateway,
             )?)
         } else {
             None
@@ -461,12 +438,58 @@ async fn prepare_bedrock(
     Ok((auth, prepared.signer, Arc::new(catalog)))
 }
 
+/// Builds, shares, and loads the provider's explicit remote catalog.
+async fn remote_catalog(
+    config: &Config,
+    url: &str,
+    catalogs: &RemoteModelCatalogs,
+    gateway: Option<Arc<GatewayAuthHeaders>>,
+    offline: bool,
+) -> Result<(OpenAiAuth, Arc<RemoteModelCatalog>)> {
+    let (auth, key) = provider_auth(
+        &config.model_provider,
+        config.model_provider_id == ra_config::model_provider::OPENAI_PROVIDER_ID,
+        config.enforce_residency.value(),
+    )?;
+    let command = config
+        .model_provider
+        .auth
+        .clone()
+        .map(CommandBearerToken::new)
+        .map(Arc::new);
+    let api_key_disabled = command.is_none()
+        && key.is_some()
+        && !config
+            .features
+            .enabled(ra_config::Feature::ApiKeyModelDiscovery);
+    let directory = catalogs.share(
+        RemoteModelCatalog::new(config, url, &auth, key, command, gateway, api_key_disabled)
+            .map_err(Error::config)?,
+    );
+    directory.load(offline).await;
+    Ok((auth, directory))
+}
+
+/// The gateway credential of a product provider. An explicit resolver owns its providers, so
+/// it never receives one.
+fn product_gateway(config: &Config, explicit: bool) -> Option<Arc<GatewayAuthHeaders>> {
+    if explicit {
+        return None;
+    }
+    GatewayAuthHeaders::for_provider(
+        &config.model_provider,
+        config.codex_home.as_path(),
+        &config.http_client_factory(),
+    )
+}
+
 fn build_registry(
     config: &Config,
     default_model: String,
     remote: Option<Arc<RemoteModelCatalog>>,
     prepared_auth: Option<(OpenAiAuth, Option<Arc<CommandBearerToken>>)>,
     signer: Option<Arc<dyn ResponsesRequestSigner>>,
+    gateway: Option<Arc<GatewayAuthHeaders>>,
 ) -> Result<ProviderRegistry> {
     let provider = ProviderKey::new(&config.model_provider_id);
     let description = &config.model_provider;
@@ -530,6 +553,9 @@ fn build_registry(
         if let Some(remote) = &remote {
             responses = responses.with_catalog_observer(remote.clone());
         }
+        if let Some(gateway) = &gateway {
+            responses = responses.with_auth_headers(gateway.clone());
+        }
         if let Some(signer) = &signer {
             responses = responses.with_request_signer(Arc::clone(signer));
         }
@@ -547,9 +573,9 @@ fn provider_auth(
     builtin_openai: bool,
     residency: Option<ra_config::ResidencyRequirement>,
 ) -> Result<(OpenAiAuth, Option<String>)> {
-    if description.gateway_oauth.is_some() || description.aws.is_some() {
+    if description.aws.is_some() {
         return Err(Error::config(
-            "this model provider requires gateway OAuth or AWS authentication unavailable on the Responses HTTP adapter",
+            "this model provider requires AWS authentication unavailable on the Responses HTTP adapter",
         ));
     }
     let key = match &description.env_key {

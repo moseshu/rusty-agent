@@ -206,10 +206,17 @@ impl WebSocketTransport {
             return Ok(None);
         }
         let call = Call::new(model, request).await?;
-        let headers = crate::openai::transport_headers(
+        let mut headers = crate::openai::transport_headers(
             &model.transport.auth,
             request.model_settings().extra_headers(),
         )?;
+        if let Some(source) = &model.transport.auth_headers {
+            // Nothing has been sent yet, so a failure to obtain the credential is safe to replay.
+            source
+                .apply_auth_headers(&mut headers)
+                .await
+                .map_err(|error| stamp_replay_safety(error, ReplaySafety::Safe))?;
+        }
         let bearer = model.transport.bearer.as_ref();
         let mut token = match bearer {
             Some(bearer) => Some(bearer.token(None).await?),

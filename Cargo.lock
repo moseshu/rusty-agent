@@ -5181,6 +5181,8 @@ dependencies = [
  "ra-executor",
  "ra-filesystem",
  "ra-http",
+ "ra-keyring-store",
+ "ra-login",
  "ra-mcp",
  "ra-model",
  "ra-network-proxy",
