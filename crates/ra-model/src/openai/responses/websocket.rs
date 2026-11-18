@@ -94,25 +94,15 @@ impl SessionCache {
     }
 }
 
-/// The credentials `model`'s accompanying source adds to `headers`, kept apart from them.
-async fn accompanying_headers(
-    model: &OpenAiResponsesModel,
-    headers: &HeaderMap,
-) -> Result<HeaderMap> {
+/// The credentials `model`'s accompanying source supplies, kept apart from the handshake headers.
+async fn accompanying_headers(model: &OpenAiResponsesModel) -> Result<HeaderMap> {
     let mut accompanying = HeaderMap::new();
-    if let Some(source) = &model.transport.auth_headers {
-        let mut composed = headers.clone();
-        // Nothing has been sent yet, so a failure to obtain the credential is safe to replay.
-        source
-            .apply_auth_headers(&mut composed)
-            .await
-            .map_err(|error| stamp_replay_safety(error, ReplaySafety::Safe))?;
-        for (name, value) in &composed {
-            if !headers.contains_key(name) {
-                accompanying.append(name.clone(), value.clone());
-            }
-        }
-    }
+    // Nothing has been sent yet, so a failure to obtain the credential is safe to replay.
+    model
+        .transport
+        .apply_auth_headers(&mut accompanying)
+        .await
+        .map_err(|error| stamp_replay_safety(error, ReplaySafety::Safe))?;
     Ok(accompanying)
 }
 
@@ -243,7 +233,7 @@ impl WebSocketTransport {
             &model.transport.auth,
             request.model_settings().extra_headers(),
         )?;
-        let accompanying = accompanying_headers(model, &headers).await?;
+        let accompanying = accompanying_headers(model).await?;
         let bearer = model.transport.bearer.as_ref();
         let mut token = match bearer {
             Some(bearer) => Some(bearer.token(None).await?),
@@ -384,8 +374,15 @@ impl WebSocketTransport {
             .as_str()
             .into_client_request()
             .map_err(|_| Error::config("invalid Responses WebSocket handshake request"))?;
-        upgrade.headers_mut().extend(key.headers.clone());
-        upgrade.headers_mut().extend(key.accompanying.clone());
+        // Codex adds an accompanying credential only where the handshake headers lack it, so a
+        // configured or per-request header of the same name keeps its value.
+        let mut headers = key.headers.clone();
+        for (name, value) in &key.accompanying {
+            if !key.headers.contains_key(name) {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+        upgrade.headers_mut().extend(headers);
         let limit = call
             .request
             .model_settings()
@@ -476,11 +473,6 @@ impl Call {
                 .map_err(|_| Error::config("invalid Responses WebSocket bearer credential"))?;
             authorization.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, authorization);
-        }
-        if accompanying.keys().any(|name| headers.contains_key(name)) {
-            return Err(Error::config(
-                "accompanying credentials conflict with Responses WebSocket handshake headers",
-            ));
         }
         Ok(ConnectionKey {
             url,

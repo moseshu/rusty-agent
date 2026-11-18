@@ -20,7 +20,7 @@ use ra_core::{
 use ra_http::{HttpClientFactory, OutboundProxyPolicy, websocket::WebSocketConnector};
 use ra_model::openai::{
     auth::OpenAiAuth,
-    responses::{OpenAiResponsesProvider, ResponsesBearerToken},
+    responses::{OpenAiResponsesProvider, ResponsesAuthHeaders, ResponsesBearerToken},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -33,6 +33,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         handshake::server::{Request, Response},
+        http::{HeaderMap, HeaderName, HeaderValue},
     },
 };
 use wiremock::{
@@ -322,4 +323,101 @@ async fn closed_cached_socket_is_replaced_even_with_no_retry_budget() {
     timeout(PATIENCE, close_sent).await.unwrap().unwrap();
     completed(model.as_ref(), retry_disabled_session_request()).await;
     timeout(PATIENCE, peer).await.unwrap().unwrap();
+}
+
+/// Accompanying credentials that, like Codex's gateway composition, refuse a header the request
+/// already has.
+struct Accompanying(&'static [(&'static str, &'static str)]);
+
+#[async_trait::async_trait]
+impl ResponsesAuthHeaders for Accompanying {
+    async fn apply_auth_headers(&self, headers: &mut HeaderMap) -> ra_core::error::Result<()> {
+        for (name, value) in self.0 {
+            let name = HeaderName::from_static(name);
+            if headers.contains_key(&name) {
+                return Err(ra_core::error::Error::config(
+                    "conflicts with request headers",
+                ));
+            }
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn handshake_keeps_its_own_header_over_an_accompanying_credential() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(&listener, PATIENCE).with_auth_headers(Arc::new(Accompanying(&[
+        ("x-gateway-auth", "Bearer gateway"),
+        ("x-gateway-extra", "extra"),
+    ])));
+    let model = provider.get_model(None).unwrap();
+    // Codex adds the credential to a handshake only where it is absent, so the per-request header
+    // keeps its value and the connection still opens; the other credential is still sent.
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_hdr_async(socket, |request: &Request, response: Response| {
+            let gateway: Vec<_> = request.headers().get_all("x-gateway-auth").iter().collect();
+            assert_eq!(gateway, ["from-settings"]);
+            assert_eq!(request.headers()["x-gateway-extra"], "extra");
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        socket.next().await.unwrap().unwrap();
+        send(&mut socket, completion()).await;
+    });
+    completed(
+        model.as_ref(),
+        request(&ModelSettings::new().with_extra_header("x-gateway-auth", "from-settings")),
+    )
+    .await;
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn accompanying_authorization_conflicts_with_the_primary_bearer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    let source = Arc::new(Accompanying(&[("authorization", "Bearer gateway")]));
+    let websocket = OpenAiResponsesProvider::new(
+        OpenAiAuth::keyless(endpoint.clone()).with_api_key("primary"),
+        "model",
+    )
+    .unwrap()
+    .with_websocket(WebSocketConnector::new(&factory).unwrap(), PATIENCE)
+    .with_auth_headers(source.clone());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let http = OpenAiResponsesProvider::new(
+        OpenAiAuth::keyless(format!("{}/v1", server.uri())).with_api_key("primary"),
+        "model",
+    )
+    .unwrap()
+    .with_auth_headers(source);
+    // Codex rejects a composed credential in a header the primary credential sends, on both
+    // transports and before anything is sent.
+    for provider in [websocket, http] {
+        let model = provider.get_model(None).unwrap();
+        let mut stream = model.stream_response(request(&ModelSettings::new()));
+        let error = timeout(PATIENCE, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), "config", "{error}");
+    }
+    assert!(
+        timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "no handshake is attempted"
+    );
 }

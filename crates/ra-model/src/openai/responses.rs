@@ -66,7 +66,10 @@ pub trait ResponsesBearerToken: Send + Sync {
 /// the primary bearer stays in `Authorization` and the extra credential travels in its own header
 /// or cookie. The source is applied once per request, to HTTP requests and to the WebSocket
 /// handshake alike. As in Codex, an open WebSocket connection stays in use when only this
-/// credential changes; a new connection's handshake carries the current value.
+/// credential changes; a new connection's handshake carries the current value. An HTTP request
+/// that already has one of the source's headers fails, while a WebSocket handshake keeps the
+/// header it already has, as Codex adds the credential to a handshake only where it is absent.
+/// Either fails when the source supplies `Authorization` alongside a primary bearer.
 #[async_trait]
 pub trait ResponsesAuthHeaders: Send + Sync {
     /// Adds this source's credentials to the request headers. Fails, without sending anything,
@@ -213,6 +216,27 @@ struct ResponsesTransport {
     signer: Option<Arc<dyn ResponsesRequestSigner>>,
     catalog_observer: Option<Arc<dyn ResponsesCatalogObserver>>,
     websocket: Option<Arc<websocket::WebSocketTransport>>,
+}
+
+impl ResponsesTransport {
+    /// Adds the accompanying credentials to `headers`, which must not carry `Authorization`.
+    ///
+    /// Codex composes them onto the primary credential and rejects one that would use a header
+    /// the primary credential sends; here that is the bearer's `Authorization`.
+    async fn apply_auth_headers(&self, headers: &mut reqwest::header::HeaderMap) -> Result<()> {
+        let Some(source) = &self.auth_headers else {
+            return Ok(());
+        };
+        source.apply_auth_headers(headers).await?;
+        if headers.contains_key(reqwest::header::AUTHORIZATION)
+            && (self.bearer.is_some() || self.auth.api_key().is_some())
+        {
+            return Err(Error::config(
+                "accompanying credentials conflict with the primary Authorization header",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `OpenAI` Responses provider with a shared HTTP client and per-model instance cache.
@@ -453,9 +477,7 @@ impl OpenAiResponsesModel {
             &self.transport.auth,
             request.model_settings().extra_headers(),
         )?;
-        if let Some(source) = &self.transport.auth_headers {
-            source.apply_auth_headers(&mut headers).await?;
-        }
+        self.transport.apply_auth_headers(&mut headers).await?;
         if let Some(signer) = &self.transport.signer {
             return self
                 .send_signed(signer.as_ref(), request, &body, headers, retries)
