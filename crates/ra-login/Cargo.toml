@@ -1,0 +1,44 @@
+[package]
+name = "ra-login"
+description = "Provider OAuth: token grants, loopback browser authorization, and gateway credentials."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[features]
+# Exposes the OAuth protocol module and gateway manager internals to the separate test workspace.
+test-api = []
+
+[dependencies]
+ra-http = { workspace = true }
+ra-keyring-store = { workspace = true }
+ra-secrets = { workspace = true }
+base64 = { workspace = true }
+http = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tiny_http = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+webbrowser = { workspace = true }

@@ -78,6 +78,22 @@ local upstream checkouts used for the port; each file lists its original source.
 | `tests/it-keyring-store/tests/errors.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/keyring-store/src/{error_kind_tests,error_display_tests}.rs |
 | `tests/it-secrets/tests/sanitizer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/sanitizer.rs (unit tests) |
 | `tests/it-secrets/tests/local.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/{lib,local}.rs (unit tests; account namespace replaced by managed secrets; repository-name and gateway-cache cases added) |
+| `crates/ra-login/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/lib.rs (gateway and OAuth exports only; account sign-in is not ported) |
+| `crates/ra-login/src/oauth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/mod.rs |
+| `crates/ra-login/src/oauth/authorization.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/authorization.rs |
+| `crates/ra-login/src/oauth/client.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/client.rs |
+| `crates/ra-login/src/oauth/diagnostics.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/diagnostics.rs |
+| `crates/ra-login/src/oauth/error.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/error.rs |
+| `crates/ra-login/src/oauth/pkce.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/pkce.rs |
+| `crates/ra-login/src/gateway_auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth.rs (clock read without chrono) |
+| `crates/ra-login/src/gateway_auth/callback.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_callback.rs |
+| `crates/ra-login/src/gateway_auth/login.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_login.rs (login control keyed on home and HTTP client factory instead of the account runtime configuration) |
+| `crates/ra-login/src/gateway_auth/storage.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_storage.rs |
+| `crates/ra-login/src/gateway_auth/token.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_token.rs |
+| `tests/it-login/tests/oauth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/oauth/{authorization,diagnostics,error,client}_tests.rs |
+| `tests/it-login/tests/gateway_auth/main.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_tests.rs (internals reached through ra_login::test_api; account credential file check replaced by the managed-secrets file) |
+| `tests/it-login/tests/gateway_auth/login.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_login_tests.rs |
+| `tests/it-login/tests/gateway_auth/storage.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/login/src/gateway_auth_storage_tests.rs |
 | `crates/ra-coding/src/config/amazon_bedrock.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/mod.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth_refresh.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth_refresh.rs |

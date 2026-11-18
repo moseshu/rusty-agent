@@ -81,6 +81,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-aws-auth", Layer::Service),
     ("ra-keyring-store", Layer::Service),
     ("ra-secrets", Layer::Service),
+    ("ra-login", Layer::Service),
     ("ra-tls", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
@@ -184,6 +185,9 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // Codex's secrets: age-encrypted local files whose passphrases live in the keyring. Gateway
     // OAuth keeps its credentials here, isolated from other namespaces in file and key.
     ("ra-secrets", &["ra-keyring-store"]),
+    // Codex's login crate, reduced to provider OAuth: token grants over route-aware HTTP and
+    // gateway credentials kept in the secrets store. Account sign-in is not ported.
+    ("ra-login", &["ra-http", "ra-keyring-store", "ra-secrets"]),
     ("ra-tls", &[]),
     ("ra-executor-protocol", &["ra-paths", "ra-filesystem"]),
     (

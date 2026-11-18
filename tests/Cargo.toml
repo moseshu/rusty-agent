@@ -32,6 +32,7 @@ members = [
     "it-aws-auth",
     "it-keyring-store",
     "it-secrets",
+    "it-login",
     "it-tls",
     "it-sandbox",
     "it-mcp",

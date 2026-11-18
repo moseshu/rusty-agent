@@ -1,0 +1,22 @@
+[package]
+name = "it-login"
+description = "Integration tests for provider OAuth grants and gateway credentials."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-http = { path = "../../crates/ra-http" }
+ra-keyring-store = { path = "../../crates/ra-keyring-store" }
+ra-login = { path = "../../crates/ra-login", features = ["test-api"] }
+base64 = "0.22"
+http = "1"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+url = "2"
+wiremock = "0.6"
