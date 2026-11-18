@@ -477,7 +477,7 @@ fn product_gateway(config: &Config, explicit: bool) -> Option<Arc<GatewayAuthHea
     GatewayAuthHeaders::for_provider(
         &config.model_provider,
         config.codex_home.as_path(),
-        &config.http_client_factory(),
+        &config.gateway_auth_http_client_factory(),
     )
 }
 

@@ -25,15 +25,15 @@ const GATEWAY_FAILURE: &str =
     "Gateway OAuth authentication failed; check the gateway configuration and credential store.";
 
 /// A product home whose gateway credentials live in an in-memory keyring.
-struct GatewayProduct {
-    product: ProductModels,
-    home: PathBuf,
+pub(super) struct GatewayProduct {
+    pub(super) product: ProductModels,
+    pub(super) home: PathBuf,
     keyring: Arc<MockKeyringStore>,
     _keyring: KeyringOverride,
 }
 
 impl GatewayProduct {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let product = ProductModels::new();
         let home = product.home.path().canonicalize().unwrap();
         let keyring = Arc::new(MockKeyringStore::default());
@@ -46,12 +46,12 @@ impl GatewayProduct {
         }
     }
 
-    fn seed(&self, config: &GatewayOAuthConfig, token: Token) {
+    pub(super) fn seed(&self, config: &GatewayOAuthConfig, token: Token) {
         seed_gateway_auth(config, &self.home, self.keyring.clone(), &token).unwrap();
     }
 }
 
-fn token(access_token: &str, refresh_token: Option<&str>, expires_at: i64) -> Token {
+pub(super) fn token(access_token: &str, refresh_token: Option<&str>, expires_at: i64) -> Token {
     Token {
         access_token: access_token.into(),
         refresh_token: refresh_token.map(Into::into),
@@ -59,7 +59,7 @@ fn token(access_token: &str, refresh_token: Option<&str>, expires_at: i64) -> To
     }
 }
 
-fn gateway_config(uri: &str, delivery: GatewayOAuthDelivery) -> GatewayOAuthConfig {
+pub(super) fn gateway_config(uri: &str, delivery: GatewayOAuthDelivery) -> GatewayOAuthConfig {
     GatewayOAuthConfig {
         authorization_url: format!("{uri}/authorize"),
         token_url: format!("{uri}/token"),
@@ -71,7 +71,7 @@ fn gateway_config(uri: &str, delivery: GatewayOAuthDelivery) -> GatewayOAuthConf
     }
 }
 
-fn header_delivery() -> GatewayOAuthDelivery {
+pub(super) fn header_delivery() -> GatewayOAuthDelivery {
     GatewayOAuthDelivery::Header {
         name: "x-gateway-auth".into(),
         scheme: "Bearer".into(),
@@ -79,7 +79,7 @@ fn header_delivery() -> GatewayOAuthDelivery {
 }
 
 /// Writes a provider with a primary bearer, the gateway OAuth table, and `provider_settings`.
-fn configure(
+pub(super) fn configure(
     product: &ProductModels,
     base_url: &str,
     gateway: &GatewayOAuthConfig,
@@ -97,6 +97,9 @@ fn configure(
         .resource
         .as_ref()
         .map_or_else(String::new, |resource| format!("resource = {resource:?}"));
+    let redirect_port = gateway
+        .redirect_port
+        .map_or_else(String::new, |port| format!("redirect_port = {port}"));
     product.write(
         "config.toml",
         &format!(
@@ -116,6 +119,7 @@ authorization_url = {authorization_url:?}
 token_url = {token_url:?}
 client_id = {client_id:?}
 {resource}
+{redirect_port}
 delivery = {delivery}
 "#,
             authorization_url = gateway.authorization_url,
@@ -125,7 +129,7 @@ delivery = {delivery}
     );
 }
 
-fn completion() -> ResponseTemplate {
+pub(super) fn completion() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(
         format!("data: {}\n\n", websocket_completion(1)),
         "text/event-stream",

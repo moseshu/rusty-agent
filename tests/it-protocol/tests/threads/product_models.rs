@@ -34,6 +34,27 @@ impl ProductModels {
         resolver: Option<Arc<dyn ModelResolver>>,
         role: ra_core::prompt::PromptRole,
     ) -> Server {
+        let (host, settings, builder) = self.parts();
+        let factory = match resolver {
+            Some(resolver) => {
+                CodingThreadFactory::new(host, resolver, settings).with_product_config(builder)
+            }
+            None => CodingThreadFactory::from_product_config(host, settings, builder),
+        }
+        .with_role(role);
+        build(
+            Options {
+                store: Some(Arc::new(InMemoryThreadStore::new())),
+                factory: Some(Arc::new(factory)),
+                unload_delay: None,
+            },
+            None,
+        )
+        .0
+    }
+
+    /// The workspace host, settings adapter and configuration builder of the product's threads.
+    fn parts(&self) -> (CodingHost, CodingThreadSettingsAdapter, ConfigBuilder) {
         let root = self.workspace.path().canonicalize().unwrap();
         let home = self.home.path().canonicalize().unwrap();
         let host = CodingHost::open(&root).unwrap();
@@ -53,22 +74,7 @@ impl ProductModels {
                 system_requirements_path: Some(home.join("requirements.toml")),
                 ..LoaderOverrides::without_managed_config_for_tests()
             });
-        let factory = match resolver {
-            Some(resolver) => {
-                CodingThreadFactory::new(host, resolver, settings).with_product_config(builder)
-            }
-            None => CodingThreadFactory::from_product_config(host, settings, builder),
-        }
-        .with_role(role);
-        build(
-            Options {
-                store: Some(Arc::new(InMemoryThreadStore::new())),
-                factory: Some(Arc::new(factory)),
-                unload_delay: None,
-            },
-            None,
-        )
-        .0
+        (host, settings, builder)
     }
 }
 
@@ -858,6 +864,9 @@ mod bedrock;
 
 #[path = "product_models/gateway.rs"]
 mod gateway;
+
+#[path = "product_models/gateway_oauth.rs"]
+mod gateway_oauth;
 
 #[path = "product_models/sampling_retry.rs"]
 mod sampling_retry;

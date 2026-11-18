@@ -99,7 +99,7 @@ use std::{
     io::ErrorKind,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use toml::Value as TomlValue;
@@ -431,6 +431,13 @@ pub enum ThreadStoreConfig {
 pub struct Config {
     /// App-server-owned destination policy; other runtimes remain unmanaged.
     pub application_network_policy: ra_http::NetworkPolicy,
+    /// Gateway authentication routing owned by the app server's startup runtime. Provider
+    /// configuration still reloads, while RPCs and product threads share credentials, login
+    /// policy and status notifications, as Codex does through its account runtime.
+    /// Other runtimes derive gateway routing from their effective configuration. Only
+    /// [`ConfigBuilder::build`] sets it, so it always matches the routing that keys the login
+    /// control.
+    pub(crate) gateway_auth_http_client_factory: Option<ra_http::HttpClientFactory>,
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
     pub config_layer_stack: ConfigLayerStack,
@@ -1253,9 +1260,22 @@ pub struct ConfigBuilder {
     thread_config_loader: Option<Arc<dyn ThreadConfigLoader>>,
     fallback_cwd: Option<PathBuf>,
     without_project_context: bool,
+    // Shared by builder clones used for RPCs, threads and configuration reloads. Codex carries
+    // this routing in its account runtime; that account machinery is not ported here.
+    gateway_auth_http_client_factory: Arc<OnceLock<ra_http::HttpClientFactory>>,
 }
 
 impl ConfigBuilder {
+    /// Binds gateway authentication to the server's startup routing across builder clones.
+    pub(crate) fn bind_gateway_auth_http_client_factory(
+        &self,
+        factory: ra_http::HttpClientFactory,
+    ) -> ra_http::HttpClientFactory {
+        self.gateway_auth_http_client_factory
+            .get_or_init(|| factory)
+            .clone()
+    }
+
     pub(crate) fn ignores_user_config(&self) -> bool {
         self.loader_overrides
             .as_ref()
@@ -1342,6 +1362,7 @@ impl ConfigBuilder {
             thread_config_loader,
             fallback_cwd,
             without_project_context,
+            gateway_auth_http_client_factory,
         } = self;
         let codex_home = match codex_home {
             Some(codex_home) => AbsolutePathBuf::from_absolute_path(codex_home)?,
@@ -1372,14 +1393,16 @@ impl ConfigBuilder {
         )
         .await?;
         let config_toml = config_toml_from_layers(&config_layer_stack).await?;
-        Config::load_config_with_layer_stack(
+        let mut config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             config_toml,
             harness_overrides,
             codex_home,
             config_layer_stack,
         )
-        .await
+        .await?;
+        config.gateway_auth_http_client_factory = gateway_auth_http_client_factory.get().cloned();
+        Ok(config)
     }
 
     #[cfg(feature = "test-api")]
@@ -3094,6 +3117,7 @@ impl Config {
             log_dir,
             config_layer_stack,
             application_network_policy: ra_http::NetworkPolicy::default(),
+            gateway_auth_http_client_factory: None,
             history,
             ephemeral: ephemeral.unwrap_or_default(),
             extra_config: None,
@@ -3682,6 +3706,13 @@ impl Config {
     pub fn sqlite_config(&self) -> &SqliteConfig {
         &self.sqlite
     }
+    /// Gateway authentication uses startup routing when an app server owns its runtime.
+    pub(crate) fn gateway_auth_http_client_factory(&self) -> ra_http::HttpClientFactory {
+        self.gateway_auth_http_client_factory
+            .clone()
+            .unwrap_or_else(|| self.http_client_factory())
+    }
+
     #[must_use]
     pub fn http_client_factory(&self) -> ra_http::HttpClientFactory {
         let policy = if self.respect_system_proxy {

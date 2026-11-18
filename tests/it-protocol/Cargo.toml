@@ -16,6 +16,8 @@ ra-coding = { path = "../../crates/ra-coding", features = ["test-api"] }
 # Gateway OAuth credentials seeded behind an in-memory keyring.
 ra-keyring-store = { path = "../../crates/ra-keyring-store" }
 ra-login = { path = "../../crates/ra-login", features = ["test-api"] }
+# Reads the redirect URI and state out of a gateway authorization URL.
+url = "2"
 ra-config = { path = "../../crates/ra-config" }
 ra-filesystem = { path = "../../crates/ra-filesystem" }
 ra-exec = { path = "../../crates/ra-exec" }

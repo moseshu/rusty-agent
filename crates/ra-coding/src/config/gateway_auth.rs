@@ -134,6 +134,12 @@ impl GatewayAuthHeaders {
         }))
     }
 
+    /// The shared manager, or why it could not be created: Codex's provider
+    /// `gateway_auth_manager`.
+    pub(crate) fn manager(&self) -> std::result::Result<Arc<GatewayAuthManager>, String> {
+        self.manager.clone()
+    }
+
     /// The configuration that distinguishes this gateway's credentials in cache identities.
     pub(crate) const fn config(&self) -> &GatewayOAuthConfig {
         &self.config

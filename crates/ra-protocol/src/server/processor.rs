@@ -19,11 +19,12 @@
 //! restart, no new permit is given (see [`super::turn_admission`]), and a turn that waited in its
 //! thread's queue checks again when its turn comes.
 //!
-//! Codex's `initialize` also does its account and product work: it selects how its gateway logs
-//! in, makes the client's name the `originator` and `User-Agent` suffix of every request to its
-//! backend, enables user verification for its own desktop and terminal clients, reports the
-//! connection to its analytics, and registers its Windows desktop install. None of this is ported;
-//! the agent's own `User-Agent` stays as it is whoever connects.
+//! `initialize` selects how the product's gateway signs in (see [`super::gateway_oauth`]). Codex's
+//! `initialize` also does its account and product work: it makes the client's name the
+//! `originator` and `User-Agent` suffix of every request to its backend, enables user verification
+//! for its own desktop and terminal clients, reports the connection to its analytics, and registers
+//! its Windows desktop install. None of this is ported; the agent's own `User-Agent` stays as it is
+//! whoever connects.
 
 use std::{
     collections::HashSet,
@@ -40,8 +41,8 @@ use super::{
     connection_rpc_gate::ConnectionRpcGate,
     outgoing::{ConnectionRequestId, OutgoingMessageSender},
     protocol::{
-        ClientRequest, InitializeParams, InitializeResponse, MockExperimentalMethodResponse,
-        experimental_required_message,
+        ClientRequest, GATEWAY_OAUTH_CHANGED_METHOD, InitializeParams, InitializeResponse,
+        MockExperimentalMethodResponse, experimental_required_message,
     },
     request_serialization::{
         QueuedInitializedRequest, RequestSerializationQueueKey, RequestSerializationQueues,
@@ -148,6 +149,7 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     pub(crate) mcp: super::mcp::McpControlSlot,
     pub(crate) plugins: super::plugin_management::PluginControlSlot,
+    pub(crate) gateway_oauth: super::gateway_oauth::GatewayOAuthSlot,
     codex_home: PathBuf,
     thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
@@ -185,6 +187,7 @@ impl MessageProcessor {
             outgoing,
             mcp: super::mcp::McpControlSlot::default(),
             plugins: super::plugin_management::PluginControlSlot::default(),
+            gateway_oauth: super::gateway_oauth::GatewayOAuthSlot::default(),
             codex_home,
             thread_manager,
             request_serialization_queues: RequestSerializationQueues::default(),
@@ -271,6 +274,7 @@ impl MessageProcessor {
         session: &ConnectionSessionState,
     ) {
         session.rpc_gate.close().await;
+        self.gateway_oauth.connection_closed(connection_id);
         self.request_serialization_queues.discard_closed().await;
         if timeout(CONNECTION_RPC_DRAIN_TIMEOUT, session.rpc_gate.shutdown())
             .await
@@ -358,7 +362,7 @@ impl MessageProcessor {
         // sharing a thread may see it differently, and that it may become a choice the first
         // connection makes for the whole server; it is per connection there as here.
         let (client_info, capabilities) = params.into_parts();
-        let (experimental_api_enabled, opt_out_notification_methods) =
+        let (explicit_gateway_oauth, experimental_api_enabled, opt_out_notification_methods) =
             capabilities.unwrap_or_default().into_parts();
         let (name, version) = client_info.into_name_and_version();
         // Codex sends the name in the headers of its requests to OpenAI. It is not sent here, but
@@ -368,6 +372,7 @@ impl MessageProcessor {
                 "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
             )));
         }
+        let client_name = name.clone();
         if session
             .initialize(InitializedConnectionSessionState {
                 experimental_api_enabled,
@@ -379,6 +384,8 @@ impl MessageProcessor {
         {
             return Err(JsonRpcErrorObject::invalid_request("Already initialized"));
         }
+        self.gateway_oauth
+            .initialize(&client_name, explicit_gateway_oauth);
 
         self.outgoing
             .thread_state()
@@ -408,6 +415,17 @@ impl MessageProcessor {
         {
             return Err(JsonRpcErrorObject::invalid_request(
                 experimental_required_message(reason),
+            ));
+        }
+
+        // The authorization URL reaches the client only as a status notification.
+        if matches!(client_request, ClientRequest::GatewayOAuthLogin { .. })
+            && session
+                .opted_out_notification_methods()
+                .contains(GATEWAY_OAUTH_CHANGED_METHOD)
+        {
+            return Err(JsonRpcErrorObject::invalid_request(
+                "Gateway login requires account/gatewayOAuth/changed notifications",
             ));
         }
 
@@ -695,6 +713,30 @@ impl MessageProcessor {
                     .turn_interrupt(&request_id, params)
                     .await;
                 self.finish_turn_method(request_id, result).await;
+            }
+            ClientRequest::GatewayOAuthRead { .. } => {
+                match Box::pin(self.gateway_oauth.read()).await {
+                    Ok(response) => self.send_response(request_id, response).await,
+                    Err(error) => self.outgoing.send_error(request_id, error).await,
+                }
+            }
+            ClientRequest::GatewayOAuthLogin { .. } => {
+                let result = Box::pin(self.gateway_oauth.login(
+                    request_id.connection_id,
+                    &rpc_gate,
+                    &self.outgoing,
+                ))
+                .await;
+                match result {
+                    Ok(response) => self.send_response(request_id, response).await,
+                    Err(error) => self.outgoing.send_error(request_id, error).await,
+                }
+            }
+            ClientRequest::GatewayOAuthCancel { .. } => {
+                match self.gateway_oauth.cancel(request_id.connection_id).await {
+                    Ok(response) => self.send_response(request_id, response).await,
+                    Err(error) => self.outgoing.send_error(request_id, error).await,
+                }
             }
             ClientRequest::MockExperimentalMethod { params, .. } => {
                 let response = MockExperimentalMethodResponse::new(params.into_value());

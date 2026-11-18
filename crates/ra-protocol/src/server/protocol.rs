@@ -40,6 +40,7 @@
 
 mod config;
 mod dynamic_tools;
+mod gateway_oauth;
 mod hook_notifications;
 mod hooks;
 mod item;
@@ -75,6 +76,10 @@ pub use self::config::{
     ConfigValueWriteParams, ConfigWriteErrorCode, ConfigWriteResponse, MergeStrategy,
     OverriddenMetadata, SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse,
     ToolsV2, WriteStatus,
+};
+pub use self::gateway_oauth::{
+    GATEWAY_OAUTH_CHANGED_METHOD, GatewayOAuthCancelResponse, GatewayOAuthChangedNotification,
+    GatewayOAuthLoginResponse, GatewayOAuthReadResponse, GatewayOAuthStatus,
 };
 pub use self::hook_notifications::{
     HOOK_COMPLETED_METHOD, HOOK_STARTED_METHOD, HookCompletedNotification, HookStartedNotification,
@@ -604,6 +609,37 @@ pub enum ClientRequest {
         /// The thread and the turn.
         params: TurnInterruptParams,
     },
+    /// Reads the effective provider's gateway OAuth readiness without refreshing or signing in.
+    #[serde(rename = "account/gatewayOAuth/read")]
+    GatewayOAuthRead {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Takes no parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<()>,
+    },
+    /// Runs browser authorization for the effective provider's gateway until the credential is
+    /// saved.
+    #[serde(rename = "account/gatewayOAuth/login")]
+    GatewayOAuthLogin {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Takes no parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<()>,
+    },
+    /// Cancels the calling connection's gateway sign-in.
+    #[serde(rename = "account/gatewayOAuth/cancel")]
+    GatewayOAuthCancel {
+        /// The id its answer will carry.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Takes no parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<()>,
+    },
     /// Echoes its value back. It exists to exercise the experimental gate, as Codex's does.
     #[serde(rename = "mock/experimentalMethod")]
     MockExperimentalMethod {
@@ -664,6 +700,9 @@ impl ClientRequest {
             | Self::TurnStart { request_id, .. }
             | Self::TurnSteer { request_id, .. }
             | Self::TurnInterrupt { request_id, .. }
+            | Self::GatewayOAuthRead { request_id, .. }
+            | Self::GatewayOAuthLogin { request_id, .. }
+            | Self::GatewayOAuthCancel { request_id, .. }
             | Self::MockExperimentalMethod { request_id, .. } => request_id,
         }
     }
@@ -719,6 +758,9 @@ impl ClientRequest {
             Self::TurnStart { .. } => "turn/start",
             Self::TurnSteer { .. } => "turn/steer",
             Self::TurnInterrupt { .. } => "turn/interrupt",
+            Self::GatewayOAuthRead { .. } => "account/gatewayOAuth/read",
+            Self::GatewayOAuthLogin { .. } => "account/gatewayOAuth/login",
+            Self::GatewayOAuthCancel { .. } => "account/gatewayOAuth/cancel",
             Self::MockExperimentalMethod { .. } => "mock/experimentalMethod",
         }
     }
@@ -762,7 +804,10 @@ impl ClientRequest {
             | Self::ThreadTurnsList { .. }
             | Self::ThreadItemsList { .. }
             | Self::ThreadCompactStart { .. }
-            | Self::TurnInterrupt { .. } => None,
+            | Self::TurnInterrupt { .. }
+            | Self::GatewayOAuthRead { .. }
+            | Self::GatewayOAuthLogin { .. }
+            | Self::GatewayOAuthCancel { .. } => None,
             Self::ThreadMetadataUpdate { params, .. } => params.experimental_reason(),
             Self::ThreadList { params, .. } => params.experimental_reason(),
             Self::ThreadStart { params, .. } => params.experimental_reason(),
@@ -835,6 +880,10 @@ impl ClientRequest {
             | Self::ThreadLoadedList { .. }
             | Self::ThreadTurnsList { .. }
             | Self::ThreadItemsList { .. }
+            // Codex runs gateway OAuth methods unserialized.
+            | Self::GatewayOAuthRead { .. }
+            | Self::GatewayOAuthLogin { .. }
+            | Self::GatewayOAuthCancel { .. }
             | Self::MockExperimentalMethod { .. } => None,
             // Codex keys these by path when one is given; a path is not supported here.
             Self::ThreadArchive { params, .. } => Some(params.thread_id()),
@@ -994,13 +1043,15 @@ impl ClientInfo {
 
 /// What the client declares it can take: Codex's `InitializeCapabilities`.
 ///
-/// Codex's other capabilities are not read here: `explicitGatewayOauth` and `requestAttestation`
-/// belong to its account machinery, and `mcpServerOpenaiFormElicitation` and `extensions` are MCP
-/// client settings, which come with the MCP methods.
+/// Codex's other capabilities are not read here: `requestAttestation` belongs to its account
+/// machinery, and `mcpServerOpenaiFormElicitation` and `extensions` are MCP client settings, which
+/// come with the MCP methods.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    explicit_gateway_oauth: bool,
     #[serde(default)]
     experimental_api: bool,
     opt_out_notification_methods: Option<Vec<String>>,
@@ -1011,6 +1062,20 @@ impl InitializeCapabilities {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Uses explicit gateway OAuth login instead of automatic browser authorization. It applies to
+    /// the server's gateway sign-in policy, and later connections cannot undo it.
+    #[must_use]
+    pub const fn with_explicit_gateway_oauth(mut self, explicit_gateway_oauth: bool) -> Self {
+        self.explicit_gateway_oauth = explicit_gateway_oauth;
+        self
+    }
+
+    /// Whether the client signs in to gateways only through `account/gatewayOAuth/login`.
+    #[must_use]
+    pub const fn explicit_gateway_oauth(&self) -> bool {
+        self.explicit_gateway_oauth
     }
 
     /// Opts into the experimental methods and notifications, or out of them.
@@ -1042,8 +1107,9 @@ impl InitializeCapabilities {
         self.opt_out_notification_methods.as_deref()
     }
 
-    pub(crate) fn into_parts(self) -> (bool, Vec<String>) {
+    pub(crate) fn into_parts(self) -> (bool, bool, Vec<String>) {
         (
+            self.explicit_gateway_oauth,
             self.experimental_api,
             self.opt_out_notification_methods.unwrap_or_default(),
         )

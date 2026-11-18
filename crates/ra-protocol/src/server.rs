@@ -55,6 +55,12 @@
 //!
 //! A managed Unix control socket can request the same drain through `TransportEvent::DaemonShutdown`.
 //!
+//! A product that signs in to model gateways installs [`GatewayOAuth`]
+//! ([`AppServer::with_gateway_oauth`]): clients read readiness with `account/gatewayOAuth/read`,
+//! sign in with `account/gatewayOAuth/login`, cancel with `account/gatewayOAuth/cancel`, and are
+//! sent `account/gatewayOAuth/changed`. A client declaring `explicitGatewayOauth` keeps requests
+//! from opening a browser on their own.
+//!
 //! Codex's loop also recovers the threads of its daemon, attaches the threads its agents spawn to
 //! every connection and reports the status of remote control; none of it is ported.
 
@@ -68,6 +74,7 @@ mod connection_cleanup;
 mod connection_rpc_gate;
 mod dynamic_tool_calls;
 mod dynamic_tools;
+mod gateway_oauth;
 mod image_url;
 mod json_schema;
 mod mcp;
@@ -98,6 +105,7 @@ mod user_input_requests;
 
 pub use self::approvals::ReviewDecision;
 pub use self::background_terminals::{BackgroundTerminalInfo, ThreadBackgroundTerminals};
+pub use self::gateway_oauth::GatewayOAuth;
 pub use self::mcp::McpRuntimeControl;
 mod plugin_management;
 pub use self::permission_requests::ThreadServerRequests;
@@ -395,6 +403,18 @@ impl AppServer {
         self
     }
 
+    /// Installs the product's gateway OAuth sign-in: the `account/gatewayOAuth/*` methods, the
+    /// `explicitGatewayOauth` capability and `account/gatewayOAuth/changed` notifications.
+    ///
+    /// As Codex's server does at startup, installing it requires explicit login until a client's
+    /// `initialize` selects the policy, so credential reads before then never open a browser.
+    /// Without it, the methods answer that gateway OAuth is not configured.
+    #[must_use]
+    pub fn with_gateway_oauth(self, control: Arc<dyn GatewayOAuth>) -> Self {
+        self.processor.gateway_oauth.set(control);
+        self
+    }
+
     /// Installs the host's MCP controls and broadcasts their status changes to initialized clients.
     #[must_use]
     pub fn with_mcp_runtime(self, control: Arc<dyn McpRuntimeControl>) -> Self {
@@ -459,6 +479,9 @@ impl AppServer {
         let outbound_handle = tokio::spawn(run_outbound_router(outbound_control_rx, outgoing_rx));
         let mcp_forwarder = processor.mcp.forward(Arc::clone(processor.outgoing()));
         let plugin_forwarder = processor.plugins.forward(Arc::clone(processor.outgoing()));
+        let gateway_forwarder = processor
+            .gateway_oauth
+            .forward(Arc::clone(processor.outgoing()));
 
         let (transport_shutdown, signals) = match graceful_restart {
             Some(GracefulRestart {
@@ -620,6 +643,7 @@ impl AppServer {
         if let Ok(control) = processor.mcp.get() {
             control.shutdown().await;
         }
+        drop(gateway_forwarder);
         drop(plugin_forwarder);
         drop(mcp_forwarder);
         drop(outbound_control_tx);

@@ -34,7 +34,7 @@ pub use ra_config::{
 mod agent_role_config;
 mod amazon_bedrock;
 pub mod catalog;
-mod gateway_auth;
+pub(crate) mod gateway_auth;
 mod model_auth;
 pub(crate) mod model_catalog_remote;
 pub(crate) mod model_runtime;

@@ -525,7 +525,9 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
                    `thread/compact/start`, `thread/backgroundTerminals/clean`, \
                    `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, \
                    `thread/settings/update`, `turn/settings/update`, `turn/start`, `turn/steer`, \
-                   `turn/interrupt`, `mock/experimentalMethod`";
+                   `turn/interrupt`, `account/gatewayOAuth/read`, \
+                   `account/gatewayOAuth/login`, `account/gatewayOAuth/cancel`, \
+                   `mock/experimentalMethod`";
 
     let answer = server
         .call(&mut connection, 1, "configRequirements/read", None)
