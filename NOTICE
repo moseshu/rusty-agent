@@ -69,6 +69,15 @@ local upstream checkouts used for the port; each file lists its original source.
 | `crates/ra-aws-auth/src/discovery.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/discovery.rs |
 | `crates/ra-aws-auth/src/signing.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/signing.rs |
 | `crates/ra-aws-auth/src/transport.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/aws-auth/src/transport.rs |
+| `crates/ra-keyring-store/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/keyring-store/src/lib.rs |
+| `crates/ra-keyring-store/src/error_kind.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/keyring-store/src/error_kind.rs |
+| `crates/ra-secrets/src/lib.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/lib.rs (the Codex account-credential namespace is not ported; keyring service renamed) |
+| `crates/ra-secrets/src/local.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/local.rs (key wipe through zeroize instead of unsafe volatile writes) |
+| `crates/ra-secrets/src/sanitizer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/sanitizer.rs |
+| `crates/ra-secrets/src/git.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/git-utils/src/info.rs (get_git_repo_root and find_ancestor_git_entry) |
+| `tests/it-keyring-store/tests/errors.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/keyring-store/src/{error_kind_tests,error_display_tests}.rs |
+| `tests/it-secrets/tests/sanitizer.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/sanitizer.rs (unit tests) |
+| `tests/it-secrets/tests/local.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/secrets/src/{lib,local}.rs (unit tests; account namespace replaced by managed secrets; repository-name and gateway-cache cases added) |
 | `crates/ra-coding/src/config/amazon_bedrock.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/mod.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth.rs |
 | `crates/ra-coding/src/config/amazon_bedrock/auth_refresh.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/model-provider/src/amazon_bedrock/auth_refresh.rs |

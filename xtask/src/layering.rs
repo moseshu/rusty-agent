@@ -79,6 +79,8 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ra-executor", Layer::Service),
     ("ra-http", Layer::Service),
     ("ra-aws-auth", Layer::Service),
+    ("ra-keyring-store", Layer::Service),
+    ("ra-secrets", Layer::Service),
     ("ra-tls", Layer::Service),
     ("ra-sandbox", Layer::Service),
     ("ra-session", Layer::Service),
@@ -177,6 +179,11 @@ const ALLOWED_INTERNAL_DEPS: &[(&str, &[&str])] = &[
     // Codex's aws-auth: AWS SDK credentials and SigV4 signing, with SDK HTTP routed through the
     // application client so network policy applies to metadata and STS traffic.
     ("ra-aws-auth", &["ra-http"]),
+    // Codex's keyring-store: the OS keyring seam, with no framework knowledge.
+    ("ra-keyring-store", &[]),
+    // Codex's secrets: age-encrypted local files whose passphrases live in the keyring. Gateway
+    // OAuth keeps its credentials here, isolated from other namespaces in file and key.
+    ("ra-secrets", &["ra-keyring-store"]),
     ("ra-tls", &[]),
     ("ra-executor-protocol", &["ra-paths", "ra-filesystem"]),
     (

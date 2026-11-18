@@ -30,6 +30,8 @@ members = [
     "it-executor-protocol",
     "it-http",
     "it-aws-auth",
+    "it-keyring-store",
+    "it-secrets",
     "it-tls",
     "it-sandbox",
     "it-mcp",

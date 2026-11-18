@@ -1,0 +1,17 @@
+[package]
+name = "it-secrets"
+description = "Integration tests for the age-encrypted local secrets store."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-keyring-store = { path = "../../crates/ra-keyring-store" }
+ra-secrets = { path = "../../crates/ra-secrets", features = ["test-api"] }
+anyhow = "1"
+keyring = { version = "3.6", default-features = false }
+sha2 = "0.10"
+tempfile = "3"

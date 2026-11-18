@@ -39,6 +39,8 @@ missing_panics_doc = "allow"
 ra-tls = { path = "crates/ra-tls", version = "0.3.0" }
 ra-http = { path = "crates/ra-http", version = "0.3.0" }
 ra-aws-auth = { path = "crates/ra-aws-auth", version = "0.3.0" }
+ra-keyring-store = { path = "crates/ra-keyring-store", version = "0.3.0" }
+ra-secrets = { path = "crates/ra-secrets", version = "0.3.0" }
 ra-executor = { path = "crates/ra-executor", version = "0.3.0" }
 ra-executor-protocol = { path = "crates/ra-executor-protocol", version = "0.3.0" }
 ra-filesystem = { path = "crates/ra-filesystem", version = "0.3.0" }
@@ -189,6 +191,11 @@ aws-sigv4 = "1"
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
 aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 aws-types = "1"
+# OS credential stores and the age-encrypted local secrets file, as Codex keyring-store and
+# secrets use them. Native keyring backends are selected per target in ra-keyring-store.
+keyring = { version = "3.6", default-features = false }
+age = "0.12.1"
+zeroize = "1.8.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

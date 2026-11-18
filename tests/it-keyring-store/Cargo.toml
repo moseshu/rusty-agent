@@ -1,0 +1,19 @@
+[package]
+name = "it-keyring-store"
+description = "Integration tests for keyring credential storage and error classification."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+ra-keyring-store = { path = "../../crates/ra-keyring-store" }
+keyring = { version = "3.6", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+secret-service = "4"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3"
