@@ -13,6 +13,26 @@ use serde_json::Value;
 
 use crate::retry::RetryHints;
 
+#[derive(Debug, thiserror::Error)]
+#[error("OpenAI error type {0}")]
+struct ErrorType(String);
+
+/// Returns the provider's error `type`, independently of its error `code`.
+///
+/// Both fields can be present. Product policies use the type to recognize usage and quota
+/// failures while the normalized error retains the original code.
+#[must_use]
+pub fn error_type(error: &Error) -> Option<&str> {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(error_type) = current.downcast_ref::<ErrorType>() {
+            return Some(&error_type.0);
+        }
+        source = current.source();
+    }
+    None
+}
+
 /// Header carrying the endpoint's diagnostic identifier for one request.
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -172,6 +192,14 @@ pub(crate) fn response_failure_as(
     };
     if let Some(code) = error_code(payload) {
         normalized = normalized.with_error_code(code);
+    }
+    if let Some(error_type) = payload
+        .get("error")
+        .unwrap_or(payload)
+        .get("type")
+        .and_then(Value::as_str)
+    {
+        normalized = normalized.with_source(ErrorType(error_type.to_owned()));
     }
     if let Some(request_id) = request_id {
         normalized = normalized.with_request_id(request_id);

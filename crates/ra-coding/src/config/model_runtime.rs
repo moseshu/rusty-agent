@@ -20,10 +20,7 @@ use ra_core::{
     error::{Error, Result},
     filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     item::{Message, ModelInputItem},
-    model::{
-        ApiProtocol, ModelProvider, ModelResolver, ModelRetrySettings, ModelSettings, ProviderKey,
-        ResolvedModel,
-    },
+    model::{ApiProtocol, ModelProvider, ModelResolver, ModelSettings, ProviderKey, ResolvedModel},
     sandbox::token_truncation::{
         TruncationPolicy, approx_bytes_for_tokens, approx_token_count, truncate_text,
     },
@@ -46,6 +43,7 @@ use super::{
     gateway_auth::GatewayAuthHeaders,
     model_auth::CommandBearerToken,
     model_catalog_remote::{RemoteModelCatalog, RemoteModelCatalogs},
+    responses_retry,
     support::forwards_configured_response_metadata,
 };
 
@@ -496,7 +494,7 @@ fn build_registry(
     let protocol = match description.wire_api {
         WireApi::Responses => ApiProtocol::OpenAiResponses,
     };
-    let defaults = ModelSettings::new().with_retry(ModelRetrySettings::new().with_max_retries(
+    let defaults = ModelSettings::new().with_retry(responses_retry::sampling_retry(
         u32::try_from(description.stream_max_retries.unwrap_or(5).min(100)).unwrap_or(100),
     ));
     let description = description.clone();

@@ -19,6 +19,8 @@ pub mod responses;
 pub(crate) mod sse;
 mod stream_events;
 
+pub use error::error_type;
+
 use self::auth::OpenAiAuth;
 
 /// Applies endpoint and request transport headers with request values taking precedence.

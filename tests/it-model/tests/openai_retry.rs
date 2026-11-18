@@ -108,6 +108,34 @@ fn facts(error: &Error) -> &NormalizedProviderError {
     NormalizedProviderError::from_error(error).expect("a provider failure must carry its facts")
 }
 
+#[rstest]
+#[case("insufficient_quota")]
+#[case("usage_limit_reached")]
+#[case("usage_not_included")]
+#[case("rate_limit_error")]
+#[tokio::test]
+async fn error_type_survives_alongside_the_original_code(#[case] error_type: &str) {
+    let server = MockServer::start().await;
+    let model = responses_model(
+        &server,
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "0")
+            .set_body_json(json!({"error": {
+                "message": "request refused",
+                "code": "rate_limit_exceeded",
+                "type": error_type,
+            }})),
+    )
+    .await;
+
+    for error in [failed_call(&model).await, failed_stream(&model).await] {
+        assert_eq!(facts(&error).error_code(), Some("rate_limit_exceeded"));
+        assert_eq!(facts(&error).kind(), ProviderErrorKind::RateLimit);
+        assert_eq!(facts(&error).retry_after(), Some(Duration::ZERO));
+        assert_eq!(ra_model::openai::error_type(&error), Some(error_type));
+    }
+}
+
 /// A rate limit is the one failure where the endpoint knows how long to wait, and that number has
 /// to arrive as a field: a policy cannot read it out of the message without parsing prose.
 #[tokio::test]

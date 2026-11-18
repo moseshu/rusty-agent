@@ -858,3 +858,6 @@ mod bedrock;
 
 #[path = "product_models/gateway.rs"]
 mod gateway;
+
+#[path = "product_models/sampling_retry.rs"]
+mod sampling_retry;

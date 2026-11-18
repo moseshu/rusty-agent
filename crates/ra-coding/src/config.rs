@@ -42,6 +42,7 @@ mod otel;
 mod product;
 mod requirements;
 mod resolved_permission_profile;
+mod responses_retry;
 mod roles_discovery;
 mod roles_loader;
 mod support;

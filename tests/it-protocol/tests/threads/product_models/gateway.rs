@@ -210,7 +210,8 @@ async fn gateway_refresh_preserves_primary_auth_and_hides_issuer_errors() {
             &gateway.product,
             &format!("{}/product/v1", endpoint.uri()),
             &config,
-            "",
+            // One stream retry shows that issuer failures stay retryable.
+            "stream_max_retries = 1",
         );
         gateway.seed(&config, token("expired", Some("refresh-secret"), 0));
         let body = if succeeds {
@@ -226,10 +227,8 @@ async fn gateway_refresh_preserves_primary_auth_and_hides_issuer_errors() {
             .respond_with(
                 ResponseTemplate::new(if succeeds { 200 } else { 500 }).set_body_json(body),
             )
-            // Codex classifies the issuer failure as retryable and its turn loop retries it.
-            // The failure is retryable here too, but product sampling has no turn-level retry
-            // policy, so the turn reports it after one attempt.
-            .expect(1)
+            // A failed refresh is retried by the turn, as Codex retries its `Io` error.
+            .expect(if succeeds { 1 } else { 2 })
             .mount(&endpoint)
             .await;
         Mock::given(method("POST"))
