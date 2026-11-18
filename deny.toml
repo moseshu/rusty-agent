@@ -24,7 +24,11 @@ yanked = "deny"
 # rama 0.3.0-alpha.4 的 rama-core 依赖 tokio-graceful 0.2.2，后者只在 `cfg(loom)` 下依赖
 # loom 0.7.2 -> pin-utils 0.1.1；常规构建从不编译它。这是「不再维护」告警，没有修复版。
 # 2026-11-10 由维护者明确接受本条精确例外；rama 升级去掉 tokio-graceful/loom 后撤销。
+# chrono 0.4.45 被标记为「不再维护」，没有修复版。除 ra-coding / ra-network-proxy 直接依赖外，
+# rama-http / rama-http-headers 0.3.0-alpha.4、rmcp 3.9.0 与 schemars 1.2.3 也依赖它，
+# 只迁移本仓代码无法消除。2026-11-18 由维护者明确接受本条精确例外；上游都去掉 chrono 后撤销。
 ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "Maintainer explicitly accepted this exact exception on 2026-11-18. chrono 0.4.45 is unmaintained with no safe upgrade; besides the direct ra-coding and ra-network-proxy dependencies it is reached through rama-http / rama-http-headers 0.3.0-alpha.4, rmcp 3.9.0, and schemars 1.2.3, so migrating our own code alone cannot remove it; remove when those dependencies drop chrono" },
     { id = "RUSTSEC-2026-0441", reason = "Maintainer explicitly accepted this exact exception on 2026-11-10. pin-utils 0.1.1 is unmaintained with no safe upgrade; it is reached only through rama-core 0.3.0-alpha.4 -> tokio-graceful 0.2.2 -> loom 0.7.2, a cfg(loom)-only dependency never compiled in normal builds; remove when rama drops tokio-graceful/loom" },
     { id = "RUSTSEC-2024-0449", reason = "Maintainer explicitly accepted this exact exception on 2026-10-23. Ported Codex skill parser uses serde_yaml 0.9.34 -> unsafe-libyaml 0.2.11; upstream Codex has this same unmaintained advisory exception, with no patched release; remove when the port migrates off this parser" },
     { id = "RUSTSEC-2024-0388", reason = "derivative 不再维护；依赖链 ra-execpolicy -> starlark / starlark_syntax 0.14.2 -> derivative 2.2.0；codex deny.toml 同样忽略；starlark 去掉它后撤销" },
