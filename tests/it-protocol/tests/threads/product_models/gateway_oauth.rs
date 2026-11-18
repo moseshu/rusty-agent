@@ -133,6 +133,13 @@ async fn login_saves_the_credential_for_existing_requests() {
         .await;
     Mock::given(method("POST"))
         .and(path("/product/v1/responses"))
+        .and(header("x-gateway-auth", "Bearer old-access"))
+        .respond_with(completion())
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
         .and(header("x-gateway-auth", "Bearer new-access"))
         .respond_with(completion())
         .expect(1)
@@ -151,6 +158,8 @@ async fn login_saves_the_credential_for_existing_requests() {
     // A client without the capability keeps automatic login and may still sign in explicitly.
     let mut connection = server.connect(1).await;
     let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let first = completed_turn(&server, &mut connection, &thread, "hello").await;
+    assert_eq!(first["turn"]["status"], "completed", "{first}");
     // The new token must reach the thread started before the routing change.
     change_network_config(&gateway.product);
 
