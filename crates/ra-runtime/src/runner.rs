@@ -124,6 +124,48 @@ pub trait ModelRetryRecovery: Send + Sync {
     fn report_retry(&self, _retry: u32) -> bool {
         true
     }
+
+    /// A retry that does not consume the model call's retry budget, as Codex keeps a sampling
+    /// request alive while its network connection is down. `previous` counts the exempt retries
+    /// already made for this model call.
+    ///
+    /// It is asked before the retry policy and even when the budget is spent. The runtime still
+    /// refuses it after a cancellation, once the call's output was consumed, or when the adapter
+    /// cannot vouch for replaying a request that continues provider-held state.
+    fn budget_exempt_retry(&self, _error: &Error, _previous: u32) -> Option<BudgetExemptRetry> {
+        None
+    }
+}
+
+/// A retry outside the retry budget: how long to wait and what to tell the thread's client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetExemptRetry {
+    delay: std::time::Duration,
+    notice: String,
+}
+
+impl BudgetExemptRetry {
+    /// Waits `delay` before the next attempt and reports `notice` as a stream error that will
+    /// retry.
+    #[must_use]
+    pub fn new(delay: std::time::Duration, notice: impl Into<String>) -> Self {
+        Self {
+            delay,
+            notice: notice.into(),
+        }
+    }
+
+    /// The wait before the next attempt.
+    #[must_use]
+    pub const fn delay(&self) -> std::time::Duration {
+        self.delay
+    }
+
+    /// The notice reported to the thread's client.
+    #[must_use]
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
 }
 
 /// Pure upstream grouping calculation for the external parity-test workspace.
@@ -7251,6 +7293,7 @@ async fn call_model(
         .unwrap_or(0);
     let mut attempt = 0;
     let mut failed_attempts = 0;
+    let mut exempt_retries = 0;
     let mut retry_trace = None;
 
     loop {
@@ -7292,47 +7335,130 @@ async fn call_model(
                     &error,
                     attempt,
                 );
-                let Some((decision, delay)) = evaluate_retry(RetryEvaluation {
-                    turn_scope,
-                    model: &model,
-                    request: &model_request,
-                    error: &error,
-                    retry_settings: retry_settings.as_ref(),
-                    attempt,
-                    max_retries,
-                    consumed,
-                })
+                let Some((exempt, trace)) = next_retry(
+                    RetryEvaluation {
+                        turn_scope,
+                        model: &model,
+                        request: &model_request,
+                        error: &error,
+                        retry_settings: retry_settings.as_ref(),
+                        attempt,
+                        max_retries,
+                        consumed,
+                    },
+                    context,
+                    narration.model_stream_sink,
+                    exempt_retries,
+                )
                 .await?
                 else {
                     return Err(error);
                 };
-
-                warn!(
-                    error.code = error.code(),
-                    retry.attempt = attempt + 1,
-                    retry.max = max_retries,
-                    retry.delay_ms = duration_ms(delay),
-                    retry.reason = decision.reason().unwrap_or(""),
-                    "retrying failed model request"
-                );
-                if let Some(sink) = narration.model_stream_sink
-                    && context
-                        .config
-                        .model_retry_recovery
-                        .as_ref()
-                        .is_none_or(|recovery| recovery.report_retry(attempt.saturating_add(1)))
-                {
-                    sink.retrying(attempt.saturating_add(1), max_retries, &error);
+                if exempt {
+                    exempt_retries = exempt_retries.saturating_add(1);
+                } else {
+                    attempt = attempt.saturating_add(1);
                 }
-                turn_scope.run(tokio::time::sleep(delay)).await?;
-                attempt = attempt.saturating_add(1);
                 failed_attempts = failed_attempts.saturating_add(1);
-                retry_trace = Some(RetryTrace {
-                    delay,
-                    reason: decision.reason().map(str::to_owned),
-                });
+                retry_trace = Some(trace);
             }
         }
+    }
+}
+
+/// Announces and waits out the next retry of a failed model call: a budget-exempt retry the
+/// installed recovery asks for, or else one the retry policy grants. Returns whether the retry
+/// was budget-exempt and its trace, or `None` when the call should fail.
+async fn next_retry(
+    input: RetryEvaluation<'_>,
+    context: &TurnLoopContext<'_>,
+    sink: Option<&dyn stream::ModelStreamSink>,
+    exempt_retries: u32,
+) -> Result<Option<(bool, RetryTrace)>> {
+    let (turn_scope, error, attempt, max_retries) = (
+        input.turn_scope,
+        input.error,
+        input.attempt,
+        input.max_retries,
+    );
+    if let Some(retry) = budget_exempt_retry(context, &input, exempt_retries) {
+        warn!(
+            error.code = error.code(),
+            retry.exempt = exempt_retries + 1,
+            retry.delay_ms = duration_ms(retry.delay()),
+            "waiting to retry failed model request outside the retry budget"
+        );
+        if let Some(sink) = sink {
+            sink.retry_notice(retry.notice(), error);
+        }
+        turn_scope.run(tokio::time::sleep(retry.delay())).await?;
+        let trace = RetryTrace {
+            delay: retry.delay(),
+            reason: Some(retry.notice().to_owned()),
+        };
+        return Ok(Some((true, trace)));
+    }
+    let Some((decision, delay)) = evaluate_retry(input).await? else {
+        return Ok(None);
+    };
+    warn!(
+        error.code = error.code(),
+        retry.attempt = attempt + 1,
+        retry.max = max_retries,
+        retry.delay_ms = duration_ms(delay),
+        retry.reason = decision.reason().unwrap_or(""),
+        "retrying failed model request"
+    );
+    if let Some(sink) = sink
+        && context
+            .config
+            .model_retry_recovery
+            .as_ref()
+            .is_none_or(|recovery| recovery.report_retry(attempt.saturating_add(1)))
+    {
+        sink.retrying(attempt.saturating_add(1), max_retries, error);
+    }
+    turn_scope.run(tokio::time::sleep(delay)).await?;
+    let trace = RetryTrace {
+        delay,
+        reason: decision.reason().map(str::to_owned),
+    };
+    Ok(Some((false, trace)))
+}
+
+/// The installed recovery's budget-exempt retry, if the runtime's replay boundary allows it.
+fn budget_exempt_retry(
+    context: &TurnLoopContext<'_>,
+    input: &RetryEvaluation<'_>,
+    previous: u32,
+) -> Option<BudgetExemptRetry> {
+    if input.error.is_cancelled() || input.consumed.any() {
+        return None;
+    }
+    let retry = context
+        .config
+        .model_retry_recovery
+        .as_ref()?
+        .budget_exempt_retry(input.error, previous)?;
+    // The same replay boundary as a budgeted retry: an adapter's `Unsafe` is final, and a request
+    // continuing provider-held state is replayed only when the adapter calls it safe.
+    let safety = input
+        .model
+        .get_retry_advice(&ModelRetryAdviceRequest::new(
+            input.error,
+            input.attempt,
+            true,
+            input.request.continuation(),
+        ))
+        .map_or_else(
+            || replay_safety_of(input.error),
+            |advice| advice.replay_safety(),
+        );
+    match safety {
+        ReplaySafety::Safe => Some(retry),
+        ReplaySafety::Unsafe => None,
+        _ if input.request.continuation().is_server_managed() => None,
+        _ => Some(retry),
     }
 }
 

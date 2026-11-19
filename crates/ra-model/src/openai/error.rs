@@ -48,6 +48,25 @@ pub fn error_code(error: &Error) -> Option<&str> {
     NormalizedProviderError::from_error(error).and_then(NormalizedProviderError::error_code)
 }
 
+/// Whether the request failed before it reached the endpoint because no connection could be
+/// established, as Codex's HTTP transport reports `TransportError::Connection` for a client error
+/// that `is_connect()`. This includes connection timeouts for which `is_connect()` is true;
+/// other timeouts, failures after the connection was made, and WebSocket failures are excluded.
+#[must_use]
+pub fn is_connection_failure(error: &Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(http) = current.downcast_ref::<ra_http::HttpError>() {
+            return http.is_connect();
+        }
+        if let Some(request) = current.downcast_ref::<reqwest::Error>() {
+            return request.is_connect();
+        }
+        source = current.source();
+    }
+    false
+}
+
 /// Header carrying the endpoint's diagnostic identifier for one request.
 const REQUEST_ID_HEADER: &str = "x-request-id";
 

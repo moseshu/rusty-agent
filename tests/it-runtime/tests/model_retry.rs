@@ -574,3 +574,175 @@ async fn recovery_is_recorded_before_the_budget_check_and_retry_notices_can_be_s
         }
     }
 }
+
+fn connect_error() -> Error {
+    ra_core::model::NormalizedProviderError::new(ProviderErrorKind::Network, "connect refused")
+        .into_error()
+}
+
+/// Retries a refused connection outside the budget, as Codex waits for the network.
+#[derive(Default)]
+struct ConnectionRecovery {
+    previous: Mutex<Vec<u32>>,
+}
+
+impl ra_runtime::runner::ModelRetryRecovery for ConnectionRecovery {
+    fn budget_exempt_retry(
+        &self,
+        error: &Error,
+        previous: u32,
+    ) -> Option<ra_runtime::runner::BudgetExemptRetry> {
+        self.previous.lock().unwrap().push(previous);
+        error.to_string().contains("connect refused").then(|| {
+            ra_runtime::runner::BudgetExemptRetry::new(
+                std::time::Duration::ZERO,
+                "Reconnecting... waiting for network",
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn budget_exempt_retries_leave_the_retry_budget_for_other_failures() {
+    use ra_core::session::SessionId;
+    use ra_runtime::thread::{AgentThread, ThreadEvent, TurnInputRequest, TurnInputSubmission};
+    let model = RetryingModel::new(
+        vec![
+            Err(connect_error()),
+            Err(connect_error()),
+            Err(network_error()),
+            Ok(answer()),
+        ],
+        None,
+    );
+    let recovery = Arc::new(ConnectionRecovery::default());
+    let thread = AgentThread::builder(
+        SessionId::new("connection-recovery"),
+        AgentBinding::direct(
+            AgentSpec::builder()
+                .id(AgentId::new("lead"))
+                .name("Lead")
+                .instructions("answer")
+                .build()
+                .unwrap(),
+        ),
+        Arc::new(Resolver {
+            model: model.clone(),
+        }),
+    )
+    .with_config(
+        retry_config(false, 1, std::time::Duration::ZERO)
+            .with_model_retry_recovery(recovery.clone()),
+    )
+    .build();
+    assert!(matches!(
+        thread
+            .start_or_steer_turn(TurnInputRequest::new(vec![
+                ra_core::item::ContentBlock::text("hello")
+            ]))
+            .await,
+        TurnInputSubmission::Started { .. }
+    ));
+    let mut notices = Vec::new();
+    let completed = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), thread.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            ThreadEvent::StreamError { message, .. } => notices.push(message),
+            ThreadEvent::TurnComplete { .. } => break true,
+            ThreadEvent::TurnAborted { .. } => break false,
+            _ => {}
+        }
+    };
+    // Two refused connections wait outside the budget of one, which the reset still gets.
+    assert!(completed);
+    assert_eq!(
+        notices,
+        [
+            "Reconnecting... waiting for network",
+            "Reconnecting... waiting for network",
+            "Reconnecting... 1/1",
+        ]
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(*recovery.previous.lock().unwrap(), [0, 1, 2]);
+}
+
+#[tokio::test]
+async fn budget_exempt_retries_respect_the_replay_boundary() {
+    let recovery = Arc::new(ConnectionRecovery::default());
+    let model = RetryingModel::new(
+        vec![Err(connect_error()), Ok(answer())],
+        Some(RetryAdvice::new().with_replay_safety(ReplaySafety::Unsafe)),
+    );
+    let request = request(model.clone(), &CancelScope::root(), false, 0).with_config(
+        retry_config(false, 0, std::time::Duration::ZERO).with_model_retry_recovery(recovery),
+    );
+    assert!(Runner::run(request).await.is_err());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+}
+
+/// An adapter that permits the initial attempt but vetoes replay after a budgeted retry.
+struct AttemptAwareModel {
+    inner: Arc<RetryingModel>,
+    advice_attempts: Mutex<Vec<u32>>,
+}
+
+#[async_trait]
+impl Model for AttemptAwareModel {
+    async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        self.inner.get_response(request).await
+    }
+
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        self.inner.stream_response(request)
+    }
+
+    fn get_retry_advice(
+        &self,
+        request: &ra_core::model::ModelRetryAdviceRequest<'_>,
+    ) -> Option<RetryAdvice> {
+        self.advice_attempts.lock().unwrap().push(request.attempt());
+        Some(
+            RetryAdvice::new().with_replay_safety(if request.attempt() == 0 {
+                ReplaySafety::Safe
+            } else {
+                ReplaySafety::Unsafe
+            }),
+        )
+    }
+}
+
+#[tokio::test]
+async fn budget_exempt_retries_preserve_adapter_attempts_after_a_budgeted_retry() {
+    for budget in [1, 2] {
+        let inner = RetryingModel::new(
+            vec![Err(network_error()), Err(connect_error()), Ok(answer())],
+            None,
+        );
+        let model = Arc::new(AttemptAwareModel {
+            inner: inner.clone(),
+            advice_attempts: Mutex::default(),
+        });
+        let recovery = Arc::new(ConnectionRecovery::default());
+        let cancel = CancelScope::root();
+        let request = request(model.clone(), &cancel, false, budget).with_config(
+            retry_config(false, budget, std::time::Duration::ZERO)
+                .with_model_retry_recovery(recovery.clone()),
+        );
+
+        // The connection failure is the first exempt candidate, but the adapter must still see
+        // the budgeted retry already taken, even when that retry exhausted the budget.
+        assert!(Runner::run(request).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*recovery.previous.lock().unwrap(), [0, 0]);
+        let expected = if budget == 1 {
+            vec![0, 1]
+        } else {
+            vec![0, 1, 1]
+        };
+        assert_eq!(*model.advice_attempts.lock().unwrap(), expected);
+    }
+}

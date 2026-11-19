@@ -490,3 +490,118 @@ async fn content_filter_guidance_uses_bounded_catalog_text_even_after_retry_exha
         .await;
     }
 }
+
+fn unreachable_provider(product: &ProductModels, address: std::net::SocketAddr, extra: &str) {
+    product.write(
+        "config.toml",
+        &format!(
+            r#"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model = "local-model"
+model_provider = "gateway"
+{extra}
+[model_providers.gateway]
+name = "Gateway"
+base_url = "http://{address}/product/v1"
+experimental_bearer_token = "test-key"
+request_max_retries = 0
+stream_max_retries = 1
+"#
+        ),
+    );
+}
+
+/// Codex `core/tests/suite/stream_no_completed.rs`: a refused connection waits for the network
+/// without spending the retry budget, which a later stream failure still gets.
+#[tokio::test]
+async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() {
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    let product = ProductModels::new();
+    unreachable_provider(&product, address, "");
+
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    server
+        .turn_start(
+            &mut connection,
+            &thread,
+            "recover after the network returns",
+        )
+        .await;
+    let waiting = connection.notification("error").await;
+    assert_eq!(waiting["willRetry"], true, "{waiting}");
+    assert_eq!(
+        waiting["error"]["message"], "Reconnecting... waiting for network",
+        "{waiting}"
+    );
+
+    let recovered = MockServer::builder()
+        .listener(std::net::TcpListener::bind(address).unwrap())
+        .start()
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.created", "response": {"id": "lost"}})
+            ),
+            "text/event-stream",
+        ))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&recovered)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("data: {}\n\n", websocket_completion(1)),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&recovered)
+        .await;
+
+    let retry = connection.notification("error").await;
+    assert_eq!(retry["error"]["message"], "Reconnecting... 1/1", "{retry}");
+    let completed = connection.notification("turn/completed").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    recovered.verify().await;
+}
+
+#[tokio::test]
+async fn disabled_connection_retries_spend_the_retry_budget() {
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    let product = ProductModels::new();
+    unreachable_provider(
+        &product,
+        address,
+        "[features]\nunbounded_connection_retries = false",
+    );
+
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    server.turn_start(&mut connection, &thread, "hello").await;
+    // Without the feature the refused connection spends the one retry and the turn fails.
+    let retry = connection.notification("error").await;
+    assert_eq!(retry["error"]["message"], "Reconnecting... 1/1", "{retry}");
+    let completed = connection.notification("turn/completed").await;
+    assert_eq!(completed["turn"]["status"], "failed", "{completed}");
+}
+
+#[test]
+fn connection_retry_waits_double_from_five_seconds_to_a_minute() {
+    use ra_coding::config::responses_retry_test_api::connection_delay;
+    let waits: Vec<_> = (0..7)
+        .map(|previous| connection_delay(previous).as_secs())
+        .collect();
+    assert_eq!(waits, [5, 10, 20, 40, 60, 60, 60]);
+    assert_eq!(connection_delay(u32::MAX).as_secs(), 60);
+}

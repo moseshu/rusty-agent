@@ -8,9 +8,11 @@
 //! duplicate accepted output; this policy supplies
 //! Codex's per-error decision and delay on top of it.
 //!
-//! Codex also retries failed connections without limit, on a separate counter with a 5 to 60
-//! second delay, when `unbounded_connection_retries` is enabled. The runner counts every attempt
-//! against one budget, so that mode is not ported here.
+//! Codex also keeps a sampling request alive while its connection cannot be established: with
+//! `unbounded_connection_retries` (on by default), such a failure is retried without limit and
+//! without spending the budget, waiting 5 seconds and doubling up to 60. The product installs that
+//! through the runner's budget-exempt recovery hook, not this policy, so the framework retry
+//! contract keeps one budget.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,8 @@ use ra_core::model::{
 use rand::Rng;
 
 const INITIAL_DELAY_MS: f64 = 200.0;
+const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_mins(1);
 const BACKOFF_FACTOR: f64 = 2.0;
 
 /// Quota codes recognized on HTTP 429, independently of the error type.
@@ -151,6 +155,15 @@ fn backoff(retry: u64) -> Duration {
     Duration::from_secs_f64((base * jitter / 1000.0).min(Duration::MAX.as_secs_f64()))
 }
 
+/// The wait before retrying a failed connection without spending the retry budget: Codex starts
+/// at 5 seconds and doubles each time, up to 60 seconds. `previous` counts the earlier waits.
+pub(super) fn connection_retry_delay(previous: u32) -> Duration {
+    let factor = 1_u32.checked_shl(previous).unwrap_or(u32::MAX);
+    INITIAL_CONNECTION_RETRY_DELAY
+        .saturating_mul(factor)
+        .min(MAX_CONNECTION_RETRY_DELAY)
+}
+
 /// Codex hides the first WebSocket reconnect notification only in release builds.
 pub(super) const fn report_retry(retry: u32, debug: bool, websocket: bool) -> bool {
     retry > 1 || debug || !websocket
@@ -166,6 +179,12 @@ pub mod test_api {
         super::retry_delay(&ra_core::model::RetryPolicyContext::new(
             error, attempt, 5, true, None,
         ))
+    }
+
+    /// The wait before retrying a failed connection outside the retry budget.
+    #[must_use]
+    pub fn connection_delay(previous: u32) -> std::time::Duration {
+        super::connection_retry_delay(previous)
     }
 
     /// Whether Codex would surface a reconnect notification for these build and transport flags.

@@ -7,7 +7,9 @@ use std::{
 };
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use ra_config::{ModelProviderInfo, Personality, ReasoningEffort, ReasoningSummary, WireApi};
+use ra_config::{
+    Feature, ModelProviderInfo, Personality, ReasoningEffort, ReasoningSummary, WireApi,
+};
 use ra_context::{
     compaction::CompactionCapability,
     window::{ContextWindowConfig, ContextWindowThresholdRatio},
@@ -34,7 +36,7 @@ use ra_model::{
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
-use ra_runtime::runner::{ModelRetryRecovery, RunConfig};
+use ra_runtime::runner::{BudgetExemptRetry, ModelRetryRecovery, RunConfig};
 use serde_json::{Map, json};
 
 use super::{
@@ -160,10 +162,24 @@ impl ProductModelRuntime {
         })
     }
 
-    pub(crate) fn configure_run(self: &Arc<Self>, mut config: RunConfig) -> RunConfig {
+    /// Installs the product's sampling recovery and catalog snapshot. An internal session, such
+    /// as memory consolidation, does not wait for a lost network connection, as in Codex.
+    pub(crate) fn configure_run(
+        self: &Arc<Self>,
+        mut config: RunConfig,
+        internal_session: bool,
+    ) -> RunConfig {
         if self.explicit.is_none() {
-            config =
-                config.with_model_retry_recovery(Arc::clone(self) as Arc<dyn ModelRetryRecovery>);
+            let connection_retries = self
+                .config
+                .features
+                .enabled(Feature::UnboundedConnectionRetries)
+                && !self.config.model_provider.is_amazon_bedrock()
+                && !internal_session;
+            config = config.with_model_retry_recovery(Arc::new(ProductRetryRecovery {
+                runtime: Arc::clone(self),
+                connection_retries,
+            }));
         }
         let Some(source) = &self.remote else {
             return config;
@@ -774,7 +790,39 @@ fn truncate_tool_output(
     })
 }
 
-impl ModelRetryRecovery for ProductModelRuntime {
+/// The product's sampling recovery for one thread.
+struct ProductRetryRecovery {
+    runtime: Arc<ProductModelRuntime>,
+    /// Codex's `unbounded_connection_retries`, for a session that is not internal and a provider
+    /// that is not Amazon Bedrock.
+    connection_retries: bool,
+}
+
+impl ModelRetryRecovery for ProductRetryRecovery {
+    fn recovery_message(&self, error: &Error, model: Option<&str>) -> Option<Message> {
+        self.runtime.recovery_message(error, model)
+    }
+
+    fn report_retry(&self, retry: u32) -> bool {
+        let provider = &self.runtime.config.model_provider;
+        responses_retry::report_retry(
+            retry,
+            cfg!(debug_assertions),
+            provider.supports_websockets && !provider.is_amazon_bedrock(),
+        )
+    }
+
+    fn budget_exempt_retry(&self, error: &Error, previous: u32) -> Option<BudgetExemptRetry> {
+        (self.connection_retries && ra_model::openai::is_connection_failure(error)).then(|| {
+            BudgetExemptRetry::new(
+                responses_retry::connection_retry_delay(previous),
+                "Reconnecting... waiting for network",
+            )
+        })
+    }
+}
+
+impl ProductModelRuntime {
     fn recovery_message(&self, error: &Error, model: Option<&str>) -> Option<Message> {
         if ra_model::openai::response_failure_event(error) != Some("response.incomplete")
             || ra_model::openai::response_incomplete_reason(error) != Some("content_filter")
@@ -791,15 +839,6 @@ impl ModelRetryRecovery for ProductModelRuntime {
         Some(Message::developer(format!(
             "<content_filter_guidance>\n{text}\n</content_filter_guidance>"
         )))
-    }
-
-    fn report_retry(&self, retry: u32) -> bool {
-        responses_retry::report_retry(
-            retry,
-            cfg!(debug_assertions),
-            self.config.model_provider.supports_websockets
-                && !self.config.model_provider.is_amazon_bedrock(),
-        )
     }
 }
 

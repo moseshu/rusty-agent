@@ -263,6 +263,10 @@ impl ThreadFactory for CodingThreadFactory {
                 runtime.configure_run(
                     CodingHost::build_run_config_with_compaction(runtime.clone())
                         .with_context_filter(runtime.clone()),
+                    matches!(
+                        request.session_source(),
+                        ra_protocol::server::SessionSource::Internal(_)
+                    ),
                 ),
                 runtime,
             ),

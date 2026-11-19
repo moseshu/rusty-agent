@@ -1845,6 +1845,17 @@ impl crate::runner::stream::ModelStreamSink for ThreadRecorder {
         });
     }
 
+    fn retry_notice(&self, notice: &str, error: &ra_core::error::Error) {
+        let Some(thread) = self.thread.upgrade() else {
+            return;
+        };
+        thread.emit(ThreadEvent::StreamError {
+            turn_id: self.turn_id.clone(),
+            message: notice.to_owned(),
+            additional_details: error.to_string(),
+        });
+    }
+
     fn warning(&self, message: String) {
         if let Some(thread) = self.thread.upgrade() {
             thread.emit(ThreadEvent::Warning { message });
