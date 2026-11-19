@@ -5,15 +5,24 @@
 //! asks the policy about every failure except a cancellation, whatever its
 //! [`Recoverability`](crate::error::Recoverability), so a policy filters the failures it accepts:
 //! check [`Error::is_retryable`] to retry transient failures only. A policy cannot bypass the
-//! runtime's attempt cap, cancellation, a stream event that was already published, or an adapter
-//! that marked the replay unsafe.
+//! runtime's attempt cap, cancellation, a stream event that was already published, or a streamed
+//! failure the adapter marked unsafe to replay.
+//!
+//! Replay protection follows the SDK too. An ordinary [`RetryDecision::retry`] never replays a
+//! failure the adapter marked unsafe, nor a request continuing provider-held state whose safety
+//! the adapter did not establish. [`RetryDecision::with_unsafe_replay_approval`] lifts only the
+//! first, and only for a non-streaming call; replay safety the adapter left unknown cannot be
+//! approved by a policy.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{NormalizedProviderError, RetryAdvice};
-use crate::error::Error;
+use super::{NormalizedProviderError, ReplaySafety, RetryAdvice, replay_safety_of};
+use crate::{error::Error, model::request::ConversationContinuation};
+
+/// The continuation of a context built without one: the request carried its own history.
+static CLIENT_HISTORY: ConversationContinuation = ConversationContinuation::None;
 
 /// Context supplied to a retry policy after one failed model attempt.
 #[non_exhaustive]
@@ -24,6 +33,7 @@ pub struct RetryPolicyContext<'a> {
     max_retries: u32,
     streaming: bool,
     provider_advice: Option<&'a RetryAdvice>,
+    continuation: &'a ConversationContinuation,
 }
 
 impl<'a> RetryPolicyContext<'a> {
@@ -42,7 +52,16 @@ impl<'a> RetryPolicyContext<'a> {
             max_retries,
             streaming,
             provider_advice,
+            continuation: &CLIENT_HISTORY,
         }
+    }
+
+    /// Records how the failed request continued the conversation. Without it the request is taken
+    /// to have carried its own history.
+    #[must_use]
+    pub const fn with_continuation(mut self, continuation: &'a ConversationContinuation) -> Self {
+        self.continuation = continuation;
+        self
     }
 
     /// The error returned by the failed attempt.
@@ -83,6 +102,37 @@ impl<'a> RetryPolicyContext<'a> {
     pub fn normalized(&self) -> Option<&NormalizedProviderError> {
         NormalizedProviderError::from_error(self.error)
     }
+
+    /// The replay verdict the runtime applies to this failure: the adapter's advice, or else the
+    /// verdict stamped on the error.
+    ///
+    /// The context only lends the advice, so a policy cannot change the verdict it is judged
+    /// against.
+    #[must_use]
+    pub fn replay_safety(&self) -> ReplaySafety {
+        self.provider_advice
+            .map_or_else(|| replay_safety_of(self.error), RetryAdvice::replay_safety)
+    }
+
+    /// Whether the provider had begun emitting the response when the failure occurred.
+    #[must_use]
+    pub fn response_started(&self) -> bool {
+        self.provider_advice
+            .is_some_and(RetryAdvice::response_started)
+    }
+
+    /// How the failed request continued the conversation.
+    #[must_use]
+    pub const fn continuation(&self) -> &ConversationContinuation {
+        self.continuation
+    }
+
+    /// Whether the request continued provider-held state, through a previous response ID or a
+    /// provider conversation.
+    #[must_use]
+    pub const fn is_stateful_request(&self) -> bool {
+        self.continuation.is_server_managed()
+    }
 }
 
 /// A retry policy's answer for one failed attempt.
@@ -92,7 +142,7 @@ pub struct RetryDecision {
     retry: bool,
     delay: Option<Duration>,
     reason: Option<String>,
-    replay_approved: bool,
+    unsafe_replay_approved: bool,
 }
 
 impl RetryDecision {
@@ -103,7 +153,7 @@ impl RetryDecision {
             retry: false,
             delay: None,
             reason: None,
-            replay_approved: false,
+            unsafe_replay_approved: false,
         }
     }
 
@@ -114,7 +164,7 @@ impl RetryDecision {
             retry: true,
             delay: None,
             reason: None,
-            replay_approved: false,
+            unsafe_replay_approved: false,
         }
     }
 
@@ -132,15 +182,18 @@ impl RetryDecision {
         self
     }
 
-    /// Explicitly approves replay where the adapter could not establish safety.
+    /// Approves replaying a request the adapter marked [`ReplaySafety::Unsafe`], as the SDK's
+    /// `approve_unsafe_replay`.
     ///
-    /// This is intentionally explicit. It cannot override an unsafe verdict or a stream event
-    /// that has already reached the run subscriber, but it lets a host that owns stronger
-    /// idempotency evidence permit a server-managed request whose adapter correctly reported
-    /// [`super::ReplaySafety::Unknown`].
+    /// This is separate from [`Self::retry`]: an ordinary retry never bypasses replay protection.
+    /// Set it only for workloads where repeating provider-side work that may already have happened
+    /// is acceptable. It applies to a non-streaming call only, and also to one that continues
+    /// provider-held state. It does not lift a stream event that already reached a subscriber, a
+    /// streamed failure, or a stateful request whose replay safety the adapter left
+    /// [`ReplaySafety::Unknown`].
     #[must_use]
-    pub const fn with_replay_approval(mut self) -> Self {
-        self.replay_approved = true;
+    pub const fn with_unsafe_replay_approval(mut self) -> Self {
+        self.unsafe_replay_approved = true;
         self
     }
 
@@ -162,10 +215,10 @@ impl RetryDecision {
         self.reason.as_deref()
     }
 
-    /// Whether the policy explicitly accepts an otherwise-unknown replay boundary.
+    /// Whether the policy approved replaying a request the adapter marked unsafe.
     #[must_use]
-    pub const fn replay_approved(&self) -> bool {
-        self.replay_approved
+    pub const fn approves_unsafe_replay(&self) -> bool {
+        self.unsafe_replay_approved
     }
 }
 
@@ -191,6 +244,10 @@ impl ModelRetryPolicy for NeverRetryPolicy {
 }
 
 /// A policy that follows an adapter's positive retry recommendation.
+///
+/// The SDK's version also marks its decision when the adapter called the replay safe. That marker
+/// only matters to policy combinators, which are not ported; the runtime reads the adapter's
+/// verdict directly.
 #[derive(Debug, Default)]
 pub struct ProviderSuggestedRetryPolicy;
 
@@ -200,8 +257,17 @@ impl ModelRetryPolicy for ProviderSuggestedRetryPolicy {
         let Some(advice) = context.provider_advice() else {
             return RetryDecision::no_retry();
         };
-        if advice.suggested() != Some(true) {
-            return RetryDecision::no_retry();
+        match advice.suggested() {
+            None => return RetryDecision::no_retry(),
+            // A provider veto keeps its reason, as the SDK's does.
+            Some(false) => {
+                let decision = RetryDecision::no_retry();
+                return match advice.reason() {
+                    Some(reason) => decision.with_reason(reason),
+                    None => decision,
+                };
+            }
+            Some(true) => {}
         }
         let mut decision = RetryDecision::retry();
         if let Some(delay) = advice.retry_after() {
@@ -209,9 +275,6 @@ impl ModelRetryPolicy for ProviderSuggestedRetryPolicy {
         }
         if let Some(reason) = advice.reason() {
             decision = decision.with_reason(reason);
-        }
-        if matches!(advice.replay_safety(), super::ReplaySafety::Safe) {
-            decision = decision.with_replay_approval();
         }
         decision
     }

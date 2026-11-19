@@ -13,8 +13,8 @@ The runner used to reject any model failure whose `Recoverability` was not `Retr
 asked the retry policy. It now asks the policy about every failure except a cancellation, as the
 OpenAI Agents SDK does: a rejected request, an invalid credential, a model behavior or refusal
 error, and caller or configuration errors reach `ModelRetryPolicy::evaluate` too. The attempt cap,
-cancellation, already-published stream events, dispatched tools and adapter-reported unsafe replays
-still stop a retry before the policy is consulted.
+cancellation, already-published stream events, dispatched tools and adapter-reported unsafe replays of
+a streamed call still stop a retry before the policy is consulted.
 
 | Change | Who is affected | What to do |
 | --- | --- | --- |
@@ -43,6 +43,33 @@ so these changes add no retries.
 
 The runner's own zero-based attempt index is unchanged where it was already visible: in persisted
 retry-recovery message IDs and the generation span's `retry.attempt`.
+
+### Unsafe replay is approved explicitly, as in the Agents SDK
+
+Replay protection now follows the OpenAI Agents SDK's contract. `RetryDecision::with_replay_approval`
+and `RetryDecision::replay_approved` are removed: they let a policy replay a request continuing
+provider-held state whose replay safety the adapter left unknown, which the SDK does not allow. In
+their place, `RetryDecision::with_unsafe_replay_approval` and `approves_unsafe_replay` port the SDK's
+`approve_unsafe_replay`. For a non-streaming call, a failure the adapter marked `ReplaySafety::Unsafe`
+now reaches the retry policy instead of being refused before it; an ordinary retry still does not
+replay it, and the approval does. A streamed failure the adapter marked unsafe is still refused
+before the policy runs. A request continuing provider-held state is replayed when the adapter called
+the failure safe, or when the policy approved a failure the adapter marked unsafe, and never when its
+replay safety is unknown.
+
+Summary requests for a thread's compaction use the non-streaming entry point and are now reported to
+adapters and policies as non-streaming; they were reported as streaming. `RetryPolicyContext` gains
+`with_continuation`, `continuation`, `is_stateful_request`, `replay_safety` and `response_started`;
+`RetryAdvice` and `NormalizedProviderError` gain `with_response_started` and `response_started`, and
+`stamp_response_started` marks a provider error that failed after the response began. The OpenAI
+Responses WebSocket adapter marks a failure after the first response event this way.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| `with_replay_approval` and `replay_approved` are removed | Custom `ModelRetryPolicy` implementations that called them | Call `with_unsafe_replay_approval` to replay a failure the adapter marked unsafe; a stateful request with unknown replay safety can no longer be approved |
+| Non-streaming unsafe failures reach the policy | Custom policies that retry whatever reaches them | Nothing to change: an ordinary retry still does not replay them |
+| Summary requests report `is_streaming()` as false | Adapters and policies that read the flag | Treat them as the non-streaming calls they are; for an unstamped failure, `ra-model` adapters now give the unstarted verdict |
+| The OpenAI Responses and Chat models call a replay safe when the endpoint sent `x-should-retry: true`, or answered a request continuing provider-held state with 408, 409, 429 or 5xx, unless the error already carries a verdict | Policies that relied on such a stateful failure staying `Unknown` | Nothing to change for the built-in policies; a custom policy that must not replay these should decline them |
 
 ### Continuation input after in-run compaction
 

@@ -131,6 +131,11 @@ async fn lock_uses_the_request_timeout_and_timeout_is_replay_safe() {
         ProviderErrorKind::Timeout
     );
     assert_eq!(replay_safety_of(&error), ReplaySafety::Safe);
+    assert!(
+        !NormalizedProviderError::from_error(&error)
+            .unwrap()
+            .response_started()
+    );
 
     let mut waiting = model.stream_response(request(&ModelSettings::new()));
     // Waiting longer than the connection timeout still leaves the sessionless call queued.
@@ -420,4 +425,49 @@ async fn accompanying_authorization_conflicts_with_the_primary_bearer() {
             .is_err(),
         "no handshake is attempted"
     );
+}
+
+/// A WebSocket failure after the first response event is unsafe to replay and records that the
+/// provider had begun responding, as the SDK's WebSocket adapter marks it; the advice carries it
+/// to the retry policy.
+#[tokio::test]
+async fn a_failure_after_the_first_event_records_that_the_response_started() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(&listener, CONNECT_TIMEOUT);
+    let model = provider.get_model(None).unwrap();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        send(
+            &mut socket,
+            json!({"type": "response.created", "response": {"id": "resp_partial"}}),
+        )
+        .await;
+        drop(socket);
+    });
+    let request = request(&ModelSettings::new());
+    let mut stream = model.stream_response(request.clone());
+    let error = loop {
+        match timeout(PATIENCE, stream.next()).await.unwrap() {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => panic!("the dropped socket must end the stream with an error"),
+        }
+    };
+    peer.await.unwrap();
+
+    let normalized = NormalizedProviderError::from_error(&error).unwrap();
+    assert_eq!(normalized.replay_safety(), ReplaySafety::Unsafe);
+    assert!(normalized.response_started());
+    let advice = model
+        .get_retry_advice(&ra_core::model::ModelRetryAdviceRequest::new(
+            &error,
+            1,
+            true,
+            request.continuation(),
+        ))
+        .unwrap();
+    assert!(advice.response_started());
+    assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
 }

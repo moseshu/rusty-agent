@@ -30,6 +30,7 @@ pub use request::{
     ProviderConversationId, custom_tool_input_schema,
 };
 pub use resolution::{ModelSelector, ResolvedModel};
+pub use retry::stamp_response_started;
 pub use retry::{
     JitterSample, ModelRetryAdviceRequest, ModelRetryPolicy, ModelRetrySettings,
     NetworkErrorRetryPolicy, NeverRetryPolicy, NormalizedProviderError,

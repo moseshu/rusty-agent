@@ -32,6 +32,7 @@ pub use backoff::{
     DEFAULT_INITIAL_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MULTIPLIER, JITTER_RANGE, JitterSample,
     MAX_HONORED_RETRY_AFTER, RetryBackoff,
 };
+pub use normalized::stamp_response_started;
 pub use normalized::{NormalizedProviderError, replay_safety_of, stamp_replay_safety};
 pub use policy::{
     ModelRetryPolicy, NetworkErrorRetryPolicy, NeverRetryPolicy, ProviderSuggestedRetryPolicy,
@@ -65,6 +66,7 @@ pub struct RetryAdvice {
     retry_after: Option<Duration>,
     replay_safety: ReplaySafety,
     reason: Option<String>,
+    response_started: bool,
 }
 
 impl RetryAdvice {
@@ -76,6 +78,7 @@ impl RetryAdvice {
             retry_after: None,
             replay_safety: ReplaySafety::Unknown,
             reason: None,
+            response_started: false,
         }
     }
 
@@ -107,6 +110,13 @@ impl RetryAdvice {
         self
     }
 
+    /// Records that the provider had begun emitting the response when the failure occurred.
+    #[must_use]
+    pub const fn with_response_started(mut self, response_started: bool) -> Self {
+        self.response_started = response_started;
+        self
+    }
+
     /// Provider retry recommendation.
     #[must_use]
     pub const fn suggested(&self) -> Option<bool> {
@@ -129,6 +139,12 @@ impl RetryAdvice {
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
+    }
+
+    /// Whether the provider had begun emitting the response when the failure occurred.
+    #[must_use]
+    pub const fn response_started(&self) -> bool {
+        self.response_started
     }
 }
 

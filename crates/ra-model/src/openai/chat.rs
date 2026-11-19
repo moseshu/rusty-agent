@@ -498,6 +498,6 @@ impl Model for OpenAiChatModel {
     }
 
     fn get_retry_advice(&self, request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
-        crate::retry::retry_advice(request)
+        super::retry::retry_advice(request)
     }
 }

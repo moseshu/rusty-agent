@@ -45,6 +45,7 @@ pub struct NormalizedProviderError {
     retry_after: Option<Duration>,
     should_retry: Option<bool>,
     replay_safety: ReplaySafety,
+    response_started: bool,
     source: Option<BoxError>,
 }
 
@@ -66,6 +67,7 @@ impl NormalizedProviderError {
             retry_after: None,
             should_retry: None,
             replay_safety: ReplaySafety::Unknown,
+            response_started: false,
             source: None,
         }
     }
@@ -114,6 +116,13 @@ impl NormalizedProviderError {
     #[must_use]
     pub const fn with_replay_safety(mut self, replay_safety: ReplaySafety) -> Self {
         self.replay_safety = replay_safety;
+        self
+    }
+
+    /// Records that the provider had begun emitting the response when the failure occurred.
+    #[must_use]
+    pub const fn with_response_started(mut self, response_started: bool) -> Self {
+        self.response_started = response_started;
         self
     }
 
@@ -170,6 +179,12 @@ impl NormalizedProviderError {
     #[must_use]
     pub const fn replay_safety(&self) -> ReplaySafety {
         self.replay_safety
+    }
+
+    /// Whether the provider had begun emitting the response when the failure occurred.
+    #[must_use]
+    pub const fn response_started(&self) -> bool {
+        self.response_started
     }
 
     /// Whether the call timed out. Derived from [`Self::kind`], never stored separately.
@@ -265,37 +280,38 @@ impl StdError for NormalizedProviderError {
 /// defect as a network blip.
 #[must_use]
 pub fn stamp_replay_safety(error: Error, replay_safety: ReplaySafety) -> Error {
-    match error {
-        Error::Provider {
-            kind,
-            message,
-            source,
-        } => restate(kind, message, source, replay_safety),
-        other => other,
-    }
+    restate(error, |normalized| normalized.replay_safety = replay_safety)
 }
 
-/// Rebuilds one provider error around an updated replay verdict.
-fn restate(
-    kind: ProviderErrorKind,
-    message: String,
-    source: Option<BoxError>,
-    replay_safety: ReplaySafety,
-) -> Error {
-    let normalized = match source {
-        // Already normalized: only the verdict changes, so every other fact the adapter recorded
-        // survives the restatement.
-        Some(source) => match source.downcast::<NormalizedProviderError>() {
-            Ok(mut normalized) => {
-                normalized.replay_safety = replay_safety;
-                *normalized
-            }
-            Err(source) => NormalizedProviderError::new(kind, message)
-                .with_replay_safety(replay_safety)
-                .with_source(source),
-        },
-        None => NormalizedProviderError::new(kind, message).with_replay_safety(replay_safety),
+/// Restates a provider error as one that failed after the provider began emitting the response.
+///
+/// Like the replay verdict, only the layer that delivered the first response event knows this, so
+/// it is stamped on in the same way and other errors pass through untouched.
+#[must_use]
+pub fn stamp_response_started(error: Error) -> Error {
+    restate(error, |normalized| normalized.response_started = true)
+}
+
+/// Rebuilds one provider error with an updated fact.
+fn restate(error: Error, update: impl FnOnce(&mut NormalizedProviderError)) -> Error {
+    let Error::Provider {
+        kind,
+        message,
+        source,
+    } = error
+    else {
+        return error;
     };
+    let mut normalized = match source {
+        // Already normalized: only the updated fact changes, so every other fact the adapter
+        // recorded survives the restatement.
+        Some(source) => match source.downcast::<NormalizedProviderError>() {
+            Ok(normalized) => *normalized,
+            Err(source) => NormalizedProviderError::new(kind, message).with_source(source),
+        },
+        None => NormalizedProviderError::new(kind, message),
+    };
+    update(&mut normalized);
     normalized.into_error()
 }
 

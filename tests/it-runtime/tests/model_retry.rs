@@ -888,3 +888,367 @@ async fn attempt_numbers_and_advice_follow_the_sdk_runner() {
         assert_eq!(*policy.seen.lock().unwrap(), case.policy, "{}", case.name);
     }
 }
+
+/// What a retry policy saw, so a test can check the context it scoped its approval with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeenContext {
+    streaming: bool,
+    replay_safety: ReplaySafety,
+    response_started: bool,
+    stateful: bool,
+}
+
+/// A policy that always retries, approving unsafe replays when `approve` is set, and records the
+/// context it was given.
+struct ApprovingPolicy {
+    approve: bool,
+    seen: Mutex<Vec<SeenContext>>,
+}
+
+impl ApprovingPolicy {
+    fn new(approve: bool) -> Arc<Self> {
+        Arc::new(Self {
+            approve,
+            seen: Mutex::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl ra_core::model::ModelRetryPolicy for ApprovingPolicy {
+    async fn evaluate(
+        &self,
+        context: &ra_core::model::RetryPolicyContext<'_>,
+    ) -> ra_core::model::RetryDecision {
+        self.seen.lock().unwrap().push(SeenContext {
+            streaming: context.is_streaming(),
+            replay_safety: context.replay_safety(),
+            response_started: context.response_started(),
+            stateful: context.is_stateful_request(),
+        });
+        let decision = ra_core::model::RetryDecision::retry().with_delay(std::time::Duration::ZERO);
+        if self.approve {
+            decision.with_unsafe_replay_approval()
+        } else {
+            decision
+        }
+    }
+}
+
+/// The advice the SDK's WebSocket adapter gives a failure after the first response event.
+fn started_unsafe_advice() -> RetryAdvice {
+    RetryAdvice::new()
+        .with_suggested(false)
+        .with_replay_safety(ReplaySafety::Unsafe)
+        .with_response_started(true)
+}
+
+fn bare_request(continuation: ra_core::model::ConversationContinuation) -> ModelRequest {
+    ModelRequest::new(
+        vec![ModelInputItem::Message(Message::user("hello"))],
+        ra_core::model::SettingsLayers::new().resolve(&ProviderKey::new("test-provider")),
+    )
+    .with_continuation(continuation)
+}
+
+/// Whether the runtime would retry the first failure of `request` under `policy`, with the
+/// adapter answering `advice`.
+async fn retries_first_failure(
+    advice: Option<RetryAdvice>,
+    policy: Arc<ApprovingPolicy>,
+    request: &ModelRequest,
+    streaming: bool,
+) -> bool {
+    let model: Arc<dyn Model> = RetryingModel::new(Vec::new(), advice);
+    let settings = ModelRetrySettings::new()
+        .with_max_retries(1)
+        .with_policy(policy);
+    ra_runtime::runner::retry_test_api::decide_first_failure(
+        &model,
+        request,
+        &network_error(),
+        &settings,
+        streaming,
+        &CancelScope::root(),
+    )
+    .await
+    .unwrap()
+    .is_some()
+}
+
+/// A non-streaming failure the adapter marked unsafe reaches the policy, which sees the structured
+/// facts it needs to scope an approval, and is replayed only when the policy approves unsafe
+/// replay explicitly: an ordinary retry decision never bypasses replay protection.
+#[tokio::test]
+async fn an_unsafe_non_streaming_failure_replays_only_with_explicit_approval() {
+    let request = bare_request(ra_core::model::ConversationContinuation::None);
+
+    let approving = ApprovingPolicy::new(true);
+    assert!(
+        retries_first_failure(
+            Some(started_unsafe_advice()),
+            approving.clone(),
+            &request,
+            false
+        )
+        .await
+    );
+    assert_eq!(
+        *approving.seen.lock().unwrap(),
+        [SeenContext {
+            streaming: false,
+            replay_safety: ReplaySafety::Unsafe,
+            response_started: true,
+            stateful: false,
+        }]
+    );
+
+    let ordinary = ApprovingPolicy::new(false);
+    assert!(
+        !retries_first_failure(
+            Some(started_unsafe_advice()),
+            ordinary.clone(),
+            &request,
+            false
+        )
+        .await
+    );
+    assert_eq!(ordinary.seen.lock().unwrap().len(), 1);
+}
+
+/// A streamed failure the adapter marked unsafe stays blocked before the policy runs, so an
+/// approval cannot replay it.
+#[tokio::test]
+async fn unsafe_replay_approval_is_ignored_for_streamed_calls() {
+    let request = bare_request(ra_core::model::ConversationContinuation::None);
+    let policy = ApprovingPolicy::new(true);
+    assert!(
+        !retries_first_failure(
+            Some(started_unsafe_advice()),
+            policy.clone(),
+            &request,
+            true
+        )
+        .await
+    );
+    assert!(policy.seen.lock().unwrap().is_empty());
+}
+
+/// A request continuing provider-held state fails closed: it is replayed when the adapter called
+/// the failure safe, or when the policy approved a failure the adapter marked unsafe, but never
+/// when replay safety is unknown, approval or not.
+#[tokio::test]
+async fn a_stateful_request_replays_only_on_safe_advice_or_an_approved_unsafe_failure() {
+    let safe = RetryAdvice::new()
+        .with_suggested(true)
+        .with_replay_safety(ReplaySafety::Safe);
+    let unknown = RetryAdvice::new().with_suggested(true);
+    let cases = [
+        ("safe advice, ordinary retry", Some(safe), false, true),
+        (
+            "unsafe advice, approved",
+            Some(started_unsafe_advice()),
+            true,
+            true,
+        ),
+        (
+            "unsafe advice, ordinary retry",
+            Some(started_unsafe_advice()),
+            false,
+            false,
+        ),
+        (
+            "unknown advice, ordinary retry",
+            Some(unknown),
+            false,
+            false,
+        ),
+        ("no advice, approved", None, true, false),
+    ];
+    for continuation in [
+        ra_core::model::ConversationContinuation::PreviousResponseId("resp_1".to_owned()),
+        ra_core::model::ConversationContinuation::ConversationId(
+            ra_core::model::ProviderConversationId::new("conv_1"),
+        ),
+    ] {
+        let request = bare_request(continuation);
+        for (name, advice, approve, retried) in cases.clone() {
+            let policy = ApprovingPolicy::new(approve);
+            assert_eq!(
+                retries_first_failure(advice, policy.clone(), &request, false).await,
+                retried,
+                "{name}"
+            );
+            assert!(policy.seen.lock().unwrap()[0].stateful, "{name}");
+        }
+    }
+}
+
+/// A model whose summary requests fail and then answer, recording the streaming flag the runtime
+/// reports when it asks for retry advice.
+struct SummaryModel {
+    responses: Mutex<Vec<Result<ModelResponse>>>,
+    calls: AtomicUsize,
+    advice: RetryAdvice,
+    advice_streaming: Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl Model for SummaryModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.responses.lock().unwrap().remove(0)
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        stream::iter(vec![Err(Error::caller(
+            "only summary requests are expected",
+        ))])
+        .boxed()
+    }
+
+    fn get_retry_advice(
+        &self,
+        request: &ra_core::model::ModelRetryAdviceRequest<'_>,
+    ) -> Option<RetryAdvice> {
+        self.advice_streaming
+            .lock()
+            .unwrap()
+            .push(request.is_streaming());
+        Some(self.advice.clone())
+    }
+}
+
+fn summary_answer() -> ModelResponse {
+    ModelResponse::new(vec![RunItem::new(
+        ItemId::new("summary"),
+        RunItemKind::Message(Message::assistant(
+            r#"{"primary_request_and_intent":"intent","key_technical_concepts":"concepts","files_and_code_sections":"files","errors_and_fixes":"errors","problem_solving":"solving","pending_tasks":"tasks","current_work":"work","optional_next_step":"next"}"#,
+            OutputPhase::Final,
+        )),
+    )])
+}
+
+/// A thread's compaction summary is a non-streaming request: the adapter and the policy are told
+/// so, and the policy can approve replaying a summary failure the adapter marked unsafe, which an
+/// ordinary retry decision cannot.
+#[tokio::test]
+async fn a_summary_request_reports_non_streaming_and_accepts_unsafe_replay_approval() {
+    use ra_core::session::SessionId;
+    use ra_runtime::thread::{AgentThread, ThreadEvent};
+    for approve in [false, true] {
+        let model = Arc::new(SummaryModel {
+            responses: Mutex::new(vec![Err(network_error()), Ok(summary_answer())]),
+            calls: AtomicUsize::new(0),
+            advice: started_unsafe_advice(),
+            advice_streaming: Mutex::default(),
+        });
+        let policy = ApprovingPolicy::new(approve);
+        let thread = AgentThread::builder(
+            SessionId::new("summary-retry"),
+            AgentBinding::direct(
+                AgentSpec::builder()
+                    .id(AgentId::new("lead"))
+                    .name("Lead")
+                    .instructions("answer")
+                    .build()
+                    .unwrap(),
+            ),
+            Arc::new(Resolver {
+                model: model.clone(),
+            }),
+        )
+        .with_config(
+            RunConfig::new()
+                .with_capability(Arc::new(
+                    ra_context::compaction::CompactionCapability::default(),
+                ))
+                .with_compaction_retry(
+                    ModelRetrySettings::new()
+                        .with_max_retries(1)
+                        .with_policy(policy.clone()),
+                ),
+        )
+        .build();
+        thread.compact().unwrap();
+        let completed = loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), thread.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            match event {
+                ThreadEvent::TurnComplete { .. } => break true,
+                ThreadEvent::TurnAborted { .. } => break false,
+                _ => {}
+            }
+        };
+
+        assert_eq!(
+            *model.advice_streaming.lock().unwrap(),
+            [false],
+            "{approve}"
+        );
+        assert_eq!(
+            *policy.seen.lock().unwrap(),
+            [SeenContext {
+                streaming: false,
+                replay_safety: ReplaySafety::Unsafe,
+                response_started: true,
+                stateful: false,
+            }],
+            "{approve}"
+        );
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            if approve { 2 } else { 1 },
+            "{approve}"
+        );
+        let summarized = serde_json::to_string(&thread.history())
+            .unwrap()
+            .contains("intent");
+        assert_eq!(summarized, approve, "{approve} completed={completed}");
+    }
+}
+
+/// As the SDK's `test_get_response_with_retry_allows_custom_policy_to_override_provider_veto`: a
+/// policy may retry a failure the provider advised against, here with the delay the provider
+/// named. What it overrides is the provider's `suggested=false`, not replay protection: the same
+/// policy cannot replay a failure the adapter marked unsafe.
+#[tokio::test]
+async fn a_policy_may_override_a_provider_veto_but_not_replay_protection() {
+    let request = bare_request(ra_core::model::ConversationContinuation::None);
+    let veto = RetryAdvice::new()
+        .with_suggested(false)
+        .with_retry_after(std::time::Duration::from_millis(1_750))
+        .with_reason("server veto");
+    let settings = ModelRetrySettings::new()
+        .with_max_retries(1)
+        .with_policy(Arc::new(ra_core::model::RetryAfterPolicy));
+    let decide = |advice: RetryAdvice| {
+        let model: Arc<dyn Model> = RetryingModel::new(Vec::new(), Some(advice));
+        let settings = settings.clone();
+        let request = request.clone();
+        async move {
+            ra_runtime::runner::retry_test_api::decide_first_failure(
+                &model,
+                &request,
+                &network_error(),
+                &settings,
+                false,
+                &CancelScope::root(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    assert_eq!(
+        decide(veto.clone()).await,
+        Some(std::time::Duration::from_millis(1_750))
+    );
+    assert_eq!(
+        decide(veto.with_replay_safety(ReplaySafety::Unsafe)).await,
+        None
+    );
+}

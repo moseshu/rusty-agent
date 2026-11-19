@@ -186,6 +186,54 @@ pub mod prompt_cache_key_test_api {
     }
 }
 
+/// One failed call's retry decision, for porting the SDK's `get_response_with_retry` and
+/// `stream_response_with_retry` cases to the external test workspace.
+///
+/// The runtime has no producer of a provider-held continuation yet, so a stateful request reaches
+/// the replay vetoes only through this seam.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub mod retry_test_api {
+    use std::{sync::Arc, time::Duration};
+
+    use ra_core::{
+        cancel::CancelScope,
+        error::{Error, Result},
+        model::{Model, ModelRequest, ModelRetrySettings},
+    };
+
+    /// The delay before the retry the runtime would schedule after `error` on the first attempt,
+    /// or `None` when it would fail the call. The adapter's advice is asked as for a real failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `cancel` ends the policy's evaluation.
+    pub async fn decide_first_failure(
+        model: &Arc<dyn Model>,
+        request: &ModelRequest,
+        error: &Error,
+        settings: &ModelRetrySettings,
+        streaming: bool,
+        cancel: &CancelScope,
+    ) -> Result<Option<Duration>> {
+        let input = super::RetryEvaluation {
+            turn_scope: cancel,
+            model,
+            request,
+            error,
+            retry_settings: Some(settings),
+            attempt: 0,
+            max_retries: settings.max_retries().unwrap_or(0),
+            consumed: super::CallConsumption::default(),
+            streaming,
+        };
+        let advice = super::retry_advice(&input);
+        Ok(super::evaluate_retry(input, advice.as_ref())
+            .await?
+            .map(|(_, delay)| delay))
+    }
+}
+
 pub mod result;
 #[doc(hidden)]
 pub mod session_persistence;
@@ -6883,6 +6931,8 @@ impl<'a> RunnerContextSummarizer<'a> {
                 attempt,
                 max_retries,
                 consumed: CallConsumption::default(),
+                // A summary is requested through the non-streaming entry point.
+                streaming: false,
             };
             let advice = retry_advice(&input);
             let Some((_, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
@@ -7248,6 +7298,9 @@ struct RetryEvaluation<'a> {
     attempt: u32,
     max_retries: u32,
     consumed: CallConsumption,
+    /// Whether the failed call used the streaming entry point. A turn's sampling request always
+    /// streams; a summary request does not.
+    streaming: bool,
 }
 
 impl RetryEvaluation<'_> {
@@ -7258,18 +7311,6 @@ impl RetryEvaluation<'_> {
         self.attempt.saturating_add(1)
     }
 }
-
-// The streaming flag reported to adapters and policies about a failed call. A turn's sampling
-// request always streams, so this is a constant rather than a mode, and it stays in the two
-// provider-facing values because they describe the transport a policy is reasoning about.
-//
-// A summary request evaluated for retry uses the non-streaming entry point but reports this value
-// too, where the `OpenAI` Agents SDK reports `stream=False` for non-streaming retries. Adapters
-// therefore keep an unstamped failure `Unknown` instead of judging it as unstarted, and policies
-// see `is_streaming()` as true. Reporting `false` alone would not port the SDK's non-streaming
-// contract: there a policy may approve replaying a provider-unsafe failure, while here an `Unsafe`
-// verdict is final and replay approval covers only `Unknown`.
-const STREAMED: bool = true;
 
 /// The adapter's retry advice for a failed call that was not cancelled.
 ///
@@ -7282,7 +7323,7 @@ fn retry_advice(input: &RetryEvaluation<'_>) -> Option<RetryAdvice> {
     input.model.get_retry_advice(&ModelRetryAdviceRequest::new(
         input.error,
         input.budget_attempt(),
-        STREAMED,
+        input.streaming,
         input.request.continuation(),
     ))
 }
@@ -7382,6 +7423,7 @@ async fn call_model(
                         attempt,
                         max_retries,
                         consumed,
+                        streaming: true,
                     },
                     context,
                     narration.model_stream_sink,
@@ -7649,36 +7691,32 @@ async fn evaluate_retry(
         return Ok(None);
     }
 
-    // `Unsafe` means the adapter knows replay would duplicate accepted output or state. It is a
-    // hard boundary, not a provider preference a policy may overrule.
-    if matches!(
-        advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety),
-        ReplaySafety::Unsafe
-    ) {
+    // `Unsafe` means the adapter knows replay would duplicate accepted output or state. For a
+    // streamed call it is final before the policy runs, as in the SDK; a non-streaming call asks
+    // the policy, which may approve the replay explicitly below.
+    let safety = advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
+    if input.streaming && matches!(safety, ReplaySafety::Unsafe) {
         return Ok(None);
     }
     let decision = input
         .turn_scope
-        .run(policy.evaluate(&RetryPolicyContext::new(
-            input.error,
-            input.budget_attempt(),
-            input.max_retries,
-            STREAMED,
-            advice,
-        )))
+        .run(
+            policy.evaluate(
+                &RetryPolicyContext::new(
+                    input.error,
+                    input.budget_attempt(),
+                    input.max_retries,
+                    input.streaming,
+                    advice,
+                )
+                .with_continuation(input.request.continuation()),
+            ),
+        )
         .await?;
     if !decision.should_retry() {
         return Ok(None);
     }
-
-    // Nothing left this runtime — the check above established that — so the remaining question is
-    // whether the *provider* is holding state this request would be replayed against. A stateless
-    // continuation is holding none, which makes the replay free regardless of what the adapter was
-    // able to determine about the failure itself.
-    let safety = advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
-    let nothing_to_duplicate = !input.request.continuation().is_server_managed();
-    if !matches!(safety, ReplaySafety::Safe) && !nothing_to_duplicate && !decision.replay_approved()
-    {
+    if !replay_permitted(safety, input.request.continuation(), &decision) {
         return Ok(None);
     }
 
@@ -7693,6 +7731,29 @@ async fn evaluate_retry(
         )
     });
     Ok(Some((decision, delay)))
+}
+
+/// The SDK's replay vetoes after a policy chose to retry; nothing left this runtime, as the checks
+/// before the policy established.
+///
+/// A request continuing provider-held state fails closed: it is replayed when the adapter called
+/// the failure safe, or when the policy approved a replay the adapter marked unsafe, never when
+/// replay safety is unknown. A failure the adapter marked unsafe is replayed only with that
+/// approval, which is distinct from an ordinary retry. A stateless request whose safety is unknown
+/// is replayed freely, since the provider holds nothing it could duplicate.
+fn replay_permitted(
+    safety: ReplaySafety,
+    continuation: &ra_core::model::ConversationContinuation,
+    decision: &RetryDecision,
+) -> bool {
+    let unsafe_replay_approved =
+        matches!(safety, ReplaySafety::Unsafe) && decision.approves_unsafe_replay();
+    if continuation.is_server_managed()
+        && !(matches!(safety, ReplaySafety::Safe) || unsafe_replay_approved)
+    {
+        return false;
+    }
+    !matches!(safety, ReplaySafety::Unsafe) || unsafe_replay_approved
 }
 
 /// Adds one zero-cost ledger entry for each request that failed before reporting usage.

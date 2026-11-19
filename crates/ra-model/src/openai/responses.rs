@@ -795,8 +795,13 @@ impl Model for OpenAiResponsesModel {
                             unstarted,
                         )
                         .map(|event| {
+                            // The first response event already arrived, as the SDK marks a
+                            // WebSocket failure after any received event.
                             event.map_err(|error| {
-                                stamp_replay_safety(error, ra_core::model::ReplaySafety::Unsafe)
+                                ra_core::model::stamp_response_started(stamp_replay_safety(
+                                    error,
+                                    ra_core::model::ReplaySafety::Unsafe,
+                                ))
                             })
                         })
                         .boxed();
@@ -841,7 +846,7 @@ impl Model for OpenAiResponsesModel {
     }
 
     fn get_retry_advice(&self, request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
-        crate::retry::retry_advice(request)
+        super::retry::retry_advice(request)
     }
 }
 
