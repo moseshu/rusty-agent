@@ -282,7 +282,7 @@ async fn test_model_contract_04() {
 
     let error = Error::provider(ProviderErrorKind::Network, "disconnected");
     let continuation = ConversationContinuation::None;
-    let advice_request = ModelRetryAdviceRequest::new(&error, 0, true, &continuation);
+    let advice_request = ModelRetryAdviceRequest::new(&error, 1, true, &continuation);
     let advice = resolved
         .get_retry_advice(&advice_request)
         .expect("fake model 应给建议");

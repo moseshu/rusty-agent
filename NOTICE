@@ -1129,7 +1129,9 @@ existing upstream attribution and licensing.
 | `tests/it-protocol/tests/threads/product_hooks/manual_compaction.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/tests/suite/compact.rs; codex-rs/app-server/tests/suite/v2/compaction.rs (manual compaction hooks and protocol) |
 | `tests/it-protocol/tests/threads/product_hooks/stdin_permission.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/unified_exec/stdin_approval.rs; codex-rs/core/src/tools/approvals.rs (WriteStdin permission request payload) |
 
-The retry safety boundary in crates/ra-runtime/src/runner.rs and cases in
+The retry safety boundary, one-based attempt numbering and retry-advice timing in
+crates/ra-runtime/src/runner.rs, the backoff attempt numbering in
+crates/ra-core/src/model/retry/backoff.rs, and cases in
 tests/it-runtime/tests/model_retry.rs adapt openai/openai-agents-python,
 revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/run_internal/model_retry.py and tests/models/test_model_retry.py (MIT).

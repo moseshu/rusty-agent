@@ -684,10 +684,12 @@ async fn budget_exempt_retries_respect_the_replay_boundary() {
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
 }
 
-/// An adapter that permits the initial attempt but vetoes replay after a budgeted retry.
+/// An adapter that records every advice request and, when `veto_after_first` is set, permits
+/// replaying the first failure only.
 struct AttemptAwareModel {
     inner: Arc<RetryingModel>,
     advice_attempts: Mutex<Vec<u32>>,
+    veto_after_first: bool,
 }
 
 #[async_trait]
@@ -705,13 +707,13 @@ impl Model for AttemptAwareModel {
         request: &ra_core::model::ModelRetryAdviceRequest<'_>,
     ) -> Option<RetryAdvice> {
         self.advice_attempts.lock().unwrap().push(request.attempt());
-        Some(
-            RetryAdvice::new().with_replay_safety(if request.attempt() == 0 {
+        self.veto_after_first.then(|| {
+            RetryAdvice::new().with_replay_safety(if request.attempt() == 1 {
                 ReplaySafety::Safe
             } else {
                 ReplaySafety::Unsafe
-            }),
-        )
+            })
+        })
     }
 }
 
@@ -725,6 +727,7 @@ async fn budget_exempt_retries_preserve_adapter_attempts_after_a_budgeted_retry(
         let model = Arc::new(AttemptAwareModel {
             inner: inner.clone(),
             advice_attempts: Mutex::default(),
+            veto_after_first: true,
         });
         let recovery = Arc::new(ConnectionRecovery::default());
         let cancel = CancelScope::root();
@@ -734,15 +737,154 @@ async fn budget_exempt_retries_preserve_adapter_attempts_after_a_budgeted_retry(
         );
 
         // The connection failure is the first exempt candidate, but the adapter must still see
-        // the budgeted retry already taken, even when that retry exhausted the budget.
+        // the budgeted retry already taken, even when that retry exhausted the budget. It is
+        // asked once per failure, and the exempt and budgeted decisions share that answer.
         assert!(Runner::run(request).await.is_err());
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
         assert_eq!(*recovery.previous.lock().unwrap(), [0, 0]);
-        let expected = if budget == 1 {
-            vec![0, 1]
-        } else {
-            vec![0, 1, 1]
-        };
-        assert_eq!(*model.advice_attempts.lock().unwrap(), expected);
+        assert_eq!(*model.advice_attempts.lock().unwrap(), [1, 2]);
+    }
+}
+
+/// A policy that records what it is asked and always retries at once.
+#[derive(Default)]
+struct RecordingPolicy {
+    seen: Mutex<Vec<(u32, u32)>>,
+}
+
+#[async_trait]
+impl ra_core::model::ModelRetryPolicy for RecordingPolicy {
+    async fn evaluate(
+        &self,
+        context: &ra_core::model::RetryPolicyContext<'_>,
+    ) -> ra_core::model::RetryDecision {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((context.attempt(), context.max_retries()));
+        ra_core::model::RetryDecision::retry().with_delay(std::time::Duration::ZERO)
+    }
+}
+
+/// Attempt numbers and advice timing follow the OpenAI Agents SDK runner: numbers start at one,
+/// the adapter is asked about every failure that was not cancelled, also once the budget is spent
+/// or when no policy can retry, and the policy only while the budget lasts. Asking the adapter
+/// never adds a retry.
+#[tokio::test]
+async fn attempt_numbers_and_advice_follow_the_sdk_runner() {
+    struct Case {
+        name: &'static str,
+        error: fn() -> Error,
+        max_retries: Option<u32>,
+        with_policy: bool,
+        calls: usize,
+        succeeds: bool,
+        advice: &'static [u32],
+        policy: &'static [(u32, u32)],
+    }
+    let cases = [
+        Case {
+            name: "budget of two",
+            error: network_error,
+            max_retries: Some(2),
+            with_policy: true,
+            calls: 3,
+            succeeds: false,
+            advice: &[1, 2, 3],
+            policy: &[(1, 2), (2, 2)],
+        },
+        Case {
+            name: "budget of three",
+            error: network_error,
+            max_retries: Some(3),
+            with_policy: true,
+            calls: 4,
+            succeeds: true,
+            advice: &[1, 2, 3],
+            policy: &[(1, 3), (2, 3), (3, 3)],
+        },
+        Case {
+            name: "zero budget",
+            error: network_error,
+            max_retries: Some(0),
+            with_policy: true,
+            calls: 1,
+            succeeds: false,
+            advice: &[1],
+            policy: &[],
+        },
+        Case {
+            name: "no retry settings",
+            error: network_error,
+            max_retries: None,
+            with_policy: false,
+            calls: 1,
+            succeeds: false,
+            advice: &[1],
+            policy: &[],
+        },
+        Case {
+            name: "budget without a policy",
+            error: network_error,
+            max_retries: Some(2),
+            with_policy: false,
+            calls: 1,
+            succeeds: false,
+            advice: &[1],
+            policy: &[],
+        },
+        Case {
+            name: "cancellation",
+            error: || Error::cancelled("stop"),
+            max_retries: Some(2),
+            with_policy: true,
+            calls: 1,
+            succeeds: false,
+            advice: &[],
+            policy: &[],
+        },
+    ];
+    for case in cases {
+        let inner = RetryingModel::new(
+            vec![
+                Err((case.error)()),
+                Err((case.error)()),
+                Err((case.error)()),
+                Ok(answer()),
+            ],
+            None,
+        );
+        let model = Arc::new(AttemptAwareModel {
+            inner: inner.clone(),
+            advice_attempts: Mutex::default(),
+            veto_after_first: false,
+        });
+        let policy = Arc::new(RecordingPolicy::default());
+        let mut settings = ModelSettings::new();
+        if let Some(max_retries) = case.max_retries {
+            let mut retry = ModelRetrySettings::new().with_max_retries(max_retries);
+            if case.with_policy {
+                retry = retry.with_policy(policy.clone());
+            }
+            settings = settings.with_retry(retry);
+        }
+        let request = request(model.clone(), &CancelScope::root(), false, 0)
+            .with_config(RunConfig::new().with_model_settings(settings));
+
+        let result = Runner::run(request).await;
+        assert_eq!(result.is_ok(), case.succeeds, "{}", case.name);
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            case.calls,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            *model.advice_attempts.lock().unwrap(),
+            case.advice,
+            "{}",
+            case.name
+        );
+        assert_eq!(*policy.seen.lock().unwrap(), case.policy, "{}", case.name);
     }
 }

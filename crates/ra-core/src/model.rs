@@ -97,6 +97,11 @@ pub trait Model: Send + Sync + 'static {
     }
 
     /// Returns provider-specific evidence for the runtime retry policy.
+    ///
+    /// The runtime asks once for every non-cancelled failure of a model call that enters its retry
+    /// evaluation, as the `OpenAI` Agents SDK runner does. It asks even when the retry budget is
+    /// zero or spent, or no retry policy is configured, so a call says nothing about whether a
+    /// retry will follow.
     fn get_retry_advice(&self, _request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice> {
         None
     }

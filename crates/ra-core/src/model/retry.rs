@@ -171,7 +171,9 @@ impl<'a> ModelRetryAdviceRequest<'a> {
         self.error
     }
 
-    /// Zero-based attempt number.
+    /// The failed attempt's number within the retry budget, as in the `OpenAI` Agents SDK: `1` is
+    /// the first failure. A retry that does not consume the budget does not advance it, so this
+    /// is not a count of requests sent.
     #[must_use]
     pub const fn attempt(&self) -> u32 {
         self.attempt

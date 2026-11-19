@@ -143,7 +143,7 @@ fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
             }
         }
     }
-    Some(server_delay.unwrap_or_else(|| backoff(u64::from(context.attempt()) + 1)))
+    Some(server_delay.unwrap_or_else(|| backoff(u64::from(context.attempt()))))
 }
 
 /// Codex's retry backoff: 200 ms, doubling on each later retry, with up to ten percent jitter.
@@ -174,6 +174,7 @@ pub(super) const fn report_retry(retry: u32, debug: bool, websocket: bool) -> bo
 #[doc(hidden)]
 pub mod test_api {
     /// The product delay for one failed attempt, before the runtime enforces replay safety.
+    /// `attempt` is the one-based budget number a retry policy receives.
     #[must_use]
     pub fn delay(error: &ra_core::error::Error, attempt: u32) -> Option<std::time::Duration> {
         super::retry_delay(&ra_core::model::RetryPolicyContext::new(

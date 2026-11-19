@@ -145,13 +145,14 @@ fn stamping_leaves_errors_from_other_subsystems_alone() {
     assert!(NormalizedProviderError::from_error(&caller).is_none());
 }
 
-/// Attempt zero is the wait between the original request and the first retry, and the ceiling is a
-/// ceiling: an exponent that would overflow it produces the ceiling, not an unbounded sleep.
+/// Attempt one is the wait between the original request and the first retry, as in the OpenAI
+/// Agents SDK, which also reads attempt zero as one. The ceiling is a ceiling: an exponent that
+/// would overflow it produces the ceiling, not an unbounded sleep.
 #[test]
 fn the_schedule_grows_by_the_multiplier_until_it_reaches_the_ceiling() {
     let backoff = RetryBackoff::new();
 
-    let schedule: Vec<Duration> = (0..6).map(|attempt| backoff.base_delay(attempt)).collect();
+    let schedule: Vec<Duration> = (1..=6).map(|attempt| backoff.base_delay(attempt)).collect();
     assert_eq!(
         schedule,
         vec![
@@ -163,6 +164,7 @@ fn the_schedule_grows_by_the_multiplier_until_it_reaches_the_ceiling() {
             Duration::from_secs(8),
         ]
     );
+    assert_eq!(backoff.base_delay(0), backoff.base_delay(1));
     assert_eq!(backoff.base_delay(u32::MAX), Duration::from_secs(8));
 }
 
@@ -195,22 +197,22 @@ fn jitter_only_ever_shortens_the_delay_and_by_at_most_a_quarter() {
     let backoff = RetryBackoff::new();
 
     assert_eq!(
-        backoff.delay(1, None, JitterSample::ZERO),
+        backoff.delay(2, None, JitterSample::ZERO),
         Duration::from_secs(1)
     );
     assert_eq!(
-        backoff.delay(1, None, JitterSample::new(1.0)),
+        backoff.delay(2, None, JitterSample::new(1.0)),
         Duration::from_millis(750)
     );
     assert_eq!(
-        backoff.delay(1, None, JitterSample::new(f64::NAN)),
+        backoff.delay(2, None, JitterSample::new(f64::NAN)),
         Duration::from_secs(1),
         "a misbehaving generator costs a slightly wrong delay, never a failed run"
     );
 
     let steady = RetryBackoff::from_settings(Some(&RetryBackoffSettings::new().with_jitter(false)));
     assert_eq!(
-        steady.delay(2, None, JitterSample::new(1.0)),
+        steady.delay(3, None, JitterSample::new(1.0)),
         Duration::from_secs(2)
     );
 }
@@ -222,21 +224,21 @@ fn an_endpoint_delay_wins_unless_it_is_unusable() {
     let backoff = RetryBackoff::new();
 
     assert_eq!(
-        backoff.delay(0, Some(Duration::from_secs(30)), JitterSample::new(1.0)),
+        backoff.delay(1, Some(Duration::from_secs(30)), JitterSample::new(1.0)),
         Duration::from_secs(30),
         "an honored delay is not jittered"
     );
     assert_eq!(
-        backoff.delay(1, Some(Duration::from_secs(3600)), JitterSample::ZERO),
+        backoff.delay(2, Some(Duration::from_secs(3600)), JitterSample::ZERO),
         Duration::from_secs(1),
         "an absurd delay falls back to the bounded schedule"
     );
     assert_eq!(
-        backoff.delay(1, Some(Duration::ZERO), JitterSample::ZERO),
+        backoff.delay(2, Some(Duration::ZERO), JitterSample::ZERO),
         Duration::from_secs(1)
     );
     assert_eq!(
-        backoff.delay(1, None, JitterSample::ZERO),
+        backoff.delay(2, None, JitterSample::ZERO),
         Duration::from_secs(1)
     );
 }

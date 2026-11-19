@@ -214,8 +214,8 @@ async fn a_delay_expressed_as_a_date_is_honored() {
         "a date decades out is a long wait, not a missing one: {requested:?}"
     );
     assert_eq!(
-        RetryBackoff::new().delay(0, Some(requested), JitterSample::ZERO),
-        RetryBackoff::new().base_delay(0),
+        RetryBackoff::new().delay(1, Some(requested), JitterSample::ZERO),
+        RetryBackoff::new().base_delay(1),
         "the delay is recorded as the endpoint stated it, and the honored window is what keeps an \
          absurd one from parking the run"
     );

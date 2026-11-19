@@ -24,6 +24,26 @@ still stop a retry before the policy is consulted.
 `NeverRetryPolicy` and `NetworkErrorRetryPolicy` behave as before. `RunConfig::with_model_retry_recovery`
 is new and optional; runs without it are unaffected.
 
+### Retry attempt numbers start at one, and adapters are asked before the retry budget is checked
+
+Retry attempts are now numbered as the OpenAI Agents SDK numbers them. `ModelRetryAdviceRequest::attempt`
+and `RetryPolicyContext::attempt` report the failed attempt's number within the retry budget, and the
+first failure is `1` instead of `0`. A retry that does not consume the budget does not advance it, so
+the number is not a count of requests sent. For a model call that enters the runner's retry
+evaluation, the runner now asks `Model::get_retry_advice` once for every failure that was not
+cancelled, even when the budget is zero or spent, or no retry policy is configured; it used to ask
+only when the policy was about to be consulted. A policy is still asked only while the budget lasts,
+so these changes add no retries.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| Attempt numbers seen by adapters and policies are one higher | Custom `ModelRetryPolicy` or `Model::get_retry_advice` implementations that compare `attempt()` | Add one to the compared value, or read `attempt() - 1` as the old number |
+| Adapters are asked about every non-cancelled failure that enters retry evaluation | Adapters that count or meter advice requests | Count failures, not expected retries |
+| `RetryBackoff::base_delay(n)` and `delay(n, ..)` take the one-based number: `1` is the wait before the first retry, and `0` is read as `1` | Hosts that call `RetryBackoff` directly | Add one to the number passed in |
+
+The runner's own zero-based attempt index is unchanged where it was already visible: in persisted
+retry-recovery message IDs and the generation span's `retry.attempt`.
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

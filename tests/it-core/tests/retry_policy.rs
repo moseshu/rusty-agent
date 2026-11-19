@@ -40,7 +40,7 @@ async fn built_in_policies_read_normalized_facts_and_preserve_provider_replay_ap
         NormalizedProviderError::new(ProviderErrorKind::Network, "connection reset").into_error();
     let network = NetworkErrorRetryPolicy;
     let decision = network
-        .evaluate(&RetryPolicyContext::new(&error, 0, 2, false, None))
+        .evaluate(&RetryPolicyContext::new(&error, 1, 2, false, None))
         .await;
     assert!(decision.should_retry());
 
@@ -51,7 +51,7 @@ async fn built_in_policies_read_normalized_facts_and_preserve_provider_replay_ap
         .with_reason("endpoint_should_retry_header");
     let provider = ProviderSuggestedRetryPolicy;
     let decision = provider
-        .evaluate(&RetryPolicyContext::new(&error, 0, 2, false, Some(&advice)))
+        .evaluate(&RetryPolicyContext::new(&error, 1, 2, false, Some(&advice)))
         .await;
     assert!(decision.should_retry());
     assert_eq!(decision.delay(), Some(Duration::from_millis(25)));

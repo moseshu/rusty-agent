@@ -154,11 +154,12 @@ impl RetryBackoff {
 
     /// The scheduled delay before the retry that follows `attempt`, with no jitter applied.
     ///
-    /// `attempt` is zero-based and counts the attempts already made, so `0` is the wait between the
-    /// original request and the first retry.
+    /// `attempt` is the failed attempt's budget number, as for
+    /// [`RetryPolicyContext::attempt`](super::RetryPolicyContext::attempt): `1` is the wait between
+    /// the original request and the first retry. As in the `OpenAI` Agents SDK, `0` is read as `1`.
     #[must_use]
     pub fn base_delay(&self, attempt: u32) -> Duration {
-        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
         let seconds = self.initial_delay.as_secs_f64() * self.multiplier.powi(exponent);
         if !seconds.is_finite() {
             return self.max_delay;

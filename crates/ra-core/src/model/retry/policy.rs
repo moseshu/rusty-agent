@@ -51,7 +51,10 @@ impl<'a> RetryPolicyContext<'a> {
         self.error
     }
 
-    /// Zero-based number of the failed attempt.
+    /// The failed attempt's number within the retry budget, as in the `OpenAI` Agents SDK: `1` is
+    /// the first failure, and a retry is allowed while it does not exceed [`Self::max_retries`]. A
+    /// retry that does not consume the budget does not advance it, so this is not a count of
+    /// requests sent.
     #[must_use]
     pub const fn attempt(&self) -> u32 {
         self.attempt

@@ -434,7 +434,7 @@ async fn stream_failures_reach_the_product_retry_policy_and_filter_guidance_is_p
 fn product_retry_backoff_matches_codex_and_zero_server_delay_is_not_replaced() {
     use ra_coding::config::responses_retry_test_api::delay;
     use ra_core::{error::ProviderErrorKind, model::NormalizedProviderError};
-    for (attempt, low, high) in [(0, 180, 220), (2, 720, 880)] {
+    for (attempt, low, high) in [(1, 180, 220), (3, 720, 880)] {
         for _ in 0..64 {
             let error =
                 NormalizedProviderError::new(ProviderErrorKind::Network, "connection reset")
@@ -451,7 +451,7 @@ fn product_retry_backoff_matches_codex_and_zero_server_delay_is_not_replaced() {
         .with_status_code(429)
         .with_retry_after(std::time::Duration::ZERO)
         .into_error();
-    assert_eq!(delay(&error, 2), Some(std::time::Duration::ZERO));
+    assert_eq!(delay(&error, 3), Some(std::time::Duration::ZERO));
 }
 
 #[test]

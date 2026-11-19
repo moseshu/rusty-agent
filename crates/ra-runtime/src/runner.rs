@@ -6874,7 +6874,7 @@ impl<'a> RunnerContextSummarizer<'a> {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
             };
-            let Some((_, delay)) = evaluate_retry(RetryEvaluation {
+            let input = RetryEvaluation {
                 turn_scope: self.cancel,
                 model: self.model,
                 request: &request,
@@ -6883,9 +6883,9 @@ impl<'a> RunnerContextSummarizer<'a> {
                 attempt,
                 max_retries,
                 consumed: CallConsumption::default(),
-            })
-            .await?
-            else {
+            };
+            let advice = retry_advice(&input);
+            let Some((_, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
                 return Err(error);
             };
             if let Some(sink) = self.retry_sink {
@@ -7250,6 +7250,43 @@ struct RetryEvaluation<'a> {
     consumed: CallConsumption,
 }
 
+impl RetryEvaluation<'_> {
+    /// The failed attempt's number within the retry budget as adapters, policies and backoff see
+    /// it: one-based, as in the `OpenAI` Agents SDK. `attempt` stays zero-based inside the runner,
+    /// where it also names persisted recovery messages and the generation span's `retry.attempt`.
+    const fn budget_attempt(&self) -> u32 {
+        self.attempt.saturating_add(1)
+    }
+}
+
+// The streaming flag reported to adapters and policies about a failed call. A turn's sampling
+// request always streams, so this is a constant rather than a mode, and it stays in the two
+// provider-facing values because they describe the transport a policy is reasoning about.
+//
+// A summary request evaluated for retry uses the non-streaming entry point but reports this value
+// too, where the `OpenAI` Agents SDK reports `stream=False` for non-streaming retries. Adapters
+// therefore keep an unstamped failure `Unknown` instead of judging it as unstarted, and policies
+// see `is_streaming()` as true. Reporting `false` alone would not port the SDK's non-streaming
+// contract: there a policy may approve replaying a provider-unsafe failure, while here an `Unsafe`
+// verdict is final and replay approval covers only `Unknown`.
+const STREAMED: bool = true;
+
+/// The adapter's retry advice for a failed call that was not cancelled.
+///
+/// Asked once for every such failure before any retry limit applies, as the `OpenAI` Agents SDK
+/// runner asks whether or not a retry can follow, and shared by every retry decision for it.
+fn retry_advice(input: &RetryEvaluation<'_>) -> Option<RetryAdvice> {
+    if input.error.is_cancelled() {
+        return None;
+    }
+    input.model.get_retry_advice(&ModelRetryAdviceRequest::new(
+        input.error,
+        input.budget_attempt(),
+        STREAMED,
+        input.request.continuation(),
+    ))
+}
+
 /// Executes one prepared model call and records its provider-neutral terminal facts.
 ///
 /// Every call streams, because a completed function call in the stream is what lets a tool overlap
@@ -7375,13 +7412,14 @@ async fn next_retry(
     sink: Option<&dyn stream::ModelStreamSink>,
     exempt_retries: u32,
 ) -> Result<Option<(bool, RetryTrace)>> {
-    let (turn_scope, error, attempt, max_retries) = (
+    let (turn_scope, error, retry_number, max_retries) = (
         input.turn_scope,
         input.error,
-        input.attempt,
+        input.budget_attempt(),
         input.max_retries,
     );
-    if let Some(retry) = budget_exempt_retry(context, &input, exempt_retries) {
+    let advice = retry_advice(&input);
+    if let Some(retry) = budget_exempt_retry(context, &input, advice.as_ref(), exempt_retries) {
         warn!(
             error.code = error.code(),
             retry.exempt = exempt_retries + 1,
@@ -7398,12 +7436,12 @@ async fn next_retry(
         };
         return Ok(Some((true, trace)));
     }
-    let Some((decision, delay)) = evaluate_retry(input).await? else {
+    let Some((decision, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
         return Ok(None);
     };
     warn!(
         error.code = error.code(),
-        retry.attempt = attempt + 1,
+        retry.attempt = retry_number,
         retry.max = max_retries,
         retry.delay_ms = duration_ms(delay),
         retry.reason = decision.reason().unwrap_or(""),
@@ -7414,9 +7452,9 @@ async fn next_retry(
             .config
             .model_retry_recovery
             .as_ref()
-            .is_none_or(|recovery| recovery.report_retry(attempt.saturating_add(1)))
+            .is_none_or(|recovery| recovery.report_retry(retry_number))
     {
-        sink.retrying(attempt.saturating_add(1), max_retries, error);
+        sink.retrying(retry_number, max_retries, error);
     }
     turn_scope.run(tokio::time::sleep(delay)).await?;
     let trace = RetryTrace {
@@ -7430,6 +7468,7 @@ async fn next_retry(
 fn budget_exempt_retry(
     context: &TurnLoopContext<'_>,
     input: &RetryEvaluation<'_>,
+    advice: Option<&RetryAdvice>,
     previous: u32,
 ) -> Option<BudgetExemptRetry> {
     if input.error.is_cancelled() || input.consumed.any() {
@@ -7442,18 +7481,7 @@ fn budget_exempt_retry(
         .budget_exempt_retry(input.error, previous)?;
     // The same replay boundary as a budgeted retry: an adapter's `Unsafe` is final, and a request
     // continuing provider-held state is replayed only when the adapter calls it safe.
-    let safety = input
-        .model
-        .get_retry_advice(&ModelRetryAdviceRequest::new(
-            input.error,
-            input.attempt,
-            true,
-            input.request.continuation(),
-        ))
-        .map_or_else(
-            || replay_safety_of(input.error),
-            |advice| advice.replay_safety(),
-        );
+    let safety = advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
     match safety {
         ReplaySafety::Safe => Some(retry),
         ReplaySafety::Unsafe => None,
@@ -7596,13 +7624,12 @@ async fn call_model_attempt(
 }
 
 /// Applies the runner-owned retry limits and replay boundary to a policy decision.
+///
+/// `advice` is [`retry_advice`] for this failure, asked before these limits apply.
 async fn evaluate_retry(
     input: RetryEvaluation<'_>,
+    advice: Option<&RetryAdvice>,
 ) -> Result<Option<(RetryDecision, std::time::Duration)>> {
-    // Every model call streams, so this is a constant rather than a mode. It stays in the two
-    // provider-facing values because they describe the transport a policy is reasoning about.
-    const STREAMED: bool = true;
-
     if input.attempt >= input.max_retries || input.error.is_cancelled() {
         return Ok(None);
     }
@@ -7613,28 +7640,19 @@ async fn evaluate_retry(
         return Ok(None);
     };
 
-    // Asked before the adapter is, because this is not the adapter's question. The runtime is the
-    // only party that knows a raw frame reached a subscriber or that a tool already ran on the
-    // strength of this call, and no provider advice can make repeating either of those safe. An
-    // adapter reporting `Safe` for a mid-stream drop is answering truthfully about the *request*
-    // while knowing nothing about the file a tool has already written.
+    // Decided whatever the adapter said, because this is not the adapter's question. The runtime
+    // is the only party that knows a raw frame reached a subscriber or that a tool already ran on
+    // the strength of this call, and no provider advice can make repeating either of those safe.
+    // An adapter reporting `Safe` for a mid-stream drop is answering truthfully about the
+    // *request* while knowing nothing about the file a tool has already written.
     if input.consumed.any() {
         return Ok(None);
     }
 
-    let advice = input.model.get_retry_advice(&ModelRetryAdviceRequest::new(
-        input.error,
-        input.attempt,
-        STREAMED,
-        input.request.continuation(),
-    ));
-
     // `Unsafe` means the adapter knows replay would duplicate accepted output or state. It is a
     // hard boundary, not a provider preference a policy may overrule.
     if matches!(
-        advice
-            .as_ref()
-            .map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety),
+        advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety),
         ReplaySafety::Unsafe
     ) {
         return Ok(None);
@@ -7643,10 +7661,10 @@ async fn evaluate_retry(
         .turn_scope
         .run(policy.evaluate(&RetryPolicyContext::new(
             input.error,
-            input.attempt,
+            input.budget_attempt(),
             input.max_retries,
             STREAMED,
-            advice.as_ref(),
+            advice,
         )))
         .await?;
     if !decision.should_retry() {
@@ -7657,9 +7675,7 @@ async fn evaluate_retry(
     // whether the *provider* is holding state this request would be replayed against. A stateless
     // continuation is holding none, which makes the replay free regardless of what the adapter was
     // able to determine about the failure itself.
-    let safety = advice
-        .as_ref()
-        .map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
+    let safety = advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
     let nothing_to_duplicate = !input.request.continuation().is_server_managed();
     if !matches!(safety, ReplaySafety::Safe) && !nothing_to_duplicate && !decision.replay_approved()
     {
@@ -7668,14 +7684,11 @@ async fn evaluate_retry(
 
     let delay = decision.delay().unwrap_or_else(|| {
         RetryBackoff::from_settings(settings.backoff()).delay(
-            input.attempt,
-            advice
-                .as_ref()
-                .and_then(RetryAdvice::retry_after)
-                .or_else(|| {
-                    ra_core::model::NormalizedProviderError::from_error(input.error)
-                        .and_then(ra_core::model::NormalizedProviderError::retry_after)
-                }),
+            input.budget_attempt(),
+            advice.and_then(RetryAdvice::retry_after).or_else(|| {
+                ra_core::model::NormalizedProviderError::from_error(input.error)
+                    .and_then(ra_core::model::NormalizedProviderError::retry_after)
+            }),
             ra_core::model::JitterSample::new(rand::random()),
         )
     });
