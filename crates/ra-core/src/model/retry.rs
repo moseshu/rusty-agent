@@ -34,6 +34,7 @@ pub use backoff::{
 };
 pub use normalized::stamp_response_started;
 pub use normalized::{NormalizedProviderError, replay_safety_of, stamp_replay_safety};
+pub use policy::{AllRetryPolicy, AnyRetryPolicy, HttpStatusRetryPolicy};
 pub use policy::{
     ModelRetryPolicy, NetworkErrorRetryPolicy, NeverRetryPolicy, ProviderSuggestedRetryPolicy,
     RetryAfterPolicy, RetryDecision, RetryPolicyContext,

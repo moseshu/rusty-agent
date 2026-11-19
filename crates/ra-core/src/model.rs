@@ -31,6 +31,7 @@ pub use request::{
 };
 pub use resolution::{ModelSelector, ResolvedModel};
 pub use retry::stamp_response_started;
+pub use retry::{AllRetryPolicy, AnyRetryPolicy, HttpStatusRetryPolicy};
 pub use retry::{
     JitterSample, ModelRetryAdviceRequest, ModelRetryPolicy, ModelRetrySettings,
     NetworkErrorRetryPolicy, NeverRetryPolicy, NormalizedProviderError,

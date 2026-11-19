@@ -1252,3 +1252,111 @@ async fn a_policy_may_override_a_provider_veto_but_not_replay_protection() {
         None
     );
 }
+
+/// Whether the runtime would retry a non-streaming first failure under `policy`, with the adapter
+/// answering `advice`.
+async fn retries_with_policy(
+    advice: RetryAdvice,
+    policy: Arc<dyn ra_core::model::ModelRetryPolicy>,
+    continuation: ra_core::model::ConversationContinuation,
+) -> bool {
+    let model: Arc<dyn Model> = RetryingModel::new(Vec::new(), Some(advice));
+    let settings = ModelRetrySettings::new()
+        .with_max_retries(1)
+        .with_policy(policy);
+    ra_runtime::runner::retry_test_api::decide_first_failure(
+        &model,
+        &bare_request(continuation),
+        &network_error(),
+        &settings,
+        false,
+        &CancelScope::root(),
+    )
+    .await
+    .unwrap()
+    .is_some()
+}
+
+/// The SDK's combinator cases through the runtime's replay vetoes:
+/// - an unsafe-replay approval resolves a provider veto over an unsafe replay under `all` and
+///   `any`, in either order (`test_unsafe_replay_approval_resolves_provider_veto_in_policy_combinators`);
+/// - a provider hard veto stops `any(provider_suggested, network_error)`
+///   (`test_get_response_with_retry_honors_provider_hard_veto`);
+/// - a combined ordinary retry replays neither a stateful request the provider vetoed as unsafe
+///   nor one whose safety it left unknown (`test_composed_policy_cannot_mutate_provider_authority`,
+///   whose mutation half the borrowed context rules out in Rust).
+#[tokio::test]
+async fn combined_policies_follow_the_sdk_through_the_replay_vetoes() {
+    use ra_core::model::{
+        AllRetryPolicy, AnyRetryPolicy, ConversationContinuation, ModelRetryPolicy,
+        NetworkErrorRetryPolicy, ProviderSuggestedRetryPolicy,
+    };
+
+    let combine = |any: bool, list: Vec<Arc<dyn ModelRetryPolicy>>| -> Arc<dyn ModelRetryPolicy> {
+        if any {
+            Arc::new(AnyRetryPolicy::new(list))
+        } else {
+            Arc::new(AllRetryPolicy::new(list))
+        }
+    };
+    for any in [false, true] {
+        for provider_first in [false, true] {
+            let approving: Arc<dyn ModelRetryPolicy> = ApprovingPolicy::new(true);
+            let provider: Arc<dyn ModelRetryPolicy> = Arc::new(ProviderSuggestedRetryPolicy);
+            let list = if provider_first {
+                vec![provider, approving]
+            } else {
+                vec![approving, provider]
+            };
+            assert!(
+                retries_with_policy(
+                    started_unsafe_advice(),
+                    combine(any, list),
+                    ConversationContinuation::None
+                )
+                .await,
+                "any {any}, provider first {provider_first}"
+            );
+        }
+
+        let vetoed = RetryAdvice::new()
+            .with_suggested(false)
+            .with_reason("server veto");
+        assert!(
+            !retries_with_policy(
+                vetoed,
+                combine(
+                    any,
+                    vec![
+                        Arc::new(ProviderSuggestedRetryPolicy),
+                        Arc::new(NetworkErrorRetryPolicy)
+                    ]
+                ),
+                ConversationContinuation::None
+            )
+            .await,
+            "any {any}"
+        );
+
+        for advice in [
+            started_unsafe_advice(),
+            RetryAdvice::new().with_replay_safety(ReplaySafety::Unknown),
+        ] {
+            assert!(
+                !retries_with_policy(
+                    advice,
+                    combine(
+                        any,
+                        vec![
+                            ApprovingPolicy::new(false),
+                            Arc::new(ProviderSuggestedRetryPolicy)
+                        ]
+                    ),
+                    ConversationContinuation::PreviousResponseId("resp_1".to_owned())
+                )
+                .await,
+                "any {any}"
+            );
+        }
+    }
+}

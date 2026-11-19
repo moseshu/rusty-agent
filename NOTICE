@@ -1130,8 +1130,9 @@ existing upstream attribution and licensing.
 | `tests/it-protocol/tests/threads/product_hooks/stdin_permission.rs` | openai/codex | 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052 | codex-rs/core/src/unified_exec/stdin_approval.rs; codex-rs/core/src/tools/approvals.rs (WriteStdin permission request payload) |
 
 The retry safety boundary, unsafe-replay approval, one-based attempt numbering and
-retry-advice timing in crates/ra-runtime/src/runner.rs, the replay approval and policy context
-in crates/ra-core/src/model/retry/policy.rs, the backoff defaults, jitter, attempt numbering and
+retry-advice timing in crates/ra-runtime/src/runner.rs, the replay approval, policy context,
+policy combinators, provider vetoes and HTTP status policy in
+crates/ra-core/src/model/retry/policy.rs, the backoff defaults, jitter, attempt numbering and
 use of endpoint delays in crates/ra-core/src/model/retry/backoff.rs, and cases in
 tests/it-runtime/tests/model_retry.rs
 and tests/it-core/tests/retry_policy.rs adapt openai/openai-agents-python,

@@ -14,7 +14,7 @@
 //! first, and only for a non-streaming call; replay safety the adapter left unknown cannot be
 //! approved by a policy.
 
-use std::time::Duration;
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 
@@ -136,13 +136,21 @@ impl<'a> RetryPolicyContext<'a> {
 }
 
 /// A retry policy's answer for one failed attempt.
+///
+/// Equality and `Debug` cover the decision's public meaning only. The markers policy combinators
+/// read are left out, as the SDK declares its private fields with `compare=False` and `repr=False`.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RetryDecision {
     retry: bool,
     delay: Option<Duration>,
     reason: Option<String>,
     unsafe_replay_approved: bool,
+    /// The SDK's `_hard_veto` and `_delegable_replay_veto`, which only policy combinators read.
+    veto: Veto,
+    /// The SDK's `_approves_replay`: the provider called the replay safe. Only
+    /// [`ProviderSuggestedRetryPolicy`] sets it, and combinators carry it into their decision.
+    provider_replay_approved: bool,
 }
 
 impl RetryDecision {
@@ -154,6 +162,8 @@ impl RetryDecision {
             delay: None,
             reason: None,
             unsafe_replay_approved: false,
+            veto: Veto::None,
+            provider_replay_approved: false,
         }
     }
 
@@ -165,6 +175,8 @@ impl RetryDecision {
             delay: None,
             reason: None,
             unsafe_replay_approved: false,
+            veto: Veto::None,
+            provider_replay_approved: false,
         }
     }
 
@@ -220,6 +232,93 @@ impl RetryDecision {
     pub const fn approves_unsafe_replay(&self) -> bool {
         self.unsafe_replay_approved
     }
+
+    /// The SDK's `_with_hard_veto`.
+    const fn with_hard_veto(mut self) -> Self {
+        self.veto = Veto::Hard;
+        self
+    }
+
+    /// The SDK's `_with_delegable_replay_veto`.
+    const fn with_delegable_replay_veto(mut self) -> Self {
+        self.veto = Veto::DelegableReplay;
+        self
+    }
+
+    /// The SDK's `_with_replay_safe_approval`.
+    const fn with_provider_replay_approval(mut self) -> Self {
+        self.provider_replay_approved = true;
+        self
+    }
+
+    /// The SDK's `_merge_positive_retry_decisions`: a later positive decision's delay and reason
+    /// replace earlier ones, and approvals accumulate.
+    fn merge_positive(mut self, incoming: Self) -> Self {
+        let mut merged = Self::retry();
+        merged.delay = incoming.delay.or(self.delay);
+        merged.reason = incoming.reason.or_else(|| self.reason.take());
+        merged.unsafe_replay_approved =
+            self.unsafe_replay_approved || incoming.unsafe_replay_approved;
+        merged.provider_replay_approved =
+            self.provider_replay_approved || incoming.provider_replay_approved;
+        merged
+    }
+
+    /// The SDK's `_resolve_delegable_replay_veto`: the veto stands unless the approving decision
+    /// retries with an unsafe-replay approval, which then replaces it.
+    fn resolve_delegable_veto(self, approving: Self) -> Self {
+        if !approving.retry || !approving.unsafe_replay_approved {
+            return self;
+        }
+        let mut resolved = Self::retry().with_unsafe_replay_approval();
+        resolved.delay = approving.delay;
+        // The SDK's `approving.reason or veto.reason`: an empty reason falls back too.
+        resolved.reason = approving
+            .reason
+            .filter(|reason| !reason.is_empty())
+            .or(self.reason);
+        resolved.provider_replay_approved = approving.provider_replay_approved;
+        resolved
+    }
+}
+
+impl PartialEq for RetryDecision {
+    fn eq(&self, other: &Self) -> bool {
+        self.retry == other.retry
+            && self.delay == other.delay
+            && self.reason == other.reason
+            && self.unsafe_replay_approved == other.unsafe_replay_approved
+    }
+}
+
+impl Eq for RetryDecision {}
+
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "The SDK hides the combinator markers with repr=False."
+)]
+impl fmt::Debug for RetryDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetryDecision")
+            .field("retry", &self.retry)
+            .field("delay", &self.delay)
+            .field("reason", &self.reason)
+            .field("unsafe_replay_approved", &self.unsafe_replay_approved)
+            .finish()
+    }
+}
+
+/// How a policy combinator treats a decision not to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Veto {
+    /// An ordinary decision, weighed with the others.
+    None,
+    /// Ends the combined evaluation with this decision.
+    Hard,
+    /// A hard veto over an unsafe replay, which another combined policy's unsafe-replay approval
+    /// can resolve.
+    DelegableReplay,
 }
 
 /// Runtime-only decision procedure for model-call retries.
@@ -245,9 +344,10 @@ impl ModelRetryPolicy for NeverRetryPolicy {
 
 /// A policy that follows an adapter's positive retry recommendation.
 ///
-/// The SDK's version also marks its decision when the adapter called the replay safe. That marker
-/// only matters to policy combinators, which are not ported; the runtime reads the adapter's
-/// verdict directly.
+/// As the SDK's `provider_suggested`, a provider veto is a hard veto for [`AllRetryPolicy`] and
+/// [`AnyRetryPolicy`]: one over a replay the adapter marked unsafe can be resolved by another
+/// combined policy's unsafe-replay approval, any other cannot. A positive suggestion the adapter
+/// called safe to replay carries that approval into the combined decision.
 #[derive(Debug, Default)]
 pub struct ProviderSuggestedRetryPolicy;
 
@@ -261,10 +361,14 @@ impl ModelRetryPolicy for ProviderSuggestedRetryPolicy {
             None => return RetryDecision::no_retry(),
             // A provider veto keeps its reason, as the SDK's does.
             Some(false) => {
-                let decision = RetryDecision::no_retry();
-                return match advice.reason() {
-                    Some(reason) => decision.with_reason(reason),
-                    None => decision,
+                let mut decision = RetryDecision::no_retry();
+                if let Some(reason) = advice.reason() {
+                    decision = decision.with_reason(reason);
+                }
+                return if advice.replay_safety() == ReplaySafety::Unsafe {
+                    decision.with_delegable_replay_veto()
+                } else {
+                    decision.with_hard_veto()
                 };
             }
             Some(true) => {}
@@ -275,6 +379,9 @@ impl ModelRetryPolicy for ProviderSuggestedRetryPolicy {
         }
         if let Some(reason) = advice.reason() {
             decision = decision.with_reason(reason);
+        }
+        if advice.replay_safety() == ReplaySafety::Safe {
+            decision = decision.with_provider_replay_approval();
         }
         decision
     }
@@ -314,6 +421,166 @@ impl ModelRetryPolicy for RetryAfterPolicy {
         match delay {
             Some(delay) => RetryDecision::retry().with_delay(delay),
             None => RetryDecision::no_retry(),
+        }
+    }
+}
+
+/// A policy that retries only when every combined policy does, as the SDK's `retry_policies.all`.
+///
+/// Policies are asked in order. A hard veto ends the evaluation with that veto, and so does the
+/// first decision not to retry. A provider veto over an unsafe replay is set aside instead, and
+/// stands unless the combined decision approves unsafe replay. Later delays and reasons replace
+/// earlier ones, and approvals accumulate. With no policies it never retries.
+pub struct AllRetryPolicy {
+    policies: Vec<Arc<dyn ModelRetryPolicy>>,
+}
+
+impl AllRetryPolicy {
+    /// Combines `policies`, asked in the given order.
+    #[must_use]
+    pub fn new(policies: impl IntoIterator<Item = Arc<dyn ModelRetryPolicy>>) -> Self {
+        Self {
+            policies: policies.into_iter().collect(),
+        }
+    }
+}
+
+impl fmt::Debug for AllRetryPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AllRetryPolicy")
+            .field("policies", &self.policies.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ModelRetryPolicy for AllRetryPolicy {
+    async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
+        if self.policies.is_empty() {
+            return RetryDecision::no_retry();
+        }
+        let mut merged = RetryDecision::retry();
+        let mut delegable_veto = None;
+        for policy in &self.policies {
+            let decision = policy.evaluate(context).await;
+            match decision.veto {
+                Veto::DelegableReplay => {
+                    delegable_veto.get_or_insert(decision);
+                    continue;
+                }
+                Veto::Hard => return decision,
+                Veto::None => {}
+            }
+            if !decision.retry {
+                return decision;
+            }
+            if decision.delay.is_some() {
+                merged.delay = decision.delay;
+            }
+            if decision.reason.is_some() {
+                merged.reason = decision.reason;
+            }
+            merged.unsafe_replay_approved |= decision.unsafe_replay_approved;
+            merged.provider_replay_approved |= decision.provider_replay_approved;
+        }
+        match delegable_veto {
+            Some(veto) => veto.resolve_delegable_veto(merged),
+            None => merged,
+        }
+    }
+}
+
+/// A policy that retries when any combined policy does, as the SDK's `retry_policies.any`.
+///
+/// Every policy is asked, in order, unless one returns a hard veto, which ends the evaluation with
+/// that veto. A provider veto over an unsafe replay is set aside instead, and stands unless the
+/// positive decisions approve unsafe replay. Positive decisions merge, later delays and reasons
+/// replacing earlier ones; without one, the last decision not to retry is returned. With no
+/// policies it never retries.
+pub struct AnyRetryPolicy {
+    policies: Vec<Arc<dyn ModelRetryPolicy>>,
+}
+
+impl AnyRetryPolicy {
+    /// Combines `policies`, asked in the given order.
+    #[must_use]
+    pub fn new(policies: impl IntoIterator<Item = Arc<dyn ModelRetryPolicy>>) -> Self {
+        Self {
+            policies: policies.into_iter().collect(),
+        }
+    }
+}
+
+impl fmt::Debug for AnyRetryPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnyRetryPolicy")
+            .field("policies", &self.policies.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ModelRetryPolicy for AnyRetryPolicy {
+    async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
+        let mut first_positive: Option<RetryDecision> = None;
+        let mut last_negative = None;
+        let mut delegable_veto = None;
+        for policy in &self.policies {
+            let decision = policy.evaluate(context).await;
+            match decision.veto {
+                Veto::DelegableReplay => {
+                    delegable_veto.get_or_insert(decision);
+                    continue;
+                }
+                Veto::Hard => return decision,
+                Veto::None => {}
+            }
+            if decision.retry {
+                first_positive = Some(match first_positive {
+                    Some(earlier) => earlier.merge_positive(decision),
+                    None => decision,
+                });
+                continue;
+            }
+            last_negative = Some(decision);
+        }
+        match (delegable_veto, first_positive) {
+            (Some(veto), Some(positive)) => veto.resolve_delegable_veto(positive),
+            (Some(veto), None) => veto,
+            (None, Some(positive)) => positive,
+            (None, None) => last_negative.unwrap_or_else(RetryDecision::no_retry),
+        }
+    }
+}
+
+/// A policy that retries the failures whose HTTP status is one of the given codes, as the SDK's
+/// `retry_policies.http_status`.
+#[derive(Debug, Clone, Default)]
+pub struct HttpStatusRetryPolicy {
+    statuses: Vec<u16>,
+}
+
+impl HttpStatusRetryPolicy {
+    /// Retries failures answered with any of `statuses`.
+    #[must_use]
+    pub fn new(statuses: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            statuses: statuses.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelRetryPolicy for HttpStatusRetryPolicy {
+    async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
+        match context
+            .normalized()
+            .and_then(NormalizedProviderError::status_code)
+        {
+            Some(status) if self.statuses.contains(&status) => RetryDecision::retry(),
+            _ => RetryDecision::no_retry(),
         }
     }
 }
