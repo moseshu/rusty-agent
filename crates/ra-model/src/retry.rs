@@ -162,23 +162,23 @@ fn parse_millis(value: &str) -> Option<Duration> {
 /// Parses the two forms `Retry-After` is defined to carry: a second count, or a date.
 ///
 /// The date form is resolved against this machine's clock, so the delay it yields inherits whatever
-/// skew that clock has. It is still read rather than dropped — a wrong-by-seconds delay is closer to
-/// what the endpoint asked for than ignoring the instruction altogether — and the ceiling on how
-/// long a requested delay is honored keeps a badly skewed clock from parking the run.
+/// skew that clock has. It is still read rather than dropped: a wrong-by-seconds delay is closer to
+/// what the endpoint asked for than ignoring the instruction altogether, and cancelling the run
+/// still ends a long wait.
 ///
-/// A date that has already passed names no wait at all, so it reads as absent and the schedule
-/// answers instead. That keeps one invariant on the field: a delay that is present is a delay worth
-/// waiting.
+/// A date that has already passed asks for no wait, so it reads as zero and the retry goes at once,
+/// as the SDK's `parse_retry_after_value` reads it.
 fn parse_seconds(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(seconds) = value.parse::<f64>() {
         return duration_from_millis(seconds * 1_000.0);
     }
     let deadline = httpdate::parse_http_date(value).ok()?;
-    deadline
-        .duration_since(SystemTime::now())
-        .ok()
-        .filter(|delay| !delay.is_zero())
+    Some(
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 fn duration_from_millis(millis: f64) -> Option<Duration> {

@@ -215,9 +215,8 @@ async fn a_delay_expressed_as_a_date_is_honored() {
     );
     assert_eq!(
         RetryBackoff::new().delay(1, Some(requested), JitterSample::ZERO),
-        RetryBackoff::new().base_delay(1),
-        "the delay is recorded as the endpoint stated it, and the honored window is what keeps an \
-         absurd one from parking the run"
+        requested,
+        "the delay is waited out as the endpoint stated it, as in the SDK"
     );
 }
 
@@ -239,10 +238,10 @@ fn retry_hints_accept_all_standard_http_date_forms() {
     }
 }
 
-/// A date that has already passed names no wait, so it reads as absent rather than as zero: a
-/// present delay is a delay worth waiting.
+/// A date that has already passed asks for no wait, so it reads as zero and the retry goes at once,
+/// as the SDK's `parse_retry_after_value` reads it.
 #[tokio::test]
-async fn a_delay_that_has_already_elapsed_reads_as_no_delay() {
+async fn a_delay_that_has_already_elapsed_reads_as_zero() {
     let server = MockServer::start().await;
     let model = chat_model(
         &server,
@@ -253,12 +252,16 @@ async fn a_delay_that_has_already_elapsed_reads_as_no_delay() {
     .await;
 
     let error = failed_call(&model).await;
-    assert_eq!(facts(&error).retry_after(), None);
+    assert_eq!(facts(&error).retry_after(), Some(Duration::ZERO));
     assert_eq!(
         advice(&model, &error, false)
             .expect("a provider failure yields advice")
             .retry_after(),
-        None
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        RetryBackoff::new().delay(1, Some(Duration::ZERO), JitterSample::MIDPOINT),
+        Duration::ZERO
     );
 }
 

@@ -1131,15 +1131,17 @@ existing upstream attribution and licensing.
 
 The retry safety boundary, unsafe-replay approval, one-based attempt numbering and
 retry-advice timing in crates/ra-runtime/src/runner.rs, the replay approval and policy context
-in crates/ra-core/src/model/retry/policy.rs, the backoff attempt numbering in
-crates/ra-core/src/model/retry/backoff.rs, and cases in tests/it-runtime/tests/model_retry.rs
+in crates/ra-core/src/model/retry/policy.rs, the backoff defaults, jitter, attempt numbering and
+use of endpoint delays in crates/ra-core/src/model/retry/backoff.rs, and cases in
+tests/it-runtime/tests/model_retry.rs
 and tests/it-core/tests/retry_policy.rs adapt openai/openai-agents-python,
 revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/run_internal/model_retry.py, src/agents/retry.py and tests/models/test_model_retry.py
 (MIT). The response-started mark on Responses WebSocket failures in
 crates/ra-model/src/openai/responses.rs follows src/agents/models/openai_responses.py, and the
 OpenAI replay verdict in crates/ra-model/src/openai/retry.rs adapts
-src/agents/models/_openai_retry.py.
+src/agents/models/_openai_retry.py; the Retry-After reading of an elapsed date in
+crates/ra-model/src/retry.rs follows src/agents/models/_retry_runtime.py.
 The product retry recovery hook in that runner ports the conversation-recording and notification
 mechanism from openai/codex revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
 codex-rs/core/src/responses_retry.rs. The product selects it explicitly; no provider retry

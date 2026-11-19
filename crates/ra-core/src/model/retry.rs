@@ -30,7 +30,7 @@ pub mod policy;
 
 pub use backoff::{
     DEFAULT_INITIAL_DELAY, DEFAULT_MAX_DELAY, DEFAULT_MULTIPLIER, JITTER_RANGE, JitterSample,
-    MAX_HONORED_RETRY_AFTER, RetryBackoff,
+    RetryBackoff,
 };
 pub use normalized::stamp_response_started;
 pub use normalized::{NormalizedProviderError, replay_safety_of, stamp_replay_safety};

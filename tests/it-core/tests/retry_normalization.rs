@@ -145,33 +145,34 @@ fn stamping_leaves_errors_from_other_subsystems_alone() {
     assert!(NormalizedProviderError::from_error(&caller).is_none());
 }
 
-/// Attempt one is the wait between the original request and the first retry, as in the OpenAI
-/// Agents SDK, which also reads attempt zero as one. The ceiling is a ceiling: an exponent that
-/// would overflow it produces the ceiling, not an unbounded sleep.
+/// The SDK's default schedule: a quarter of a second before the first retry, doubling up to two
+/// seconds. Attempt one is the wait before the first retry, and attempt zero reads as one. The
+/// ceiling is a ceiling: an exponent that would overflow it produces the ceiling, not an unbounded
+/// sleep.
 #[test]
 fn the_schedule_grows_by_the_multiplier_until_it_reaches_the_ceiling() {
     let backoff = RetryBackoff::new();
 
-    let schedule: Vec<Duration> = (1..=6).map(|attempt| backoff.base_delay(attempt)).collect();
+    let schedule: Vec<Duration> = (1..=5).map(|attempt| backoff.base_delay(attempt)).collect();
     assert_eq!(
         schedule,
         vec![
+            Duration::from_millis(250),
             Duration::from_millis(500),
             Duration::from_secs(1),
             Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(8),
+            Duration::from_secs(2),
         ]
     );
     assert_eq!(backoff.base_delay(0), backoff.base_delay(1));
-    assert_eq!(backoff.base_delay(u32::MAX), Duration::from_secs(8));
+    assert_eq!(backoff.base_delay(u32::MAX), Duration::from_secs(2));
 }
 
-/// Configuration is optional field by field, and a multiplier that shrinks the delay would turn
-/// backoff into a loop that tightens under exactly the load it exists to relieve.
+/// Configuration is optional field by field. As in the SDK, any non-negative multiplier is used as
+/// given, including zero, a shrinking one and infinity, which the ceiling bounds; a negative or
+/// `NaN` multiplier, which the SDK rejects when its settings are built, is treated as unset.
 #[test]
-fn settings_fill_only_the_fields_they_set_and_a_shrinking_multiplier_is_refused() {
+fn settings_fill_only_the_fields_they_set_and_accept_the_sdk_multipliers() {
     assert_eq!(RetryBackoff::from_settings(None), RetryBackoff::new());
 
     let sparse = RetryBackoffSettings::new().with_initial_delay(Duration::from_millis(100));
@@ -181,46 +182,109 @@ fn settings_fill_only_the_fields_they_set_and_a_shrinking_multiplier_is_refused(
     assert_eq!(resolved.multiplier(), RetryBackoff::new().multiplier());
     assert!(resolved.jitter());
 
-    let shrinking = RetryBackoffSettings::new().with_multiplier(0.5);
-    assert_eq!(
-        RetryBackoff::from_settings(Some(&shrinking)).multiplier(),
-        1.0
-    );
-    let broken = RetryBackoffSettings::new().with_multiplier(f64::NAN);
-    assert_eq!(RetryBackoff::from_settings(Some(&broken)).multiplier(), 2.0);
+    let schedule = |multiplier: f64| {
+        let backoff = RetryBackoff::from_settings(Some(
+            &RetryBackoffSettings::new()
+                .with_initial_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(10))
+                .with_multiplier(multiplier)
+                .with_jitter(false),
+        ));
+        (1..=3)
+            .map(|attempt| backoff.base_delay(attempt).as_secs_f64())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(schedule(0.0), [1.0, 0.0, 0.0]);
+    assert_eq!(schedule(0.5), [1.0, 0.5, 0.25]);
+    assert_eq!(schedule(f64::INFINITY), [1.0, 10.0, 10.0]);
+
+    for rejected in [f64::NAN, -1.0] {
+        let settings = RetryBackoffSettings::new().with_multiplier(rejected);
+        assert_eq!(
+            RetryBackoff::from_settings(Some(&settings)).multiplier(),
+            2.0
+        );
+    }
+
+    let inverted = RetryBackoff::from_settings(Some(
+        &RetryBackoffSettings::new()
+            .with_initial_delay(Duration::from_secs(5))
+            .with_max_delay(Duration::from_secs(2))
+            .with_jitter(false),
+    ));
+    assert_eq!(inverted.base_delay(1), Duration::from_secs(2));
 }
 
-/// Jitter spreads a herd apart; it must never push a delay past the ceiling, and with jitter off
-/// the schedule has to be exactly what it says.
+/// As in the SDK, jitter scales the scheduled delay by `[0.875, 1.125]` and the ceiling applies
+/// afterwards, so it never pushes a delay past the ceiling; with jitter off the schedule is exact.
 #[test]
-fn jitter_only_ever_shortens_the_delay_and_by_at_most_a_quarter() {
+fn jitter_spreads_the_delay_around_the_schedule_within_the_ceiling() {
     let backoff = RetryBackoff::new();
 
     assert_eq!(
-        backoff.delay(2, None, JitterSample::ZERO),
+        backoff.delay(3, None, JitterSample::ZERO),
+        Duration::from_millis(875)
+    );
+    assert_eq!(
+        backoff.delay(3, None, JitterSample::MIDPOINT),
         Duration::from_secs(1)
     );
     assert_eq!(
-        backoff.delay(2, None, JitterSample::new(1.0)),
-        Duration::from_millis(750)
+        backoff.delay(3, None, JitterSample::new(1.0)),
+        Duration::from_millis(1_125)
     );
     assert_eq!(
-        backoff.delay(2, None, JitterSample::new(f64::NAN)),
+        backoff.delay(3, None, JitterSample::new(f64::NAN)),
         Duration::from_secs(1),
         "a misbehaving generator costs a slightly wrong delay, never a failed run"
+    );
+    assert_eq!(JitterSample::default(), JitterSample::MIDPOINT);
+
+    // At the ceiling, the longest jittered delay is the ceiling itself.
+    assert_eq!(
+        backoff.delay(4, None, JitterSample::new(1.0)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        backoff.delay(4, None, JitterSample::ZERO),
+        Duration::from_millis(1_750)
     );
 
     let steady = RetryBackoff::from_settings(Some(&RetryBackoffSettings::new().with_jitter(false)));
     assert_eq!(
         steady.delay(3, None, JitterSample::new(1.0)),
-        Duration::from_secs(2)
+        Duration::from_secs(1)
     );
 }
 
-/// The endpoint's own delay is an instruction about its state, not a guess that needs spreading
-/// out — but an endpoint asking to be left alone for an hour is no longer describing this request.
+/// Jitter is capped before conversion to a duration, even when the uncapped result would overflow.
 #[test]
-fn an_endpoint_delay_wins_unless_it_is_unusable() {
+fn jitter_caps_large_delays_without_overflowing() {
+    for (initial_delay, max_delay) in [
+        (
+            Duration::from_secs(17_000_000_000_000_000_000),
+            Duration::from_secs(18_000_000_000_000_000_000),
+        ),
+        (Duration::MAX, Duration::MAX),
+        (
+            Duration::from_secs((1_u64 << 54) - 1),
+            Duration::from_secs((1_u64 << 54) - 1),
+        ),
+    ] {
+        let backoff = RetryBackoff::from_settings(Some(
+            &RetryBackoffSettings::new()
+                .with_initial_delay(initial_delay)
+                .with_max_delay(max_delay),
+        ));
+        assert_eq!(backoff.delay(1, None, JitterSample::new(1.0)), max_delay);
+        assert!(backoff.delay(1, None, JitterSample::ZERO) < initial_delay);
+    }
+}
+
+/// The endpoint's own delay is an instruction about its state, not a guess that needs spreading
+/// out. As in the SDK it is waited out exactly, however long, and zero means retry at once.
+#[test]
+fn an_endpoint_delay_is_waited_out_exactly() {
     let backoff = RetryBackoff::new();
 
     assert_eq!(
@@ -230,15 +294,15 @@ fn an_endpoint_delay_wins_unless_it_is_unusable() {
     );
     assert_eq!(
         backoff.delay(2, Some(Duration::from_secs(3600)), JitterSample::ZERO),
-        Duration::from_secs(1),
-        "an absurd delay falls back to the bounded schedule"
+        Duration::from_secs(3600),
+        "nor capped by the ceiling"
     );
     assert_eq!(
         backoff.delay(2, Some(Duration::ZERO), JitterSample::ZERO),
-        Duration::from_secs(1)
+        Duration::ZERO
     );
     assert_eq!(
-        backoff.delay(2, None, JitterSample::ZERO),
-        Duration::from_secs(1)
+        backoff.delay(2, None, JitterSample::MIDPOINT),
+        Duration::from_millis(500)
     );
 }

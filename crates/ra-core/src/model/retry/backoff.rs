@@ -11,34 +11,33 @@
 //! [`JitterSample`]. That keeps the kernel deterministic — the same inputs give the same delay, so
 //! a schedule can be asserted rather than approximated — and it leaves the choice of generator to
 //! the layer that already owns the run's non-determinism.
+//!
+//! # The SDK's schedule
+//!
+//! The defaults, the jitter and the use of an endpoint's own delay follow the `OpenAI` Agents
+//! SDK's `_default_retry_delay` and `_evaluate_retry`: the delay starts at a quarter of a second
+//! and doubles up to two seconds, jitter scales it by `[0.875, 1.125]` and then the ceiling
+//! applies, and a delay the endpoint asked for is waited out exactly, however short or long.
 
 use std::time::Duration;
 
 use super::RetryBackoffSettings;
 
-/// Delay before the first retry when no layer configured one.
-pub const DEFAULT_INITIAL_DELAY: Duration = Duration::from_millis(500);
-/// Ceiling on the computed delay when no layer configured one.
-pub const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(8);
+/// Delay before the first retry when no layer configured one, as in the SDK.
+pub const DEFAULT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+/// Ceiling on the computed delay when no layer configured one, as in the SDK.
+pub const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(2);
 /// Growth factor per attempt when no layer configured one.
 pub const DEFAULT_MULTIPLIER: f64 = 2.0;
 
-/// How much of the delay jitter may remove.
+/// The total width of the jitter factor, centered on the scheduled delay.
 ///
-/// The sampled factor lands in `[0.75, 1.0]`: jitter spreads a thundering herd apart without ever
-/// making a client wait materially less than the schedule says. Delaying *more* is not an option
-/// either — a ceiling that the jitter can exceed is not a ceiling.
+/// The sampled factor lands in `[0.875, 1.125]`, as in the SDK, and the ceiling applies after it,
+/// so jitter never pushes a delay past [`RetryBackoff::max_delay`].
 pub const JITTER_RANGE: f64 = 0.25;
 
-/// The longest endpoint-requested delay that is honored verbatim.
-///
-/// Beyond it the computed backoff is used instead. An endpoint asking for an hour is not describing
-/// this request any more; honoring it would park the run in a sleep no budget accounts for and no
-/// user can see, whereas falling back to bounded backoff fails the attempt quickly and lets the
-/// retry budget end the run in the open.
-pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_mins(1);
-
-/// A uniform random sample in `[0, 1]`, used to jitter one delay.
+/// A uniform random sample in `[0, 1]`, used to jitter one delay: `0` gives the shortest jittered
+/// delay, [`Self::MIDPOINT`] the scheduled one and `1` the longest.
 ///
 /// A newtype rather than a bare `f64` because the two obvious mistakes — passing a value on the
 /// wrong scale, or passing the delay itself — both compile and both silently produce a schedule
@@ -47,8 +46,11 @@ pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_mins(1);
 pub struct JitterSample(f64);
 
 impl JitterSample {
-    /// The sample that removes nothing, leaving the computed delay exactly as scheduled.
+    /// The lowest sample, which shortens the delay the most.
     pub const ZERO: Self = Self(0.0);
+
+    /// The sample that leaves the computed delay exactly as scheduled.
+    pub const MIDPOINT: Self = Self(0.5);
 
     /// Clamps any value into the unit interval.
     ///
@@ -57,7 +59,7 @@ impl JitterSample {
     #[must_use]
     pub fn new(sample: f64) -> Self {
         if sample.is_nan() {
-            return Self::ZERO;
+            return Self::MIDPOINT;
         }
         Self(sample.clamp(0.0, 1.0))
     }
@@ -71,7 +73,7 @@ impl JitterSample {
 
 impl Default for JitterSample {
     fn default() -> Self {
-        Self::ZERO
+        Self::MIDPOINT
     }
 }
 
@@ -99,10 +101,10 @@ impl RetryBackoff {
 
     /// Resolves configuration, falling back to the defaults field by field.
     ///
-    /// A multiplier below `1.0` is raised to it. Configuration that shrinks the delay on every
-    /// attempt is not slow backoff, it is a loop that tightens under exactly the load it was meant
-    /// to relieve; refusing the call instead would fail a run over a number that has a sane reading.
-    /// A non-finite multiplier falls back to the default for the same reason.
+    /// Any multiplier the SDK accepts is used as given: zero, a value below one, and infinity, which
+    /// the ceiling bounds. The SDK rejects a negative or `NaN` multiplier when its settings are
+    /// built; a Rust builder cannot fail there, so such a value is treated as unset and the default
+    /// applies.
     #[must_use]
     pub fn from_settings(settings: Option<&RetryBackoffSettings>) -> Self {
         let mut resolved = Self::new();
@@ -115,12 +117,10 @@ impl RetryBackoff {
         if let Some(max_delay) = settings.max_delay() {
             resolved.max_delay = max_delay;
         }
-        if let Some(multiplier) = settings.multiplier() {
-            resolved.multiplier = if multiplier.is_finite() {
-                multiplier.max(1.0)
-            } else {
-                DEFAULT_MULTIPLIER
-            };
+        if let Some(multiplier) = settings.multiplier()
+            && multiplier >= 0.0
+        {
+            resolved.multiplier = multiplier;
         }
         if let Some(jitter) = settings.jitter() {
             resolved.jitter = jitter;
@@ -170,10 +170,10 @@ impl RetryBackoff {
 
     /// The delay to actually wait before retrying, given what the endpoint asked for.
     ///
-    /// A usable `retry_after` wins outright and is **not** jittered: it is an instruction about
-    /// this endpoint's own state, not a guess that needs spreading out, and shortening it is how a
-    /// client turns one rate-limit response into two. Anything else falls back to the jittered
-    /// schedule.
+    /// A `retry_after` wins outright and is **not** jittered or capped, as in the SDK: it is an
+    /// instruction about this endpoint's own state, not a guess that needs spreading out, and
+    /// shortening it is how a client turns one rate-limit response into two. Zero means retry at
+    /// once. Without one, the jittered schedule applies.
     #[must_use]
     pub fn delay(
         &self,
@@ -181,17 +181,20 @@ impl RetryBackoff {
         retry_after: Option<Duration>,
         sample: JitterSample,
     ) -> Duration {
-        if let Some(retry_after) = retry_after
-            && retry_after > Duration::ZERO
-            && retry_after <= MAX_HONORED_RETRY_AFTER
-        {
+        if let Some(retry_after) = retry_after {
             return retry_after;
         }
         let base = self.base_delay(attempt);
         if !self.jitter {
             return base;
         }
-        base.mul_f64(1.0 - JITTER_RANGE * sample.get())
+        let factor = 1.0 - JITTER_RANGE / 2.0 + JITTER_RANGE * sample.get();
+        let seconds = (base.as_secs_f64() * factor).min(self.max_delay.as_secs_f64());
+        // Cap before conversion: jitter can exceed Duration's range, and the floating-point
+        // representation of the ceiling can itself round beyond that range or the exact ceiling.
+        Duration::try_from_secs_f64(seconds)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay)
     }
 }
 

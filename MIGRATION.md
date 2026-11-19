@@ -71,6 +71,28 @@ Responses WebSocket adapter marks a failure after the first response event this 
 | Summary requests report `is_streaming()` as false | Adapters and policies that read the flag | Treat them as the non-streaming calls they are; for an unstamped failure, `ra-model` adapters now give the unstarted verdict |
 | The OpenAI Responses and Chat models call a replay safe when the endpoint sent `x-should-retry: true`, or answered a request continuing provider-held state with 408, 409, 429 or 5xx, unless the error already carries a verdict | Policies that relied on such a stateful failure staying `Unknown` | Nothing to change for the built-in policies; a custom policy that must not replay these should decline them |
 
+### Retry backoff follows the Agents SDK's schedule
+
+`RetryBackoff` now computes the OpenAI Agents SDK's delays. With nothing configured, the first retry
+waits 0.25 seconds instead of 0.5 and the delay doubles up to 2 seconds instead of 8. Jitter scales
+the scheduled delay by `[0.875, 1.125]`, and the ceiling applies afterwards; it used to scale it by
+`[0.75, 1.0]`. A delay the endpoint asked for is waited out exactly, however long, and zero retries
+at once; such a delay used to be honored only within 60 seconds, and zero fell back to the
+schedule. A multiplier is used as given when it is zero or more, including one below 1 and
+infinity, which the ceiling bounds; it used to be raised to 1, and an infinite one fell back to 2. A
+negative or `NaN` multiplier, which the SDK rejects when its settings are built, is treated as
+unset because the Rust builder cannot fail. A `Retry-After` date that has already passed now reads
+as zero instead of as no delay.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| `DEFAULT_INITIAL_DELAY` is 250 ms and `DEFAULT_MAX_DELAY` is 2 s | Hosts that retry with the default backoff | Set `RetryBackoffSettings` to keep the old 500 ms and 8 s |
+| Jitter can lengthen a delay by up to 12.5%, within the ceiling; `JitterSample::ZERO` now gives the shortest delay, and the new `JitterSample::MIDPOINT`, which `JitterSample::default` returns, gives the scheduled one | Callers of `RetryBackoff::delay` that pass a fixed sample | Pass `JitterSample::MIDPOINT` for the unjittered delay, or turn jitter off |
+| Runner retries that use jitter can now wait up to 12.5% longer than scheduled, still within the ceiling; there is no setting for the old shorten-only jitter | Hosts that retry with jitter on, the default, and need a delay no longer than scheduled | Turn jitter off with `RetryBackoffSettings::with_jitter(false)` |
+| `MAX_HONORED_RETRY_AFTER` is removed and endpoint delays are no longer capped | Hosts that relied on the 60-second cap | Return a `RetryDecision` delay of your own from the policy to bound the wait |
+| An endpoint delay of zero, including a past `Retry-After` date, retries at once | Hosts that expected the schedule after such an answer | Return a delay from the policy if a pause is still wanted |
+| Multipliers from 0 up are used as given | Hosts that set a multiplier below 1 or an infinite one | Set 1 or a finite value to keep the old behavior |
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records
