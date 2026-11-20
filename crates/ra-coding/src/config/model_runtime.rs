@@ -35,7 +35,10 @@ use ra_http::{ClientRouteClass, RouteAwareClientPool};
 use ra_model::{
     openai::{
         auth::OpenAiAuth,
-        responses::{OpenAiResponsesProvider, ResponsesRequestSigner, developer_prefix},
+        responses::{
+            OpenAiResponsesProvider, ResponsesRequestSigner, developer_prefix,
+            response_continues_turn,
+        },
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
@@ -184,10 +187,12 @@ impl ProductModelRuntime {
                 .enabled(Feature::UnboundedConnectionRetries)
                 && !self.config.model_provider.is_amazon_bedrock()
                 && !internal_session;
-            config = config.with_model_retry_recovery(Arc::new(ProductRetryRecovery {
-                runtime: Arc::clone(self),
-                connection_retries,
-            }));
+            config = config
+                .with_model_retry_recovery(Arc::new(ProductRetryRecovery {
+                    runtime: Arc::clone(self),
+                    connection_retries,
+                }))
+                .with_model_follow_up(response_continues_turn);
         }
         let Some(source) = &self.remote else {
             return config;
@@ -560,7 +565,10 @@ fn build_registry(
         // Its WebSocket client does not reconnect on its own: the turn's retry loop retries the
         // stream and moves the session to HTTPS once it has spent its retries.
         .with_independent_transport_retries()
-        .with_runner_transport_fallback();
+        .with_runner_transport_fallback()
+        // Codex follows up a response the server interrupted, or one whose `end_turn` is false,
+        // within the same turn instead of failing it or delivering its answer.
+        .with_end_turn_signals();
         if description.supports_websockets {
             let connector =
                 ra_http::websocket::WebSocketConnector::new(&http_factory).map_err(|error| {

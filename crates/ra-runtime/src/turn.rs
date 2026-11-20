@@ -78,6 +78,7 @@ pub struct TurnSettlementRequest<'a> {
     pre_step_items: Vec<RunItem>,
     handoff_input_filter: Option<Arc<dyn HandoffInputFilter>>,
     server_manages_conversation: bool,
+    model_follow_up: bool,
     recovery: Option<&'a mut TurnRecovery>,
 }
 
@@ -126,6 +127,7 @@ impl<'a> TurnSettlementRequest<'a> {
             pre_step_items: Vec::new(),
             handoff_input_filter: None,
             server_manages_conversation: false,
+            model_follow_up: false,
             recovery: None,
         }
     }
@@ -190,6 +192,11 @@ impl<'a> TurnSettlementRequest<'a> {
     /// Records whether the provider owns conversation history for this turn.
     pub const fn with_server_managed_conversation(mut self, enabled: bool) -> Self {
         self.server_manages_conversation = enabled;
+        self
+    }
+
+    pub(crate) const fn with_model_follow_up(mut self, follow_up: bool) -> Self {
+        self.model_follow_up = follow_up;
         self
     }
 
@@ -291,6 +298,7 @@ pub async fn settle_turn(mut request: TurnSettlementRequest<'_>) -> Result<Singl
         request.agent.public().tool_use_behavior(),
         request.cancel,
         &request.run,
+        request.model_follow_up,
     )
     .await?;
 

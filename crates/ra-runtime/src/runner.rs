@@ -72,8 +72,9 @@ use ra_core::{
     },
     model::{
         Model, ModelRequest, ModelResolver, ModelRetryAdviceRequest, ModelSettings,
-        ModelStreamEvent, ModelToolDefinition, ModelTracing, ReplaySafety, RetryAdvice,
-        RetryBackoff, RetryDecision, RetryPolicyContext, replay_safety_of, stamp_replay_safety,
+        ModelStreamEvent, ModelToolDefinition, ModelTracing, RawResponseEvent, ReplaySafety,
+        RetryAdvice, RetryBackoff, RetryDecision, RetryPolicyContext, replay_safety_of,
+        stamp_replay_safety,
     },
     output::{OutputSchema, OutputValue},
     permission::PermissionRule,
@@ -418,6 +419,7 @@ pub struct RunConfig {
     tracing: ModelTracing,
     error_handler: Option<Arc<dyn RunErrorHandler>>,
     model_retry_recovery: Option<Arc<dyn ModelRetryRecovery>>,
+    model_follow_up: Option<fn(&RawResponseEvent) -> bool>,
     partial_messages: bool,
     tool_name_collision_policy: ToolNameCollisionPolicy,
     action_surface_budget: ActionSurfaceBudget,
@@ -467,6 +469,7 @@ impl RunConfig {
             tracing: ModelTracing::Disabled,
             error_handler: None,
             model_retry_recovery: None,
+            model_follow_up: None,
             partial_messages: false,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             action_surface_budget: ActionSurfaceBudget::default(),
@@ -1094,6 +1097,13 @@ impl RunConfig {
         self
     }
 
+    /// Lets a product request another sampling round from the last raw event of a successful
+    /// model stream. The rule leaves tool-stop, handoff and interruption decisions intact.
+    pub const fn with_model_follow_up(mut self, rule: fn(&RawResponseEvent) -> bool) -> Self {
+        self.model_follow_up = Some(rule);
+        self
+    }
+
     /// Retries for a thread's compaction summary request; see [`Self::with_compaction_retry`].
     #[must_use]
     pub const fn compaction_retry(&self) -> Option<&ra_core::model::ModelRetrySettings> {
@@ -1303,7 +1313,7 @@ impl std::fmt::Debug for RunConfig {
                 "pre_approval_tool_input_guardrails",
                 &self.pre_approval_tool_input_guardrails,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -5644,7 +5654,7 @@ async fn run_one_turn(
         }
     }
     let mut early = EarlyRecords::new(context.events.rollout, agent.public());
-    let (surface, response, streamed_dispatches) = call_model(
+    let (surface, settled_response, streamed_dispatches) = call_model(
         turn_scope,
         prepared,
         context,
@@ -5653,6 +5663,10 @@ async fn run_one_turn(
         state,
     )
     .await?;
+    let StreamedModelResponse {
+        response,
+        follow_up,
+    } = settled_response;
     state.record_memory_exposures(memory_exposures);
 
     // Both facts about a completed call are recorded here, before settlement, and the stop
@@ -5747,6 +5761,7 @@ async fn run_one_turn(
     .with_user_hooks(context.config.user_hooks().clone())
     .with_lifecycle_hooks(lifecycle.clone())
     .with_server_managed_conversation(server_manages_conversation)
+    .with_model_follow_up(follow_up)
     .with_max_function_tool_concurrency(config.max_function_tool_concurrency)
     .with_streamed_dispatches(streamed_dispatches)
     .with_recovery(&mut recovery);
@@ -7302,6 +7317,12 @@ struct ModelCallAttempt<'a> {
     max_retries: u32,
     retry_trace: Option<RetryTrace>,
     streaming_dispatch: StreamedDispatchInput,
+    model_follow_up: Option<fn(&RawResponseEvent) -> bool>,
+}
+
+struct StreamedModelResponse {
+    response: ModelResponse,
+    follow_up: bool,
 }
 
 /// What one attempt let out of the runtime before it failed.
@@ -7428,7 +7449,11 @@ async fn call_model(
     streaming_dispatch: StreamedDispatchInput,
     early: &mut EarlyRecords<'_>,
     state: &mut RunState,
-) -> Result<(TurnActionSurface, ModelResponse, StreamedFunctionDispatches)> {
+) -> Result<(
+    TurnActionSurface,
+    StreamedModelResponse,
+    StreamedFunctionDispatches,
+)> {
     let model = Arc::clone(prepared.model());
     let selector = prepared.selector().clone();
     let (surface, mut model_request) = prepared.into_call();
@@ -7476,6 +7501,7 @@ async fn call_model(
                 max_retries,
                 retry_trace: retry_trace.take(),
                 streaming_dispatch: streaming_dispatch.clone(),
+                model_follow_up: context.config.model_follow_up,
             },
             provider_retries::coordinate(
                 model_request.clone(),
@@ -7488,12 +7514,12 @@ async fn call_model(
         ))
         .await;
         match response {
-            Ok((mut response, streamed_dispatches)) => {
+            Ok((mut settled, streamed_dispatches)) => {
                 if failed_attempts > 0 {
-                    let usage = prepend_failed_attempts(response.usage(), failed_attempts);
-                    response = response.with_usage(usage);
+                    let usage = prepend_failed_attempts(settled.response.usage(), failed_attempts);
+                    settled.response = settled.response.with_usage(usage);
                 }
-                return Ok((surface, response, streamed_dispatches));
+                return Ok((surface, settled, streamed_dispatches));
             }
             Err(error) => {
                 record_retry_recovery(
@@ -7728,7 +7754,7 @@ async fn call_model_attempt(
     surface: &TurnActionSurface,
     consumed: &mut CallConsumption,
     early: &mut EarlyRecords<'_>,
-) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
+) -> Result<(StreamedModelResponse, StreamedFunctionDispatches)> {
     // A retried attempt starts over: what the failed one streamed was never acted on.
     early.discard_pending();
     let model_name = attempt.selector.model().unwrap_or("<provider_default>");
@@ -7782,6 +7808,7 @@ async fn call_model_attempt(
         attempt.streaming_dispatch.start(),
         consumed,
         early,
+        attempt.model_follow_up,
     )
     .instrument(generation_span.clone())
     .await;
@@ -7791,18 +7818,18 @@ async fn call_model_attempt(
         duration_ms(started.elapsed()),
     );
     match response {
-        Ok((response, streamed_dispatches)) => {
+        Ok((settled, streamed_dispatches)) => {
             generation_span.in_scope(|| {
                 trace::observe(
                     attempt.rollout,
                     "model_response",
                     serde_json::json!({"outcome": "ok"}),
-                    || serde_json::to_value(&response),
+                    || serde_json::to_value(&settled.response),
                 );
             });
-            record_generation_usage(&generation_span, response.usage());
+            record_generation_usage(&generation_span, settled.response.usage());
             ra_core::trace::record_outcome(&generation_span, ra_core::trace::SpanOutcome::Ok);
-            Ok((response, streamed_dispatches))
+            Ok((settled, streamed_dispatches))
         }
         Err(error) => {
             generation_span.in_scope(|| {
@@ -7948,7 +7975,8 @@ async fn stream_model_call(
     mut dispatches: StreamedFunctionDispatches,
     consumed: &mut CallConsumption,
     early: &mut EarlyRecords<'_>,
-) -> Result<(ModelResponse, StreamedFunctionDispatches)> {
+    model_follow_up: Option<fn(&RawResponseEvent) -> bool>,
+) -> Result<(StreamedModelResponse, StreamedFunctionDispatches)> {
     // `CancelScope::run` cannot wrap this call: the dispatcher below owns spawned tasks that have
     // to be drained rather than dropped when the scope fires. Its entry checkpoint is taken here
     // instead, and it earns its place twice — an already-cancelled scope opens no provider
@@ -7964,6 +7992,7 @@ async fn stream_model_call(
         &mut dispatches,
         consumed,
         early,
+        model_follow_up,
     )
     .await;
     match settled {
@@ -8000,9 +8029,11 @@ async fn read_model_stream(
     dispatches: &mut StreamedFunctionDispatches,
     consumed: &mut CallConsumption,
     early: &mut EarlyRecords<'_>,
-) -> Result<ModelResponse> {
+    model_follow_up: Option<fn(&RawResponseEvent) -> bool>,
+) -> Result<StreamedModelResponse> {
     let mut stream = model.stream_response(request);
     let mut settled: Option<ModelResponse> = None;
+    let mut last_raw = None;
     loop {
         let event = tokio::select! {
             () = cancel.cancelled() => {
@@ -8036,7 +8067,12 @@ async fn read_model_stream(
                 }
                 // Narration only: it is not a session record, so it never reaches the rollout.
                 if let Some(sender) = events.stream {
+                    if model_follow_up.is_some() {
+                        last_raw = Some(raw.clone());
+                    }
                     let _ = sender.send(RunStreamEvent::RawResponse(raw));
+                } else if model_follow_up.is_some() {
+                    last_raw = Some(raw);
                 }
             }
             ModelStreamEvent::Completed(response) => settled = Some(*response),
@@ -8067,13 +8103,20 @@ async fn read_model_stream(
             _ => {}
         }
     }
-    settled.ok_or_else(|| {
-        Error::provider(
-            ProviderErrorKind::Behavior,
-            "the model stream ended without a terminal response, so the turn has no usage, no \
+    settled
+        .map(|response| StreamedModelResponse {
+            response,
+            follow_up: model_follow_up
+                .zip(last_raw.as_ref())
+                .is_some_and(|(rule, event)| rule(event)),
+        })
+        .ok_or_else(|| {
+            Error::provider(
+                ProviderErrorKind::Behavior,
+                "the model stream ended without a terminal response, so the turn has no usage, no \
              request identifier and no settled output order",
-        )
-    })
+            )
+        })
 }
 
 /// Starts a tool from one completed stream item, when the item is a function call this turn

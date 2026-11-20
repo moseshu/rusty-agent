@@ -1806,3 +1806,82 @@ async fn a_spent_budget_moves_to_the_fallback_transport_only_when_the_recovery_o
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     assert_eq!(recovery.switches.load(Ordering::SeqCst), 0);
 }
+
+struct FollowUpModel {
+    calls: AtomicUsize,
+    end_turn: Option<bool>,
+}
+
+#[async_trait]
+impl Model for FollowUpModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("this fixture only supports streaming"))
+    }
+
+    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (id, text, end_turn) = if call == 0 {
+            ("msg_cut", "Checked the tests.", self.end_turn)
+        } else {
+            ("msg_final", "All done.", None)
+        };
+        let raw = RawResponseEvent::new(
+            ProviderKey::new("fixture"),
+            "terminal",
+            json!({ "end_turn": end_turn }),
+        );
+        let response = ModelResponse::new(vec![RunItem::new(
+            ItemId::new(id),
+            RunItemKind::Message(Message::assistant(text, OutputPhase::Final)),
+        )]);
+        stream::iter([
+            Ok(ModelStreamEvent::RawResponse(raw)),
+            Ok(ModelStreamEvent::Completed(Box::new(response))),
+        ])
+        .boxed()
+    }
+}
+
+/// The product can select another sampling round from a successful stream. An unconfigured
+/// runtime ignores the same raw event, and neither choice changes the stored response shape.
+#[tokio::test]
+async fn a_host_can_follow_up_a_successful_model_stream() {
+    for (enabled, end_turn, expected_calls) in [
+        (true, Some(false), 2),
+        (true, Some(true), 1),
+        (true, None, 1),
+        (false, Some(false), 1),
+    ] {
+        let model = Arc::new(FollowUpModel {
+            calls: AtomicUsize::new(0),
+            end_turn,
+        });
+        let cancel = CancelScope::root();
+        let mut config = RunConfig::new();
+        if enabled {
+            config = config
+                .with_model_follow_up(|event| event.payload()["end_turn"].as_bool() == Some(false));
+        }
+        let result = Runner::run(
+            request(Arc::clone(&model) as Arc<dyn Model>, &cancel, true, 0).with_config(config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.calls.load(Ordering::SeqCst), expected_calls);
+        if expected_calls == 2 {
+            assert_eq!(result.final_text(), "All done.");
+            let ids: Vec<_> = result
+                .new_items()
+                .iter()
+                .map(|item| item.id().as_str())
+                .collect();
+            assert_eq!(ids, ["msg_cut", "msg_final"]);
+            assert!(matches!(
+                result.new_items()[0].kind(),
+                RunItemKind::Message(message) if message.phase() == Some(OutputPhase::Commentary)
+            ));
+        } else {
+            assert_eq!(result.final_text(), "Checked the tests.");
+        }
+    }
+}

@@ -13,8 +13,8 @@ use ra_core::{
     error::{Error, ProviderErrorKind, Result},
     item::{ContentBlock, Message, MessageRole, TextBlock},
     model::{
-        Model, ModelProvider, ModelRequest, ModelRetryAdviceRequest, ModelStream, RetryAdvice,
-        stamp_replay_safety,
+        Model, ModelProvider, ModelRequest, ModelRetryAdviceRequest, ModelStream, RawResponseEvent,
+        RetryAdvice, stamp_replay_safety,
     },
     session::SessionId,
 };
@@ -32,6 +32,15 @@ pub(crate) mod request;
 pub(crate) mod stream;
 pub mod web_search;
 mod websocket;
+
+/// Whether a terminal Responses event asks the coding turn to sample again, as in Codex.
+///
+/// Install this rule alongside [`OpenAiResponsesProvider::with_end_turn_signals`]. Apply it
+/// only to a successful stream, so the event cannot authorize a retry of a failed request.
+#[must_use]
+pub fn response_continues_turn(event: &RawResponseEvent) -> bool {
+    stream::continues_turn(event.payload())
+}
 
 const PREFIX_ITEM_ID: &str = "prefix_item_id";
 
@@ -215,6 +224,9 @@ struct ResponsesTransport {
     /// Whether the WebSocket transport reconnects on its own before the first event, rather than
     /// returning the failure and leaving the move to HTTP to the runner.
     websocket_reconnects: bool,
+    /// Whether streamed responses report the provider's `end_turn` and an interrupted response
+    /// settles instead of failing, as Codex's decoder reads them.
+    end_turn_signals: bool,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
     auth_headers: Option<Arc<dyn ResponsesAuthHeaders>>,
@@ -303,6 +315,7 @@ impl OpenAiResponsesProvider {
                 request_max_retries,
                 follows_runner_retries: true,
                 websocket_reconnects: true,
+                end_turn_signals: false,
                 query: BTreeMap::new(),
                 bearer: None,
                 auth_headers: None,
@@ -354,6 +367,20 @@ impl OpenAiResponsesProvider {
     #[must_use]
     pub fn with_runner_transport_fallback(mut self) -> Self {
         Arc::make_mut(&mut self.transport).websocket_reconnects = false;
+        self
+    }
+
+    /// Reads whether a streamed response ends the turn, as Codex's Responses decoder does.
+    ///
+    /// A `response.completed` with `end_turn: false` or a `response.incomplete` with reason
+    /// `interrupted` settles from items that finished streaming. When using this option with
+    /// the runner, also install [`response_continues_turn`] through
+    /// `RunConfig::with_model_follow_up`. Without the rule, the runner can deliver an
+    /// interrupted partial answer as final. By default every `response.incomplete` is a
+    /// terminal failure, as in the Agents SDK. Other incomplete reasons fail either way.
+    #[must_use]
+    pub fn with_end_turn_signals(mut self) -> Self {
+        Arc::make_mut(&mut self.transport).end_turn_signals = true;
         self
     }
 
@@ -849,6 +876,7 @@ impl Model for OpenAiResponsesModel {
                             handoffs,
                             None,
                             unstarted,
+                            model.transport.end_turn_signals,
                         )
                         .map(|event| {
                             // The first response event already arrived, as the SDK marks a
@@ -887,6 +915,7 @@ impl Model for OpenAiResponsesModel {
                             handoffs,
                             request_id,
                             unstarted,
+                            model.transport.end_turn_signals,
                         ),
                         Err(error) => super::sse::error_stream(error, unstarted),
                     }

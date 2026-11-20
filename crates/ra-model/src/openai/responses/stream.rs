@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
-    item::ItemId,
+    item::{ItemId, ModelResponse, RunItem},
     model::{
         ModelHandoffDefinition, ModelStream, ModelStreamEvent, ProviderKey, RawResponseEvent,
         ReplaySafety, RunItemStreamEvent, replay_safety_of, stamp_replay_safety,
@@ -42,6 +42,100 @@ const COMPLETED: &str = "response.completed";
 const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
 /// The frame that names the response this stream belongs to.
 const CREATED: &str = "response.created";
+const INCOMPLETE: &str = "response.incomplete";
+
+pub(super) fn continues_turn(frame: &Value) -> bool {
+    match frame.get("type").and_then(Value::as_str) {
+        Some(COMPLETED) => {
+            frame.pointer("/response/end_turn").and_then(Value::as_bool) == Some(false)
+        }
+        Some(INCOMPLETE) => {
+            frame
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("interrupted")
+        }
+        _ => false,
+    }
+}
+
+/// Collects completed items in arrival order for Codex-style continuation. The stream and the
+/// WebSocket reuse baseline both settle from this projection, independently of the final payload.
+pub(super) struct CompletedOutput {
+    response_id: Option<String>,
+    items: Option<Vec<RunItem>>,
+}
+
+impl CompletedOutput {
+    pub(super) fn new(collect: bool) -> Self {
+        Self {
+            response_id: None,
+            items: collect.then(Vec::new),
+        }
+    }
+
+    pub(super) fn observe_created(&mut self, frame: &Value) {
+        if let Some(id) = frame.pointer("/response/id").and_then(Value::as_str) {
+            self.response_id = Some(id.to_owned());
+        }
+    }
+
+    pub(super) fn lift_done(
+        &mut self,
+        frame: &Value,
+        handoffs: &[ModelHandoffDefinition],
+        provider: &ProviderKey,
+        model: &str,
+    ) -> Result<Option<RunItem>> {
+        let item = frame
+            .get("item")
+            .ok_or_else(|| behavior_error("OpenAI response.output_item.done has no item"))?;
+        let response_id = self.response_id.as_deref().unwrap_or_default();
+        let index = frame.get("output_index").and_then(Value::as_u64);
+        // An indexless frame still needs a distinct synthesized ID if the item has no wire ID.
+        let indexless_id;
+        let (response_id, index) = match (&self.items, index) {
+            (Some(items), None) => {
+                indexless_id = format!("{response_id}:done");
+                (indexless_id.as_str(), items.len())
+            }
+            (_, index) => (
+                response_id,
+                usize::try_from(index.unwrap_or_default()).unwrap_or(usize::MAX),
+            ),
+        };
+        let result =
+            convert::convert_output_item(item, response_id, index, handoffs, provider, model)?;
+        if let (Some(items), Some(item)) = (&mut self.items, &result) {
+            items.push(item.clone());
+        }
+        Ok(result)
+    }
+
+    pub(super) fn settle_continuation(
+        &mut self,
+        frame: &Value,
+        request_id: Option<String>,
+    ) -> Result<ModelResponse> {
+        let payload = frame
+            .get("response")
+            .ok_or_else(|| behavior_error("OpenAI continuation frame has no response"))?;
+        let response_id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| behavior_error("OpenAI continuation frame has no response id"))?;
+        let items = self.items.take().ok_or_else(|| {
+            behavior_error("OpenAI continuation has no completed item collection")
+        })?;
+        let mut response = ModelResponse::new(items)
+            .with_response_id(response_id)
+            .with_usage(convert::convert_usage(payload.get("usage")));
+        if let Some(request_id) = request_id {
+            response = response.with_request_id(request_id);
+        }
+        Ok(response)
+    }
+}
 
 /// Turns a stream of Responses events into model stream events.
 pub(crate) fn events(
@@ -51,6 +145,7 @@ pub(crate) fn events(
     handoffs: Vec<ModelHandoffDefinition>,
     request_id: Option<String>,
     unstarted: ReplaySafety,
+    end_turn_signals: bool,
 ) -> ModelStream<'static> {
     let driver = StreamDriver {
         frames: frames.boxed(),
@@ -58,7 +153,7 @@ pub(crate) fn events(
         model,
         handoffs,
         request_id,
-        response_id: None,
+        output: CompletedOutput::new(end_turn_signals),
         output_ids: BTreeMap::new(),
         pending: VecDeque::new(),
         emitted: false,
@@ -81,7 +176,7 @@ struct StreamDriver {
     /// Transport diagnostics from the response headers, which no frame carries.
     request_id: Option<String>,
     /// The response identifier, used to name an item the endpoint did not name itself.
-    response_id: Option<String>,
+    output: CompletedOutput,
     /// Canonical identities for deltas whose frame only names an output slot.
     output_ids: BTreeMap<u64, ItemId>,
     /// Events decoded from the last frame, waiting to be yielded.
@@ -176,8 +271,10 @@ impl StreamDriver {
         // A failure frame is the provider stating an outcome, and it is the only place that outcome
         // appears: the body simply ends afterwards, which the check for a missing terminal frame
         // would report as a dropped connection instead of as the refusal or the truncation it was.
+        let continue_turn = self.output.items.is_some() && continues_turn(frame);
         let terminal_failure = match event_type.as_str() {
-            "response.failed" | "response.incomplete" => Some(failure(&event_type, frame)),
+            "response.failed" => Some(failure(&event_type, frame)),
+            INCOMPLETE if !continue_turn => Some(failure(&event_type, frame)),
             "error" | "response.error" => Some(stream_error(&event_type, frame)),
             _ => None,
         };
@@ -199,18 +296,18 @@ impl StreamDriver {
         }
 
         match event_type.as_str() {
-            CREATED => {
-                if let Some(id) = frame.pointer("/response/id").and_then(Value::as_str) {
-                    self.response_id = Some(id.to_owned());
-                }
-            }
+            CREATED => self.output.observe_created(frame),
             OUTPUT_ITEM_DONE => {
-                if let Some(event) = self.lift_output_item(frame)? {
-                    self.pending.push_back(Ok(event));
+                if let Some(item) =
+                    self.output
+                        .lift_done(frame, &self.handoffs, &self.provider, &self.model)?
+                {
+                    let event = RunItemStreamEvent::new(item.kind().label(), item);
+                    self.pending.push_back(Ok(ModelStreamEvent::RunItem(event)));
                 }
             }
-            COMPLETED => {
-                let event = self.settle(frame)?;
+            COMPLETED | INCOMPLETE => {
+                let event = self.settle(frame, continue_turn)?;
                 self.pending.push_back(Ok(event));
             }
             _ => {}
@@ -236,7 +333,7 @@ impl StreamDriver {
                 || {
                     ItemId::new(format!(
                         "{}:{index}:{kind}",
-                        self.response_id.as_deref().unwrap_or_default()
+                        self.output.response_id.as_deref().unwrap_or_default()
                     ))
                 },
                 ItemId::new,
@@ -261,51 +358,25 @@ impl StreamDriver {
         }
     }
 
-    /// Publishes a finished output item on the normalized channel.
-    fn lift_output_item(&mut self, frame: &Value) -> Result<Option<ModelStreamEvent>> {
-        let item = frame
-            .get("item")
-            .ok_or_else(|| behavior_error("OpenAI response.output_item.done has no item"))?;
-        let index = frame
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let Some(run_item) = convert::convert_output_item(
-            item,
-            self.response_id.as_deref().unwrap_or_default(),
-            usize::try_from(index).unwrap_or(usize::MAX),
-            &self.handoffs,
-            &self.provider,
-            &self.model,
-        )?
-        else {
-            return Ok(None);
+    /// Settles a continuation from finished stream items, or reads the ordinary final payload.
+    fn settle(&mut self, frame: &Value, continue_turn: bool) -> Result<ModelStreamEvent> {
+        let response = if continue_turn {
+            self.output
+                .settle_continuation(frame, self.request_id.take())?
+        } else {
+            let payload = frame
+                .get("response")
+                .ok_or_else(|| behavior_error("OpenAI response.completed has no response"))?;
+            convert::convert_response(
+                payload,
+                self.request_id.take(),
+                &self.handoffs,
+                &self.provider,
+                &self.model,
+            )?
         };
-        let name = run_item.kind().label();
-        Ok(Some(ModelStreamEvent::RunItem(RunItemStreamEvent::new(
-            name, run_item,
-        ))))
-    }
-
-    /// Lifts the finished response object the terminal frame carries.
-    ///
-    /// The whole object is there, so this is the non-streaming conversion applied to a payload that
-    /// arrived in pieces — including its refusal of a response whose status is not `completed`.
-    fn settle(&mut self, frame: &Value) -> Result<ModelStreamEvent> {
-        let payload = frame
-            .get("response")
-            .ok_or_else(|| behavior_error("OpenAI response.completed has no response"))?;
-        let response = convert::convert_response(
-            payload,
-            self.request_id.clone(),
-            &self.handoffs,
-            &self.provider,
-            &self.model,
-        )?;
         self.settled = true;
-        // `response.completed` is terminal for this protocol. Stop reading at it so the terminal
-        // model event is also the final event a consumer observes; the trailing `[DONE]` marker is
-        // transport punctuation and carries no facts the completed response lacks.
+        // The terminal model event is last; the trailing `[DONE]` marker adds no response facts.
         self.finished = true;
         Ok(ModelStreamEvent::Completed(Box::new(response)))
     }

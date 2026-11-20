@@ -422,3 +422,14 @@ fn unparsed_argument_text_is_kept_apart_and_older_records_read_as_parsed() {
         approval
     );
 }
+
+#[test]
+fn model_response_preserves_legacy_end_turn_metadata() {
+    for value in [json!("legacy metadata"), json!(false)] {
+        let mut wire = serde_json::to_value(ModelResponse::new(vec![])).unwrap();
+        wire["end_turn"] = value.clone();
+        let restored: ModelResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.unknown().get("end_turn"), Some(&value));
+        assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+    }
+}

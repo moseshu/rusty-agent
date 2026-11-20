@@ -13,6 +13,7 @@ use futures::{
 };
 use ra_core::{
     error::{Error, ProviderErrorKind, Result},
+    item::{MessageRole, ModelInputItem, ModelResponse, OutputPhase},
     model::{ModelRequest, NormalizedProviderError, ReplaySafety, stamp_replay_safety},
     session::SessionId,
 };
@@ -34,7 +35,7 @@ use tokio_tungstenite::tungstenite::{
     Error as WsError, Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
 
-use super::{OpenAiResponsesModel, convert, request};
+use super::{OpenAiResponsesModel, convert, request, stream::CompletedOutput};
 use crate::openai::{
     error::{
         ResponseFacts, behavior_error, response_failure, response_failure_as, retry_after_deadline,
@@ -165,6 +166,7 @@ struct ActiveResponse {
     cache: Arc<Mutex<SessionCache>>,
     connection: Option<Connection>,
     call: Call,
+    completed_output: Option<CompletedOutput>,
     _session: OwnedMutexGuard<()>,
 }
 
@@ -291,13 +293,9 @@ impl WebSocketTransport {
                 .take_connection(request.session_id());
             match self.attempt(&call, cached, key).await {
                 Ok((connection, first)) => {
-                    let mut active = ActiveResponse {
-                        cache: Arc::clone(&self.cache),
-                        connection: Some(connection),
-                        call,
-                        _session: session,
-                    };
-                    active.finish_if_terminal(&first).await;
+                    let mut active =
+                        ActiveResponse::new(Arc::clone(&self.cache), connection, call, session);
+                    active.observe_event(&first).await;
                     return Ok(Some(
                         stream::once(async { Ok(SseFrame::Data(first)) })
                             .chain(active.frames())
@@ -530,16 +528,23 @@ impl Call {
         body
     }
 
-    async fn baseline(&self, event: &Value) -> Option<PreviousResponse> {
+    fn response_from_payload(&self, event: &Value) -> Option<ModelResponse> {
         let payload = event.get("response")?;
-        let response = convert::convert_response(
+        convert::convert_response(
             payload,
             None,
             self.request.handoffs(),
             self.request.model_settings().provider(),
             &self.model.model,
         )
-        .ok()?;
+        .ok()
+    }
+
+    async fn baseline(
+        &self,
+        response: &ModelResponse,
+        continues_turn: bool,
+    ) -> Option<PreviousResponse> {
         let id = response
             .response_id()
             .filter(|id| !id.is_empty())?
@@ -550,6 +555,16 @@ impl Call {
             .iter()
             .filter_map(ra_core::item::RunItem::to_model_input)
         {
+            // The runner records assistant text as commentary when the response continues.
+            // Compare against that history projection before deciding whether to send a delta.
+            let item = match item {
+                ModelInputItem::Message(message)
+                    if continues_turn && message.role() == MessageRole::Assistant =>
+                {
+                    ModelInputItem::Message(message.with_phase(OutputPhase::Commentary))
+                }
+                item => item,
+            };
             output.push(
                 request::lower_input_item(&item, self.request.handoffs())
                     .await
@@ -588,20 +603,77 @@ impl PreviousResponse {
 }
 
 impl ActiveResponse {
-    async fn finish_if_terminal(&mut self, event: &Value) {
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.completed") => {
-                if let Some(mut connection) = self.connection.take() {
-                    connection.previous = self.call.baseline(event).await;
-                    if let Ok(mut cache) = self.cache.lock() {
-                        cache.put_connection(self.call.request.session_id(), connection);
-                    }
+    fn new(
+        cache: Arc<Mutex<SessionCache>>,
+        connection: Connection,
+        call: Call,
+        session: OwnedMutexGuard<()>,
+    ) -> Self {
+        let completed_output = call
+            .model
+            .transport
+            .end_turn_signals
+            .then(|| CompletedOutput::new(true));
+        Self {
+            cache,
+            connection: Some(connection),
+            call,
+            completed_output,
+            _session: session,
+        }
+    }
+
+    async fn observe_event(&mut self, event: &Value) {
+        let event_type = event.get("type").and_then(Value::as_str);
+        if let Some(output) = &mut self.completed_output {
+            match event_type {
+                Some("response.created") => output.observe_created(event),
+                Some("response.output_item.done")
+                    if output
+                        .lift_done(
+                            event,
+                            self.call.request.handoffs(),
+                            self.call.request.model_settings().provider(),
+                            &self.call.model.model,
+                        )
+                        .is_err() =>
+                {
+                    // The decoder reports the error. A partial projection cannot be reused.
+                    self.completed_output = None;
                 }
+                _ => {}
             }
-            Some("response.failed" | "response.incomplete" | "response.error") => {
+        }
+        let continues_turn =
+            self.call.model.transport.end_turn_signals && super::stream::continues_turn(event);
+        let response = if continues_turn {
+            let Some(response) = self
+                .completed_output
+                .as_mut()
+                .and_then(|output| output.settle_continuation(event, None).ok())
+            else {
                 self.connection = None;
+                return;
+            };
+            Some(response)
+        } else {
+            match event_type {
+                Some("response.completed") => self.call.response_from_payload(event),
+                Some("response.failed" | "response.incomplete" | "response.error") => {
+                    self.connection = None;
+                    return;
+                }
+                _ => return,
             }
-            _ => {}
+        };
+        if let Some(mut connection) = self.connection.take() {
+            connection.previous = match &response {
+                Some(response) => self.call.baseline(response, continues_turn).await,
+                None => None,
+            };
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.put_connection(self.call.request.session_id(), connection);
+            }
         }
     }
 
@@ -610,7 +682,7 @@ impl ActiveResponse {
             let connection = active.connection.as_mut()?;
             let event = match next_event(&mut connection.socket, active.call.idle_timeout).await {
                 Ok(event) => {
-                    active.finish_if_terminal(&event).await;
+                    active.observe_event(&event).await;
                     Ok(SseFrame::Data(event))
                 }
                 Err(error) => {

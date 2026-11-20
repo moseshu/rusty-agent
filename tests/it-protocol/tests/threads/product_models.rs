@@ -947,6 +947,151 @@ async fn product_responses_websocket_does_not_fall_back_after_a_terminal_upgrade
     }
 }
 
+/// As Codex's sampling loop: a response the server interrupted settles with the items that
+/// finished and does not end the turn, so the product asks the model again within the same turn,
+/// sending the finished message back, and completes with the next response.
+#[tokio::test]
+async fn product_follows_up_an_interrupted_response_within_the_turn() {
+    let endpoint = MockServer::start().await;
+    let finished = json!({
+        "id": "msg_cut", "type": "message", "role": "assistant", "status": "completed",
+        "phase": "commentary",
+        "content": [{"type": "output_text", "text": "Checked the tests."}]
+    });
+    let interrupted = [
+        json!({"type": "response.created", "response": {"id": "resp_cut"}}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": finished}),
+        json!({"type": "response.incomplete", "response": {
+            "id": "resp_cut", "status": "incomplete",
+            "incomplete_details": {"reason": "interrupted"},
+            "output": [finished],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }}),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(interrupted, "text/event-stream"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("data: {}\n\n", websocket_completion(2)),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let product = ProductModels::new();
+    product.write(
+        "config.toml",
+        &format!(
+            r#"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model = "local-model"
+model_provider = "gateway"
+[model_providers.gateway]
+name = "Gateway"
+base_url = "{}/product/v1"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+            endpoint.uri()
+        ),
+    );
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let completed = completed_turn(&server, &mut connection, &thread, "keep going").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+
+    let requests = endpoint.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let follow_up: Value = requests[1].body_json().unwrap();
+    assert!(
+        follow_up["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["content"][0]["text"] == "Checked the tests."),
+        "{follow_up}"
+    );
+    endpoint.verify().await;
+}
+
+#[tokio::test]
+async fn product_responses_websocket_reuses_the_connection_for_both_follow_up_signals() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message as Frame};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("http://{}/product/v1", listener.local_addr().unwrap()),
+        "stream_max_retries = 0",
+    );
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        for (step, terminal) in [
+            (
+                1,
+                json!({"type": "response.incomplete", "response": {
+                    "id": "resp_1", "incomplete_details": {"reason": "interrupted"}
+                }}),
+            ),
+            (
+                2,
+                json!({"type": "response.completed", "response": {
+                    "id": "resp_2", "end_turn": false
+                }}),
+            ),
+        ] {
+            let frame = ws.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if step == 1 {
+                assert!(request.get("previous_response_id").is_none());
+            } else {
+                assert_eq!(request["previous_response_id"], "resp_1", "{request}");
+                assert_eq!(request["input"], json!([]));
+            }
+            for suffix in ["a", "b"] {
+                let done = json!({"type": "response.output_item.done", "item": {
+                    "id": format!("msg_{step}_{suffix}"), "type": "message",
+                    "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": format!("Finished {step} {suffix}.")}]
+                }});
+                ws.send(Frame::Text(done.to_string().into())).await.unwrap();
+            }
+            ws.send(Frame::Text(terminal.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let frame = ws.next().await.unwrap().unwrap();
+        let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(request["previous_response_id"], "resp_2", "{request}");
+        assert_eq!(request["input"], json!([]));
+        ws.send(Frame::Text(websocket_completion(3).to_string().into()))
+            .await
+            .unwrap();
+    });
+
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    let completed = completed_turn(&server, &mut connection, &thread, "keep going").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn product_responses_websocket_reconnects_after_a_connection_limit_error() {
     websocket_reconnects_after(json!({

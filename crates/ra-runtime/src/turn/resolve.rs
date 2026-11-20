@@ -31,7 +31,7 @@ pub async fn resolve_next_step(
     cancel: &CancelScope,
     run: &RunContext,
 ) -> Result<NextStep> {
-    resolve_next_step_with_output(processed, execution, tool_use_behavior, cancel, run)
+    resolve_next_step_with_output(processed, execution, tool_use_behavior, cancel, run, false)
         .await
         .map(|(step, _)| step)
 }
@@ -42,6 +42,7 @@ pub(super) async fn resolve_next_step_with_output(
     tool_use_behavior: &ToolUseBehavior,
     cancel: &CancelScope,
     run: &RunContext,
+    model_follow_up: bool,
 ) -> Result<(NextStep, Option<OutputValue>)> {
     // The run's own questions first, then those its agent tools' nested runs stopped on, each run's
     // in model order. The reference interleaves the two by call; keeping this run's records together
@@ -80,7 +81,8 @@ pub(super) async fn resolve_next_step_with_output(
     // Something was owed an answer and now has one — including a call that resolved to nothing,
     // whose failure observation the model has not seen yet. Concluding here would end the run on
     // a result the model never got to read.
-    if processed.has_tools_or_approvals_to_run() {
+    // A host-selected follow-up also keeps this turn open before output phases are assigned.
+    if model_follow_up || processed.has_tools_or_approvals_to_run() {
         return Ok((NextStep::RunAgain, None));
     }
 

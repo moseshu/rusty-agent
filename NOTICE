@@ -1160,4 +1160,13 @@ crates/ra-model/src/openai/error.rs follows codex-rs/codex-api/src/api_bridge.rs
 codex-rs/codex-api/src/sse/responses_error.rs at the same revision. The product explicitly selects
 this recovery; no provider retry classification or content-filter guidance is added to the
 provider-neutral framework contract.
+The product's end-of-turn handling follows the same Codex revision. Continuation settlement in
+crates/ra-model/src/openai/responses/stream.rs follows codex-rs/codex-api/src/sse/responses.rs
+and codex-rs/core/src/client.rs (map_response_events). The connection reuse and incremental
+request baseline in crates/ra-model/src/openai/responses/websocket.rs follow
+codex-rs/codex-api/src/endpoint/responses_websocket.rs and codex-rs/core/src/client.rs.
+The runtime applies the product-selected rule in crates/ra-runtime/src/runner.rs and
+crates/ra-runtime/src/turn.rs, following codex-rs/core/src/session/turn.rs. The default
+response.incomplete error behavior and the provider-neutral response format follow the
+openai-agents-python contract.
 See the retained licenses above.

@@ -145,6 +145,20 @@ budget. Summary requests end when their own retry budget is spent.
 | A Responses provider can delegate WebSocket recovery to its host | Hosts of the Responses adapter | Use `with_runner_transport_fallback` and call the provider's session switch from the recovery hook |
 | The product reports `Reconnecting... n/max` and warns when the budget triggers HTTPS fallback | Clients of the coding product | Expect release builds to suppress the first retry only while the session uses WebSocket |
 
+### Responses can say they do not end the turn, as Codex reads them
+
+The coding product enables `OpenAiResponsesProvider::with_end_turn_signals` and installs
+`response_continues_turn` through `RunConfig::with_model_follow_up`. A `response.completed` with
+`end_turn: false` or a `response.incomplete` with reason `interrupted` settles from the items
+that finished streaming. The product samples again in the same turn and can reuse its WebSocket
+connection with the new response ID. The default provider follows the OpenAI Agents SDK and
+reports every `response.incomplete` as a failure.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| The product supports server-requested follow-up sampling | Hosts opting into Codex Responses behavior | Enable the provider option and install the Responses follow-up rule in the runtime |
+| Both continuation frames keep the product turn open | Clients of the coding product | Expect another model call in the same turn |
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

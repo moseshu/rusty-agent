@@ -1527,3 +1527,160 @@ async fn developer_history_and_host_selection_omission_follow_framework_contract
     assert_eq!(body["input"][0]["role"], "developer");
     assert!(!body.to_string().contains("hidden"));
 }
+
+/// Streams `frames` from a provider that reads the end-of-turn signal when `signals` is set.
+async fn signalled_events(
+    frames: &[Value],
+    signals: bool,
+) -> Vec<ra_core::error::Result<ModelStreamEvent>> {
+    use ra_core::model::ModelProvider;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_body(frames), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let mut provider = OpenAiResponsesProvider::new(
+        OpenAiAuth::new("test-secret").with_base_url(format!("{}/v1/", server.uri())),
+        "gpt-test",
+    )
+    .unwrap();
+    if signals {
+        provider = provider.with_end_turn_signals();
+    }
+    provider
+        .get_model(None)
+        .unwrap()
+        .stream_response(ModelRequest::new(vec![], resolved(ModelSettings::new())))
+        .collect::<Vec<_>>()
+        .await
+}
+
+fn settled(events: Vec<ra_core::error::Result<ModelStreamEvent>>) -> ra_core::item::ModelResponse {
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            Ok(ModelStreamEvent::Completed(response)) => Some(*response),
+            Ok(_) => None,
+            Err(error) => panic!("the stream failed: {error}"),
+        })
+        .expect("the stream settled")
+}
+
+/// As Codex's Responses decoder, a provider that reads the end-of-turn signal settles a response
+/// the server interrupted as one that does not end the turn, keeping only the items that finished
+/// streaming. By default every `response.incomplete` fails, as in the Agents SDK, and any other
+/// incomplete reason fails either way.
+#[tokio::test]
+async fn an_interrupted_response_settles_only_when_the_provider_reads_end_turn() {
+    let finished = json!({
+        "id": "msg_done", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "output_text", "text": "Checked the tests."}]
+    });
+    let partial = json!({
+        "id": "msg_partial", "type": "message", "role": "assistant", "status": "incomplete",
+        "content": [{"type": "output_text", "text": "Now I"}]
+    });
+    let first = json!({
+        "id": "msg_first", "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Found the failing test."}]
+    });
+    let frames = |reason: &str| {
+        vec![
+            json!({"type": "response.created", "response": {"id": "resp_cut"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "msg_done", "type": "message"}}),
+            json!({"type": "response.output_item.done", "item": first}),
+            json!({"type": "response.output_item.done", "item": finished}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "msg_partial", "type": "message"}}),
+            json!({"type": "response.incomplete", "response": {
+                "id": "resp_cut", "status": "incomplete",
+                "incomplete_details": {"reason": reason},
+                "output": [first, finished, partial],
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+            }}),
+        ]
+    };
+
+    let error = signalled_events(&frames("interrupted"), false)
+        .await
+        .into_iter()
+        .find_map(Result::err)
+        .expect("the Agents SDK fails every incomplete response");
+    assert_eq!(error.code(), "provider.behavior");
+
+    let response = settled(signalled_events(&frames("interrupted"), true).await);
+    assert_eq!(response.response_id(), Some("resp_cut"));
+    let ids: Vec<&str> = response
+        .output()
+        .iter()
+        .map(|item| item.id().as_str())
+        .collect();
+    assert_eq!(ids, ["msg_first", "msg_done"]);
+    assert_eq!(response.usage().output_tokens(), 2);
+
+    let error = signalled_events(&frames("max_output_tokens"), true)
+        .await
+        .into_iter()
+        .find_map(Result::err)
+        .expect("only an interrupted response settles");
+    assert_eq!(error.code(), "provider.output_limit");
+}
+
+#[tokio::test]
+async fn continuation_synthesizes_distinct_ids_for_items_without_ids_or_indices() {
+    let done = |text| {
+        json!({"type": "response.output_item.done", "item": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }})
+    };
+    let frames = [
+        json!({"type": "response.created", "response": {"id": "resp_cut"}}),
+        done("first message"),
+        done("second message"),
+        json!({"type": "response.incomplete", "response": {
+            "id": "resp_cut", "incomplete_details": {"reason": "interrupted"}
+        }}),
+    ];
+    let response = settled(signalled_events(&frames, true).await);
+    let [first, second] = response.output() else {
+        panic!("expected two finished items, got {:?}", response.output());
+    };
+    assert_ne!(first.id(), second.id());
+    for (item, expected) in [(first, "first message"), (second, "second message")] {
+        let RunItemKind::Message(message) = item.kind() else {
+            panic!("expected a message, got {:?}", item.kind());
+        };
+        assert_eq!(message.text_content(), expected);
+    }
+}
+
+/// Codex accepts the response ID and end-of-turn flag alone. When the payload also carries
+/// output, only the items that finished streaming belong to the continuation.
+#[tokio::test]
+async fn a_completed_response_that_continues_settles_from_finished_stream_items() {
+    let item = |id| {
+        json!({"id": id, "type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": id}]})
+    };
+    let mut frames = [
+        json!({"type": "response.output_item.done", "item": item("finished")}),
+        json!({"type": "response.completed", "response": {"id": "resp", "end_turn": false}}),
+    ];
+    let response = settled(signalled_events(&frames, true).await);
+    assert_eq!(response.response_id(), Some("resp"));
+    assert_eq!(response.output()[0].id().as_str(), "finished");
+    assert_eq!(response.output().len(), 1);
+
+    frames[1]["response"]["output"] = json!([item("terminal_only")]);
+    let response = settled(signalled_events(&frames, true).await);
+    assert_eq!(response.output()[0].id().as_str(), "finished");
+    assert_eq!(response.output().len(), 1);
+    let response = settled(signalled_events(&frames, false).await);
+    assert_eq!(response.output()[0].id().as_str(), "terminal_only");
+}
