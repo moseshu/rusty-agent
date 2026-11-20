@@ -405,3 +405,80 @@ async fn resolving_a_veto_falls_back_to_its_reason_for_an_empty_approval_reason(
         assert_eq!(decision.reason(), Some("provider veto"));
     }
 }
+
+/// A custom policy that claims both capabilities, as the SDK's falsey policy carrying both
+/// markers does.
+#[derive(Debug)]
+struct ClaimsEveryCapability;
+
+#[async_trait::async_trait]
+impl ModelRetryPolicy for ClaimsEveryCapability {
+    async fn evaluate(&self, _context: &RetryPolicyContext<'_>) -> RetryDecision {
+        RetryDecision::no_retry()
+    }
+
+    fn retries_safe_transport_errors(&self) -> bool {
+        true
+    }
+
+    fn retries_all_transient_errors(&self) -> bool {
+        true
+    }
+}
+
+/// As the SDK's `_mark_retry_capabilities` on each built-in policy and combinator, and
+/// `test_retry_capabilities_preserve_falsey_policy`: an unmarked custom policy claims neither
+/// capability, a custom policy's own claim is reported as made, `all` claims what every policy
+/// claims, `any` what one does, and neither claims anything with no policies.
+#[test]
+fn retry_capabilities_follow_the_sdk_markers() {
+    use ra_core::model::{
+        AllRetryPolicy, AnyRetryPolicy, HttpStatusRetryPolicy, NeverRetryPolicy, RetryAfterPolicy,
+    };
+
+    let capabilities = |policy: &dyn ModelRetryPolicy| -> (bool, bool) {
+        (
+            policy.retries_safe_transport_errors(),
+            policy.retries_all_transient_errors(),
+        )
+    };
+    assert_eq!(capabilities(&NeverRetryPolicy), (false, false));
+    assert_eq!(capabilities(&ProviderSuggestedRetryPolicy), (true, false));
+    assert_eq!(capabilities(&NetworkErrorRetryPolicy), (true, false));
+    assert_eq!(capabilities(&RetryAfterPolicy), (false, false));
+    assert_eq!(
+        capabilities(&HttpStatusRetryPolicy::new([429])),
+        (false, false)
+    );
+    assert_eq!(capabilities(&AlwaysRetry), (false, false));
+    assert_eq!(capabilities(&ClaimsEveryCapability), (true, true));
+
+    let network = || Arc::new(NetworkErrorRetryPolicy) as Arc<dyn ModelRetryPolicy>;
+    let status = || Arc::new(HttpStatusRetryPolicy::new([500])) as Arc<dyn ModelRetryPolicy>;
+    let claims = || Arc::new(ClaimsEveryCapability) as Arc<dyn ModelRetryPolicy>;
+    assert_eq!(
+        capabilities(&AllRetryPolicy::new([
+            network(),
+            Arc::new(ProviderSuggestedRetryPolicy)
+        ])),
+        (true, false)
+    );
+    assert_eq!(
+        capabilities(&AllRetryPolicy::new([network(), status()])),
+        (false, false)
+    );
+    assert_eq!(
+        capabilities(&AllRetryPolicy::new([claims(), claims()])),
+        (true, true)
+    );
+    assert_eq!(
+        capabilities(&AnyRetryPolicy::new([network(), status()])),
+        (true, false)
+    );
+    assert_eq!(
+        capabilities(&AnyRetryPolicy::new([status(), claims()])),
+        (true, true)
+    );
+    assert_eq!(capabilities(&AllRetryPolicy::new([])), (false, false));
+    assert_eq!(capabilities(&AnyRetryPolicy::new([])), (false, false));
+}

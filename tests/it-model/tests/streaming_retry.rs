@@ -141,6 +141,68 @@ impl ModelResolver for Resolver {
     }
 }
 
+/// A failed WebSocket upgrade must reach the runner's budget and policy before any replay.
+#[tokio::test]
+async fn websocket_failures_obey_the_runner_budget_and_policy_without_http_replay() {
+    use ra_core::model::{AnyRetryPolicy, HttpStatusRetryPolicy, ModelProvider, ModelRetryPolicy};
+    use ra_http::{HttpClientFactory, OutboundProxyPolicy, websocket::WebSocketConnector};
+    use ra_model::openai::responses::OpenAiResponsesProvider;
+
+    for (budget, accepts_server_errors, upgrades) in [(0, true, 1), (1, false, 1), (1, true, 2)] {
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .expect(upgrades)
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&endpoint)
+            .await;
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let provider = OpenAiResponsesProvider::new(
+            OpenAiAuth::keyless(format!("{}/v1", endpoint.uri())),
+            "mock-model",
+        )
+        .unwrap()
+        .with_websocket(
+            WebSocketConnector::new(&factory).unwrap(),
+            Duration::from_secs(5),
+        );
+        let network = Arc::new(NetworkErrorRetryPolicy) as Arc<dyn ModelRetryPolicy>;
+        let policy: Arc<dyn ModelRetryPolicy> = if accepts_server_errors {
+            Arc::new(AnyRetryPolicy::new([
+                network,
+                Arc::new(HttpStatusRetryPolicy::new([503])),
+            ]))
+        } else {
+            network
+        };
+        let retry = ModelRetrySettings::new()
+            .with_max_retries(budget)
+            .with_policy(policy);
+        let request = RunRequest::new(
+            agent(),
+            Arc::new(Resolver(
+                provider.get_model(None).unwrap(),
+                Protocol::Responses,
+            )),
+            RunId::new("websocket-retry-run"),
+            CancelScope::root(),
+            vec![ModelInputItem::Message(Message::user("hello"))],
+        )
+        .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry)));
+        let error = Runner::run(request)
+            .await
+            .expect_err("the upgrade always fails");
+        assert_eq!(error.code(), "provider.server_error");
+        endpoint.verify().await;
+    }
+}
+
 fn agent() -> AgentBinding {
     AgentBinding::direct(
         AgentSpec::builder()

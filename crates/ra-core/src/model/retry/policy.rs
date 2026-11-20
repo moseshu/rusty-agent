@@ -329,6 +329,27 @@ pub trait ModelRetryPolicy: Send + Sync {
     /// It is called for non-transient failures too, such as a rejected request or an invalid
     /// credential; a policy that accepts everything retries those.
     async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision;
+
+    /// Whether this policy retries the transport failures an adapter could otherwise retry on its
+    /// own before any response event, as the SDK's `retry_policy_retries_safe_transport_errors`.
+    ///
+    /// The runner reads it to decide whether an adapter's own pre-event reconnects would only
+    /// duplicate its retries (see [`ModelRequest::should_disable_websocket_pre_event_retries`]).
+    /// A policy that does not say so is assumed not to, as an unmarked SDK policy is.
+    ///
+    /// [`ModelRequest::should_disable_websocket_pre_event_retries`]:
+    ///     crate::model::ModelRequest::should_disable_websocket_pre_event_retries
+    fn retries_safe_transport_errors(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy retries every transient failure, as the SDK's
+    /// `retry_policy_retries_all_transient_errors`. A policy that does not say so is assumed not
+    /// to. No built-in policy claims it; combinators carry it through as they carry
+    /// [`Self::retries_safe_transport_errors`].
+    fn retries_all_transient_errors(&self) -> bool {
+        false
+    }
 }
 
 /// A policy that never retries.
@@ -385,6 +406,10 @@ impl ModelRetryPolicy for ProviderSuggestedRetryPolicy {
         }
         decision
     }
+
+    fn retries_safe_transport_errors(&self) -> bool {
+        true
+    }
 }
 
 /// A policy that retries network and timeout provider failures.
@@ -400,6 +425,10 @@ impl ModelRetryPolicy for NetworkErrorRetryPolicy {
             }
             _ => RetryDecision::no_retry(),
         }
+    }
+
+    fn retries_safe_transport_errors(&self) -> bool {
+        true
     }
 }
 
@@ -489,6 +518,24 @@ impl ModelRetryPolicy for AllRetryPolicy {
             None => merged,
         }
     }
+
+    /// Claimed only when every combined policy claims it; with no policies, never, as the SDK's
+    /// `all()` of nothing is its `never()`.
+    fn retries_safe_transport_errors(&self) -> bool {
+        !self.policies.is_empty()
+            && self
+                .policies
+                .iter()
+                .all(|policy| policy.retries_safe_transport_errors())
+    }
+
+    fn retries_all_transient_errors(&self) -> bool {
+        !self.policies.is_empty()
+            && self
+                .policies
+                .iter()
+                .all(|policy| policy.retries_all_transient_errors())
+    }
 }
 
 /// A policy that retries when any combined policy does, as the SDK's `retry_policies.any`.
@@ -552,6 +599,19 @@ impl ModelRetryPolicy for AnyRetryPolicy {
             (None, Some(positive)) => positive,
             (None, None) => last_negative.unwrap_or_else(RetryDecision::no_retry),
         }
+    }
+
+    /// Claimed when any combined policy claims it.
+    fn retries_safe_transport_errors(&self) -> bool {
+        self.policies
+            .iter()
+            .any(|policy| policy.retries_safe_transport_errors())
+    }
+
+    fn retries_all_transient_errors(&self) -> bool {
+        self.policies
+            .iter()
+            .any(|policy| policy.retries_all_transient_errors())
     }
 }
 

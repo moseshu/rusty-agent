@@ -210,6 +210,8 @@ struct ResponsesTransport {
     client: HttpClient,
     stream_idle_timeout: Option<Duration>,
     request_max_retries: u32,
+    /// Whether the runner's per-attempt requests to skip this transport's own retries are obeyed.
+    follows_runner_retries: bool,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
     auth_headers: Option<Arc<dyn ResponsesAuthHeaders>>,
@@ -296,6 +298,7 @@ impl OpenAiResponsesProvider {
                 client,
                 stream_idle_timeout,
                 request_max_retries,
+                follows_runner_retries: true,
                 query: BTreeMap::new(),
                 bearer: None,
                 auth_headers: None,
@@ -322,6 +325,20 @@ impl OpenAiResponsesProvider {
         Arc::make_mut(&mut self.transport).websocket = Some(Arc::new(
             websocket::WebSocketTransport::new(connector, connect_timeout),
         ));
+        self
+    }
+
+    /// Keeps this provider's own retries whatever the runner asks of each attempt.
+    ///
+    /// By default the provider follows the Agents SDK contract: an attempt whose request reports
+    /// [`ModelRequest::should_disable_provider_managed_retries`] gets no HTTP retries, and one
+    /// reporting [`ModelRequest::should_disable_websocket_pre_event_retries`] gets no WebSocket
+    /// reconnects or HTTP replays after ordinary failures before its first event. A product that,
+    /// like Codex, configures request retries,
+    /// WebSocket reconnects and turn retries as independent nested budgets selects this instead.
+    #[must_use]
+    pub fn with_independent_transport_retries(mut self) -> Self {
+        Arc::make_mut(&mut self.transport).follows_runner_retries = false;
         self
     }
 
@@ -461,10 +478,15 @@ impl OpenAiResponsesModel {
     }
 
     /// Sends the Responses POST. A replay of a stored response could advance provider state.
+    ///
+    /// The transport's own retries are skipped when the runner asks for that, as the Agents SDK's
+    /// Responses model then uses a client with `max_retries=0`.
     async fn send(&self, request: &ModelRequest, streaming: bool) -> Result<HttpResponse> {
         let body =
             request::build_request_body(&self.model, request, self.quirks, streaming).await?;
         let retries = if body["store"] == false
+            && !(self.transport.follows_runner_retries
+                && request.should_disable_provider_managed_retries())
             && matches!(
                 request.continuation(),
                 ra_core::model::ConversationContinuation::None

@@ -693,3 +693,44 @@ fn the_openai_replay_verdict_does_not_reach_other_providers() {
         ReplaySafety::Unknown
     );
 }
+
+/// As the SDK's `test_get_client_disables_provider_managed_retries_when_requested`: the Responses
+/// transport's own HTTP retries apply to an attempt unless the runtime asked the adapter to skip
+/// them, and a provider that keeps independent transport retries, as Codex does, ignores that.
+#[tokio::test]
+async fn http_retries_follow_the_runtime_unless_the_provider_keeps_its_own() {
+    use ra_http::{ClientRouteClass, HttpClientFactory, OutboundProxyPolicy};
+    use ra_model::openai::responses::OpenAiResponsesProvider;
+
+    for (disabled, independent, posts) in [(false, false, 3), (true, false, 1), (true, true, 3)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .expect(posts)
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/v1", server.uri());
+        let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .build_client_without_request_logging(&endpoint, ClientRouteClass::Api)
+            .unwrap();
+        let mut provider = OpenAiResponsesProvider::with_http_client(
+            OpenAiAuth::keyless(endpoint),
+            MODEL,
+            client,
+            Duration::from_secs(5),
+            2,
+        )
+        .unwrap();
+        if independent {
+            provider = provider.with_independent_transport_retries();
+        }
+        let model = ra_core::model::ModelProvider::get_model(&provider, None).unwrap();
+        let error = model
+            .get_response(request().with_provider_managed_retries_disabled(disabled))
+            .await
+            .unwrap_err();
+        assert_eq!(facts(&error).status_code(), Some(503));
+        server.verify().await;
+    }
+}

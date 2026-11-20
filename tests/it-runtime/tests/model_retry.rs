@@ -1099,6 +1099,7 @@ struct SummaryModel {
     streams: AtomicUsize,
     advice: RetryAdvice,
     advice_streaming: Mutex<Vec<bool>>,
+    provider_retries_disabled: Mutex<Vec<bool>>,
 }
 
 impl SummaryModel {
@@ -1108,6 +1109,7 @@ impl SummaryModel {
             streams: AtomicUsize::new(0),
             advice,
             advice_streaming: Mutex::default(),
+            provider_retries_disabled: Mutex::default(),
         })
     }
 }
@@ -1118,8 +1120,12 @@ impl Model for SummaryModel {
         Err(Error::caller("summary requests stream"))
     }
 
-    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
         self.streams.fetch_add(1, Ordering::SeqCst);
+        self.provider_retries_disabled
+            .lock()
+            .unwrap()
+            .push(request.should_disable_provider_managed_retries());
         let created = Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
             ProviderKey::new("test-provider"),
             "response.created",
@@ -1225,6 +1231,11 @@ async fn a_summary_request_streams_and_retries_within_the_replay_boundary() {
     assert!(compact_with(model.clone(), policy.clone()).await);
     assert_eq!(model.streams.load(Ordering::SeqCst), 2);
     assert_eq!(*model.advice_streaming.lock().unwrap(), [true]);
+    // The summary's retry is the runtime's, so the adapter's own retries stay off for it.
+    assert_eq!(
+        *model.provider_retries_disabled.lock().unwrap(),
+        [false, true]
+    );
     assert_eq!(
         *policy.seen.lock().unwrap(),
         [SeenContext {
@@ -1407,5 +1418,243 @@ async fn combined_policies_follow_the_sdk_through_the_replay_vetoes() {
                 "any {any}"
             );
         }
+    }
+}
+
+/// Records, for every attempt, which of its own retries the runtime asked the adapter to skip:
+/// `(provider-managed, WebSocket pre-event)`.
+struct RetryFlagModel {
+    responses: Mutex<Vec<Result<ModelResponse>>>,
+    flags: Mutex<Vec<(bool, bool)>>,
+}
+
+impl RetryFlagModel {
+    fn new(responses: Vec<Result<ModelResponse>>) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(responses),
+            flags: Mutex::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl Model for RetryFlagModel {
+    async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::caller("this fixture only supports streaming"))
+    }
+
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        self.flags.lock().unwrap().push((
+            request.should_disable_provider_managed_retries(),
+            request.should_disable_websocket_pre_event_retries(),
+        ));
+        let event = self
+            .responses
+            .lock()
+            .unwrap()
+            .remove(0)
+            .map(|response| ModelStreamEvent::Completed(Box::new(response)));
+        stream::iter(vec![event]).boxed()
+    }
+}
+
+/// Runs one turn against `model` with `retry` as the run's retry settings.
+async fn run_with_retry(model: Arc<RetryFlagModel>, retry: ModelRetrySettings) -> Result<()> {
+    let cancel = CancelScope::root();
+    let mut request = request(model as Arc<dyn Model>, &cancel, false, 0);
+    request = request
+        .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry)));
+    Runner::run(request).await.map(|_| ())
+}
+
+/// As the SDK's `test_get_response_with_retry_keeps_provider_retries_on_first_attempt`,
+/// `..._disables_websocket_pre_event_retries_when_runner_managed`,
+/// `..._disables_provider_retries_when_explicitly_disabled`,
+/// `..._disables_websocket_pre_event_retries_when_disabled` and
+/// `..._keeps_provider_retries_without_runner_policy`: a stateless call keeps the adapter's own
+/// retries on its first attempt and loses them on the runtime's retry; a policy that retries safe
+/// transport failures takes over the WebSocket reconnects; an explicit zero budget turns both off;
+/// a budget without a policy leaves both on.
+#[tokio::test]
+async fn the_runtime_tells_the_adapter_which_of_its_own_retries_to_skip() {
+    let backoff = RetryBackoffSettings::new()
+        .with_initial_delay(std::time::Duration::ZERO)
+        .with_jitter(false);
+
+    let model = RetryFlagModel::new(vec![Err(network_error()), Ok(answer())]);
+    run_with_retry(
+        Arc::clone(&model),
+        ModelRetrySettings::new()
+            .with_max_retries(1)
+            .with_backoff(backoff.clone())
+            .with_policy(Arc::new(NetworkErrorRetryPolicy)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*model.flags.lock().unwrap(), [(false, true), (true, true)]);
+
+    let model = RetryFlagModel::new(vec![Ok(answer())]);
+    run_with_retry(
+        Arc::clone(&model),
+        ModelRetrySettings::new()
+            .with_max_retries(0)
+            .with_policy(Arc::new(ra_core::model::NeverRetryPolicy)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*model.flags.lock().unwrap(), [(true, true)]);
+
+    let model = RetryFlagModel::new(vec![Ok(answer())]);
+    run_with_retry(
+        Arc::clone(&model),
+        ModelRetrySettings::new().with_max_retries(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*model.flags.lock().unwrap(), [(false, false)]);
+
+    // A policy that does not retry transport failures leaves the WebSocket reconnects alone.
+    let model = RetryFlagModel::new(vec![Err(network_error())]);
+    run_with_retry(
+        Arc::clone(&model),
+        ModelRetrySettings::new()
+            .with_max_retries(1)
+            .with_backoff(backoff)
+            .with_policy(Arc::new(ra_core::model::HttpStatusRetryPolicy::new([429]))),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(*model.flags.lock().unwrap(), [(false, false)]);
+}
+
+/// The SDK's stateful cases, through the seam because the runtime does not yet produce a request
+/// continuing provider-held state: `..._disables_provider_retries_on_first_stateful_provider_hint`,
+/// `..._disables_stateful_provider_retries_with_narrow_policy`,
+/// `..._keeps_stateful_provider_retries_when_budget_omitted`,
+/// `..._disables_stateful_provider_retries_for_network_only_policy`,
+/// `..._disables_stateful_provider_retries_for_partial_policy`,
+/// `..._keeps_websocket_pre_event_retries_with_unrelated_policy`,
+/// `..._keeps_websocket_pre_event_retries_for_partial_all_policy` and
+/// `..._disables_provider_retries_on_stateful_compat_replay`.
+#[test]
+fn a_stateful_request_routes_its_replays_through_the_runtime() {
+    use ra_core::model::{
+        AllRetryPolicy, AnyRetryPolicy, ConversationContinuation, HttpStatusRetryPolicy,
+        ModelRetryPolicy, ProviderSuggestedRetryPolicy,
+    };
+    use ra_runtime::runner::retry_test_api::coordinate_provider_retries;
+
+    let flags = |settings: Option<&ModelRetrySettings>, replay: bool| {
+        let request = coordinate_provider_retries(
+            bare_request(ConversationContinuation::PreviousResponseId(
+                "resp_prev".to_owned(),
+            )),
+            settings,
+            replay,
+        );
+        (
+            request.should_disable_provider_managed_retries(),
+            request.should_disable_websocket_pre_event_retries(),
+        )
+    };
+    let budgeted = |policy: Arc<dyn ModelRetryPolicy>| {
+        ModelRetrySettings::new()
+            .with_max_retries(1)
+            .with_policy(policy)
+    };
+    let network = || Arc::new(NetworkErrorRetryPolicy) as Arc<dyn ModelRetryPolicy>;
+    let status = |code| Arc::new(HttpStatusRetryPolicy::new([code])) as Arc<dyn ModelRetryPolicy>;
+
+    let suggested = budgeted(Arc::new(ProviderSuggestedRetryPolicy));
+    assert_eq!(flags(Some(&suggested), false), (true, true));
+    assert_eq!(flags(Some(&suggested), true), (true, true));
+
+    assert_eq!(flags(Some(&budgeted(status(429))), false), (true, false));
+    assert_eq!(
+        flags(
+            Some(&ModelRetrySettings::new().with_policy(network())),
+            false
+        ),
+        (false, false)
+    );
+    assert_eq!(flags(Some(&budgeted(network())), false), (true, true));
+    assert_eq!(
+        flags(
+            Some(&budgeted(Arc::new(AnyRetryPolicy::new([
+                network(),
+                status(500)
+            ])))),
+            false
+        ),
+        (true, true)
+    );
+    assert_eq!(
+        flags(
+            Some(&budgeted(Arc::new(AllRetryPolicy::new([
+                network(),
+                status(500)
+            ])))),
+            false
+        ),
+        (true, false)
+    );
+
+    // Without retry settings the first attempt keeps the adapter's retries; any replay the runtime
+    // schedules for a stateful request has passed its replay checks and turns them off.
+    assert_eq!(flags(None, false), (false, false));
+    assert_eq!(flags(None, true), (true, false));
+}
+
+/// A context processor that asks for one summary through the runtime and leaves the input as is.
+struct SummarizingProcessor;
+
+#[async_trait]
+impl ra_core::capability::ContextProcessor for SummarizingProcessor {
+    async fn process_context(
+        &self,
+        request: ra_core::capability::ContextProcessorRequest,
+        summarizer: &dyn ra_core::capability::ContextSummarizer,
+    ) -> Result<ra_core::capability::ContextProcessorResult> {
+        summarizer
+            .summarize(ra_core::capability::ContextSummaryRequest::new(
+                request.input().to_vec(),
+                "summarize",
+            ))
+            .await?;
+        Ok(ra_core::capability::ContextProcessorResult::new(
+            request.input().to_vec(),
+        ))
+    }
+}
+
+/// A run-scoped context processor sends its summary once and declines on failure, so the runtime
+/// owns none of that request's retries and leaves the adapter's own in place, even under a policy
+/// that would take the WebSocket reconnects over for an ordinary call. An explicit zero budget
+/// still opts out of every retry.
+#[tokio::test]
+async fn a_summary_sent_once_keeps_the_adapter_retries_the_runtime_does_not_replace() {
+    for (max_retries, summary, call) in [
+        (1, (false, false), (false, true)),
+        (0, (true, true), (true, true)),
+    ] {
+        let model = RetryFlagModel::new(vec![Ok(answer()), Ok(answer())]);
+        let cancel = CancelScope::root();
+        let request = request(Arc::clone(&model) as Arc<dyn Model>, &cancel, false, 0).with_config(
+            RunConfig::new()
+                .with_context_processor(Arc::new(SummarizingProcessor))
+                .with_model_settings(
+                    ModelSettings::new().with_retry(
+                        ModelRetrySettings::new()
+                            .with_max_retries(max_retries)
+                            .with_policy(Arc::new(NetworkErrorRetryPolicy)),
+                    ),
+                ),
+        );
+        Runner::run(request).await.unwrap();
+        assert_eq!(
+            *model.flags.lock().unwrap(),
+            [summary, call],
+            "max_retries={max_retries}"
+        );
     }
 }

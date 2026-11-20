@@ -241,11 +241,7 @@ impl WebSocketTransport {
         };
         let mut refreshed = false;
         let mut retries = 0;
-        let max_retries = request
-            .model_settings()
-            .retry()
-            .and_then(ra_core::model::ModelRetrySettings::max_retries)
-            .unwrap_or(DEFAULT_STREAM_MAX_RETRIES);
+        let max_retries = reconnect_budget(model, request);
         loop {
             let key = call.connection_key(
                 headers.clone(),
@@ -298,12 +294,13 @@ impl WebSocketTransport {
                         });
                     if !upgrade_required
                         && (!retryable
-                            || ra_core::model::replay_safety_of(&error) != ReplaySafety::Safe)
+                            || ra_core::model::replay_safety_of(&error) != ReplaySafety::Safe
+                            || max_retries.is_none())
                     {
                         return Err(error);
                     }
                     let delay = facts.and_then(NormalizedProviderError::retry_after);
-                    if upgrade_required || retries >= max_retries {
+                    if upgrade_required || max_retries.is_some_and(|max| retries >= max) {
                         session.fallback = true;
                         if let Some(delay) = delay {
                             sleep(delay).await;
@@ -759,4 +756,24 @@ pub(super) fn observe_catalog_etags(
             }
         })
         .boxed()
+}
+
+/// Reconnects allowed before the first response event, after which the session switches to HTTP.
+///
+/// `None` hands ordinary failures to the runner without reconnecting or replaying over HTTP,
+/// as in the Agents SDK. A provider with independent transport retries keeps Codex's fallback
+/// even with a zero reconnect budget. HTTP 426 still negotiates the required transport.
+fn reconnect_budget(model: &OpenAiResponsesModel, request: &ModelRequest) -> Option<u32> {
+    if model.transport.follows_runner_retries
+        && request.should_disable_websocket_pre_event_retries()
+    {
+        return None;
+    }
+    Some(
+        request
+            .model_settings()
+            .retry()
+            .and_then(ra_core::model::ModelRetrySettings::max_retries)
+            .unwrap_or(DEFAULT_STREAM_MAX_RETRIES),
+    )
 }

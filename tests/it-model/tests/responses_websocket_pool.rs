@@ -471,3 +471,51 @@ async fn a_failure_after_the_first_event_records_that_the_response_started() {
     assert!(advice.response_started());
     assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
 }
+
+/// As the SDK's `test_websocket_pre_event_disconnect_retry_respects_websocket_retry_disable`: an
+/// attempt whose retry the runtime owns returns its failure without reconnecting or sending HTTP.
+/// A provider keeping independent transport retries, as Codex does, reconnects as configured.
+/// HTTP 426 still negotiates the required HTTP transport without a reconnect.
+#[tokio::test]
+async fn a_runtime_owned_retry_returns_the_failure_without_an_http_replay() {
+    for (independent, status, upgrades) in [(false, 503, 1), (true, 503, 6), (false, 426, 1)] {
+        let falls_back = independent || status == 426;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0"))
+            .expect(upgrades)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {}\n\n", completion()), "text/event-stream"),
+            )
+            .expect(if falls_back { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        let mut provider = provider_at(format!("{}/v1", server.uri()), PATIENCE);
+        if independent {
+            provider = provider.with_independent_transport_retries();
+        }
+        let model = provider.get_model(None).unwrap();
+        let request =
+            request(&ModelSettings::new()).with_websocket_pre_event_retries_disabled(true);
+        if falls_back {
+            completed(model.as_ref(), request).await;
+        } else {
+            let mut stream = model.stream_response(request);
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                NormalizedProviderError::from_error(&error)
+                    .unwrap()
+                    .status_code(),
+                Some(503)
+            );
+            assert!(stream.next().await.is_none());
+        }
+        server.verify().await;
+    }
+}

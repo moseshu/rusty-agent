@@ -546,7 +546,10 @@ fn build_registry(
             idle,
             u32::try_from(description.request_max_retries.unwrap_or(4).min(100)).unwrap_or(100),
         )?
-        .with_quirks(quirks);
+        .with_quirks(quirks)
+        // Codex nests request retries and WebSocket reconnects inside each turn retry, with
+        // independent budgets, rather than handing them to the turn's retry loop.
+        .with_independent_transport_retries();
         if description.supports_websockets {
             let connector =
                 ra_http::websocket::WebSocketConnector::new(&http_factory).map_err(|error| {

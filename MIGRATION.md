@@ -108,6 +108,30 @@ retries a summary stream that closed early or could not be decoded, as Codex ret
 | Summaries go through `stream_response` | Custom `Model` implementations that answer summaries only from `get_response` | Answer the same request from `stream_response`, ending with `ModelStreamEvent::Completed` |
 | A summary stream without a terminal response fails | Models whose streams end without `Completed` | End every successful stream with `Completed` |
 
+### The Responses provider leaves retries to the runner when the runner owns them
+
+The runner now tells the adapter, on every attempt, which of the adapter's own retries to skip, as
+the OpenAI Agents SDK does around each attempt.
+`ModelRequest::should_disable_provider_managed_retries` is set on an explicit zero retry budget; on
+every retry the runner schedules while a policy and a nonzero budget are installed; on every retry
+of a request continuing provider-held state; and on the first attempt of such a request when a
+policy and a nonzero budget let the runner retry it.
+`ModelRequest::should_disable_websocket_pre_event_retries` is set on an explicit zero budget, and
+when the budget is nonzero and the policy reports `ModelRetryPolicy::retries_safe_transport_errors`,
+which `NetworkErrorRetryPolicy`, `ProviderSuggestedRetryPolicy` and combinations of them report. The
+OpenAI Responses provider obeys both: it skips its `request_max_retries` HTTP retries, and its
+WebSocket reconnects before the first event, returning ordinary WebSocket failures to the runner
+without replaying them over HTTP. HTTP 426 still negotiates HTTP transport. A summary that a
+run-scoped context processor sends once, without runner retries, is marked only under an explicit
+zero budget. The Chat Completions and Anthropic adapters had no retries of their own and are
+unaffected; the coding product keeps Codex's nested retry budgets.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| A Responses provider built with `with_http_client(.., request_max_retries)` no longer retries a 5xx or transport failure on the runner's retries, or at all under `max_retries = 0` | Hosts relying on both the runner's and the transport's retries | Raise the runner's retry budget, or call `OpenAiResponsesProvider::with_independent_transport_retries` to keep the transport's own |
+| With a policy that retries transport failures, or a zero budget, ordinary WebSocket failures return to the runner without reconnecting or replaying over HTTP | Hosts using `with_websocket` with such a policy | Let the runner's budget and policy decide retries, or call `with_independent_transport_retries` to keep the transport's reconnects and fallback |
+| `ModelRetryPolicy` gains `retries_safe_transport_errors` and `retries_all_transient_errors`, both defaulting to `false` | Custom policies that retry transport failures | Override `retries_safe_transport_errors` to return `true` so the runner takes the reconnects over |
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

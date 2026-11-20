@@ -835,6 +835,8 @@ pub struct ModelRequest {
     cache_plan: Option<CachePlan>,
     prompt_cache_key: Option<String>,
     session_id: Option<crate::session::SessionId>,
+    provider_managed_retries_disabled: bool,
+    websocket_pre_event_retries_disabled: bool,
 }
 
 impl ModelRequest {
@@ -853,6 +855,8 @@ impl ModelRequest {
             cache_plan: None,
             prompt_cache_key: None,
             session_id: None,
+            provider_managed_retries_disabled: false,
+            websocket_pre_event_retries_disabled: false,
         }
     }
 
@@ -1048,5 +1052,48 @@ impl ModelRequest {
     #[must_use]
     pub const fn continuation(&self) -> &ConversationContinuation {
         &self.continuation
+    }
+
+    /// Asks the adapter not to retry this attempt on its own, as the `OpenAI` Agents SDK's
+    /// `provider_managed_retries_disabled` does.
+    ///
+    /// The runner sets it per attempt. The SDK carries the flag in a context variable around each
+    /// attempt; here it travels on the request, because a Rust stream is polled outside any scope
+    /// that started it and an adapter may continue its work on a spawned task, neither of which
+    /// carries an ambient value along.
+    #[must_use]
+    pub const fn with_provider_managed_retries_disabled(mut self, disabled: bool) -> Self {
+        self.provider_managed_retries_disabled = disabled;
+        self
+    }
+
+    /// Whether the adapter must skip the retries it would otherwise make itself, such as an HTTP
+    /// client's own retry loop, as the SDK's `should_disable_provider_managed_retries`.
+    ///
+    /// The runner asks for this when its own retry settings opt out of retries entirely, when a
+    /// request continuing provider-held state could be retried by the runner, whose replay checks
+    /// a hidden retry would bypass, and on any retry the runner itself scheduled.
+    #[must_use]
+    pub const fn should_disable_provider_managed_retries(&self) -> bool {
+        self.provider_managed_retries_disabled
+    }
+
+    /// Asks the adapter not to reconnect a WebSocket on its own before the first response event,
+    /// as the SDK's `websocket_pre_event_retries_disabled` does. Set per attempt by the runner.
+    #[must_use]
+    pub const fn with_websocket_pre_event_retries_disabled(mut self, disabled: bool) -> Self {
+        self.websocket_pre_event_retries_disabled = disabled;
+        self
+    }
+
+    /// Whether the adapter must not reconnect a WebSocket on its own before the first response
+    /// event, as the SDK's `should_disable_websocket_pre_event_retries`.
+    ///
+    /// The runner asks for this when its retry settings opt out of retries entirely, or when its
+    /// policy retries the same safe transport failures itself
+    /// ([`ModelRetryPolicy::retries_safe_transport_errors`](crate::model::ModelRetryPolicy::retries_safe_transport_errors)).
+    #[must_use]
+    pub const fn should_disable_websocket_pre_event_retries(&self) -> bool {
+        self.websocket_pre_event_retries_disabled
     }
 }

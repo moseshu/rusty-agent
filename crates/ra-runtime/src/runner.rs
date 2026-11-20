@@ -105,6 +105,7 @@ mod live_settings;
 mod output;
 mod pending_input;
 mod prompt_cache_key;
+mod provider_retries;
 
 /// Product-specific recovery around a failed sampling request, as Codex records contextual
 /// guidance before deciding whether to retry.
@@ -231,6 +232,17 @@ pub mod retry_test_api {
         Ok(super::evaluate_retry(input, advice.as_ref())
             .await?
             .map(|(_, delay)| delay))
+    }
+
+    /// `request` as the runtime would send it: on its first attempt, or on a retry when `replay`
+    /// is set, marked with the adapter retries the runtime disables under `settings`.
+    #[must_use]
+    pub fn coordinate_provider_retries(
+        request: ModelRequest,
+        settings: Option<&ModelRetrySettings>,
+        replay: bool,
+    ) -> ModelRequest {
+        super::provider_retries::coordinate(request, settings, replay)
     }
 }
 
@@ -6922,21 +6934,30 @@ impl<'a> RunnerContextSummarizer<'a> {
     /// Sends the request, and again under the template's retry policy when `retry_sink` asks for
     /// it, with the same limits and replay boundary as an ordinary model call.
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
-        if !self.retry {
-            return self.drain_to_completed(request).await;
-        }
         let retry_settings = request
             .model_settings()
             .retry()
             .or(self.fallback_retry)
             .cloned();
+        if !self.retry {
+            // The runtime does not retry this request, so it takes over none of the adapter's own
+            // retries. Only an explicit zero budget still switches them off, as the caller's way
+            // to opt out of retries entirely.
+            let opted_out = retry_settings
+                .as_ref()
+                .filter(|settings| settings.max_retries() == Some(0));
+            let request = provider_retries::coordinate(request, opted_out, false);
+            return self.drain_to_completed(request).await;
+        }
         let max_retries = retry_settings
             .as_ref()
             .and_then(ra_core::model::ModelRetrySettings::max_retries)
             .unwrap_or(0);
         let mut attempt = 0;
         loop {
-            let error = match self.drain_to_completed(request.clone()).await {
+            let attempt_request =
+                provider_retries::coordinate(request.clone(), retry_settings.as_ref(), attempt > 0);
+            let error = match self.drain_to_completed(attempt_request).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.is_cancelled() => return Err(error),
                 Err(error) => error,
@@ -7410,7 +7431,11 @@ async fn call_model(
                 retry_trace: retry_trace.take(),
                 streaming_dispatch: streaming_dispatch.clone(),
             },
-            model_request.clone(),
+            provider_retries::coordinate(
+                model_request.clone(),
+                retry_settings.as_ref(),
+                failed_attempts > 0,
+            ),
             &surface,
             &mut consumed,
             early,
