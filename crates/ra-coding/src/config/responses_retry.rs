@@ -66,7 +66,9 @@ struct SamplingRetryPolicy;
 #[async_trait::async_trait]
 impl ModelRetryPolicy for SamplingRetryPolicy {
     async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
-        match retry_delay(context) {
+        match retry_delay(context.error(), context.provider_advice(), || {
+            backoff(u64::from(context.attempt()))
+        }) {
             Some(delay) => RetryDecision::retry()
                 .with_delay(delay)
                 .with_reason("stream disconnected - retrying sampling request"),
@@ -75,10 +77,13 @@ impl ModelRetryPolicy for SamplingRetryPolicy {
     }
 }
 
-/// Codex's `CodexErr::retry_delay` for the failures that reach a retry policy.
-fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
-    let normalized = context.normalized();
-    let error = context.error();
+/// Codex's budget-independent classification and delay for a failed sampling request.
+pub(super) fn retry_delay(
+    error: &Error,
+    advice: Option<&RetryAdvice>,
+    backoff: impl FnOnce() -> Duration,
+) -> Option<Duration> {
+    let normalized = NormalizedProviderError::from_error(error);
     let status = normalized.and_then(NormalizedProviderError::status_code);
     let event = ra_model::openai::response_failure_event(error);
     // Codex reads a stream frame's code only from its nested `error` object.
@@ -91,7 +96,7 @@ fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
     };
     let server_delay = normalized
         .and_then(NormalizedProviderError::retry_after)
-        .or_else(|| context.provider_advice().and_then(RetryAdvice::retry_after));
+        .or_else(|| advice.and_then(RetryAdvice::retry_after));
     match status {
         Some(400) => return None,
         Some(429) => {
@@ -143,7 +148,7 @@ fn retry_delay(context: &RetryPolicyContext<'_>) -> Option<Duration> {
             }
         }
     }
-    Some(server_delay.unwrap_or_else(|| backoff(u64::from(context.attempt()))))
+    Some(server_delay.unwrap_or_else(backoff))
 }
 
 /// Codex's retry backoff: 200 ms, doubling on each later retry, with up to ten percent jitter.
@@ -177,9 +182,7 @@ pub mod test_api {
     /// `attempt` is the one-based budget number a retry policy receives.
     #[must_use]
     pub fn delay(error: &ra_core::error::Error, attempt: u32) -> Option<std::time::Duration> {
-        super::retry_delay(&ra_core::model::RetryPolicyContext::new(
-            error, attempt, 5, true, None,
-        ))
+        super::retry_delay(error, None, || super::backoff(u64::from(attempt)))
     }
 
     /// The wait before retrying a failed connection outside the retry budget.

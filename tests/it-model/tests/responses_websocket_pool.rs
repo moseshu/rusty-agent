@@ -472,6 +472,43 @@ async fn a_failure_after_the_first_event_records_that_the_response_started() {
     assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
 }
 
+#[tokio::test]
+async fn a_failed_first_response_frame_preserves_the_deadline_and_is_unsafe_to_replay() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(&listener, CONNECT_TIMEOUT).with_runner_transport_fallback();
+    let model = provider.get_model(None).unwrap();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        send(
+            &mut socket,
+            json!({"type": "response.failed", "response": {"error": {
+                "code": "rate_limit_exceeded", "message": "Try again in 30 seconds",
+            }}}),
+        )
+        .await;
+    });
+    let before = tokio::time::Instant::now();
+    let mut stream = model.stream_response(request(&ModelSettings::new()));
+    let error = loop {
+        match timeout(PATIENCE, stream.next()).await.unwrap() {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => panic!("the failed response must end the stream with an error"),
+        }
+    };
+    let after = tokio::time::Instant::now();
+    peer.await.unwrap();
+
+    let delay = Duration::from_secs(30);
+    let deadline = ra_model::openai::retry_after_deadline(&error).unwrap();
+    assert!((before + delay..=after + delay).contains(&deadline));
+    let normalized = NormalizedProviderError::from_error(&error).unwrap();
+    assert!(normalized.response_started());
+    assert_eq!(normalized.replay_safety(), ReplaySafety::Unsafe);
+}
+
 /// As the SDK's `test_websocket_pre_event_disconnect_retry_respects_websocket_retry_disable`: an
 /// attempt whose retry the runtime owns returns its failure without reconnecting or sending HTTP.
 /// A provider keeping independent transport retries, as Codex does, reconnects as configured.
@@ -518,4 +555,55 @@ async fn a_runtime_owned_retry_returns_the_failure_without_an_http_replay() {
         }
         server.verify().await;
     }
+}
+
+/// As Codex's Responses WebSocket client: a provider that leaves the move to HTTP to the runner
+/// returns an ordinary failure before the first event without reconnecting or replaying over HTTP,
+/// even without the runner's per-attempt request. Once the runner switches the session, the
+/// session stays on HTTP, and a second switch reports that the fallback was already active.
+#[tokio::test]
+async fn a_runner_owned_fallback_returns_websocket_failures_and_switches_on_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {}\n\n", completion()), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider =
+        provider_at(format!("{}/v1", server.uri()), PATIENCE).with_runner_transport_fallback();
+    let model = provider.get_model(None).unwrap();
+
+    let request = request(&ModelSettings::new()).with_session_id(SessionId::new("failed"));
+    assert!(provider.websocket_enabled(request.session_id()));
+    let before = tokio::time::Instant::now();
+    let mut stream = model.stream_response(request.clone());
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(
+        NormalizedProviderError::from_error(&error)
+            .unwrap()
+            .status_code(),
+        Some(503)
+    );
+    let deadline = ra_model::openai::retry_after_deadline(&error).unwrap();
+    assert!(deadline >= before + Duration::from_secs(30));
+    assert!(deadline <= tokio::time::Instant::now() + Duration::from_secs(30));
+    assert!(stream.next().await.is_none());
+    drop(stream);
+
+    assert!(provider.switch_to_fallback_transport(&request).await);
+    assert!(!provider.switch_to_fallback_transport(&request).await);
+    assert!(!provider.websocket_enabled(request.session_id()));
+    assert!(provider.websocket_enabled(Some(&SessionId::new("other"))));
+    completed(model.as_ref(), request).await;
+    server.verify().await;
 }

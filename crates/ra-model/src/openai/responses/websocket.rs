@@ -2,7 +2,7 @@
 //! Session-owned Responses WebSocket connections and HTTP fallback.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -16,7 +16,10 @@ use ra_core::{
     model::{ModelRequest, NormalizedProviderError, ReplaySafety, stamp_replay_safety},
     session::SessionId,
 };
-use ra_http::websocket::{WebSocketConnection, WebSocketConnector, network_policy_denial};
+use ra_http::{
+    RetryAfter,
+    websocket::{WebSocketConnection, WebSocketConnector, network_policy_denial},
+};
 use rand::Rng;
 use reqwest::{
     StatusCode, Url,
@@ -33,7 +36,9 @@ use tokio_tungstenite::tungstenite::{
 
 use super::{OpenAiResponsesModel, convert, request};
 use crate::openai::{
-    error::{ResponseFacts, behavior_error, response_failure, response_failure_as},
+    error::{
+        ResponseFacts, behavior_error, response_failure, response_failure_as, retry_after_deadline,
+    },
     sse::SseFrame,
 };
 
@@ -53,29 +58,37 @@ pub(super) struct WebSocketTransport {
 }
 
 #[derive(Default)]
-struct Session {
-    fallback: bool,
-}
-
-#[derive(Default)]
 struct SessionCache {
     closed: bool,
-    sessions: BTreeMap<Option<SessionId>, Arc<AsyncMutex<Session>>>,
+    sessions: BTreeMap<Option<SessionId>, Arc<AsyncMutex<()>>>,
+    fallback_sessions: BTreeSet<Option<SessionId>>,
     // Oldest first. In-flight calls lease their socket out of this queue.
     idle: VecDeque<(Option<SessionId>, Connection)>,
 }
 
 impl SessionCache {
-    fn lane(&mut self, id: Option<&SessionId>) -> Arc<AsyncMutex<Session>> {
+    fn lane(&mut self, id: Option<&SessionId>) -> Arc<AsyncMutex<()>> {
         let id = id.cloned();
         // Failed or evicted sessions need no lane once their in-flight callers are gone.
-        // Preserve the session's sticky fallback decision for the provider's lifetime.
         self.sessions.retain(|key, lane| {
             *key == id
-                || Arc::get_mut(lane).is_none_or(|lane| lane.get_mut().fallback)
+                || Arc::get_mut(lane).is_none()
                 || self.idle.iter().any(|(cached, _)| cached == key)
         });
         Arc::clone(self.sessions.entry(id).or_default())
+    }
+
+    fn websocket_enabled(&self, id: Option<&SessionId>) -> bool {
+        !self.closed && !self.fallback_sessions.contains(&id.cloned())
+    }
+
+    fn switch_to_fallback(&mut self, id: Option<&SessionId>) -> bool {
+        if self.closed || !self.fallback_sessions.insert(id.cloned()) {
+            return false;
+        }
+        self.take_connection(id);
+        tracing::warn!("falling back from Responses WebSocket to HTTP for this session");
+        true
     }
 
     fn take_connection(&mut self, id: Option<&SessionId>) -> Option<Connection> {
@@ -152,7 +165,7 @@ struct ActiveResponse {
     cache: Arc<Mutex<SessionCache>>,
     connection: Option<Connection>,
     call: Call,
-    _session: OwnedMutexGuard<Session>,
+    _session: OwnedMutexGuard<()>,
 }
 
 impl WebSocketTransport {
@@ -171,10 +184,11 @@ impl WebSocketTransport {
         self.closed.send_replace(true);
         cache.idle.clear();
         cache.sessions.clear();
+        cache.fallback_sessions.clear();
         Ok(())
     }
 
-    async fn lock_session(&self, request: &ModelRequest) -> Result<OwnedMutexGuard<Session>> {
+    async fn lock_session(&self, request: &ModelRequest) -> Result<OwnedMutexGuard<()>> {
         let session = {
             let mut cache = self.cache.lock().map_err(|_| poisoned_cache())?;
             if cache.closed {
@@ -192,6 +206,21 @@ impl WebSocketTransport {
                 ReplaySafety::Safe,
             )
         })
+    }
+
+    pub(super) fn websocket_enabled(&self, id: Option<&SessionId>) -> bool {
+        self.cache
+            .lock()
+            .is_ok_and(|cache| cache.websocket_enabled(id))
+    }
+
+    pub(super) async fn switch_to_fallback(&self, request: &ModelRequest) -> bool {
+        let Ok(_session) = self.lock_session(request).await else {
+            return false;
+        };
+        self.cache
+            .lock()
+            .is_ok_and(|mut cache| cache.switch_to_fallback(request.session_id()))
     }
 
     pub(super) async fn start(
@@ -224,9 +253,15 @@ impl WebSocketTransport {
         model: &OpenAiResponsesModel,
         request: &ModelRequest,
     ) -> Result<Option<Frames>> {
-        let mut session = self.lock_session(request).await?;
-        if session.fallback {
-            return Ok(None);
+        let session = self.lock_session(request).await?;
+        {
+            let cache = self.cache.lock().map_err(|_| poisoned_cache())?;
+            if cache.closed {
+                return Err(closed_error());
+            }
+            if !cache.websocket_enabled(request.session_id()) {
+                return Ok(None);
+            }
         }
         let call = Call::new(model, request).await?;
         let headers = crate::openai::transport_headers(
@@ -301,13 +336,13 @@ impl WebSocketTransport {
                     }
                     let delay = facts.and_then(NormalizedProviderError::retry_after);
                     if upgrade_required || max_retries.is_some_and(|max| retries >= max) {
-                        session.fallback = true;
-                        if let Some(delay) = delay {
-                            sleep(delay).await;
+                        self.cache
+                            .lock()
+                            .map_err(|_| poisoned_cache())?
+                            .switch_to_fallback(request.session_id());
+                        if let Some(retry_at) = retry_after_deadline(&error) {
+                            tokio::time::sleep_until(retry_at).await;
                         }
-                        tracing::warn!(
-                            "falling back from Responses WebSocket to HTTP for this session"
-                        );
                         return Ok(None);
                     }
                     sleep(delay.unwrap_or_else(|| retry_delay(retries))).await;
@@ -665,7 +700,8 @@ fn wrapped_error(event: &Value) -> Error {
     let request_id = headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok());
-    response_failure_as(None, request_id, &hints, event, kind).into_error()
+    let retry_after = hints.retry_after().and_then(RetryAfter::from_delay);
+    response_failure_as(None, request_id, &hints, retry_after, event, kind).into_error()
 }
 
 fn upgrade_error(error: &WsError) -> Error {
@@ -760,12 +796,14 @@ pub(super) fn observe_catalog_etags(
 
 /// Reconnects allowed before the first response event, after which the session switches to HTTP.
 ///
-/// `None` hands ordinary failures to the runner without reconnecting or replaying over HTTP,
-/// as in the Agents SDK. A provider with independent transport retries keeps Codex's fallback
-/// even with a zero reconnect budget. HTTP 426 still negotiates the required transport.
+/// `None` hands ordinary failures to the runner without reconnecting or replaying over HTTP:
+/// when the runner owns the retry, as in the Agents SDK, and always for a provider that leaves the
+/// move to HTTP to the runner, as Codex's client does. HTTP 426 still negotiates the required
+/// transport.
 fn reconnect_budget(model: &OpenAiResponsesModel, request: &ModelRequest) -> Option<u32> {
-    if model.transport.follows_runner_retries
-        && request.should_disable_websocket_pre_event_retries()
+    if !model.transport.websocket_reconnects
+        || (model.transport.follows_runner_retries
+            && request.should_disable_websocket_pre_event_retries())
     {
         return None;
     }

@@ -506,7 +506,9 @@ async fn response_stream_metadata_keeps_status_scopes_and_server_delay() {
                 .set_body_raw(format!("data: {frame}\n\n"), "text/event-stream"),
         )
         .await;
+        let before = tokio::time::Instant::now();
         let error = failed_stream(&model).await;
+        let after = tokio::time::Instant::now();
         assert_eq!(error.code(), "provider.behavior");
         assert_eq!(facts(&error).status_code(), None);
         assert_eq!(facts(&error).error_code(), Some("rate_limit_exceeded"));
@@ -516,6 +518,11 @@ async fn response_stream_metadata_keeps_status_scopes_and_server_delay() {
             Some("response.failed")
         );
         let wrapped = Error::caller("wrapped").with_source(error);
+        let deadline = ra_model::openai::retry_after_deadline(&wrapped).unwrap();
+        assert!(
+            (before + expected..=after + expected).contains(&deadline),
+            "{frame}"
+        );
         assert_eq!(
             ra_model::openai::response_failure_event(&wrapped),
             Some("response.failed")
@@ -573,6 +580,11 @@ async fn stream_wait_advice_is_read_only_from_a_failed_response_error() {
         .await;
         let error = failed_stream(&model).await;
         assert_eq!(facts(&error).retry_after(), expected, "{frame}");
+        assert_eq!(
+            ra_model::openai::retry_after_deadline(&error).is_some(),
+            expected.is_some(),
+            "{frame}"
+        );
     }
 }
 

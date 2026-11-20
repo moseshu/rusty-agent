@@ -817,6 +817,136 @@ async fn websocket_fallback(status: u16, retries: u32, delay: Option<Duration>, 
     }
 }
 
+/// As Codex's sampling loop: the WebSocket client does not reconnect on its own, so each failed
+/// upgrade is a turn retry the client hears about. Once the turn has spent its retries the session
+/// moves to HTTPS with a warning and a fresh retry budget, which the HTTP failures then use.
+#[tokio::test]
+async fn product_responses_websocket_retries_from_the_turn_and_falls_back_with_a_fresh_budget() {
+    let endpoint = MockServer::start().await;
+    let unavailable = ResponseTemplate::new(503).insert_header("retry-after", "0");
+    Mock::given(method("GET"))
+        .and(path("/product/v1/responses"))
+        .respond_with(unavailable.clone())
+        .expect(3)
+        .mount(&endpoint)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(unavailable)
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&endpoint)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("data: {}\n\n", websocket_completion(1)),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let product = ProductModels::new();
+    configure_websocket(
+        &product,
+        &format!("{}/product/v1", endpoint.uri()),
+        "stream_max_retries = 2",
+    );
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    server
+        .turn_start(&mut connection, &thread, "fall back")
+        .await;
+    let mut reported = Vec::new();
+    loop {
+        let message = connection
+            .until(|message| {
+                matches!(
+                    message["method"].as_str(),
+                    Some("error" | "warning" | "turn/completed")
+                )
+            })
+            .await;
+        let params = &message["params"];
+        match message["method"].as_str() {
+            Some("error") => reported.push(params["error"]["message"].as_str().unwrap().to_owned()),
+            Some("warning") => {
+                let warning = params["message"].as_str().unwrap();
+                assert!(
+                    warning.starts_with("Falling back from WebSockets to HTTPS transport. "),
+                    "{warning}"
+                );
+                reported.push("fallback".to_owned());
+            }
+            _ => {
+                assert_eq!(params["turn"]["status"], "completed", "{params}");
+                break;
+            }
+        }
+    }
+    let mut expected = vec![
+        "Reconnecting... 2/2",
+        "fallback",
+        "Reconnecting... 1/2",
+        "Reconnecting... 2/2",
+    ];
+    if cfg!(debug_assertions) {
+        expected.insert(0, "Reconnecting... 1/2");
+    }
+    assert_eq!(reported, expected);
+    endpoint.verify().await;
+}
+
+#[tokio::test]
+async fn product_responses_websocket_does_not_fall_back_after_a_terminal_upgrade_refusal() {
+    for (status, code) in [(400, "invalid_request"), (429, "insufficient_quota")] {
+        let endpoint = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/product/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "0")
+                    .set_body_json(json!({"error": {"code": code, "message": code}})),
+            )
+            .expect(1)
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/product/v1/responses"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&endpoint)
+            .await;
+
+        let product = ProductModels::new();
+        configure_websocket(
+            &product,
+            &format!("{}/product/v1", endpoint.uri()),
+            "stream_max_retries = 0",
+        );
+        let server = product.server(None);
+        let mut connection = server.connect(1).await;
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+        server.turn_start(&mut connection, &thread, "refuse").await;
+        let message = connection
+            .until(|message| {
+                matches!(
+                    message["method"].as_str(),
+                    Some("warning" | "turn/completed")
+                )
+            })
+            .await;
+        assert_eq!(message["method"], "turn/completed", "{code}: {message}");
+        assert_eq!(
+            message["params"]["turn"]["status"], "failed",
+            "{code}: {message}"
+        );
+        endpoint.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn product_responses_websocket_reconnects_after_a_connection_limit_error() {
     websocket_reconnects_after(json!({

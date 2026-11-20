@@ -2,7 +2,7 @@
 //! Resolve a product model against its catalog and build the selected Responses provider.
 
 use std::{
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, OnceLock, Weak},
     time::Duration,
 };
 
@@ -22,7 +22,10 @@ use ra_core::{
     error::{Error, Result},
     filter::{ContextFilter, ContextFilterRequest, ModelInputData},
     item::{Message, ModelInputItem},
-    model::{ApiProtocol, ModelProvider, ModelResolver, ModelSettings, ProviderKey, ResolvedModel},
+    model::{
+        ApiProtocol, ModelProvider, ModelRequest, ModelResolver, ModelSettings, ProviderKey,
+        ResolvedModel, RetryAdvice,
+    },
     sandbox::token_truncation::{
         TruncationPolicy, approx_bytes_for_tokens, approx_token_count, truncate_text,
     },
@@ -36,7 +39,7 @@ use ra_model::{
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
 };
-use ra_runtime::runner::{BudgetExemptRetry, ModelRetryRecovery, RunConfig};
+use ra_runtime::runner::{BudgetExemptRetry, ModelRetryRecovery, RunConfig, TransportFallback};
 use serde_json::{Map, json};
 
 use super::{
@@ -65,6 +68,8 @@ pub(super) fn bundled_models() -> Option<&'static ModelsResponse> {
 pub(crate) struct ProductModelRuntime {
     config: Arc<Config>,
     registry: Option<ProviderRegistry>,
+    /// The registry owns the lazy provider instance. Recovery uses its concrete transport state.
+    responses: Arc<OnceLock<Weak<OpenAiResponsesProvider>>>,
     explicit: Option<Arc<dyn ModelResolver>>,
     default_model: Option<String>,
     remote: Option<Arc<RemoteModelCatalog>>,
@@ -135,6 +140,7 @@ impl ProductModelRuntime {
                 .min_by_key(|model| (model.visibility != ModelVisibility::List, model.priority))
                 .map(|model| model.slug.clone())
         });
+        let responses = Arc::new(OnceLock::new());
         let registry = if explicit.is_none() {
             let default_model = default_model.as_deref().filter(|model| !model.trim().is_empty())
                 .ok_or_else(|| Error::config(
@@ -147,6 +153,7 @@ impl ProductModelRuntime {
                 prepared_auth,
                 signer,
                 gateway,
+                Arc::clone(&responses),
             )?)
         } else {
             None
@@ -155,6 +162,7 @@ impl ProductModelRuntime {
         Ok(Self {
             config,
             registry,
+            responses,
             explicit,
             default_model,
             remote,
@@ -508,6 +516,7 @@ fn build_registry(
     prepared_auth: Option<(OpenAiAuth, Option<Arc<CommandBearerToken>>)>,
     signer: Option<Arc<dyn ResponsesRequestSigner>>,
     gateway: Option<Arc<GatewayAuthHeaders>>,
+    responses_provider: Arc<OnceLock<Weak<OpenAiResponsesProvider>>>,
 ) -> Result<ProviderRegistry> {
     let provider = ProviderKey::new(&config.model_provider_id);
     let description = &config.model_provider;
@@ -547,9 +556,11 @@ fn build_registry(
             u32::try_from(description.request_max_retries.unwrap_or(4).min(100)).unwrap_or(100),
         )?
         .with_quirks(quirks)
-        // Codex nests request retries and WebSocket reconnects inside each turn retry, with
-        // independent budgets, rather than handing them to the turn's retry loop.
-        .with_independent_transport_retries();
+        // Codex nests HTTP request retries inside each turn retry, with an independent budget.
+        // Its WebSocket client does not reconnect on its own: the turn's retry loop retries the
+        // stream and moves the session to HTTPS once it has spent its retries.
+        .with_independent_transport_retries()
+        .with_runner_transport_fallback();
         if description.supports_websockets {
             let connector =
                 ra_http::websocket::WebSocketConnector::new(&http_factory).map_err(|error| {
@@ -580,7 +591,9 @@ fn build_registry(
         if let Some(signer) = &signer {
             responses = responses.with_request_signer(Arc::clone(signer));
         }
-        Ok(Arc::new(responses) as Arc<dyn ModelProvider>)
+        let responses = Arc::new(responses);
+        responses_provider.get_or_init(|| Arc::downgrade(&responses));
+        Ok(responses as Arc<dyn ModelProvider>)
     })
     .with_defaults(defaults)
     .with_quirks(ProviderQuirks::new().with_prompt_cache_key(true));
@@ -801,18 +814,20 @@ struct ProductRetryRecovery {
     connection_retries: bool,
 }
 
+#[async_trait::async_trait]
 impl ModelRetryRecovery for ProductRetryRecovery {
     fn recovery_message(&self, error: &Error, model: Option<&str>) -> Option<Message> {
         self.runtime.recovery_message(error, model)
     }
 
-    fn report_retry(&self, retry: u32) -> bool {
-        let provider = &self.runtime.config.model_provider;
-        responses_retry::report_retry(
-            retry,
-            cfg!(debug_assertions),
-            provider.supports_websockets && !provider.is_amazon_bedrock(),
-        )
+    fn report_retry(&self, request: &ModelRequest, retry: u32) -> bool {
+        let websocket = self
+            .runtime
+            .responses
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|provider| provider.websocket_enabled(request.session_id()));
+        responses_retry::report_retry(retry, cfg!(debug_assertions), websocket)
     }
 
     fn budget_exempt_retry(&self, error: &Error, previous: u32) -> Option<BudgetExemptRetry> {
@@ -822,6 +837,26 @@ impl ModelRetryRecovery for ProductRetryRecovery {
                 "Reconnecting... waiting for network",
             )
         })
+    }
+
+    async fn switch_to_fallback_transport(
+        &self,
+        request: &ModelRequest,
+        error: &Error,
+        advice: Option<&RetryAdvice>,
+    ) -> Option<TransportFallback> {
+        let provider = self.runtime.responses.get()?.upgrade()?;
+        if !provider.websocket_enabled(request.session_id()) {
+            return None;
+        }
+        responses_retry::retry_delay(error, advice, || Duration::ZERO)?;
+        let retry_at = ra_model::openai::retry_after_deadline(error);
+        provider
+            .switch_to_fallback_transport(request)
+            .await
+            .then(|| {
+                TransportFallback::new("Falling back from WebSockets to HTTPS transport.", retry_at)
+            })
     }
 }
 

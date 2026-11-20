@@ -21,7 +21,7 @@ use ra_core::{
 };
 use ra_runtime::{
     agent::AgentBinding,
-    runner::{RunConfig, RunRequest, RunStreamEvent, Runner},
+    runner::{RunConfig, RunRequest, RunStreamEvent, Runner, TransportFallback},
 };
 use serde_json::json;
 
@@ -499,7 +499,7 @@ impl ra_runtime::runner::ModelRetryRecovery for GuidanceRecovery {
         Some(Message::developer("offer a permitted alternative"))
     }
 
-    fn report_retry(&self, retry: u32) -> bool {
+    fn report_retry(&self, _request: &ModelRequest, retry: u32) -> bool {
         retry > 1
     }
 }
@@ -1657,4 +1657,152 @@ async fn a_summary_sent_once_keeps_the_adapter_retries_the_runtime_does_not_repl
             "max_retries={max_retries}"
         );
     }
+}
+
+#[derive(Debug, Default)]
+struct RecordingNetworkRetryPolicy(Mutex<Vec<(u32, u32)>>);
+
+#[async_trait]
+impl ra_core::model::ModelRetryPolicy for RecordingNetworkRetryPolicy {
+    async fn evaluate(
+        &self,
+        context: &ra_core::model::RetryPolicyContext<'_>,
+    ) -> ra_core::model::RetryDecision {
+        self.0
+            .lock()
+            .unwrap()
+            .push((context.attempt(), context.max_retries()));
+        NetworkErrorRetryPolicy.evaluate(context).await
+    }
+}
+
+#[derive(Default)]
+struct FallbackRecovery {
+    switches: AtomicUsize,
+    retry_at: Option<tokio::time::Instant>,
+    switch_delay: std::time::Duration,
+}
+
+#[async_trait]
+impl ra_runtime::runner::ModelRetryRecovery for FallbackRecovery {
+    async fn switch_to_fallback_transport(
+        &self,
+        _request: &ModelRequest,
+        error: &Error,
+        _advice: Option<&RetryAdvice>,
+    ) -> Option<TransportFallback> {
+        if error.is_retryable() && self.switches.fetch_add(1, Ordering::SeqCst) == 0 {
+            if !self.switch_delay.is_zero() {
+                tokio::time::sleep(self.switch_delay).await;
+            }
+            Some(TransportFallback::new("Falling back.", self.retry_at))
+        } else {
+            None
+        }
+    }
+}
+
+async fn run_with_fallback(
+    model: Arc<RetryingModel>,
+    fallback: Option<Arc<FallbackRecovery>>,
+    expected_policy_calls: usize,
+) -> Result<()> {
+    let cancel = CancelScope::root();
+    let policy = Arc::new(RecordingNetworkRetryPolicy::default());
+    let mut config = RunConfig::new().with_model_settings(
+        ModelSettings::new().with_retry(
+            ModelRetrySettings::new()
+                .with_max_retries(1)
+                .with_backoff(
+                    RetryBackoffSettings::new()
+                        .with_initial_delay(std::time::Duration::ZERO)
+                        .with_jitter(false),
+                )
+                .with_policy(policy.clone()),
+        ),
+    );
+    if let Some(fallback) = fallback {
+        config = config.with_model_retry_recovery(fallback);
+    }
+    let request = request(model as Arc<dyn Model>, &cancel, false, 0).with_config(config);
+    let result = Runner::run(request).await.map(|_| ());
+    assert_eq!(
+        *policy.0.lock().unwrap(),
+        vec![(1, 1); expected_policy_calls],
+        "the framework policy only sees attempts inside the configured budget"
+    );
+    result
+}
+
+/// The recovery owns the switch, while the runtime owns the real retry budgets and replay safety.
+#[tokio::test(start_paused = true)]
+async fn a_spent_budget_moves_to_the_fallback_transport_only_when_the_recovery_opts_in() {
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let model = RetryingModel::new(vec![Err(network_error()), Err(network_error())], None);
+    assert!(
+        run_with_fallback(Arc::clone(&model), None, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+
+    // Time spent switching transports counts toward the original server deadline.
+    let start = Instant::now();
+    let retry_at = start + Duration::from_secs(10);
+    let recovery = Arc::new(FallbackRecovery {
+        retry_at: Some(retry_at),
+        switch_delay: Duration::from_secs(4),
+        ..FallbackRecovery::default()
+    });
+    let model = RetryingModel::new(
+        vec![
+            Err(network_error()),
+            Err(network_error()),
+            Err(network_error()),
+            Ok(answer()),
+        ],
+        None,
+    );
+    run_with_fallback(Arc::clone(&model), Some(Arc::clone(&recovery)), 2)
+        .await
+        .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(recovery.switches.load(Ordering::SeqCst), 1);
+    assert!((retry_at..retry_at + Duration::from_millis(10)).contains(&Instant::now()));
+
+    // The session already uses its fallback transport, so the second spent budget is final.
+    let recovery = Arc::new(FallbackRecovery::default());
+    let model = RetryingModel::new(
+        vec![
+            Err(network_error()),
+            Err(network_error()),
+            Err(network_error()),
+            Err(network_error()),
+        ],
+        None,
+    );
+    assert!(
+        run_with_fallback(Arc::clone(&model), Some(Arc::clone(&recovery)), 2)
+            .await
+            .is_err()
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(recovery.switches.load(Ordering::SeqCst), 2);
+
+    // The runtime refuses an unsafe replay before asking the recovery to switch transports.
+    let recovery = Arc::new(FallbackRecovery::default());
+    let unsafe_error = Err(ra_core::model::stamp_replay_safety(
+        network_error(),
+        ReplaySafety::Unsafe,
+    ));
+    let model = RetryingModel::new(vec![Err(network_error()), unsafe_error], None);
+    assert!(
+        run_with_fallback(Arc::clone(&model), Some(Arc::clone(&recovery)), 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(recovery.switches.load(Ordering::SeqCst), 0);
 }

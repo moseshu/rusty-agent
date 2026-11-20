@@ -10,13 +10,29 @@ use ra_core::{
     error::{Error, ProviderErrorKind},
     model::NormalizedProviderError,
 };
+use ra_http::RetryAfter;
 use serde_json::Value;
 
 use crate::retry::RetryHints;
 
 #[derive(Debug, thiserror::Error)]
-#[error("OpenAI error type {0}")]
-struct ErrorType(String, Option<String>);
+#[error("OpenAI response error details")]
+struct ResponseErrorDetails {
+    error_type: Option<String>,
+    error_code: Option<String>,
+    retry_after: Option<RetryAfter>,
+}
+
+fn response_error_details(error: &Error) -> Option<&ResponseErrorDetails> {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(details) = current.downcast_ref::<ResponseErrorDetails>() {
+            return Some(details);
+        }
+        source = current.source();
+    }
+    None
+}
 
 /// Returns the provider's error `type`, independently of its error `code`.
 ///
@@ -24,28 +40,26 @@ struct ErrorType(String, Option<String>);
 /// failures while the normalized error retains the original code.
 #[must_use]
 pub fn error_type(error: &Error) -> Option<&str> {
-    let mut source = std::error::Error::source(error);
-    while let Some(current) = source {
-        if let Some(error_type) = current.downcast_ref::<ErrorType>() {
-            return Some(&error_type.0);
-        }
-        source = current.source();
-    }
-    None
+    response_error_details(error).and_then(|details| details.error_type.as_deref())
 }
 
 /// Returns the provider's explicit error `code`, without falling back to its `type`.
 /// The normalized framework field retains its existing code-or-type fallback.
 #[must_use]
 pub fn error_code(error: &Error) -> Option<&str> {
-    let mut source = std::error::Error::source(error);
-    while let Some(current) = source {
-        if let Some(metadata) = current.downcast_ref::<ErrorType>() {
-            return metadata.1.as_deref();
-        }
-        source = current.source();
-    }
-    NormalizedProviderError::from_error(error).and_then(NormalizedProviderError::error_code)
+    response_error_details(error).map_or_else(
+        || NormalizedProviderError::from_error(error).and_then(NormalizedProviderError::error_code),
+        |details| details.error_code.as_deref(),
+    )
+}
+
+/// The original retry deadline captured from response headers or streamed failure advice.
+#[must_use]
+pub fn retry_after_deadline(error: &Error) -> Option<tokio::time::Instant> {
+    response_error_details(error)
+        .and_then(|details| details.retry_after)
+        .or_else(|| stream_failure_metadata(error).and_then(|details| details.retry_after))
+        .map(RetryAfter::deadline)
 }
 
 /// Whether the request failed before it reached the endpoint because no connection could be
@@ -78,6 +92,7 @@ pub(crate) struct ResponseFacts {
     status: reqwest::StatusCode,
     request_id: Option<String>,
     hints: RetryHints,
+    retry_after: Option<RetryAfter>,
 }
 
 impl ResponseFacts {
@@ -90,10 +105,12 @@ impl ResponseFacts {
         headers: &reqwest::header::HeaderMap,
     ) -> Self {
         let lookup = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        let hints = RetryHints::from_headers(lookup);
         Self {
             status,
             request_id: lookup(REQUEST_ID_HEADER).map(str::to_owned),
-            hints: RetryHints::from_headers(lookup),
+            retry_after: hints.retry_after().and_then(RetryAfter::from_delay),
+            hints,
         }
     }
 
@@ -106,6 +123,7 @@ impl ResponseFacts {
             Some(self.status),
             self.request_id.as_deref(),
             &self.hints,
+            self.retry_after,
             payload,
             kind,
         )
@@ -202,6 +220,7 @@ pub(crate) fn response_failure_as(
     status: Option<reqwest::StatusCode>,
     request_id: Option<&str>,
     hints: &RetryHints,
+    retry_after: Option<RetryAfter>,
     payload: &Value,
     kind: ProviderErrorKind,
 ) -> NormalizedProviderError {
@@ -227,21 +246,14 @@ pub(crate) fn response_failure_as(
     if let Some(code) = payload_error_code(payload) {
         normalized = normalized.with_error_code(code);
     }
-    if let Some(error_type) = payload
-        .get("error")
-        .unwrap_or(payload)
-        .get("type")
-        .and_then(Value::as_str)
-    {
-        normalized = normalized.with_source(ErrorType(
-            error_type.to_owned(),
-            payload
-                .get("error")
-                .unwrap_or(payload)
-                .get("code")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        ));
+    let error = payload.get("error").unwrap_or(payload);
+    let error_type = error.get("type").and_then(Value::as_str);
+    if error_type.is_some() || retry_after.is_some() {
+        normalized = normalized.with_source(ResponseErrorDetails {
+            error_type: error_type.map(str::to_owned),
+            error_code: error.get("code").and_then(Value::as_str).map(str::to_owned),
+            retry_after,
+        });
     }
     if let Some(request_id) = request_id {
         normalized = normalized.with_request_id(request_id);
@@ -276,6 +288,7 @@ struct ResponseStreamFailure {
     incomplete_reason: Option<String>,
     /// The `code` of the frame's nested `error` object, which Codex's stream parsers read.
     error_code: Option<String>,
+    retry_after: Option<RetryAfter>,
 }
 
 fn stream_failure_metadata(error: &Error) -> Option<&ResponseStreamFailure> {
@@ -352,6 +365,7 @@ pub(crate) fn stream_failure(
                 .and_then(|error| error.get("code"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            retry_after: retry_after.and_then(RetryAfter::from_delay),
         })
         .into_error()
 }

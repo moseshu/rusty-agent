@@ -124,13 +124,26 @@ WebSocket reconnects before the first event, returning ordinary WebSocket failur
 without replaying them over HTTP. HTTP 426 still negotiates HTTP transport. A summary that a
 run-scoped context processor sends once, without runner retries, is marked only under an explicit
 zero budget. The Chat Completions and Anthropic adapters had no retries of their own and are
-unaffected; the coding product keeps Codex's nested retry budgets.
+unaffected; the coding product keeps Codex's nested HTTP request retry budget.
 
 | Change | Who is affected | What to do |
 | --- | --- | --- |
 | A Responses provider built with `with_http_client(.., request_max_retries)` no longer retries a 5xx or transport failure on the runner's retries, or at all under `max_retries = 0` | Hosts relying on both the runner's and the transport's retries | Raise the runner's retry budget, or call `OpenAiResponsesProvider::with_independent_transport_retries` to keep the transport's own |
 | With a policy that retries transport failures, or a zero budget, ordinary WebSocket failures return to the runner without reconnecting or replaying over HTTP | Hosts using `with_websocket` with such a policy | Let the runner's budget and policy decide retries, or call `with_independent_transport_retries` to keep the transport's reconnects and fallback |
 | `ModelRetryPolicy` gains `retries_safe_transport_errors` and `retries_all_transient_errors`, both defaulting to `false` | Custom policies that retry transport failures | Override `retries_safe_transport_errors` to return `true` so the runner takes the reconnects over |
+
+### The coding product retries WebSocket failures from the turn, as Codex does
+
+The coding product's Responses WebSocket returns failures before the first event to the turn's
+retry loop. Once the loop has spent `stream_max_retries`, product recovery can switch the session
+to HTTPS, preserve the server's retry deadline, and emit a warning before retrying with a fresh
+budget. Summary requests end when their own retry budget is spent.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| `ModelRetryRecovery` can switch transport after budget exhaustion and report retries using request context | Hosts that install a retry recovery | Return `TransportFallback` from `switch_to_fallback_transport` after activating a fallback. Override `report_retry` to customize notifications for the request. |
+| A Responses provider can delegate WebSocket recovery to its host | Hosts of the Responses adapter | Use `with_runner_transport_fallback` and call the provider's session switch from the recovery hook |
+| The product reports `Reconnecting... n/max` and warns when the budget triggers HTTPS fallback | Clients of the coding product | Expect release builds to suppress the first retry only while the session uses WebSocket |
 
 ### Continuation input after in-run compaction
 

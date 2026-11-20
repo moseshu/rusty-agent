@@ -1149,7 +1149,15 @@ OpenAI replay verdict in crates/ra-model/src/openai/retry.rs adapts
 src/agents/models/_openai_retry.py; the Retry-After reading of an elapsed date in
 crates/ra-model/src/retry.rs follows src/agents/models/_retry_runtime.py.
 The product retry recovery hook in that runner ports the conversation-recording and notification
-mechanism from openai/codex revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
-codex-rs/core/src/responses_retry.rs. The product selects it explicitly; no provider retry
-classification or content-filter guidance is added to the provider-neutral framework contract.
+mechanism, and the move of a sampling request that spent its retries to a fallback transport with
+a fresh budget, from openai/codex revision 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052,
+codex-rs/core/src/responses_retry.rs and codex-rs/core/src/client.rs
+(try_switch_fallback_transport). The Responses adapter owns the session switch in
+crates/ra-model/src/openai/responses/websocket.rs, and the coding product selects it through its
+sampling recovery in crates/ra-coding/src/config/model_runtime.rs.
+Capturing and carrying the original Retry-After deadline through response and stream failures in
+crates/ra-model/src/openai/error.rs follows codex-rs/codex-api/src/api_bridge.rs and
+codex-rs/codex-api/src/sse/responses_error.rs at the same revision. The product explicitly selects
+this recovery; no provider retry classification or content-filter guidance is added to the
+provider-neutral framework contract.
 See the retained licenses above.

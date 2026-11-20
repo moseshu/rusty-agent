@@ -114,6 +114,7 @@ mod provider_retries;
 /// this is an intervention rather than an observer. It is an explicitly selected runtime
 /// extension: it does not change the framework retry policy contract or its cancellation and
 /// replay boundaries.
+#[async_trait::async_trait]
 pub trait ModelRetryRecovery: Send + Sync {
     /// Context to record before deciding whether the failed request can be retried.
     fn recovery_message(&self, _error: &Error, _model: Option<&str>) -> Option<Message> {
@@ -122,7 +123,7 @@ pub trait ModelRetryRecovery: Send + Sync {
 
     /// Whether a retry should produce a frontend notification. Attempts remain counted and
     /// traced when the notification is suppressed.
-    fn report_retry(&self, _retry: u32) -> bool {
+    fn report_retry(&self, _request: &ModelRequest, _retry: u32) -> bool {
         true
     }
 
@@ -135,6 +136,51 @@ pub trait ModelRetryRecovery: Send + Sync {
     /// cannot vouch for replaying a request that continues provider-held state.
     fn budget_exempt_retry(&self, _error: &Error, _previous: u32) -> Option<BudgetExemptRetry> {
         None
+    }
+
+    /// Tries to move a failed sampling request to a fallback transport after its budget is spent.
+    ///
+    /// The recovery owns error classification and the transport switch. Return a warning and an
+    /// optional server deadline only when the switch activates. After waiting until that deadline,
+    /// the runtime reports the warning with the error and retries with a fresh budget.
+    /// The runtime checks replay safety before calling this hook.
+    async fn switch_to_fallback_transport(
+        &self,
+        _request: &ModelRequest,
+        _error: &Error,
+        _advice: Option<&RetryAdvice>,
+    ) -> Option<TransportFallback> {
+        None
+    }
+}
+
+/// A transport switch that activated a fresh retry budget for the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportFallback {
+    notice: String,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl TransportFallback {
+    /// Records the warning and the server's original retry deadline, when one was provided.
+    #[must_use]
+    pub fn new(notice: impl Into<String>, retry_at: Option<tokio::time::Instant>) -> Self {
+        Self {
+            notice: notice.into(),
+            retry_at,
+        }
+    }
+
+    /// The warning reported to the thread's client.
+    #[must_use]
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
+
+    /// The earliest time the server advised retrying.
+    #[must_use]
+    pub const fn retry_at(&self) -> Option<tokio::time::Instant> {
+        self.retry_at
     }
 }
 
@@ -229,7 +275,7 @@ pub mod retry_test_api {
             streaming,
         };
         let advice = super::retry_advice(&input);
-        Ok(super::evaluate_retry(input, advice.as_ref())
+        Ok(super::evaluate_retry(&input, advice.as_ref())
             .await?
             .map(|(_, delay)| delay))
     }
@@ -6976,7 +7022,7 @@ impl<'a> RunnerContextSummarizer<'a> {
                 streaming: true,
             };
             let advice = retry_advice(&input);
-            let Some((_, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
+            let Some((_, delay)) = evaluate_retry(&input, advice.as_ref()).await? else {
                 return Err(error);
             };
             if let Some(sink) = self.retry_sink {
@@ -7458,7 +7504,7 @@ async fn call_model(
                     &error,
                     attempt,
                 );
-                let Some((exempt, trace)) = next_retry(
+                let Some((kind, trace)) = next_retry(
                     RetryEvaluation {
                         turn_scope,
                         model: &model,
@@ -7478,10 +7524,11 @@ async fn call_model(
                 else {
                     return Err(error);
                 };
-                if exempt {
-                    exempt_retries = exempt_retries.saturating_add(1);
-                } else {
-                    attempt = attempt.saturating_add(1);
+                match kind {
+                    NextRetry::Budgeted => attempt = attempt.saturating_add(1),
+                    NextRetry::Exempt => exempt_retries = exempt_retries.saturating_add(1),
+                    // Codex resets its retry count once the session changes transport.
+                    NextRetry::FreshBudget => attempt = 0,
                 }
                 failed_attempts = failed_attempts.saturating_add(1);
                 retry_trace = Some(trace);
@@ -7490,15 +7537,26 @@ async fn call_model(
     }
 }
 
+/// How the next attempt of a failed model call stands against its retry budget.
+enum NextRetry {
+    /// A retry the policy granted, spending one retry of the budget.
+    Budgeted,
+    /// A retry the installed recovery asked for outside the budget.
+    Exempt,
+    /// A retry on the model's fallback transport, which starts the budget afresh.
+    FreshBudget,
+}
+
 /// Announces and waits out the next retry of a failed model call: a budget-exempt retry the
-/// installed recovery asks for, or else one the retry policy grants. Returns whether the retry
-/// was budget-exempt and its trace, or `None` when the call should fail.
+/// installed recovery asks for, one the retry policy grants, or once the budget is spent, one on
+/// the model's fallback transport when the recovery opts into that. Returns how the retry stands
+/// against the budget and its trace, or `None` when the call should fail.
 async fn next_retry(
     input: RetryEvaluation<'_>,
     context: &TurnLoopContext<'_>,
     sink: Option<&dyn stream::ModelStreamSink>,
     exempt_retries: u32,
-) -> Result<Option<(bool, RetryTrace)>> {
+) -> Result<Option<(NextRetry, RetryTrace)>> {
     let (turn_scope, error, retry_number, max_retries) = (
         input.turn_scope,
         input.error,
@@ -7521,10 +7579,12 @@ async fn next_retry(
             delay: retry.delay(),
             reason: Some(retry.notice().to_owned()),
         };
-        return Ok(Some((true, trace)));
+        return Ok(Some((NextRetry::Exempt, trace)));
     }
-    let Some((decision, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
-        return Ok(None);
+    let Some((decision, delay)) = evaluate_retry(&input, advice.as_ref()).await? else {
+        return Ok(transport_fallback(input, context, sink, advice.as_ref())
+            .await?
+            .map(|trace| (NextRetry::FreshBudget, trace)));
     };
     warn!(
         error.code = error.code(),
@@ -7539,7 +7599,7 @@ async fn next_retry(
             .config
             .model_retry_recovery
             .as_ref()
-            .is_none_or(|recovery| recovery.report_retry(retry_number))
+            .is_none_or(|recovery| recovery.report_retry(input.request, retry_number))
     {
         sink.retrying(retry_number, max_retries, error);
     }
@@ -7548,7 +7608,52 @@ async fn next_retry(
         delay,
         reason: decision.reason().map(str::to_owned),
     };
-    Ok(Some((false, trace)))
+    Ok(Some((NextRetry::Budgeted, trace)))
+}
+
+/// Lets the installed recovery switch transport when the sampling budget is spent and replay is
+/// safe, then waits until the server's original retry deadline before starting a fresh budget.
+async fn transport_fallback(
+    input: RetryEvaluation<'_>,
+    context: &TurnLoopContext<'_>,
+    sink: Option<&dyn stream::ModelStreamSink>,
+    advice: Option<&RetryAdvice>,
+) -> Result<Option<RetryTrace>> {
+    if input.attempt < input.max_retries || !can_replay_for_recovery(&input, advice) {
+        return Ok(None);
+    }
+    let Some(recovery) = &context.config.model_retry_recovery else {
+        return Ok(None);
+    };
+    let Some(fallback) = input
+        .turn_scope
+        .run(recovery.switch_to_fallback_transport(input.request, input.error, advice))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let retry_at = fallback.retry_at();
+    let delay = retry_at
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or_default();
+    warn!(
+        error.code = input.error.code(),
+        retry.delay_ms = duration_ms(delay),
+        "switching a model call to its fallback transport after spending its retries"
+    );
+    if let Some(retry_at) = retry_at {
+        input
+            .turn_scope
+            .run(tokio::time::sleep_until(retry_at))
+            .await?;
+    }
+    if let Some(sink) = sink {
+        sink.warning(format!("{} {}", fallback.notice(), input.error));
+    }
+    Ok(Some(RetryTrace {
+        delay,
+        reason: Some(fallback.notice),
+    }))
 }
 
 /// The installed recovery's budget-exempt retry, if the runtime's replay boundary allows it.
@@ -7566,15 +7671,22 @@ fn budget_exempt_retry(
         .model_retry_recovery
         .as_ref()?
         .budget_exempt_retry(input.error, previous)?;
+    recovery_replay_permitted(input, advice).then_some(retry)
+}
+
+fn can_replay_for_recovery(input: &RetryEvaluation<'_>, advice: Option<&RetryAdvice>) -> bool {
+    !input.error.is_cancelled() && !input.consumed.any() && recovery_replay_permitted(input, advice)
+}
+
+fn recovery_replay_permitted(input: &RetryEvaluation<'_>, advice: Option<&RetryAdvice>) -> bool {
     // The same replay boundary as a budgeted retry: an adapter's `Unsafe` is final, and a request
     // continuing provider-held state is replayed only when the adapter calls it safe.
     let safety = advice.map_or_else(|| replay_safety_of(input.error), RetryAdvice::replay_safety);
-    match safety {
-        ReplaySafety::Safe => Some(retry),
-        ReplaySafety::Unsafe => None,
-        _ if input.request.continuation().is_server_managed() => None,
-        _ => Some(retry),
-    }
+    replay_permitted(
+        safety,
+        input.request.continuation(),
+        &RetryDecision::retry(),
+    )
 }
 
 /// Records product recovery context even when the retry budget has been exhausted, as Codex
@@ -7714,7 +7826,7 @@ async fn call_model_attempt(
 ///
 /// `advice` is [`retry_advice`] for this failure, asked before these limits apply.
 async fn evaluate_retry(
-    input: RetryEvaluation<'_>,
+    input: &RetryEvaluation<'_>,
     advice: Option<&RetryAdvice>,
 ) -> Result<Option<(RetryDecision, std::time::Duration)>> {
     if input.attempt >= input.max_retries || input.error.is_cancelled() {

@@ -212,6 +212,9 @@ struct ResponsesTransport {
     request_max_retries: u32,
     /// Whether the runner's per-attempt requests to skip this transport's own retries are obeyed.
     follows_runner_retries: bool,
+    /// Whether the WebSocket transport reconnects on its own before the first event, rather than
+    /// returning the failure and leaving the move to HTTP to the runner.
+    websocket_reconnects: bool,
     query: BTreeMap<String, String>,
     bearer: Option<Arc<dyn ResponsesBearerToken>>,
     auth_headers: Option<Arc<dyn ResponsesAuthHeaders>>,
@@ -299,6 +302,7 @@ impl OpenAiResponsesProvider {
                 stream_idle_timeout,
                 request_max_retries,
                 follows_runner_retries: true,
+                websocket_reconnects: true,
                 query: BTreeMap::new(),
                 bearer: None,
                 auth_headers: None,
@@ -333,13 +337,43 @@ impl OpenAiResponsesProvider {
     /// By default the provider follows the Agents SDK contract: an attempt whose request reports
     /// [`ModelRequest::should_disable_provider_managed_retries`] gets no HTTP retries, and one
     /// reporting [`ModelRequest::should_disable_websocket_pre_event_retries`] gets no WebSocket
-    /// reconnects or HTTP replays after ordinary failures before its first event. A product that,
-    /// like Codex, configures request retries,
-    /// WebSocket reconnects and turn retries as independent nested budgets selects this instead.
+    /// reconnects or HTTP replays after ordinary failures before its first event. The coding
+    /// product uses an independent HTTP request budget, as Codex does, and separately selects
+    /// [`Self::with_runner_transport_fallback`] to hand WebSocket failures to the runner.
     #[must_use]
     pub fn with_independent_transport_retries(mut self) -> Self {
         Arc::make_mut(&mut self.transport).follows_runner_retries = false;
         self
+    }
+
+    /// Hands every ordinary WebSocket failure before the first event to the runner, as Codex's
+    /// Responses WebSocket client does, instead of reconnecting and then switching to HTTP itself.
+    ///
+    /// The session moves to HTTP when the endpoint answers the upgrade with HTTP 426, or when an
+    /// installed recovery calls [`Self::switch_to_fallback_transport`] after spending its retries.
+    #[must_use]
+    pub fn with_runner_transport_fallback(mut self) -> Self {
+        Arc::make_mut(&mut self.transport).websocket_reconnects = false;
+        self
+    }
+
+    /// Whether the adapter currently uses WebSocket for this session.
+    #[must_use]
+    pub fn websocket_enabled(&self, session: Option<&SessionId>) -> bool {
+        self.transport
+            .websocket
+            .as_ref()
+            .is_some_and(|websocket| websocket.websocket_enabled(session))
+    }
+
+    /// Disables WebSocket for the request's session and drops its cached connection.
+    ///
+    /// Returns whether this call activated HTTP fallback, as Codex's session client does.
+    pub async fn switch_to_fallback_transport(&self, request: &ModelRequest) -> bool {
+        match &self.transport.websocket {
+            Some(websocket) => websocket.switch_to_fallback(request).await,
+            None => false,
+        }
     }
 
     /// Sets endpoint query parameters. Request settings can override individual keys.

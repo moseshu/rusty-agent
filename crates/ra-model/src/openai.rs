@@ -23,6 +23,7 @@ mod stream_events;
 pub use error::error_type;
 pub use error::is_connection_failure;
 pub use error::response_stream_error_code;
+pub use error::retry_after_deadline;
 pub use error::{error_code, response_failure_event, response_incomplete_reason};
 
 use self::auth::OpenAiAuth;
