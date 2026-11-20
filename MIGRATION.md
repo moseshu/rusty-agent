@@ -57,8 +57,7 @@ before the policy runs. A request continuing provider-held state is replayed whe
 the failure safe, or when the policy approved a failure the adapter marked unsafe, and never when its
 replay safety is unknown.
 
-Summary requests for a thread's compaction use the non-streaming entry point and are now reported to
-adapters and policies as non-streaming; they were reported as streaming. `RetryPolicyContext` gains
+`RetryPolicyContext` gains
 `with_continuation`, `continuation`, `is_stateful_request`, `replay_safety` and `response_started`;
 `RetryAdvice` and `NormalizedProviderError` gain `with_response_started` and `response_started`, and
 `stamp_response_started` marks a provider error that failed after the response began. The OpenAI
@@ -68,7 +67,6 @@ Responses WebSocket adapter marks a failure after the first response event this 
 | --- | --- | --- |
 | `with_replay_approval` and `replay_approved` are removed | Custom `ModelRetryPolicy` implementations that called them | Call `with_unsafe_replay_approval` to replay a failure the adapter marked unsafe; a stateful request with unknown replay safety can no longer be approved |
 | Non-streaming unsafe failures reach the policy | Custom policies that retry whatever reaches them | Nothing to change: an ordinary retry still does not replay them |
-| Summary requests report `is_streaming()` as false | Adapters and policies that read the flag | Treat them as the non-streaming calls they are; for an unstamped failure, `ra-model` adapters now give the unstarted verdict |
 | The OpenAI Responses and Chat models call a replay safe when the endpoint sent `x-should-retry: true`, or answered a request continuing provider-held state with 408, 409, 429 or 5xx, unless the error already carries a verdict | Policies that relied on such a stateful failure staying `Unknown` | Nothing to change for the built-in policies; a custom policy that must not replay these should decline them |
 
 ### Retry backoff follows the Agents SDK's schedule
@@ -92,6 +90,23 @@ as zero instead of as no delay.
 | `MAX_HONORED_RETRY_AFTER` is removed and endpoint delays are no longer capped | Hosts that relied on the 60-second cap | Return a `RetryDecision` delay of your own from the policy to bound the wait |
 | An endpoint delay of zero, including a past `Retry-After` date, retries at once | Hosts that expected the schedule after such an answer | Return a delay from the policy if a pause is still wanted |
 | Multipliers from 0 up are used as given | Hosts that set a multiplier below 1 or an infinite one | Set 1 or a finite value to keep the old behavior |
+
+### Summary requests stream, as Codex's compaction does
+
+The runner now sends a context-summary request, for a thread's history compaction and for a
+run-scoped compaction alike, through `Model::stream_response` and drains it to its terminal
+response, as Codex's `drain_to_completed` sends its compaction request. It used `get_response`.
+Nothing the stream carries before the terminal response reaches a subscriber or the thread. A
+stream that closes before its terminal response fails with a behavior error. Retry evaluation
+reports the request as streaming, so an adapter's `Unsafe` verdict on a failed summary stream is
+final before the policy runs, as for sampling. The coding product's compaction retry policy also
+retries a summary stream that closed early or could not be decoded, as Codex retries
+`CodexErr::Stream`.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| Summaries go through `stream_response` | Custom `Model` implementations that answer summaries only from `get_response` | Answer the same request from `stream_response`, ending with `ModelStreamEvent::Completed` |
+| A summary stream without a terminal response fails | Models whose streams end without `Completed` | End every successful stream with `Completed` |
 
 ### Continuation input after in-run compaction
 

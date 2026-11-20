@@ -372,14 +372,19 @@ impl SummaryFailingModel {
 #[async_trait]
 impl Model for SummaryFailingModel {
     async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
-        self.summary_calls.fetch_add(1, Ordering::SeqCst);
-        Err(Error::provider(
-            ProviderErrorKind::Network,
-            "summary service unavailable",
-        ))
+        Err(Error::caller("this fixture only supports streaming"))
     }
 
-    fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
+    fn stream_response(&self, request: ModelRequest) -> ModelStream<'_> {
+        // A summary request streams too; it is the one that asks for structured output.
+        if request.output_schema().is_some() {
+            self.summary_calls.fetch_add(1, Ordering::SeqCst);
+            return stream::iter(vec![Err(Error::provider(
+                ProviderErrorKind::Network,
+                "summary service unavailable",
+            ))])
+            .boxed();
+        }
         let mut streamed = self.streamed.lock().unwrap();
         let response = streamed.remove(0);
         stream::iter(vec![Ok(ModelStreamEvent::Completed(Box::new(response)))]).boxed()

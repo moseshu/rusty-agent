@@ -741,6 +741,42 @@ async fn a_transient_summary_failure_is_retried_by_default() {
     assert!(request_text(&requests[3]).contains(SUMMARY_SENTINEL));
 }
 
+/// A summary stream that closed before its terminal response, or could not be decoded, fails as a
+/// behavior error, and the coding host retries it as Codex retries `CodexErr::Stream` ("stream
+/// closed before response.completed").
+#[tokio::test]
+async fn a_broken_summary_stream_is_retried_by_default() {
+    let home = HooksHome::new();
+    write_config(&home, &[]);
+    let server = home.server();
+    let mut connection = server.connect(1).await;
+    let thread = start(&server, &mut connection).await;
+    home.script
+        .push(answer("obsolete first answer", OVER_LIMIT));
+    server
+        .run_turn(&mut connection, &thread, "first user message")
+        .await;
+    connection.passed.clear();
+    home.script
+        .push(Step::FailWith(ra_core::error::ProviderErrorKind::Behavior));
+    home.script.push(Step::Respond(summary()));
+    home.script.answer("answered");
+    server
+        .run_turn(&mut connection, &thread, "second user message")
+        .await;
+    let requests = home.script.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4);
+    assert!(is_summary_request(&requests[1]) && is_summary_request(&requests[2]));
+    let events: Vec<_> = connection.passed.drain(..).collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.to_string().contains("Reconnecting... 1/5")),
+        "{events:?}"
+    );
+    assert!(request_text(&requests[3]).contains(SUMMARY_SENTINEL));
+}
+
 /// What a mid-turn summary costs is recorded once, with the run's own spend, and marked as a
 /// summary's — not as sampling — so a rebuilt thread does not read it as the history's size.
 #[tokio::test]

@@ -1084,27 +1084,55 @@ async fn a_stateful_request_replays_only_on_safe_advice_or_an_approved_unsafe_fa
     }
 }
 
-/// A model whose summary requests fail and then answer, recording the streaming flag the runtime
-/// reports when it asks for retry advice.
+/// One summary stream: a failure, a stream that closes before its terminal response, or an answer.
+enum SummaryStep {
+    Fail(Error),
+    CloseEarly,
+    Answer(ModelResponse),
+}
+
+/// A model whose summary requests are scripted streams, recording the streaming flag the runtime
+/// reports when it asks for retry advice. Its non-streaming entry point fails, so a summary sent
+/// through it shows up as an error.
 struct SummaryModel {
-    responses: Mutex<Vec<Result<ModelResponse>>>,
-    calls: AtomicUsize,
+    steps: Mutex<Vec<SummaryStep>>,
+    streams: AtomicUsize,
     advice: RetryAdvice,
     advice_streaming: Mutex<Vec<bool>>,
+}
+
+impl SummaryModel {
+    fn new(steps: Vec<SummaryStep>, advice: RetryAdvice) -> Arc<Self> {
+        Arc::new(Self {
+            steps: Mutex::new(steps),
+            streams: AtomicUsize::new(0),
+            advice,
+            advice_streaming: Mutex::default(),
+        })
+    }
 }
 
 #[async_trait]
 impl Model for SummaryModel {
     async fn get_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.responses.lock().unwrap().remove(0)
+        Err(Error::caller("summary requests stream"))
     }
 
     fn stream_response(&self, _request: ModelRequest) -> ModelStream<'_> {
-        stream::iter(vec![Err(Error::caller(
-            "only summary requests are expected",
-        ))])
-        .boxed()
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        let created = Ok(ModelStreamEvent::RawResponse(RawResponseEvent::new(
+            ProviderKey::new("test-provider"),
+            "response.created",
+            json!({}),
+        )));
+        let events = match self.steps.lock().unwrap().remove(0) {
+            SummaryStep::Fail(error) => vec![created, Err(error)],
+            SummaryStep::CloseEarly => vec![created],
+            SummaryStep::Answer(response) => {
+                vec![created, Ok(ModelStreamEvent::Completed(Box::new(response)))]
+            }
+        };
+        stream::iter(events).boxed()
     }
 
     fn get_retry_advice(
@@ -1129,86 +1157,107 @@ fn summary_answer() -> ModelResponse {
     )])
 }
 
-/// A thread's compaction summary is a non-streaming request: the adapter and the policy are told
-/// so, and the policy can approve replaying a summary failure the adapter marked unsafe, which an
-/// ordinary retry decision cannot.
-#[tokio::test]
-async fn a_summary_request_reports_non_streaming_and_accepts_unsafe_replay_approval() {
+/// Runs a thread's manual compaction against `model` under `policy` and reports whether the
+/// summary replaced the history.
+async fn compact_with(model: Arc<SummaryModel>, policy: Arc<ApprovingPolicy>) -> bool {
     use ra_core::session::SessionId;
     use ra_runtime::thread::{AgentThread, ThreadEvent};
-    for approve in [false, true] {
-        let model = Arc::new(SummaryModel {
-            responses: Mutex::new(vec![Err(network_error()), Ok(summary_answer())]),
-            calls: AtomicUsize::new(0),
-            advice: started_unsafe_advice(),
-            advice_streaming: Mutex::default(),
-        });
-        let policy = ApprovingPolicy::new(approve);
-        let thread = AgentThread::builder(
-            SessionId::new("summary-retry"),
-            AgentBinding::direct(
-                AgentSpec::builder()
-                    .id(AgentId::new("lead"))
-                    .name("Lead")
-                    .instructions("answer")
-                    .build()
-                    .unwrap(),
-            ),
-            Arc::new(Resolver {
-                model: model.clone(),
-            }),
-        )
-        .with_config(
-            RunConfig::new()
-                .with_capability(Arc::new(
-                    ra_context::compaction::CompactionCapability::default(),
-                ))
-                .with_compaction_retry(
-                    ModelRetrySettings::new()
-                        .with_max_retries(1)
-                        .with_policy(policy.clone()),
-                ),
-        )
-        .build();
-        thread.compact().unwrap();
-        let completed = loop {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(5), thread.next_event())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            match event {
-                ThreadEvent::TurnComplete { .. } => break true,
-                ThreadEvent::TurnAborted { .. } => break false,
-                _ => {}
-            }
-        };
 
-        assert_eq!(
-            *model.advice_streaming.lock().unwrap(),
-            [false],
-            "{approve}"
-        );
-        assert_eq!(
-            *policy.seen.lock().unwrap(),
-            [SeenContext {
-                streaming: false,
-                replay_safety: ReplaySafety::Unsafe,
-                response_started: true,
-                stateful: false,
-            }],
-            "{approve}"
-        );
-        assert_eq!(
-            model.calls.load(Ordering::SeqCst),
-            if approve { 2 } else { 1 },
-            "{approve}"
-        );
-        let summarized = serde_json::to_string(&thread.history())
+    let thread = AgentThread::builder(
+        SessionId::new("summary-retry"),
+        AgentBinding::direct(
+            AgentSpec::builder()
+                .id(AgentId::new("lead"))
+                .name("Lead")
+                .instructions("answer")
+                .build()
+                .unwrap(),
+        ),
+        Arc::new(Resolver { model }),
+    )
+    .with_config(
+        RunConfig::new()
+            .with_capability(Arc::new(
+                ra_context::compaction::CompactionCapability::default(),
+            ))
+            .with_compaction_retry(
+                ModelRetrySettings::new()
+                    .with_max_retries(1)
+                    .with_policy(policy),
+            ),
+    )
+    .build();
+    thread.compact().unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), thread.next_event())
+            .await
             .unwrap()
-            .contains("intent");
-        assert_eq!(summarized, approve, "{approve} completed={completed}");
+            .unwrap();
+        if matches!(
+            event,
+            ThreadEvent::TurnComplete { .. } | ThreadEvent::TurnAborted { .. }
+        ) {
+            break;
+        }
     }
+    serde_json::to_string(&thread.history())
+        .unwrap()
+        .contains("intent")
+}
+
+/// A thread's compaction summary streams and is drained to its terminal response, as Codex's
+/// `drain_to_completed` sends its compaction request. Nothing the failed stream carried was
+/// forwarded, so its retry window stays open: a failure whose replay safety is unknown is retried,
+/// and so is a stream that closed before its terminal response. A failure the adapter marked
+/// unsafe after the response started is final for a streamed request, approval or not.
+#[tokio::test]
+async fn a_summary_request_streams_and_retries_within_the_replay_boundary() {
+    let unknown = RetryAdvice::new().with_suggested(true);
+
+    let model = SummaryModel::new(
+        vec![
+            SummaryStep::Fail(network_error()),
+            SummaryStep::Answer(summary_answer()),
+        ],
+        unknown.clone(),
+    );
+    let policy = ApprovingPolicy::new(false);
+    assert!(compact_with(model.clone(), policy.clone()).await);
+    assert_eq!(model.streams.load(Ordering::SeqCst), 2);
+    assert_eq!(*model.advice_streaming.lock().unwrap(), [true]);
+    assert_eq!(
+        *policy.seen.lock().unwrap(),
+        [SeenContext {
+            streaming: true,
+            replay_safety: ReplaySafety::Unknown,
+            response_started: false,
+            stateful: false,
+        }]
+    );
+
+    let model = SummaryModel::new(
+        vec![
+            SummaryStep::CloseEarly,
+            SummaryStep::Answer(summary_answer()),
+        ],
+        unknown,
+    );
+    let policy = ApprovingPolicy::new(false);
+    assert!(compact_with(model.clone(), policy.clone()).await);
+    assert_eq!(model.streams.load(Ordering::SeqCst), 2);
+    assert_eq!(policy.seen.lock().unwrap().len(), 1);
+
+    let model = SummaryModel::new(
+        vec![
+            SummaryStep::Fail(network_error()),
+            SummaryStep::Answer(summary_answer()),
+        ],
+        started_unsafe_advice(),
+    );
+    let policy = ApprovingPolicy::new(true);
+    assert!(!compact_with(model.clone(), policy.clone()).await);
+    assert_eq!(model.streams.load(Ordering::SeqCst), 1);
+    assert!(policy.seen.lock().unwrap().is_empty());
 }
 
 /// As the SDK's `test_get_response_with_retry_allows_custom_policy_to_override_provider_veto`: a

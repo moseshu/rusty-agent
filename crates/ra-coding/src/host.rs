@@ -26,6 +26,13 @@ const CODEX_COMPACTION_MAX_RETRIES: u32 = 5;
 /// (`d3147716e0`, after the pinned baseline, narrows the retried failures to those). The runner
 /// refuses replays that could duplicate accepted output. This policy keeps the existing
 /// compaction classification explicitly, and adopts the delay a provider asked for.
+///
+/// A summary stream that closed before its terminal response, or that could not be decoded, is
+/// retried as well: Codex's compaction loop retries those failures, including `CodexErr::Stream`
+/// ("stream closed before response.completed"). The framework classifies them as behavior
+/// failures, which are not retryable unchanged, so the policy names them.
+/// An explicit incomplete response stays terminal, including when its reason is missing or
+/// unknown and the adapter classifies it as a behavior failure too.
 fn compaction_retry() -> ModelRetrySettings {
     ModelRetrySettings::new()
         .with_max_retries(CODEX_COMPACTION_MAX_RETRIES)
@@ -38,7 +45,19 @@ struct CompactionRetryPolicy;
 #[async_trait::async_trait]
 impl ModelRetryPolicy for CompactionRetryPolicy {
     async fn evaluate(&self, context: &RetryPolicyContext<'_>) -> RetryDecision {
-        if !context.error().is_retryable() {
+        // Codex's compaction loop returns ResponseIncomplete without retrying it.
+        if ra_model::openai::response_failure_event(context.error()) == Some("response.incomplete")
+        {
+            return RetryDecision::no_retry();
+        }
+        let stream_failure = matches!(
+            context.error(),
+            ra_core::error::Error::Provider {
+                kind: ra_core::error::ProviderErrorKind::Behavior,
+                ..
+            }
+        );
+        if !context.error().is_retryable() && !stream_failure {
             return RetryDecision::no_retry();
         }
         let delay = context

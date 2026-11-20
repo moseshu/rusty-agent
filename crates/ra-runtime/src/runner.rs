@@ -6869,6 +6869,10 @@ enum SummaryUsage<'a> {
 }
 
 /// Executes a context-summary request with the resolved model and stable instructions of a turn.
+///
+/// The request streams and is drained to its terminal response, as Codex's `drain_to_completed`
+/// sends its compaction request: nothing the stream carries before then reaches a subscriber or
+/// the thread, so a failed attempt leaves nothing behind that a retry could duplicate.
 struct RunnerContextSummarizer<'a> {
     model: &'a Arc<dyn Model>,
     template: &'a ModelRequest,
@@ -6897,11 +6901,29 @@ impl<'a> RunnerContextSummarizer<'a> {
         }
     }
 
+    /// Streams the request and returns its terminal response.
+    ///
+    /// Every other event is dropped. A stream that ends before its terminal response fails, as
+    /// Codex's "stream closed before response.completed" does, and the retry policy decides
+    /// whether to send it again.
+    async fn drain_to_completed(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let mut stream = self.model.stream_response(request);
+        while let Some(event) = self.cancel.run(stream.next()).await? {
+            if let ModelStreamEvent::Completed(response) = event? {
+                return Ok(*response);
+            }
+        }
+        Err(Error::provider(
+            ProviderErrorKind::Behavior,
+            "the summary stream closed before its terminal response",
+        ))
+    }
+
     /// Sends the request, and again under the template's retry policy when `retry_sink` asks for
     /// it, with the same limits and replay boundary as an ordinary model call.
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         if !self.retry {
-            return self.cancel.run(self.model.get_response(request)).await?;
+            return self.drain_to_completed(request).await;
         }
         let retry_settings = request
             .model_settings()
@@ -6914,12 +6936,9 @@ impl<'a> RunnerContextSummarizer<'a> {
             .unwrap_or(0);
         let mut attempt = 0;
         loop {
-            let error = match self
-                .cancel
-                .run(self.model.get_response(request.clone()))
-                .await?
-            {
+            let error = match self.drain_to_completed(request.clone()).await {
                 Ok(response) => return Ok(response),
+                Err(error) if error.is_cancelled() => return Err(error),
                 Err(error) => error,
             };
             let input = RetryEvaluation {
@@ -6930,9 +6949,10 @@ impl<'a> RunnerContextSummarizer<'a> {
                 retry_settings: retry_settings.as_ref(),
                 attempt,
                 max_retries,
+                // Nothing a summary stream carries is forwarded, so a failed attempt published
+                // nothing and its retry window stays open.
                 consumed: CallConsumption::default(),
-                // A summary is requested through the non-streaming entry point.
-                streaming: false,
+                streaming: true,
             };
             let advice = retry_advice(&input);
             let Some((_, delay)) = evaluate_retry(input, advice.as_ref()).await? else {
@@ -7298,8 +7318,8 @@ struct RetryEvaluation<'a> {
     attempt: u32,
     max_retries: u32,
     consumed: CallConsumption,
-    /// Whether the failed call used the streaming entry point. A turn's sampling request always
-    /// streams; a summary request does not.
+    /// Whether the failed call used the streaming entry point, as a turn's sampling request and a
+    /// summary request both do. Retry decisions made through the test seam may say otherwise.
     streaming: bool,
 }
 

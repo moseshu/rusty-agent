@@ -110,6 +110,89 @@ async fn start(server: &Server, connection: &mut Connection, params: Value) -> (
     )
 }
 
+/// Supplies a real decoder without a sampling retry policy, exercising the host's compaction policy.
+struct CompactionModelResolver(Arc<dyn Model>);
+
+impl ModelResolver for CompactionModelResolver {
+    fn resolve_model(&self, model_name: Option<&str>) -> Result<ResolvedModel> {
+        Ok(ResolvedModel::new(
+            ModelSelector::new(
+                ProviderKey::new("openai"),
+                model_name.map(str::to_owned),
+                ApiProtocol::OpenAiResponses,
+            ),
+            Arc::clone(&self.0),
+            ModelSettings::new(),
+            ModelSettings::new(),
+        ))
+    }
+}
+
+/// Codex stops compaction on an incomplete response even when its reason is absent or unknown.
+/// Exercise the real Responses decoder so its behavior classification retains that distinction.
+#[tokio::test]
+async fn incomplete_compaction_without_a_known_reason_is_not_retried() {
+    for details in [Value::Null, json!({"reason": "unknown"})] {
+        let endpoint = MockServer::start().await;
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "incomplete-summary",
+                "status": "incomplete",
+                "incomplete_details": details
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/product/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {event}\n\n"), "text/event-stream"),
+            )
+            .mount(&endpoint)
+            .await;
+        let product = ProductModels::new();
+        product.write(
+            "config.toml",
+            r#"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model = "gpt-5.4"
+"#,
+        );
+        let model = ra_model::openai::responses::OpenAiResponsesModel::new(
+            "gpt-5.4",
+            ra_model::openai::auth::OpenAiAuth::new("test-key")
+                .with_base_url(format!("{}/product/v1", endpoint.uri())),
+        )
+        .unwrap();
+        let server = product.server(Some(Arc::new(CompactionModelResolver(Arc::new(model)))));
+        let mut connection = server.connect(1).await;
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+        server
+            .call(
+                &mut connection,
+                "thread/compact/start",
+                json!({"threadId": thread}),
+            )
+            .await;
+        let ended = connection.notification("turn/completed").await;
+        assert_eq!(ended["turn"]["status"], "failed", "{details}");
+        assert_eq!(
+            endpoint.received_requests().await.unwrap().len(),
+            1,
+            "{details}"
+        );
+        assert!(
+            !connection
+                .passed
+                .iter()
+                .any(|event| event.to_string().contains("Reconnecting")),
+            "{details}: {:?}",
+            connection.passed
+        );
+    }
+}
+
 #[tokio::test]
 async fn product_models_reach_selected_provider_with_catalog_and_config_defaults() {
     let endpoint = responses_endpoint().await;
