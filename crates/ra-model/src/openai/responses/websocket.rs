@@ -32,7 +32,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::{
-    Error as WsError, Message, client::IntoClientRequest, protocol::WebSocketConfig,
+    Error as WsError, Message, client::IntoClientRequest, error::ProtocolError,
+    protocol::WebSocketConfig,
 };
 
 use super::{OpenAiResponsesModel, convert, request, stream::CompletedOutput};
@@ -40,6 +41,7 @@ use crate::openai::{
     error::{
         ResponseFacts, behavior_error, response_failure, response_failure_as, retry_after_deadline,
     },
+    retry::{mark_post_send_websocket_disconnect, mark_unsent_websocket_failure},
     sse::SseFrame,
 };
 
@@ -203,10 +205,9 @@ impl WebSocketTransport {
             .timeout()
             .unwrap_or(DEFAULT_POOL_TIMEOUT);
         timeout(limit, session.lock_owned()).await.map_err(|_| {
-            stamp_replay_safety(
-                timeout_error("waiting for a Responses WebSocket session"),
-                ReplaySafety::Safe,
-            )
+            mark_unsent_websocket_failure(timeout_error(
+                "waiting for a Responses WebSocket session",
+            ))
         })
     }
 
@@ -381,7 +382,12 @@ impl WebSocketTransport {
         .and_then(|result| result.map_err(|error| transport_error(&error)));
         let first = async {
             sent?;
-            next_event(&mut connection.socket, call.idle_timeout).await
+            next_event(
+                &mut connection.socket,
+                call.idle_timeout,
+                /*before_first_event*/ true,
+            )
+            .await
         }
         .await
         .map_err(|error| AttemptError {
@@ -425,7 +431,9 @@ impl WebSocketTransport {
             self.connector.connect(upgrade, WebSocketConfig::default()),
         )
         .await
-        .map_err(|_| timeout_error("connecting to Responses WebSocket"))?
+        .map_err(|_| {
+            mark_unsent_websocket_failure(timeout_error("connecting to Responses WebSocket"))
+        })?
         .map_err(|error| upgrade_error(&error))?;
         Ok(Connection {
             socket,
@@ -680,7 +688,13 @@ impl ActiveResponse {
     fn frames(self) -> Frames {
         stream::unfold(self, |mut active| async move {
             let connection = active.connection.as_mut()?;
-            let event = match next_event(&mut connection.socket, active.call.idle_timeout).await {
+            let event = match next_event(
+                &mut connection.socket,
+                active.call.idle_timeout,
+                /*before_first_event*/ false,
+            )
+            .await
+            {
                 Ok(event) => {
                     active.observe_event(&event).await;
                     Ok(SseFrame::Data(event))
@@ -696,7 +710,11 @@ impl ActiveResponse {
     }
 }
 
-async fn next_event(socket: &mut WebSocketConnection, idle: Duration) -> Result<Value> {
+async fn next_event(
+    socket: &mut WebSocketConnection,
+    idle: Duration,
+    before_first_event: bool,
+) -> Result<Value> {
     timeout(idle, async {
         loop {
             match socket.next().await {
@@ -710,12 +728,37 @@ async fn next_event(socket: &mut WebSocketConnection, idle: Duration) -> Result<
                     return Ok(event);
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Err(error)) => return Err(transport_error(&error)),
+                Some(Err(error)) => {
+                    let disconnected = match &error {
+                        WsError::ConnectionClosed
+                        | WsError::AlreadyClosed
+                        | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+                        WsError::Io(error) => matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::UnexpectedEof
+                        ),
+                        _ => false,
+                    };
+                    let error = transport_error(&error);
+                    return Err(if before_first_event && disconnected {
+                        mark_post_send_websocket_disconnect(error)
+                    } else {
+                        error
+                    });
+                }
                 Some(Ok(Message::Close(_))) | None => {
-                    return Err(Error::provider(
+                    let error = Error::provider(
                         ProviderErrorKind::Network,
                         "Responses WebSocket closed before a terminal event",
-                    ));
+                    );
+                    return Err(if before_first_event {
+                        mark_post_send_websocket_disconnect(error)
+                    } else {
+                        error
+                    });
                 }
                 Some(Ok(_)) => return Err(behavior_error("unexpected Responses WebSocket frame")),
             }
@@ -778,7 +821,15 @@ fn wrapped_error(event: &Value) -> Error {
 
 fn upgrade_error(error: &WsError) -> Error {
     let WsError::Http(response) = error else {
-        return transport_error(error);
+        let failure = transport_error(error);
+        return if matches!(
+            error,
+            WsError::ConnectionClosed | WsError::Protocol(ProtocolError::HandshakeIncomplete)
+        ) {
+            mark_unsent_websocket_failure(failure)
+        } else {
+            failure
+        };
     };
     let status = response.status();
     if matches!(status.as_u16(), 400 | 401 | 426 | 429 | 500..=599) {

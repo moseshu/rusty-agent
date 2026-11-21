@@ -137,6 +137,22 @@ async fn lock_uses_the_request_timeout_and_timeout_is_replay_safe() {
             .response_started()
     );
 
+    let advice = |error: &ra_core::error::Error| {
+        model
+            .get_retry_advice(&ra_core::model::ModelRetryAdviceRequest::new(
+                error,
+                1,
+                true,
+                &ra_core::model::ConversationContinuation::None,
+            ))
+            .unwrap()
+    };
+    assert_eq!(advice(&error).suggested(), Some(true));
+    assert_eq!(advice(&error).replay_safety(), ReplaySafety::Safe);
+    let restated = ra_core::model::stamp_replay_safety(error, ReplaySafety::Unsafe);
+    assert_eq!(advice(&restated).suggested(), Some(false));
+    assert_eq!(advice(&restated).replay_safety(), ReplaySafety::Unsafe);
+
     let mut waiting = model.stream_response(request(&ModelSettings::new()));
     // Waiting longer than the connection timeout still leaves the sessionless call queued.
     assert!(timeout(CONNECT_TIMEOUT * 2, waiting.next()).await.is_err());
@@ -606,4 +622,131 @@ async fn a_runner_owned_fallback_returns_websocket_failures_and_switches_on_requ
     assert!(provider.websocket_enabled(Some(&SessionId::new("other"))));
     completed(model.as_ref(), request).await;
     server.verify().await;
+}
+
+/// A rejected HTTP upgrade can be safe to replay without the provider recommending a retry.
+#[tokio::test]
+async fn rejected_websocket_upgrades_use_http_retry_advice() {
+    use ra_core::model::{ConversationContinuation, ModelRetryAdviceRequest};
+
+    for (status, veto, expected) in [
+        (400, false, None),
+        (503, true, Some(false)),
+        (503, false, Some(true)),
+    ] {
+        let server = MockServer::start().await;
+        let mut refusal = ResponseTemplate::new(status);
+        if veto {
+            refusal = refusal
+                .insert_header("x-should-retry", "false")
+                .insert_header("retry-after", "12");
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/responses"))
+            .respond_with(refusal)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = provider_at(format!("{}/v1", server.uri()), PATIENCE)
+            .with_runner_transport_fallback()
+            .get_model(None)
+            .unwrap();
+        let error = model
+            .stream_response(request(&ModelSettings::new()))
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        let advice = model.get_retry_advice(&ModelRetryAdviceRequest::new(
+            &error,
+            1,
+            true,
+            &ConversationContinuation::None,
+        ));
+        assert_eq!(
+            advice.is_some(),
+            expected.is_some(),
+            "{status}, veto={veto}"
+        );
+        if let Some(advice) = advice {
+            assert_eq!(advice.suggested(), expected, "{status}, veto={veto}");
+            assert_eq!(advice.replay_safety(), ReplaySafety::Unknown);
+            assert_eq!(advice.retry_after(), veto.then(|| Duration::from_secs(12)));
+        }
+        server.verify().await;
+    }
+}
+
+/// The SDK suggests retrying a stateless post-send disconnect, with no safety verdict.
+#[tokio::test]
+async fn post_send_websocket_disconnect_advice_depends_on_the_request_continuation() {
+    use ra_core::model::{ConversationContinuation, ModelRetryAdviceRequest};
+
+    for continuation in [
+        ConversationContinuation::None,
+        ConversationContinuation::PreviousResponseId("resp_prev".to_owned()),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = provider(&listener, PATIENCE)
+            .with_runner_transport_fallback()
+            .get_model(None)
+            .unwrap();
+        let stateful = continuation.is_server_managed();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(socket).await.unwrap();
+            let frame = socket.next().await.unwrap().unwrap();
+            let sent: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(sent["store"], true);
+            assert_eq!(sent.get("previous_response_id").is_some(), stateful);
+        });
+        let settings = ModelSettings::new().with_extra_body_value(
+            ProviderKey::new("openai"),
+            "store",
+            json!(true),
+        );
+        let request = request(&settings).with_continuation(continuation.clone());
+        let error = model
+            .stream_response(request)
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        peer.await.unwrap();
+        // The transport still avoids replaying a potentially stored request internally.
+        assert_eq!(replay_safety_of(&error), ReplaySafety::Unsafe);
+        for streaming in [true, false] {
+            let advice = model
+                .get_retry_advice(&ModelRetryAdviceRequest::new(
+                    &error,
+                    1,
+                    streaming,
+                    &continuation,
+                ))
+                .unwrap();
+            assert_eq!(advice.suggested(), Some(!stateful));
+            assert_eq!(
+                advice.replay_safety(),
+                if stateful {
+                    ReplaySafety::Unsafe
+                } else {
+                    ReplaySafety::Unknown
+                }
+            );
+            assert!(!advice.response_started());
+        }
+
+        let started = ra_core::model::stamp_response_started(error);
+        let advice = model
+            .get_retry_advice(&ModelRetryAdviceRequest::new(
+                &started,
+                1,
+                true,
+                &continuation,
+            ))
+            .unwrap();
+        assert_eq!(advice.suggested(), Some(false));
+        assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
+        assert!(advice.response_started());
+    }
 }

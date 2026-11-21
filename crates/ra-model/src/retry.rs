@@ -119,10 +119,9 @@ pub fn retry_advice(request: &ModelRetryAdviceRequest<'_>) -> Option<RetryAdvice
 /// withheld rather than denied, and the runtime does not replay a stateful request whose safety is
 /// unknown; this layer must not hand it a "safe" it cannot support.
 ///
-/// This is the provider-neutral verdict, before any response evidence. An adapter that can read
-/// more may add to it: the `OpenAI` models' advice (`openai::retry`) calls a stateful replay safe
-/// when the endpoint answered with a retryable status or sent `x-should-retry: true`, because
-/// either shows the request was refused rather than accepted.
+/// This is the provider-neutral verdict, before any response evidence. The `OpenAI` models answer
+/// with the SDK's own advice instead (`openai::retry`), which reads the endpoint's response rather
+/// than this stamp.
 #[must_use]
 pub const fn unstarted_replay_safety(continuation: &ConversationContinuation) -> ReplaySafety {
     if continuation.is_server_managed() {
@@ -135,8 +134,8 @@ pub const fn unstarted_replay_safety(continuation: &ConversationContinuation) ->
 /// Whether replaying this request can duplicate what a consumer already saw.
 ///
 /// An explicit stamp is authoritative, and this provider-neutral advice never upgrades a verdict
-/// the adapter withheld; the `OpenAI` models' advice (`openai::retry`) adds the SDK's verdict from
-/// response evidence on top of this one. After streaming begins, adapters
+/// the adapter withheld; the `OpenAI` models answer with the SDK's advice (`openai::retry`)
+/// instead. After streaming begins, adapters
 /// preserve provider evidence and leave output-consumption checks to the runtime. An unstamped
 /// streaming failure stays unknown rather than claiming that no output or state was accepted.
 fn replay_safety(

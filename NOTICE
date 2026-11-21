@@ -1141,12 +1141,15 @@ tests/it-model/tests/{openai_retry,responses_websocket_pool,streaming_retry}.rs
 and tests/it-core/tests/retry_policy.rs adapt openai/openai-agents-python,
 revision f53c62451c7f34c15f0c87fa745e05404025420f,
 src/agents/run_internal/model_retry.py, src/agents/models/_retry_runtime.py, src/agents/retry.py,
-tests/models/test_model_retry.py and tests/models/test_openai_responses.py
-(MIT). The response-started mark on Responses WebSocket failures in
+tests/models/test_model_retry.py, tests/models/test_openai_responses.py and
+tests/models/test_openai_retry_helpers.py (MIT). The response-started mark on Responses WebSocket failures in
 crates/ra-model/src/openai/responses.rs, and its skipping of HTTP retries and WebSocket reconnects
 the runner disables, follow src/agents/models/openai_responses.py, and the
-OpenAI replay verdict in crates/ra-model/src/openai/retry.rs adapts
-src/agents/models/_openai_retry.py; the Retry-After reading of an elapsed date in
+OpenAI retry advice in crates/ra-model/src/openai/retry.rs ports
+src/agents/models/_openai_retry.py (get_openai_retry_advice). The pre-send and post-send disconnect
+evidence in crates/ra-model/src/openai/responses/websocket.rs and the corresponding advice follow
+the Responses model's get_retry_advice in src/agents/models/openai_responses.py;
+the Retry-After reading of an elapsed date in
 crates/ra-model/src/retry.rs follows src/agents/models/_retry_runtime.py.
 The product retry recovery hook in that runner ports the conversation-recording and notification
 mechanism, and the move of a sampling request that spent its retries to a fallback transport with

@@ -159,6 +159,29 @@ reports every `response.incomplete` as a failure.
 | The product supports server-requested follow-up sampling | Hosts opting into Codex Responses behavior | Enable the provider option and install the Responses follow-up rule in the runtime |
 | Both continuation frames keep the product turn open | Clients of the coding product | Expect another model call in the same turn |
 
+### OpenAI retry advice follows the Agents SDK
+
+The OpenAI Chat Completions and Responses models now use the Agents SDK's generic HTTP retry
+advice. A rejected Responses WebSocket upgrade uses the same HTTP status and header rules.
+A WebSocket disconnect after sending but before the first response event can recommend a retry
+without a replay-safety verdict when the request has no provider-held continuation, even with
+`store: true`. A provider-held continuation or a started response keeps the replay veto.
+Other explicit vetoes still apply. A transient pre-send WebSocket failure, such as a connect
+timeout, can recommend a safe retry. The advice reason is the error message.
+`x-should-retry` decides first; a failure with no status suggests a retry; a 408, 409, 429 or 5xx
+suggests one whatever its error code, so a context overflow reported with those statuses is now
+suggested; a failure with only a server delay carries the delay without a suggestion; anything else
+gets no advice, where it used to get `suggested = false`. The runtime replays a stateless request
+whose safety is unknown as it replayed a safe one, so retry decisions only change for policies that
+read `suggested` or `replay_safety`.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| Generic HTTP advice derives replay safety from response evidence | Custom policies that read `RetryPolicyContext::replay_safety` | Expect `Unknown` when the provider gives no replay verdict for a stateless request |
+| A non-retryable status without a delay gets no advice instead of `suggested = false` | Combinations relying on `ProviderSuggestedRetryPolicy` vetoing such failures | Expect no veto; another policy in an `any` combination may now retry them |
+| A 429 or 5xx is suggested even with a context-overflow code | Hosts using `ProviderSuggestedRetryPolicy` | Add a policy that declines context overflows if they should not be retried |
+| `NormalizedProviderError::map_source` | Adapters adding evidence to an error they built | Use it instead of wrapping the provider error, so later restatements keep the evidence |
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

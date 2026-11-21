@@ -16,9 +16,7 @@ use ra_core::{
     },
 };
 use ra_model::openai::{auth::OpenAiAuth, chat::OpenAiChatModel, responses::OpenAiResponsesModel};
-use ra_model::retry::{
-    REASON_ENDPOINT_VERDICT, REASON_ERROR_CLASS, RETRY_AFTER_HEADER, RetryHints,
-};
+use ra_model::retry::{RETRY_AFTER_HEADER, RetryHints};
 use rstest::rstest;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -95,7 +93,7 @@ async fn drain_stream(mut stream: ModelStream<'_>) -> Error {
     panic!("the stream was expected to fail, last event: {last:?}");
 }
 
-fn advice(model: &impl Model, error: &Error, streaming: bool) -> Option<RetryAdvice> {
+fn advice(model: &(impl Model + ?Sized), error: &Error, streaming: bool) -> Option<RetryAdvice> {
     model.get_retry_advice(&ModelRetryAdviceRequest::new(
         error,
         0,
@@ -163,11 +161,11 @@ async fn a_rate_limited_call_reports_the_status_code_and_the_delay_it_asked_for(
     let advice = advice(&model, &error, false).expect("a provider failure yields advice");
     assert_eq!(advice.suggested(), Some(true));
     assert_eq!(advice.retry_after(), Some(Duration::from_secs(2)));
-    assert_eq!(advice.reason(), Some(REASON_ERROR_CLASS));
+    assert_eq!(advice.reason(), Some(facts.message()));
     assert_eq!(
         advice.replay_safety(),
-        ReplaySafety::Safe,
-        "a non-streaming call handed the caller nothing before it failed"
+        ReplaySafety::Unknown,
+        "as in the SDK, a refused request that carries its own history gets no verdict"
     );
 }
 
@@ -322,7 +320,7 @@ async fn the_endpoint_verdict_outranks_what_the_status_class_would_suggest() {
 
     let advice = advice(&model, &error, false).expect("a provider failure yields advice");
     assert_eq!(advice.suggested(), Some(false));
-    assert_eq!(advice.reason(), Some(REASON_ENDPOINT_VERDICT));
+    assert_eq!(advice.reason(), Some(facts(&error).message()));
 }
 
 /// Adapters cannot know how their events were consumed. The runtime owns the output veto, while
@@ -592,7 +590,9 @@ fn stateful() -> ConversationContinuation {
     ConversationContinuation::PreviousResponseId("resp_prev".to_owned())
 }
 
-fn stateful_advice(model: &impl Model, error: &Error, streaming: bool) -> RetryAdvice {
+/// The replay verdict the advice gives a stateful request; no advice at all is the SDK's
+/// `unknown`.
+fn stateful_safety(model: &(impl Model + ?Sized), error: &Error, streaming: bool) -> ReplaySafety {
     model
         .get_retry_advice(&ModelRetryAdviceRequest::new(
             error,
@@ -600,7 +600,7 @@ fn stateful_advice(model: &impl Model, error: &Error, streaming: bool) -> RetryA
             streaming,
             &stateful(),
         ))
-        .expect("a provider failure gets advice")
+        .map_or(ReplaySafety::Unknown, |advice| advice.replay_safety())
 }
 
 /// The SDK's order decides the verdict for a stateful request: an explicit verdict stands, then
@@ -626,7 +626,12 @@ fn stateful_advice(model: &impl Model, error: &Error, streaming: bool) -> RetryA
     ReplaySafety::Unsafe,
     ReplaySafety::Unsafe
 )]
-#[case::explicit_safe_stands(Some(400), Some(false), ReplaySafety::Safe, ReplaySafety::Safe)]
+#[case::a_stamped_safe_is_not_endpoint_evidence(
+    Some(400),
+    Some(false),
+    ReplaySafety::Safe,
+    ReplaySafety::Unknown
+)]
 #[case::no_response(None, None, ReplaySafety::Unknown, ReplaySafety::Unknown)]
 fn the_openai_replay_verdict_follows_the_sdk_order(
     #[case] status: Option<u16>,
@@ -655,12 +660,12 @@ fn the_openai_replay_verdict_follows_the_sdk_order(
     let chat = OpenAiChatModel::new(MODEL, auth()).unwrap();
     for streaming in [false, true] {
         assert_eq!(
-            stateful_advice(&responses, &error, streaming).replay_safety(),
+            stateful_safety(&responses, &error, streaming),
             expected,
             "responses, streaming {streaming}"
         );
         assert_eq!(
-            stateful_advice(&chat, &error, streaming).replay_safety(),
+            stateful_safety(&chat, &error, streaming),
             expected,
             "chat, streaming {streaming}"
         );
@@ -700,10 +705,7 @@ fn the_openai_replay_verdict_does_not_reach_other_providers() {
         .with_status_code(429)
         .with_should_retry(true)
         .into_error();
-    assert_eq!(
-        stateful_advice(&model, &error, true).replay_safety(),
-        ReplaySafety::Unknown
-    );
+    assert_eq!(stateful_safety(&model, &error, true), ReplaySafety::Unknown);
 }
 
 /// As the SDK's `test_get_client_disables_provider_managed_retries_when_requested`: the Responses
@@ -744,5 +746,146 @@ async fn http_retries_follow_the_runtime_unless_the_provider_keeps_its_own() {
             .unwrap_err();
         assert_eq!(facts(&error).status_code(), Some(503));
         server.verify().await;
+    }
+}
+
+/// The SDK's `get_openai_retry_advice` answers both models. Each case runs a real refused call
+/// through the Chat Completions and the Responses models and checks the advice for a request that
+/// carries its own history and for one continuing provider-held state.
+///
+/// Ported from `test_get_openai_retry_advice_returns_none_for_non_retryable_status`,
+/// `test_advice_returns_retry_after_only_when_no_other_signal`,
+/// `test_advice_respects_x_should_retry_false`, `test_get_retry_advice_uses_openai_headers` and
+/// `test_get_retry_advice_marks_stateful_http_failures_replay_safe`; the last case is the SDK's
+/// status branch, which suggests a retry whatever the error code says.
+#[rstest]
+#[case::rejected(ResponseTemplate::new(400), None, None, None)]
+#[case::delay_only(
+    ResponseTemplate::new(400).insert_header("retry-after", "2"),
+    None,
+    Some(Duration::from_secs(2)),
+    None
+)]
+#[case::endpoint_declines(
+    ResponseTemplate::new(503).insert_header("x-should-retry", "false"),
+    Some(false),
+    None,
+    None
+)]
+#[case::endpoint_vouches(
+    ResponseTemplate::new(429)
+        .insert_header("x-should-retry", "true")
+        .insert_header("retry-after-ms", "250"),
+    Some(true),
+    Some(Duration::from_millis(250)),
+    Some(ReplaySafety::Safe)
+)]
+#[case::rate_limited(ResponseTemplate::new(429), Some(true), None, None)]
+#[tokio::test]
+async fn openai_advice_follows_the_sdk(
+    #[case] template: ResponseTemplate,
+    #[case] suggested: Option<bool>,
+    #[case] retry_after: Option<Duration>,
+    #[case] stateless_safety: Option<ReplaySafety>,
+) {
+    let template = template.set_body_json(error_body("invalid_request_error", "refused"));
+    for chat in [false, true] {
+        let server = MockServer::start().await;
+        let error = if chat {
+            failed_call(&chat_model(&server, template.clone()).await).await
+        } else {
+            failed_call(&responses_model(&server, template.clone()).await).await
+        };
+        let auth = || OpenAiAuth::new("test-secret").with_base_url("http://127.0.0.1:9/v1/");
+        let model: Box<dyn Model> = if chat {
+            Box::new(OpenAiChatModel::new(MODEL, auth()).unwrap())
+        } else {
+            Box::new(OpenAiResponsesModel::new(MODEL, auth()).unwrap())
+        };
+        let stateless = advice(model.as_ref(), &error, false);
+        let Some(expected_safety) = stateless_safety.or(suggested.map(|_| ReplaySafety::Unknown))
+        else {
+            // No suggestion: either no advice at all or a delay alone.
+            match retry_after {
+                None => assert!(stateless.is_none(), "chat {chat}: {stateless:?}"),
+                Some(delay) => {
+                    let stateless = stateless.unwrap();
+                    assert_eq!(stateless.suggested(), None, "chat {chat}");
+                    assert_eq!(stateless.retry_after(), Some(delay), "chat {chat}");
+                }
+            }
+            continue;
+        };
+        let stateless = stateless.expect("a suggestion comes with advice");
+        assert_eq!(stateless.suggested(), suggested, "chat {chat}");
+        assert_eq!(stateless.retry_after(), retry_after, "chat {chat}");
+        assert_eq!(stateless.replay_safety(), expected_safety, "chat {chat}");
+        assert_eq!(
+            stateless.reason(),
+            Some(facts(&error).message()),
+            "chat {chat}"
+        );
+        // A retryable status, or the endpoint vouching, makes a stateful replay safe.
+        let stateful = stateful_safety(model.as_ref(), &error, false);
+        assert_eq!(
+            stateful,
+            if suggested == Some(true) {
+                ReplaySafety::Safe
+            } else {
+                ReplaySafety::Unknown
+            },
+            "chat {chat}"
+        );
+    }
+}
+
+/// The SDK's status branch suggests retrying a 429 or 5xx whatever its error code, so a context
+/// overflow reported with one of those statuses is still suggested, though the neutral
+/// classification calls it a context overflow.
+#[rstest]
+#[case(429)]
+#[case(500)]
+#[tokio::test]
+async fn a_retryable_status_is_suggested_whatever_its_error_code(#[case] status: u16) {
+    let server = MockServer::start().await;
+    let model = responses_model(
+        &server,
+        ResponseTemplate::new(status).set_body_json(error_body("context_length_exceeded", "long")),
+    )
+    .await;
+    let error = failed_call(&model).await;
+    assert_eq!(facts(&error).kind(), ProviderErrorKind::ContextOverflow);
+    let advice = advice(&model, &error, false).expect("a retryable status gets advice");
+    assert_eq!(advice.suggested(), Some(true));
+}
+
+/// As the SDK's `test_advice_unsafe_to_replay` and
+/// `test_get_retry_advice_keeps_stateless_transport_failures_retryable`: an explicit `Unsafe`
+/// refuses the replay, and a failure below the response suggests a retry without a verdict for
+/// either kind of request.
+#[test]
+fn an_explicit_unsafe_refuses_and_a_transport_failure_suggests_without_a_verdict() {
+    let auth = || OpenAiAuth::new("test-secret").with_base_url("http://127.0.0.1:9/v1/");
+    let model = OpenAiResponsesModel::new(MODEL, auth()).unwrap();
+    let unsafe_error = NormalizedProviderError::new(ProviderErrorKind::ServerError, "accepted")
+        .with_status_code(503)
+        .with_replay_safety(ReplaySafety::Unsafe)
+        .into_error();
+    let refused = advice(&model, &unsafe_error, true).unwrap();
+    assert_eq!(refused.suggested(), Some(false));
+    assert_eq!(refused.replay_safety(), ReplaySafety::Unsafe);
+
+    for kind in [ProviderErrorKind::Network, ProviderErrorKind::Timeout] {
+        let error = NormalizedProviderError::new(kind, "connection error")
+            .with_replay_safety(ReplaySafety::Safe)
+            .into_error();
+        let stateless = advice(&model, &error, false).unwrap();
+        assert_eq!(stateless.suggested(), Some(true), "{kind:?}");
+        assert_eq!(stateless.replay_safety(), ReplaySafety::Unknown, "{kind:?}");
+        assert_eq!(
+            stateful_safety(&model, &error, false),
+            ReplaySafety::Unknown,
+            "{kind:?}"
+        );
     }
 }

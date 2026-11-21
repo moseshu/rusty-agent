@@ -133,6 +133,17 @@ impl NormalizedProviderError {
         self
     }
 
+    /// Replaces the underlying source with what `wrap` makes of the current one.
+    ///
+    /// An adapter uses it to add evidence of its own to the chain of an error it already built.
+    /// A later restatement such as [`stamp_replay_safety`] keeps this record's source, so the
+    /// evidence survives it, where wrapping the whole provider error would not.
+    #[must_use]
+    pub fn map_source(mut self, wrap: impl FnOnce(Option<BoxError>) -> Option<BoxError>) -> Self {
+        self.source = wrap(self.source.take());
+        self
+    }
+
     /// Neutral classification, which decides recoverability.
     #[must_use]
     pub const fn kind(&self) -> ProviderErrorKind {
