@@ -750,3 +750,303 @@ async fn post_send_websocket_disconnect_advice_depends_on_the_request_continuati
         assert!(advice.response_started());
     }
 }
+
+/// Runs one streamed request against a peer that reads the request and answers with `replies`,
+/// then holds the socket until the client leaves; returns the first failure.
+async fn failure_after_replies(
+    replies: Vec<Message>,
+    settings: &ModelSettings,
+    continuation: &ra_core::model::ConversationContinuation,
+) -> (Arc<dyn Model>, ra_core::error::Error) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let model = provider(&listener, PATIENCE)
+        .with_runner_transport_fallback()
+        .get_model(None)
+        .unwrap();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        for reply in replies {
+            socket.send(reply).await.unwrap();
+        }
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    let request = request(settings).with_continuation(continuation.clone());
+    let mut stream = model.stream_response(request);
+    let error = loop {
+        match timeout(PATIENCE, stream.next()).await.unwrap() {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => panic!("the stream must end with a failure"),
+        }
+    };
+    drop(stream);
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+    (model, error)
+}
+
+fn advise(
+    model: &dyn Model,
+    error: &ra_core::error::Error,
+    continuation: &ra_core::model::ConversationContinuation,
+) -> Option<ra_core::model::RetryAdvice> {
+    model.get_retry_advice(&ra_core::model::ModelRetryAdviceRequest::new(
+        error,
+        1,
+        true,
+        continuation,
+    ))
+}
+
+fn continuations() -> [ra_core::model::ConversationContinuation; 2] {
+    [
+        ra_core::model::ConversationContinuation::None,
+        ra_core::model::ConversationContinuation::PreviousResponseId("resp_prev".to_owned()),
+    ]
+}
+
+/// As the SDK's `test_websocket_get_retry_advice_marks_ambiguous_replay_unsafe`,
+/// `..._allows_stateless_ambiguous_disconnect_retry`, `..._marks_stateful_receive_timeout_unsafe`
+/// and `..._allows_stateless_receive_timeout_retry`: a close frame or a read timeout after the
+/// request was sent and before the first response event is retried without a verdict unless the
+/// request continues provider-held state. The transport's own stamp for a stored request does not
+/// change the advice.
+#[tokio::test]
+async fn pre_event_close_and_read_timeout_advice_depends_on_the_request_continuation() {
+    let stored = ModelSettings::new().with_extra_body_value(
+        ProviderKey::new("openai"),
+        "store",
+        json!(true),
+    );
+    let limited = stored.clone().with_timeout(Duration::from_millis(200));
+    for (replies, settings, kind) in [
+        (
+            vec![Message::Close(None)],
+            &stored,
+            ProviderErrorKind::Network,
+        ),
+        (Vec::new(), &limited, ProviderErrorKind::Timeout),
+    ] {
+        for continuation in continuations() {
+            let stateful = continuation.is_server_managed();
+            let (model, error) =
+                failure_after_replies(replies.clone(), settings, &continuation).await;
+            let normalized = NormalizedProviderError::from_error(&error).unwrap();
+            assert_eq!(normalized.kind(), kind);
+            assert_eq!(normalized.replay_safety(), ReplaySafety::Unsafe);
+            let advice = advise(model.as_ref(), &error, &continuation).unwrap();
+            assert_eq!(advice.suggested(), Some(!stateful), "{kind:?}");
+            assert_eq!(
+                advice.replay_safety(),
+                if stateful {
+                    ReplaySafety::Unsafe
+                } else {
+                    ReplaySafety::Unknown
+                },
+                "{kind:?}"
+            );
+            assert!(!advice.response_started());
+        }
+    }
+}
+
+/// As the SDK's `test_websocket_get_retry_advice_marks_pre_response_overload_retryable`,
+/// `..._marks_pre_response_server_error_retryable`,
+/// `..._does_not_override_non_transient_error_code` and
+/// `..._ignores_other_pre_response_error_codes`: an overloaded server, or a server error without a
+/// code, reported before the first response event is retried without a verdict whatever the
+/// continuation, including when the frame carries a status. Other codes get no advice, including
+/// one Codex reads as a 503.
+#[tokio::test]
+async fn pre_response_error_frames_suggest_a_retry_only_when_transient() {
+    let frame = |error: Value| json!({"type": "error", "error": error});
+    let mut with_status = frame(json!({
+        "type": "service_unavailable_error",
+        "code": "server_is_overloaded",
+        "message": "Our servers are currently overloaded. Please try again later.",
+    }));
+    with_status["status"] = json!(503);
+    for (event, suggested) in [
+        (
+            frame(json!({
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+            })),
+            true,
+        ),
+        (
+            frame(json!({
+                "type": "server_error", "code": null, "message": "Sorry, something went wrong.",
+            })),
+            true,
+        ),
+        (with_status, true),
+        (
+            frame(json!({
+                "type": "server_error", "code": "invalid_request_error",
+                "message": "Invalid request.",
+            })),
+            false,
+        ),
+        (
+            frame(json!({
+                "type": "invalid_request_error", "code": "invalid_request",
+                "message": "Invalid request.",
+            })),
+            false,
+        ),
+        // Codex reads this code as a 503, which the SDK's error type cannot see.
+        (
+            frame(json!({
+                "type": "invalid_request_error", "code": "websocket_connection_limit_reached",
+                "message": "Too many connections.",
+            })),
+            false,
+        ),
+    ] {
+        for continuation in continuations() {
+            let (model, error) = failure_after_replies(
+                vec![Message::Text(event.to_string().into())],
+                &ModelSettings::new(),
+                &continuation,
+            )
+            .await;
+            let advice = advise(model.as_ref(), &error, &continuation);
+            if suggested {
+                let advice = advice.unwrap();
+                assert_eq!(advice.suggested(), Some(true), "{event}");
+                assert_eq!(advice.replay_safety(), ReplaySafety::Unknown, "{event}");
+            } else {
+                assert!(advice.is_none(), "{event}");
+            }
+        }
+    }
+}
+
+/// As the SDK's `test_websocket_get_retry_advice_keeps_partial_transient_error_unsafe`: a
+/// transient error frame after the first response event is unsafe to replay.
+#[tokio::test]
+async fn a_transient_error_frame_after_the_first_event_is_unsafe_to_replay() {
+    let continuation = ra_core::model::ConversationContinuation::None;
+    let (model, error) = failure_after_replies(
+        vec![
+            Message::Text(
+                json!({"type": "response.created", "response": {"id": "resp_partial"}})
+                    .to_string()
+                    .into(),
+            ),
+            Message::Text(
+                json!({"type": "error", "error": {
+                    "type": "server_error", "code": null, "message": "Transient provider error.",
+                }})
+                .to_string()
+                .into(),
+            ),
+        ],
+        &ModelSettings::new(),
+        &continuation,
+    )
+    .await;
+    let advice = advise(model.as_ref(), &error, &continuation).unwrap();
+    assert_eq!(advice.suggested(), Some(false));
+    assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
+    assert!(advice.response_started());
+}
+
+/// As the SDK's `test_websocket_get_retry_advice_marks_handshake_failure_replay_safe` and
+/// `test_websocket_get_retry_advice_ignores_malformed_handshake`: a peer that leaves during the
+/// handshake makes the request safe to retry, even one continuing provider-held state, while a
+/// malformed handshake response gets no advice.
+#[tokio::test]
+async fn handshake_advice_separates_a_departed_peer_from_a_malformed_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let continuation =
+        ra_core::model::ConversationContinuation::PreviousResponseId("resp_prev".to_owned());
+    for malformed in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = provider(&listener, PATIENCE)
+            .with_runner_transport_fallback()
+            .get_model(None)
+            .unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut upgrade = Vec::new();
+            let mut buffer = [0; 1024];
+            while !upgrade.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "the client must send its upgrade request");
+                upgrade.extend_from_slice(&buffer[..read]);
+            }
+            if malformed {
+                socket
+                    .write_all(b"HTTP/1.1 abc Switching\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        });
+        let request = request(&ModelSettings::new()).with_continuation(continuation.clone());
+        let error = timeout(PATIENCE, model.stream_response(request).next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        timeout(PATIENCE, peer).await.unwrap().unwrap();
+        let advice = advise(model.as_ref(), &error, &continuation);
+        if malformed {
+            assert!(advice.is_none(), "{error}");
+        } else {
+            let advice = advice.unwrap();
+            assert_eq!(advice.suggested(), Some(true));
+            assert_eq!(advice.replay_safety(), ReplaySafety::Safe);
+        }
+    }
+}
+
+/// As the SDK's `test_websocket_get_retry_advice_marks_close_invalidation_non_retryable`: closing
+/// the provider ends an in-flight request, and neither it nor a later request is suggested for a
+/// retry.
+#[tokio::test]
+async fn closing_the_provider_refuses_a_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = provider(&listener, PATIENCE).with_runner_transport_fallback();
+    let model = provider.get_model(None).unwrap();
+    let (received, sent) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        received.send(()).unwrap();
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    let continuation = ra_core::model::ConversationContinuation::None;
+    let mut stream = model.stream_response(request(&ModelSettings::new()));
+    let (first, ()) = tokio::join!(timeout(PATIENCE, stream.next()), async {
+        sent.await.unwrap();
+        provider.close().await.unwrap();
+    });
+    let in_flight = first.unwrap().unwrap().unwrap_err();
+    drop(stream);
+    timeout(PATIENCE, peer).await.unwrap().unwrap();
+    let later = timeout(
+        PATIENCE,
+        model.stream_response(request(&ModelSettings::new())).next(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+
+    for error in [in_flight, later] {
+        assert!(
+            matches!(error, ra_core::error::Error::Caller { .. }),
+            "{error}"
+        );
+        let advice = advise(model.as_ref(), &error, &continuation).unwrap();
+        assert_eq!(advice.suggested(), Some(false));
+        assert_eq!(advice.replay_safety(), ReplaySafety::Unsafe);
+    }
+}

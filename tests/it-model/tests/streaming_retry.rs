@@ -203,6 +203,80 @@ async fn websocket_failures_obey_the_runner_budget_and_policy_without_http_repla
     }
 }
 
+#[derive(Default)]
+struct AlwaysRetry(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ra_core::model::ModelRetryPolicy for AlwaysRetry {
+    async fn evaluate(
+        &self,
+        _context: &ra_core::model::RetryPolicyContext<'_>,
+    ) -> ra_core::model::RetryDecision {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ra_core::model::RetryDecision::retry()
+    }
+}
+
+#[tokio::test]
+async fn closing_a_websocket_provider_vetoes_replay_before_the_retry_policy() {
+    use ra_core::model::ModelProvider;
+    use ra_http::{HttpClientFactory, OutboundProxyPolicy, websocket::WebSocketConnector};
+    use ra_model::openai::responses::OpenAiResponsesProvider;
+    use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+    use tokio_tungstenite::accept_async;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let patience = Duration::from_secs(5);
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+    let provider = OpenAiResponsesProvider::new(
+        OpenAiAuth::keyless(format!("http://{}/v1", listener.local_addr().unwrap())),
+        "mock-model",
+    )
+    .unwrap()
+    .with_websocket(WebSocketConnector::new(&factory).unwrap(), patience);
+    let (sent, received) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        assert!(socket.next().await.unwrap().unwrap().is_text());
+        sent.send(()).unwrap();
+        while let Some(Ok(_)) = socket.next().await {}
+    });
+    let policy = Arc::new(AlwaysRetry::default());
+    let retry = ModelRetrySettings::new()
+        .with_max_retries(2)
+        .with_policy(policy.clone());
+    let request = RunRequest::new(
+        agent(),
+        Arc::new(Resolver(
+            provider.get_model(None).unwrap(),
+            Protocol::Responses,
+        )),
+        RunId::new("websocket-close-run"),
+        CancelScope::root(),
+        vec![ModelInputItem::Message(Message::user("hello"))],
+    )
+    .with_config(RunConfig::new().with_model_settings(ModelSettings::new().with_retry(retry)));
+
+    let (result, ()) = timeout(patience, async {
+        tokio::join!(Runner::run(request), async {
+            received.await.unwrap();
+            provider.close().await.unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    let error = result.expect_err("provider close invalidated the in-flight request");
+    assert_eq!(error.code(), "caller");
+    assert!(
+        error
+            .to_string()
+            .contains("Responses WebSocket provider has been closed")
+    );
+    assert_eq!(policy.0.load(Ordering::SeqCst), 0);
+    timeout(patience, peer).await.unwrap().unwrap();
+}
+
 fn agent() -> AgentBinding {
     AgentBinding::direct(
         AgentSpec::builder()

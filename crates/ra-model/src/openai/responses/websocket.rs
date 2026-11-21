@@ -41,7 +41,11 @@ use crate::openai::{
     error::{
         ResponseFacts, behavior_error, response_failure, response_failure_as, retry_after_deadline,
     },
-    retry::{mark_post_send_websocket_disconnect, mark_unsent_websocket_failure},
+    retry::{
+        closed_websocket_error, mark_failed_websocket_handshake,
+        mark_post_send_websocket_disconnect, mark_post_send_websocket_timeout,
+        mark_pre_response_error_frame, mark_unsent_websocket_failure,
+    },
     sse::SseFrame,
 };
 
@@ -196,7 +200,7 @@ impl WebSocketTransport {
         let session = {
             let mut cache = self.cache.lock().map_err(|_| poisoned_cache())?;
             if cache.closed {
-                return Err(closed_error());
+                return Err(closed_websocket_error());
             }
             cache.lane(request.session_id())
         };
@@ -234,7 +238,7 @@ impl WebSocketTransport {
         let mut closed = self.closed.subscribe();
         let frames = tokio::select! {
             biased;
-            _ = closed.wait_for(|closed| *closed) => return Err(closed_error()),
+            _ = closed.wait_for(|closed| *closed) => return Err(closed_websocket_error()),
             result = self.start_inner(model, request) => result?,
         };
         Ok(frames.map(|frames| {
@@ -242,7 +246,7 @@ impl WebSocketTransport {
                 let (mut frames, mut closed) = state?;
                 let event = tokio::select! {
                     biased;
-                    _ = closed.wait_for(|closed| *closed) => return Some((Err(closed_error()), None)),
+                    _ = closed.wait_for(|closed| *closed) => return Some((Err(closed_websocket_error()), None)),
                     event = frames.next() => event?,
                 };
                 Some((event, Some((frames, closed))))
@@ -260,7 +264,7 @@ impl WebSocketTransport {
         {
             let cache = self.cache.lock().map_err(|_| poisoned_cache())?;
             if cache.closed {
-                return Err(closed_error());
+                return Err(closed_websocket_error());
             }
             if !cache.websocket_enabled(request.session_id()) {
                 return Ok(None);
@@ -378,8 +382,20 @@ impl WebSocketTransport {
                 .send(Message::Text(body.to_string().into())),
         )
         .await
-        .map_err(|_| timeout_error("sending a Responses WebSocket request"))
-        .and_then(|result| result.map_err(|error| transport_error(&error)));
+        .map_err(|_| {
+            mark_post_send_websocket_timeout(timeout_error("sending a Responses WebSocket request"))
+        })
+        .and_then(|result| {
+            // The SDK treats the request as possibly transmitted once sending begins.
+            result.map_err(|error| {
+                let failure = transport_error(&error);
+                if is_disconnect(&error) {
+                    mark_post_send_websocket_disconnect(failure)
+                } else {
+                    failure
+                }
+            })
+        });
         let first = async {
             sent?;
             next_event(
@@ -723,25 +739,18 @@ async fn next_event(
                         behavior_error("invalid Responses WebSocket event JSON").with_source(error)
                     })?;
                     if event.get("type").and_then(Value::as_str) == Some("error") {
-                        return Err(wrapped_error(&event));
+                        let error = wrapped_error(&event);
+                        return Err(if before_first_event {
+                            mark_pre_response_error_frame(error, is_transient_error_frame(&event))
+                        } else {
+                            error
+                        });
                     }
                     return Ok(event);
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Err(error)) => {
-                    let disconnected = match &error {
-                        WsError::ConnectionClosed
-                        | WsError::AlreadyClosed
-                        | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
-                        WsError::Io(error) => matches!(
-                            error.kind(),
-                            std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::UnexpectedEof
-                        ),
-                        _ => false,
-                    };
+                    let disconnected = is_disconnect(&error);
                     let error = transport_error(&error);
                     return Err(if before_first_event && disconnected {
                         mark_post_send_websocket_disconnect(error)
@@ -765,7 +774,42 @@ async fn next_event(
         }
     })
     .await
-    .map_err(|_| timeout_error("reading a Responses WebSocket event"))?
+    .map_err(|_| {
+        let error = timeout_error("reading a Responses WebSocket event");
+        if before_first_event {
+            mark_post_send_websocket_timeout(error)
+        } else {
+            error
+        }
+    })?
+}
+
+/// Whether a WebSocket failure means the peer went away, as the SDK's `ConnectionClosed` and
+/// end-of-file handshake failures do.
+fn is_disconnect(error: &WsError) -> bool {
+    match error {
+        WsError::ConnectionClosed
+        | WsError::AlreadyClosed
+        | WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake | ProtocolError::HandshakeIncomplete,
+        ) => true,
+        WsError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// The SDK's transient `error` frame: an overloaded server, or a server error with no code.
+fn is_transient_error_frame(event: &Value) -> bool {
+    let code = event.pointer("/error/code").and_then(Value::as_str);
+    code == Some("server_is_overloaded")
+        || (code.is_none()
+            && event.pointer("/error/type").and_then(Value::as_str) == Some("server_error"))
 }
 
 fn wrapped_error(event: &Value) -> Error {
@@ -802,10 +846,7 @@ fn wrapped_error(event: &Value) -> Error {
         return response_failure(&ResponseFacts::from_headers(status, &headers), event)
             .into_error();
     }
-    let kind = if code == Some("server_is_overloaded")
-        || (code.is_none()
-            && event.pointer("/error/type").and_then(Value::as_str) == Some("server_error"))
-    {
+    let kind = if is_transient_error_frame(event) {
         ProviderErrorKind::ServerError
     } else {
         ProviderErrorKind::BadRequest
@@ -822,13 +863,12 @@ fn wrapped_error(event: &Value) -> Error {
 fn upgrade_error(error: &WsError) -> Error {
     let WsError::Http(response) = error else {
         let failure = transport_error(error);
-        return if matches!(
-            error,
-            WsError::ConnectionClosed | WsError::Protocol(ProtocolError::HandshakeIncomplete)
-        ) {
+        // The SDK retries a handshake the peer abandoned, and gives no advice for one that failed
+        // otherwise.
+        return if is_disconnect(error) {
             mark_unsent_websocket_failure(failure)
         } else {
-            failure
+            mark_failed_websocket_handshake(failure)
         };
     };
     let status = response.status();
@@ -873,10 +913,6 @@ fn transport_error(error: &WsError) -> Error {
 
 fn poisoned_cache() -> Error {
     Error::caller("Responses WebSocket session cache is poisoned")
-}
-
-fn closed_error() -> Error {
-    Error::caller("Responses WebSocket provider has been closed")
 }
 
 fn timeout_error(operation: &str) -> Error {

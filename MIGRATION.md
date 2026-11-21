@@ -182,6 +182,27 @@ read `suggested` or `replay_safety`.
 | A 429 or 5xx is suggested even with a context-overflow code | Hosts using `ProviderSuggestedRetryPolicy` | Add a policy that declines context overflows if they should not be retried |
 | `NormalizedProviderError::map_source` | Adapters adding evidence to an error they built | Use it instead of wrapping the provider error, so later restatements keep the evidence |
 
+The Responses WebSocket advice also follows the rest of the SDK's WebSocket branches. These failures
+are the ones whose advice changes:
+- A disconnect while sending the request is treated like one after sending.
+- A send timeout, or a read timeout before the first response event, recommends a retry without a
+  verdict, or refuses it as unsafe for a request with a provider-held continuation. Before, the
+  verdict followed the transport's own replay boundary, so a stored stateless request was refused.
+- An `error` frame before the first response event reporting `server_is_overloaded`, or a
+  `server_error` with no code, recommends a retry without a verdict for any continuation. Other
+  such frames get no advice, even with a status, headers, or a code Codex reads as a 503.
+- A handshake that fails without a response status or a disconnect, such as a malformed response,
+  a refused connection or a TLS failure, gets no advice instead of a suggested retry.
+- A request ended or refused because the provider was closed remains a caller error and gets
+  `suggested = false` with `ReplaySafety::Unsafe` as the local equivalent of the SDK's abort
+  veto. The streaming runner stops before invoking a retry policy and rules out budget-exempt
+  recovery retries and transport fallback.
+
+| Change | Who is affected | What to do |
+| --- | --- | --- |
+| Pre-response WebSocket error frames without a transient code get no advice | Policies relying on HTTP status rules for Codex error frames | Read `NormalizedProviderError::status_code` in the policy |
+| WebSocket handshake failures without a status or disconnect get no advice | Hosts using `ProviderSuggestedRetryPolicy` alone | Add `NetworkErrorRetryPolicy` to retry network failures |
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records
