@@ -303,7 +303,7 @@ impl WebAccess for UnboundAccess {
 }
 
 pub(crate) struct SearchResolver {
-    pub(crate) config: CodingWebSearch,
+    pub(crate) config: super::TurnWebSearch,
     pub(crate) standalone: Arc<dyn Tool>,
 }
 

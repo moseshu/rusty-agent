@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Coding-product assembly of native Responses web search, following Codex's tool specification.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use ra_core::{
     context::RunContext,
@@ -214,6 +214,74 @@ impl HostedToolResolver for CodingWebSearch {
         }
         let sandbox_disabled = self.sandbox_disabled_for_context(context);
         self.definition_for_turn(sandbox_disabled)
+    }
+}
+
+/// The search result kind a model's catalog entry declares, Codex's `web_search_tool_type`.
+pub(crate) trait WebSearchModels: Send + Sync {
+    /// The declared kind for `model`, or `None` when no catalog entry names it.
+    fn tool_type(&self, model: &str) -> Option<WebSearchToolType>;
+
+    /// Whether the catalog can supply a model that requests image results.
+    fn may_use_images(&self) -> bool;
+}
+
+/// Hosted search settings that take the result kind from each turn's model, as Codex reads the
+/// turn's `ModelInfo`. A model without a catalog entry keeps the configured kind.
+///
+/// The resolver reads the run's resolved model name, which is the model of the agent that started
+/// the run; the coding product does not hand runs to agents with another model.
+#[derive(Clone)]
+pub(crate) struct TurnWebSearch {
+    pub(crate) config: CodingWebSearch,
+    pub(crate) models: Option<Arc<dyn WebSearchModels>>,
+}
+
+impl TurnWebSearch {
+    pub(crate) fn new(config: CodingWebSearch, models: Option<Arc<dyn WebSearchModels>>) -> Self {
+        Self { config, models }
+    }
+
+    fn config_for(&self, context: &RunContext) -> Cow<'_, CodingWebSearch> {
+        let tool_type = self
+            .models
+            .as_ref()
+            .zip(context.resolved_model_name())
+            .and_then(|(models, model)| models.tool_type(model));
+        match tool_type {
+            Some(tool_type) if tool_type != self.config.tool_type => Cow::Owned(CodingWebSearch {
+                tool_type,
+                ..self.config.clone()
+            }),
+            _ => Cow::Borrowed(&self.config),
+        }
+    }
+
+    /// The base declaration and any larger catalog variant for the schema-byte budget.
+    pub(crate) fn candidate_configs(&self) -> Vec<CodingWebSearch> {
+        let mut configs = vec![self.config.clone()];
+        if self.config.tool_type == WebSearchToolType::Text
+            && self
+                .models
+                .as_ref()
+                .is_some_and(|models| models.may_use_images())
+        {
+            configs.push(CodingWebSearch {
+                tool_type: WebSearchToolType::TextAndImage,
+                ..self.config.clone()
+            });
+        }
+        configs
+    }
+}
+
+impl HostedToolResolver for TurnWebSearch {
+    fn resolve(
+        &self,
+        context: &RunContext,
+        protocol: ApiProtocol,
+    ) -> Result<Option<ModelToolDefinition>> {
+        self.config_for(context).resolve(context, protocol)
     }
 }
 

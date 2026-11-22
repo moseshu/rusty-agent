@@ -121,6 +121,8 @@ pub struct CodingHost {
     web: Option<Arc<dyn WebAccess>>,
     web_fallback: Option<Arc<dyn crate::web_search::WebSearchFallbackAdapter>>,
     web_search: Option<crate::web_search::CodingWebSearch>,
+    /// Catalog result kinds for hosted search, installed with a thread's product configuration.
+    web_search_models: Option<Arc<dyn crate::web_search::WebSearchModels>>,
     skills: Option<Arc<dyn SkillCatalog>>,
     skill_providers: Option<ra_tools::skills_ns::SkillProviders>,
     skill_roots: BTreeMap<String, Workspace>,
@@ -187,6 +189,7 @@ impl CodingHost {
             web: None,
             web_fallback: None,
             web_search: Some(crate::web_search::CodingWebSearch::default()),
+            web_search_models: None,
             skills: None,
             skill_providers: None,
             skill_roots: BTreeMap::new(),
@@ -257,6 +260,29 @@ impl CodingHost {
     pub fn with_web_search(mut self, config: crate::web_search::CodingWebSearch) -> Self {
         self.web_search = Some(config);
         self
+    }
+
+    /// Applies a thread's product search settings, leaving a host that selected the `WebAccess`
+    /// extension without native search, and reads each turn's result kind from `models`.
+    pub(crate) fn with_product_web_search(
+        mut self,
+        configure: impl FnOnce(
+            &crate::web_search::CodingWebSearch,
+        ) -> crate::web_search::CodingWebSearch,
+        models: Option<Arc<dyn crate::web_search::WebSearchModels>>,
+    ) -> Self {
+        if let Some(config) = &self.web_search {
+            self.web_search = Some(configure(config));
+            self.web_search_models = models;
+        }
+        self
+    }
+
+    /// Native search settings with the per-turn model lookup a product configuration installed.
+    pub(crate) fn turn_web_search(&self) -> Option<crate::web_search::TurnWebSearch> {
+        self.web_search.clone().map(|config| {
+            crate::web_search::TurnWebSearch::new(config, self.web_search_models.clone())
+        })
     }
 
     /// Native Responses search configuration, absent when the `WebAccess` extension is selected.

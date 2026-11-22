@@ -38,6 +38,7 @@ use ra_model::{
         responses::{
             OpenAiResponsesProvider, ResponsesRequestSigner, developer_prefix,
             response_continues_turn,
+            web_search::{WebSearchContextSize, WebSearchUserLocation},
         },
     },
     provider::{ProviderRegistration, ProviderRegistry, quirks::ProviderQuirks},
@@ -66,6 +67,114 @@ static BUNDLED_MODELS: LazyLock<std::result::Result<ModelsResponse, serde_json::
 #[cfg(feature = "test-api")]
 pub(super) fn bundled_models() -> Option<&'static ModelsResponse> {
     BUNDLED_MODELS.as_ref().ok()
+}
+
+/// The optional API features a model provider supports, Codex's `ProviderCapabilities`.
+///
+/// Only the capabilities with a local consumer are carried; image generation and remote
+/// compaction have none yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderCapabilities {
+    /// Whether the provider offers hosted web search at all.
+    pub(crate) web_search: bool,
+    /// Whether hosted search may reach the live web, which live and indexed modes need.
+    pub(crate) external_web_access: bool,
+}
+
+impl ProviderCapabilities {
+    /// Codex's defaults with a configured provider's overrides. Amazon Bedrock declares its own:
+    /// search only through Mantle, and never with live access.
+    pub(crate) fn of(info: &ModelProviderInfo) -> Self {
+        if info.is_amazon_bedrock() {
+            return Self {
+                web_search: !info.is_amazon_bedrock_runtime(),
+                external_web_access: false,
+            };
+        }
+        Self {
+            web_search: true,
+            external_web_access: info
+                .capabilities
+                .and_then(|capabilities| capabilities.external_web_access)
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// A thread's search settings: the configured mode and the modes requirements allow, the
+/// `[tools.web_search]` options, and the provider's capabilities.
+///
+/// Requirements and provider capabilities narrow the host's mode policy. Configured tool
+/// options take precedence field by field.
+fn product_web_search(
+    base: &crate::web_search::CodingWebSearch,
+    config: &Config,
+    capabilities: Option<ProviderCapabilities>,
+) -> crate::web_search::CodingWebSearch {
+    use crate::web_search::WebSearchMode::Disabled;
+    let tools = config.web_search_config.as_ref().map(|configured| {
+        crate::web_search::WebSearchToolConfig {
+            context_size: configured.search_context_size.map(|size| match size {
+                ra_config::WebSearchContextSize::Low => WebSearchContextSize::Low,
+                ra_config::WebSearchContextSize::Medium => WebSearchContextSize::Medium,
+                ra_config::WebSearchContextSize::High => WebSearchContextSize::High,
+            }),
+            allowed_domains: configured
+                .filters
+                .as_ref()
+                .and_then(|filters| filters.allowed_domains.clone()),
+            location: configured
+                .user_location
+                .as_ref()
+                .map(|location| WebSearchUserLocation {
+                    country: location.country.clone(),
+                    region: location.region.clone(),
+                    city: location.city.clone(),
+                    timezone: location.timezone.clone(),
+                    ..WebSearchUserLocation::default()
+                }),
+        }
+    });
+    crate::web_search::CodingWebSearch {
+        mode: config.web_search_mode.value(),
+        allowed_modes: base
+            .allowed_modes
+            .iter()
+            .copied()
+            .filter(|mode| config.web_search_mode.can_set(mode).is_ok())
+            .collect(),
+        tools: tools.map_or_else(|| base.tools.clone(), |tools| base.tools.merge(&tools)),
+        enabled: base.enabled
+            && base.mode != Disabled
+            && capabilities.is_none_or(|provider| provider.web_search),
+        external_web_access: base.external_web_access
+            && capabilities.is_none_or(|provider| provider.external_web_access),
+        ..base.clone()
+    }
+}
+
+impl crate::web_search::WebSearchModels for ProductModelRuntime {
+    fn tool_type(&self, model: &str) -> Option<crate::web_search::WebSearchToolType> {
+        self.model_info(model)
+            .map(|info| match info.web_search_tool_type {
+                super::catalog::WebSearchToolType::Text => {
+                    crate::web_search::WebSearchToolType::Text
+                }
+                super::catalog::WebSearchToolType::TextAndImage => {
+                    crate::web_search::WebSearchToolType::TextAndImage
+                }
+            })
+    }
+
+    fn may_use_images(&self) -> bool {
+        // A remote catalog can add image-capable models after the thread is assembled.
+        self.remote.is_some()
+            || self.static_catalog().is_some_and(|catalog| {
+                catalog.models.iter().any(|info| {
+                    info.web_search_tool_type == super::catalog::WebSearchToolType::TextAndImage
+                })
+            })
+    }
 }
 
 pub(crate) struct ProductModelRuntime {
@@ -208,6 +317,25 @@ impl ProductModelRuntime {
         })
     }
 
+    /// Applies the thread's search configuration to `host`, as Codex resolves a turn's search from
+    /// its configuration, its provider's capabilities and its model.
+    pub(crate) fn install_web_search(
+        self: &Arc<Self>,
+        host: crate::host::CodingHost,
+    ) -> crate::host::CodingHost {
+        let models = self
+            .explicit
+            .is_none()
+            .then(|| Arc::clone(self) as Arc<dyn crate::web_search::WebSearchModels>);
+        let capabilities = models
+            .as_ref()
+            .map(|_| ProviderCapabilities::of(&self.config.model_provider));
+        host.with_product_web_search(
+            |base| product_web_search(base, &self.config, capabilities),
+            models,
+        )
+    }
+
     fn model_info(&self, model: &str) -> Option<ModelInfo> {
         if let Some(remote) = &self.remote {
             let models = match RunConfig::current_run_snapshot::<TurnCatalog>() {
@@ -220,17 +348,20 @@ impl ProductModelRuntime {
                 .find(|candidate| candidate.slug == model)
                 .cloned();
         }
-        let catalog = self
-            .provider_catalog
-            .as_deref()
-            .or(self.config.model_catalog.as_ref())
-            .or_else(|| BUNDLED_MODELS.as_ref().ok())?;
+        let catalog = self.static_catalog()?;
         let candidates = catalog
             .models
             .iter()
             .map(|info| (info.slug.as_str(), info))
             .collect::<Vec<_>>();
         find_model_by_slug(model, &candidates).cloned()
+    }
+
+    fn static_catalog(&self) -> Option<&ModelsResponse> {
+        self.provider_catalog
+            .as_deref()
+            .or(self.config.model_catalog.as_ref())
+            .or_else(|| BUNDLED_MODELS.as_ref().ok())
     }
 
     fn product_settings(&self, model: &str, provider: &ProviderKey) -> ModelSettings {

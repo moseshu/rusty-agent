@@ -203,6 +203,31 @@ are the ones whose advice changes:
 | Pre-response WebSocket error frames without a transient code get no advice | Policies relying on HTTP status rules for Codex error frames | Read `NormalizedProviderError::status_code` in the policy |
 | WebSocket handshake failures without a status or disconnect get no advice | Hosts using `ProviderSuggestedRetryPolicy` alone | Add `NetworkErrorRetryPolicy` to retry network failures |
 
+### Product threads take web search from their configuration, provider and model
+
+A coding thread built from a product configuration now declares hosted web search as Codex does:
+`web_search` sets the preferred mode and requirements' `allowed_web_search_modes` the modes it may
+fall back to; `[tools.web_search]` supplies the context size, allowed domains and location; the
+provider's capabilities narrow the modes; and each turn's model decides whether image results are
+requested. Before, these threads used the host's default settings: cached, text-only, every mode
+allowed.
+
+- A provider with `capabilities.external_web_access = false` falls back from live and indexed
+  search to cached search.
+- Amazon Bedrock searches only through Mantle, and only cached: Bedrock Runtime declares no search,
+  and requirements that allow only live or indexed search leave Mantle without one.
+- A turn whose catalog model declares `web_search_tool_type = "text_and_image"` asks for text and
+  image results; a model without a catalog entry keeps the host's result kind.
+- Product requirements and provider capabilities only narrow the modes a host permits with
+  `CodingHost::with_web_search`. An explicit host disable remains in effect. Configured tool options
+  take precedence field by field. A host that selected `with_web_access` still has no native search.
+- Threads with an injected model resolver use the host's provider capabilities and result kind.
+  Product search modes, requirements and tool options still apply.
+
+Models marked `use_responses_lite` keep receiving hosted search. For image-capable catalog entries
+this now adds `search_content_types` to the tool and `web_search_call.results` to the request's
+`include` list. Codex omits hosted tools on Lite requests. The Lite transport is pending.
+
 ### Continuation input after in-run compaction
 
 `RunResult::continuation_input` and automatic checkpoint resume now omit generated records

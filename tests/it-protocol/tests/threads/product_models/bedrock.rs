@@ -9,7 +9,7 @@ const SESSION_TOKEN: &str = "exported-session-token";
 ///
 /// The script appends a line to `invocations`, then prints `keys.json` on its first run and
 /// `rotated.json`, when present, on later runs.
-fn configure_credential_export(product: &ProductModels, provider: &str, base_url: &str) {
+pub(super) fn configure_credential_export(product: &ProductModels, provider: &str, base_url: &str) {
     let home = product.home.path().canonicalize().unwrap();
     product.write(
         "export.sh",
@@ -57,14 +57,14 @@ fn invocations(product: &ProductModels) -> usize {
         .unwrap_or(0)
 }
 
-fn completion() -> ResponseTemplate {
+pub(super) fn completion() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(
         format!("data: {}\n\n", websocket_completion(1)),
         "text/event-stream",
     )
 }
 
-fn responses_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+pub(super) fn responses_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
     requests
         .iter()
         .filter(|request| request.url.path().ends_with("/responses"))

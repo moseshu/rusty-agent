@@ -53,6 +53,53 @@ impl ProductModels {
         .0
     }
 
+    /// A server whose threads assemble the standard tier with native search, and the services that
+    /// tier requires.
+    fn standard_server(&self) -> (Server, Arc<crate::coding_tools::configured_host::Services>) {
+        self.standard_server_with_host(None, |host| host)
+    }
+
+    fn standard_server_with_host(
+        &self,
+        resolver: Option<Arc<dyn ModelResolver>>,
+        configure_host: impl FnOnce(CodingHost) -> CodingHost,
+    ) -> (Server, Arc<crate::coding_tools::configured_host::Services>) {
+        let (host, settings, builder) = self.parts();
+        let (host, services) = Self::standard_host(configure_host(host));
+        let factory = match resolver {
+            Some(resolver) => {
+                CodingThreadFactory::new(host, resolver, settings).with_product_config(builder)
+            }
+            None => CodingThreadFactory::from_product_config(host, settings, builder),
+        }
+        .with_profile(ra_coding::CodingProfile::CodexLike)
+        .with_request_user_input();
+        let server = build(
+            Options {
+                store: Some(Arc::new(InMemoryThreadStore::new())),
+                factory: Some(Arc::new(factory)),
+                unload_delay: None,
+            },
+            None,
+        )
+        .0;
+        (server, services)
+    }
+
+    fn standard_host(
+        host: CodingHost,
+    ) -> (
+        CodingHost,
+        Arc<crate::coding_tools::configured_host::Services>,
+    ) {
+        let services = Arc::new(crate::coding_tools::configured_host::Services::default());
+        let host = host
+            .with_skill_catalog(services.clone())
+            .with_user_input(services.clone())
+            .with_collaboration();
+        (host, services)
+    }
+
     /// The workspace host, settings adapter and configuration builder of the product's threads.
     fn parts(&self) -> (CodingHost, CodingThreadSettingsAdapter, ConfigBuilder) {
         let root = self.workspace.path().canonicalize().unwrap();
@@ -1228,3 +1275,6 @@ mod gateway_oauth;
 
 #[path = "product_models/sampling_retry.rs"]
 mod sampling_retry;
+
+#[path = "product_models/web_search.rs"]
+mod web_search;

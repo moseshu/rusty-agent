@@ -240,12 +240,13 @@ impl ThreadFactory for CodingThreadFactory {
     }
 
     async fn prepare_thread(&self, request: &ThreadFactoryRequest) -> Result<PreparedThread> {
-        let host = self.host.with_new_process_manager();
+        let mut host = self.host.with_new_process_manager();
         let (settings, model_runtime, hooks) = match &self.product_config {
             Some(builder) => {
                 let (settings, runtime, hooks) = self
                     .load_product_configuration(builder.clone(), &host, request)
                     .await?;
+                host = runtime.install_web_search(host);
                 (settings, Some(runtime), Some(hooks))
             }
             None => (self.settings.clone().for_new_thread(), None, None),

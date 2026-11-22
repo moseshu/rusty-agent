@@ -268,21 +268,21 @@ pub(crate) async fn assemble_agent(
         .instructions(prefix.system_instructions())
         .tools(assembled.into_tool_surface().into_tools());
     for tool in hosted {
-        builder = if let Some(config) = host.web_search().filter(|_| tool.name() == "web_search") {
-            builder.hosted_tool_resolver(tool, Arc::new(config.clone()))
+        builder = if let Some(config) = host
+            .turn_web_search()
+            .filter(|_| tool.name() == "web_search")
+        {
+            builder.hosted_tool_resolver(tool, Arc::new(config))
         } else {
             builder.hosted_tool(tool)
         };
     }
-    if let (Some(standalone), Some(config)) = (fallback_search, host.web_search()) {
+    if let (Some(standalone), Some(config)) = (fallback_search, host.turn_web_search()) {
         let preview = ra_model::openai::responses::web_search::ResponsesWebSearchTool::default()
             .to_definition()?;
         builder = builder.hosted_tool_resolver(
             preview,
-            Arc::new(crate::web_search::SearchResolver {
-                config: config.clone(),
-                standalone,
-            }),
+            Arc::new(crate::web_search::SearchResolver { config, standalone }),
         );
     }
     if let Some(runtime) = host.mcp_runtime() {
@@ -457,17 +457,33 @@ pub async fn host_backed_surface(
         registry.assemble_with_hosted_tools(&profile, &capabilities.hosted_tools()?)?;
     // A fallback uses one search slot, but either backend can determine its largest wire cost.
     // Check the hosted projections independently rather than charging both candidates together.
-    if host.has_web_fallback()
-        && let Some(config) = host.web_search()
+    // A turn's model can also widen the hosted declaration with image results.
+    let fallback_selected = host.has_web_fallback()
         && tool_surface
             .tools()
             .iter()
-            .any(|tool| tool.origin().name() == "web_search")
+            .any(|tool| tool.origin().name() == "web_search");
+    let hosted_search_selected = tool_surface
+        .hosted_tools()
+        .iter()
+        .any(|tool| tool.name() == "web_search");
+    if let Some(search) = host.turn_web_search()
+        && (fallback_selected || (hosted_search_selected && search.models.is_some()))
     {
-        for sandbox_disabled in [false, true] {
+        for (config, sandbox_disabled) in search
+            .candidate_configs()
+            .iter()
+            .flat_map(|config| [(config, false), (config, true)])
+        {
             if let Some(hosted) = config.definition_for_turn(sandbox_disabled)? {
                 let mut definitions = tool_surface.model_definitions();
-                definitions.retain(|tool| !matches!(tool.name(), "web_search" | "web_fetch"));
+                definitions.retain(|tool| {
+                    if fallback_selected {
+                        !matches!(tool.name(), "web_search" | "web_fetch")
+                    } else {
+                        !(tool.is_hosted() && tool.name() == "web_search")
+                    }
+                });
                 definitions.push(hosted);
                 let bytes =
                     ra_core::model::ModelToolDefinition::advertised_table_bytes(&definitions)?;
