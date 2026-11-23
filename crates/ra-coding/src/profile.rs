@@ -29,7 +29,10 @@ use ra_core::{
 };
 use ra_runtime::tool::profile::{ToolProfile, ToolProfileId, ToolSurfaceBudget};
 
-use crate::{host::default_collaboration_namespace, skills::SkillToolSurface};
+use crate::{
+    host::default_collaboration_namespace, multi_agent::COLLABORATION_KINDS,
+    skills::SkillToolSurface,
+};
 use serde::{Deserialize, Serialize};
 
 /// What the coding agent's whole advertised surface may cost per turn.
@@ -71,19 +74,6 @@ const CODEX_LIKE_EXTRA: [&str; 6] = [
     "web_fetch",
     "request_user_input",
     "skill",
-];
-
-/// The six collaboration tools the standard surface adds, each with its own upstream contract.
-///
-/// Selected in the namespace the host advertises them in — Codex's `collaboration` by default — so
-/// each is routed, and counted, as an entry of its own.
-const COLLABORATION: [&str; 6] = [
-    "spawn_agent",
-    "send_message",
-    "followup_task",
-    "interrupt_agent",
-    "wait_agent",
-    "list_agents",
 ];
 
 /// Tool surface profiles supported by the coding agent product.
@@ -131,7 +121,7 @@ impl CodingProfile {
             &BTreeSet::new(),
             Some(&default_collaboration_namespace()?),
             SkillToolSurface::Merged,
-            false,
+            None,
         )
     }
 
@@ -158,17 +148,18 @@ impl CodingProfile {
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
-        product_collaboration: bool,
+        product_collaboration: Option<&[ToolLookupKey]>,
     ) -> Result<ToolProfile> {
         // A narrowed tier is a different profile and says so. The identity reaches assembly errors
         // and the surface's own record, and `core` naming three entries would read there as the
         // tier having quietly shrunk.
-        let narrowed = self
-            .declared_keys(collaboration_namespace, skills, product_collaboration)?
-            .map_or_else(
-                || !withheld.is_empty(),
-                |keys| keys.iter().any(|key| withheld.contains(key)),
-            );
+        let narrowed = Self::omitted_collaboration_count(product_collaboration) > 0
+            || self
+                .declared_keys(collaboration_namespace, skills, product_collaboration)?
+                .map_or_else(
+                    || !withheld.is_empty(),
+                    |keys| keys.iter().any(|key| withheld.contains(key)),
+                );
         let id = if narrowed {
             format!("{}-{}", self.tier_name(), role.role_name())
         } else {
@@ -221,13 +212,13 @@ impl CodingProfile {
         self,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
-        product_collaboration: bool,
+        product_collaboration: Option<&[ToolLookupKey]>,
     ) -> Result<Option<Vec<ToolLookupKey>>> {
         Ok(match self {
             Self::Core => {
                 let mut keys = lookup_keys(&CORE)?;
-                if product_collaboration {
-                    keys.extend(collaboration_keys(collaboration_namespace)?);
+                if let Some(collaboration) = product_collaboration {
+                    keys.extend_from_slice(collaboration);
                 }
                 Some(keys)
             }
@@ -246,7 +237,10 @@ impl CodingProfile {
                         } else {
                             Vec::new()
                         })
-                        .chain(collaboration_keys(collaboration_namespace)?)
+                        .chain(match product_collaboration {
+                            Some(keys) => keys.to_vec(),
+                            None => collaboration_keys(collaboration_namespace)?,
+                        })
                         .collect(),
                 )
             }
@@ -268,15 +262,15 @@ impl CodingProfile {
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
-        product_collaboration: bool,
+        product_collaboration: Option<&[ToolLookupKey]>,
     ) -> Result<ToolProfile> {
         let declared =
             self.declared_keys(collaboration_namespace, skills, product_collaboration)?;
         let (mut floor, mut ceiling) = self.band();
         // Product threads make collaboration a per-turn choice, including on the core tier.
-        if self == Self::Core && product_collaboration {
-            floor += COLLABORATION.len();
-            ceiling += COLLABORATION.len();
+        if self == Self::Core && product_collaboration.is_some() {
+            floor += COLLABORATION_KINDS.len();
+            ceiling += COLLABORATION_KINDS.len();
         } else if self != Self::Core {
             match skills {
                 SkillToolSurface::Namespace => floor += 1,
@@ -292,7 +286,7 @@ impl CodingProfile {
                 .filter(|key| withheld_advertised.contains(key))
                 .count(),
             None => withheld_advertised.len(),
-        };
+        } + Self::omitted_collaboration_count(product_collaboration);
         // The byte and name-character ceilings do not shift: they bound what one turn may cost, and
         // a smaller surface can only be further under them.
         let budget = ToolSurfaceBudget::new(
@@ -311,6 +305,10 @@ impl CodingProfile {
         };
         builder.budget(budget).build()
     }
+
+    fn omitted_collaboration_count(product_collaboration: Option<&[ToolLookupKey]>) -> usize {
+        product_collaboration.map_or(0, |keys| COLLABORATION_KINDS.len() - keys.len())
+    }
 }
 
 /// Turns declared tool names into the routing identities a profile selects by.
@@ -323,11 +321,11 @@ fn lookup_keys(names: &[&str]) -> Result<Vec<ToolLookupKey>> {
 /// The collaboration entries' routing identities in `namespace`, or bare without one. A namespace
 /// is shared metadata on the wire, not an entry: each function in it is routed and counted alone.
 fn collaboration_keys(namespace: Option<&ToolNamespace>) -> Result<Vec<ToolLookupKey>> {
-    match namespace {
-        Some(namespace) => COLLABORATION
-            .iter()
-            .map(|name| ToolLookupKey::namespaced(namespace.clone(), *name))
-            .collect(),
-        None => lookup_keys(&COLLABORATION),
-    }
+    COLLABORATION_KINDS
+        .into_iter()
+        .map(|kind| match namespace {
+            Some(namespace) => ToolLookupKey::namespaced(namespace.clone(), kind.name()),
+            None => ToolLookupKey::bare(kind.name()),
+        })
+        .collect()
 }

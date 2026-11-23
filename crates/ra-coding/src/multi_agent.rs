@@ -1,5 +1,6 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
-//! The coding product's per-thread collaboration version and per-model delegation gate.
+//! The coding product's per-thread collaboration version, per-model delegation gate, and the
+//! collaboration tool table that `[features.multi_agent_v2]` configures.
 
 use std::sync::{Arc, OnceLock};
 
@@ -14,9 +15,18 @@ use ra_core::{
 };
 use ra_protocol::server::{SessionSource, SubAgentSource, ThreadFactoryRequest};
 use ra_runtime::runner::RunConfig;
-use ra_tools::agent_ns::CollaborationTool;
+use ra_tools::agent_ns::{CollaborationKind, CollaborationTool, WaitAgentTimeoutOptions};
 
 use crate::config::{MultiAgentVersion, model_runtime::ProductModelRuntime};
+
+pub(crate) const COLLABORATION_KINDS: [CollaborationKind; 6] = [
+    CollaborationKind::SpawnAgent,
+    CollaborationKind::SendMessage,
+    CollaborationKind::FollowupTask,
+    CollaborationKind::InterruptAgent,
+    CollaborationKind::WaitAgent,
+    CollaborationKind::ListAgents,
+];
 
 pub(crate) struct ThreadCollaboration {
     runtime: Arc<ProductModelRuntime>,
@@ -25,6 +35,43 @@ pub(crate) struct ThreadCollaboration {
     /// by a migrated value, and the thread is offered no collaboration tools.
     unrecognized: Option<String>,
     spawned: bool,
+    tools: ToolTable,
+}
+
+/// What `[features.multi_agent_v2]` makes of the V2 tool table, as Codex's spec plan reads it.
+struct ToolTable {
+    /// `tool_namespace`; validated by the configuration loader.
+    namespace: Option<String>,
+    /// `disable_native_tools`: no collaboration tools at all.
+    native_tools: bool,
+    /// `disable_direct_message`: without it, `send_message` and `followup_task` are not offered.
+    direct_message: bool,
+    /// `wait_agent_enabled`.
+    wait_agent: bool,
+    wait: WaitAgentTimeoutOptions,
+    /// `usage_hint_text`, appended to the `spawn_agent` description.
+    usage_hint: Option<String>,
+    /// `max_concurrent_threads_per_session` less the root: Codex's `effective_agent_max_threads`.
+    max_spawned_threads: usize,
+}
+
+impl ToolTable {
+    fn new(runtime: &ProductModelRuntime) -> Self {
+        let config = runtime.multi_agent_v2();
+        Self {
+            namespace: config.tool_namespace.clone(),
+            native_tools: !config.disable_native_tools,
+            direct_message: !config.disable_direct_message,
+            wait_agent: config.wait_agent_enabled,
+            wait: WaitAgentTimeoutOptions::new().with_bounds(
+                config.default_wait_timeout_ms,
+                config.min_wait_timeout_ms,
+                config.max_wait_timeout_ms,
+            ),
+            usage_hint: config.usage_hint_text.clone(),
+            max_spawned_threads: config.max_concurrent_threads_per_session.saturating_sub(1),
+        }
+    }
 }
 
 impl ThreadCollaboration {
@@ -54,8 +101,10 @@ impl ThreadCollaboration {
                     MultiAgentVersion::Disabled
                 })
             });
+        let tools = ToolTable::new(&runtime);
         Self {
             runtime,
+            tools,
             version: version.map(OnceLock::from).unwrap_or_default(),
             unrecognized,
             spawned: request.thread_spawn().is_some()
@@ -78,9 +127,37 @@ impl ThreadCollaboration {
 
     /// Whether an agent assembled for this thread keeps the tools for per-turn checks.
     pub(crate) fn can_offer_tools(&self) -> bool {
-        self.version
-            .get()
-            .is_none_or(|version| *version == MultiAgentVersion::V2)
+        self.tools.native_tools
+            && self
+                .version
+                .get()
+                .is_none_or(|version| *version == MultiAgentVersion::V2)
+    }
+
+    /// The configured namespace, before any explicit host choice.
+    pub(crate) fn tool_namespace(&self) -> Option<&str> {
+        self.tools.namespace.as_deref()
+    }
+
+    /// The configured `wait_agent` timeouts.
+    pub(crate) const fn wait_timeouts(&self) -> WaitAgentTimeoutOptions {
+        self.tools.wait
+    }
+
+    /// Whether the configured tool table offers `kind`.
+    pub(crate) const fn offers(&self, kind: CollaborationKind) -> bool {
+        match kind {
+            CollaborationKind::SendMessage | CollaborationKind::FollowupTask => {
+                self.tools.direct_message
+            }
+            CollaborationKind::WaitAgent => self.tools.wait_agent,
+            _ => true,
+        }
+    }
+
+    /// How many spawned agents the thread's tree runs at once.
+    pub(crate) const fn max_spawned_threads(&self) -> usize {
+        self.tools.max_spawned_threads
     }
 
     pub(crate) fn install(self: &Arc<Self>, config: RunConfig) -> RunConfig {
@@ -107,8 +184,19 @@ impl ThreadCollaboration {
         tool: CollaborationTool,
         spawned_in_tree: bool,
     ) -> Arc<dyn Tool> {
+        // Codex appends the configured usage hint to the composed `spawn_agent` description.
+        let schema = match (&self.tools.usage_hint, tool.kind()) {
+            (Some(hint), CollaborationKind::SpawnAgent) => {
+                let description = tool.schema().description().unwrap_or_default();
+                tool.schema()
+                    .clone()
+                    .with_description(format!("{description}\n{hint}"))
+            }
+            _ => tool.schema().clone(),
+        };
         Arc::new(ProductCollaborationTool {
             tool,
+            schema,
             thread: Arc::clone(self),
             spawned_in_tree,
         })
@@ -134,6 +222,7 @@ const fn version_name(version: MultiAgentVersion) -> &'static str {
 
 struct ProductCollaborationTool {
     tool: CollaborationTool,
+    schema: ToolSchema,
     thread: Arc<ThreadCollaboration>,
     spawned_in_tree: bool,
 }
@@ -145,7 +234,7 @@ impl Tool for ProductCollaborationTool {
     }
 
     fn schema(&self) -> &ToolSchema {
-        self.tool.schema()
+        &self.schema
     }
 
     fn func_schema(&self) -> Option<&FuncSchema> {

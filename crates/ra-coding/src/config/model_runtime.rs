@@ -336,6 +336,11 @@ impl ProductModelRuntime {
         )
     }
 
+    /// The thread's `[features.multi_agent_v2]` settings.
+    pub(crate) fn multi_agent_v2(&self) -> &super::MultiAgentV2Config {
+        &self.config.multi_agent_v2
+    }
+
     pub(crate) fn multi_agent_version_override(&self) -> Option<super::MultiAgentVersion> {
         if self.config.features.enabled(Feature::MultiAgentV2) {
             Some(super::MultiAgentVersion::V2)

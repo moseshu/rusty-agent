@@ -1330,11 +1330,26 @@ boundaries and input or hook context. During preparation, the tool gate reads th
 name from `RunContext::resolved_model_name()`. The lock uses the model selector of the prepared
 request. If the names differ, tool availability for that turn can differ from the stored version.
 
+Product V2 threads now read Codex's `[features.multi_agent_v2]` tool table:
+
+- `tool_namespace` names the namespace the tools are advertised in (default `collaboration`).
+  The namespace must differ from every enabled collaboration tool's name because tool routing
+  reserves that shape for deferred top-level tools.
+- `disable_native_tools = true` offers no collaboration tools; the thread still records `v2`.
+- `disable_direct_message = true` leaves out `send_message` and `followup_task`.
+- `wait_agent_enabled = false` leaves out `wait_agent`; `min_wait_timeout_ms`,
+  `default_wait_timeout_ms` and `max_wait_timeout_ms` bound its timeout.
+- `usage_hint_text` is appended to the `spawn_agent` description.
+- `max_concurrent_threads_per_session` counts the root, so a thread's tree runs one fewer spawned
+  agent at once. The default of 4 allows 3, where product threads previously allowed 4; hosts
+  without product configuration keep `AgentControl::new()`'s 4.
+
 Providers constructed from product configuration use the Responses wire protocol. The feature
 selects the collaboration version. For Chat Completions or Anthropic through an explicit resolver,
 choose bare names by calling `CodingHost::with_collaboration()` followed by
-`CodingHost::with_collaboration_namespace(None)`, including for product-configured threads.
-These adapters reject namespaced tool definitions.
+`CodingHost::with_collaboration_namespace(None)`, including for product-configured threads. That
+explicit host choice takes precedence over `tool_namespace`, because these adapters reject
+namespaced tool definitions.
 
 ### Explicit Host skill discovery
 

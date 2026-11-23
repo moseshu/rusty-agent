@@ -19,11 +19,11 @@ use ra_core::{
 };
 use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
 use ra_tools::{
-    agent_ns::collaboration_tools,
+    agent_ns::{CollaborationTool, WaitAgentTimeoutOptions},
     request_user_input::{ModeKind, RequestUserInputTool, request_user_input_available_modes},
 };
 
-use crate::{agent::InstalledCapability, host::CodingHost};
+use crate::{agent::InstalledCapability, host::CodingHost, multi_agent::COLLABORATION_KINDS};
 
 /// What one role installs, and what being that role costs it.
 ///
@@ -32,6 +32,8 @@ use crate::{agent::InstalledCapability, host::CodingHost};
 pub(crate) struct RoleCapabilities {
     installed: CapabilityPlan,
     withheld: Vec<Arc<dyn Capability>>,
+    product_collaboration_keys: Option<Vec<ToolLookupKey>>,
+    withheld_product_collaboration: Option<CapabilityFamily>,
     native_web: Option<crate::web_search::CodingWebSearch>,
     native_web_offered: bool,
     web_fallback: bool,
@@ -98,17 +100,38 @@ impl RoleCapabilities {
             declared.push(contributor);
         }
         declared.extend(host.capabilities().iter().cloned());
-        // Known exclusions withhold the family and narrow the tier's budget. Product threads
-        // that can select V2 keep the tools available for per-turn model checks.
         let mut not_offered: Vec<Arc<dyn Capability>> = Vec::new();
-        if host.collaboration_enabled() {
-            let capability = ControlCapability::collaboration(host)?;
-            if host.collaboration_offered() {
+        let product_collaboration_keys = if host.product_collaboration().is_some() {
+            // The profile discounts omitted product tools by count. Only tools that can
+            // be offered need schemas and routing identities.
+            let mut keys = Vec::new();
+            if host.collaboration_offered() && !role.is_one_off() && !restricted {
+                let capability = ControlCapability::collaboration(host)?;
+                keys.extend(
+                    capability
+                        .tools
+                        .iter()
+                        .map(|tool| tool.origin().lookup_key().clone()),
+                );
                 declared.push(Arc::new(capability));
-            } else {
-                not_offered.push(Arc::new(capability));
             }
-        }
+            Some(keys)
+        } else {
+            if host.collaboration_enabled() {
+                let capability = Arc::new(ControlCapability::collaboration(host)?);
+                if host.collaboration_offered() {
+                    declared.push(capability);
+                } else {
+                    not_offered.push(capability);
+                }
+            }
+            None
+        };
+        let withheld_product_collaboration = product_collaboration_keys
+            .as_ref()
+            .filter(|keys| keys.is_empty())
+            .map(|_| CapabilityFamily::new(COLLABORATION_FAMILY))
+            .transpose()?;
 
         let (installed, mut withheld): (Vec<_>, Vec<_>) = if role.is_one_off() {
             (Vec::new(), declared)
@@ -125,6 +148,8 @@ impl RoleCapabilities {
         Ok(Self {
             installed: CapabilityPlan::resolve(installed)?,
             withheld,
+            product_collaboration_keys,
+            withheld_product_collaboration,
             native_web: host.web_search().cloned(),
             native_web_offered: !role.is_one_off(),
             web_fallback: host.has_web_fallback(),
@@ -176,6 +201,11 @@ impl RoleCapabilities {
             .collect()
     }
 
+    /// The configured collaboration entries this product thread can offer.
+    pub(crate) fn product_collaboration_keys(&self) -> Option<&[ToolLookupKey]> {
+        self.product_collaboration_keys.as_deref()
+    }
+
     /// The routing identities this role gave up, for a profile to discount.
     ///
     /// Keys rather than names: a profile selects by routing identity, and the model-facing name a
@@ -211,6 +241,7 @@ impl RoleCapabilities {
         self.withheld
             .iter()
             .map(|capability| capability.kind())
+            .chain(self.withheld_product_collaboration.iter().cloned())
             .chain(
                 (self.native_web.is_some() && !self.native_web_offered)
                     .then_some(CapabilityFamily::WEB),
@@ -386,23 +417,28 @@ impl ControlCapability {
         })
     }
 
-    /// The six tools, in `namespace` when the host gives one, as Codex's configuration places
-    /// them.
+    /// Builds the enabled collaboration tools in the namespace the host resolves.
     fn collaboration(host: &CodingHost) -> Result<Self> {
         let namespace = host.collaboration_namespace()?;
-        let tools = collaboration_tools()?
-            .into_iter()
-            .map(|tool| {
-                let tool = match &namespace {
-                    Some(namespace) => tool.in_namespace(namespace.clone())?,
-                    None => tool,
-                };
-                Ok(match host.product_collaboration() {
-                    Some(product) => product.tool(tool, host.is_spawned_agent()),
-                    None => Arc::new(tool) as Arc<dyn Tool>,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let product = host.product_collaboration();
+        let wait = product.map_or_else(WaitAgentTimeoutOptions::new, |product| {
+            product.wait_timeouts()
+        });
+        let mut tools = Vec::new();
+        for kind in COLLABORATION_KINDS {
+            if product.is_some_and(|product| !product.offers(kind)) {
+                continue;
+            }
+            let tool = CollaborationTool::new(kind, wait)?;
+            let tool = match &namespace {
+                Some(namespace) => tool.in_namespace(namespace.clone())?,
+                None => tool,
+            };
+            tools.push(match product {
+                Some(product) => product.tool(tool, host.is_spawned_agent()),
+                None => Arc::new(tool) as Arc<dyn Tool>,
+            });
+        }
         Ok(Self {
             family: CapabilityFamily::new(COLLABORATION_FAMILY)?,
             tools,

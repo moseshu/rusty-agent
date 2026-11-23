@@ -463,7 +463,7 @@ pub async fn host_backed_surface(
         &capabilities.withheld_advertised_tool_keys(),
         host.collaboration_namespace()?.as_ref(),
         host.skill_tool_surface(),
-        host.product_collaboration().is_some(),
+        capabilities.product_collaboration_keys(),
     )?;
     let budget = *profile.budget();
     let tool_surface =

@@ -477,9 +477,10 @@ impl CodingHost {
     ///
     /// Namespaces are an `OpenAI` Responses feature. Chat Completions and Anthropic adapters
     /// refuse a namespaced tool, so a host serving those providers selects bare names here.
-    /// Call [`Self::with_collaboration`] first to initialize the host namespace choice.
-    /// Product-configured threads require the same call order to select bare names or a custom
-    /// namespace.
+    /// Call [`Self::with_collaboration`] first to initialize the host namespace choice. Without
+    /// an explicit choice, product-configured threads use Codex's
+    /// `features.multi_agent_v2.tool_namespace`; an explicit choice here takes precedence over that
+    /// setting, because it states what the host's model adapters accept.
     #[must_use]
     pub fn with_collaboration_namespace(mut self, namespace: Option<ToolNamespace>) -> Self {
         if let Some(collaboration) = &mut self.collaboration {
@@ -545,6 +546,10 @@ impl CodingHost {
     }
 
     /// The namespace the collaboration tools are advertised in, if any.
+    ///
+    /// An explicit [`Self::with_collaboration_namespace`] choice wins, because it states what the
+    /// host's model adapters accept; otherwise a product thread takes Codex's
+    /// `features.multi_agent_v2.tool_namespace`, and anything else Codex's default.
     pub(crate) fn collaboration_namespace(&self) -> ra_core::error::Result<Option<ToolNamespace>> {
         match self
             .collaboration
@@ -552,9 +557,10 @@ impl CodingHost {
             .map(|collaboration| &collaboration.namespace)
         {
             Some(CollaborationNamespace::Chosen(namespace)) => Ok(namespace.clone()),
-            Some(CollaborationNamespace::Default) | None => {
-                default_collaboration_namespace().map(Some)
-            }
+            Some(CollaborationNamespace::Default) | None => match &self.product_collaboration {
+                Some(product) => product.tool_namespace().map(ToolNamespace::new).transpose(),
+                None => default_collaboration_namespace().map(Some),
+            },
         }
     }
 

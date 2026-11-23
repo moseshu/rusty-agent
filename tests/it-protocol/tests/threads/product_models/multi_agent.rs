@@ -464,6 +464,225 @@ async fn multi_agent_read_only_role_guidance_follows_product_version() {
     assert!(text.contains(absent) && !text.contains(dynamic), "{text}");
 }
 
+/// The collaboration namespace's functions in the latest request, by name, if it was sent.
+async fn latest_collaboration_tools(
+    endpoint: &MockServer,
+    namespace: &str,
+) -> Option<std::collections::BTreeMap<String, Value>> {
+    let requests = endpoint.received_requests().await.unwrap();
+    let body: Value = requests.last().unwrap().body_json().unwrap();
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == namespace && tool["type"] == "namespace")
+        .map(|namespace| {
+            namespace["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| (tool["name"].as_str().unwrap().to_owned(), tool.clone()))
+                .collect()
+        })
+}
+
+/// Codex's `[features.multi_agent_v2]` tool table: the namespace, the direct-message and
+/// `wait_agent` switches, the wait bounds, the `spawn_agent` usage hint, and the switch that drops
+/// the tools while the thread stays on V2. A model outside the catalog is offered them at the root.
+#[tokio::test]
+async fn multi_agent_v2_tool_table_follows_configuration() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+
+    setup_catalog(
+        &product,
+        &endpoint,
+        r#"
+[features.multi_agent_v2]
+enabled = true
+tool_namespace = "agents"
+disable_direct_message = true
+usage_hint_text = "Delegate carefully."
+min_wait_timeout_ms = 15000
+default_wait_timeout_ms = 20000
+max_wait_timeout_ms = 60000
+"#,
+    );
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "outside-catalog").await;
+    let tools = latest_collaboration_tools(&endpoint, "agents")
+        .await
+        .unwrap();
+    assert_eq!(
+        tools.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "interrupt_agent",
+            "list_agents",
+            "spawn_agent",
+            "wait_agent"
+        ]
+    );
+    assert!(
+        latest_collaboration_tools(&endpoint, "collaboration")
+            .await
+            .is_none()
+    );
+    let spawn = tools["spawn_agent"]["description"].as_str().unwrap();
+    assert!(spawn.ends_with("\nDelegate carefully."), "{spawn}");
+    assert_eq!(
+        tools["wait_agent"]["parameters"]["properties"]["timeout_ms"]["description"],
+        "Timeout in milliseconds. Defaults to 20000, min 15000, max 60000."
+    );
+    let requests = endpoint.received_requests().await.unwrap();
+    let body: Value = requests.last().unwrap().body_json().unwrap();
+    assert!(
+        !body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("agents.spawn_agent"),
+        "per-turn tools stay out of the stable prefix"
+    );
+
+    let mut response = websocket_completion(0);
+    response["response"]["output"] = json!([{
+        "id": "wait", "type": "function_call", "call_id": "wait-too-long",
+        "namespace": "agents", "name": "wait_agent", "arguments": "{\"timeout_ms\":60001}"
+    }]);
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    run_on_model(&server, &mut connection, &thread, "outside-catalog").await;
+    let requests = endpoint.received_requests().await.unwrap();
+    let body: Value = requests.last().unwrap().body_json().unwrap();
+    let output = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "wait-too-long")
+        .unwrap();
+    assert_eq!(
+        output["output"],
+        json!([{"type": "input_text", "text": "timeout_ms must be at most 60000"}])
+    );
+
+    setup_catalog(
+        &product,
+        &endpoint,
+        r#"
+[features.multi_agent_v2]
+enabled = true
+wait_agent_enabled = false
+tool_namespace = "wait_agent"
+"#,
+    );
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "outside-catalog").await;
+    let tools = latest_collaboration_tools(&endpoint, "wait_agent")
+        .await
+        .unwrap();
+    assert_eq!(
+        tools.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "followup_task",
+            "interrupt_agent",
+            "list_agents",
+            "send_message",
+            "spawn_agent"
+        ]
+    );
+
+    setup_catalog(
+        &product,
+        &endpoint,
+        r#"
+[features.multi_agent_v2]
+enabled = true
+disable_native_tools = true
+tool_namespace = "spawn_agent"
+"#,
+    );
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+    assert_latest_tools(&endpoint, "catalog-v2", false).await;
+    assert!(
+        latest_collaboration_tools(&endpoint, "spawn_agent")
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        version_records(&server, &thread).await,
+        [("turn_context".to_owned(), "v2".to_owned())]
+    );
+}
+
+/// A host whose model adapters refuse namespaced tools keeps its explicit bare-name choice over the
+/// configured namespace, through an injected resolver.
+#[tokio::test]
+async fn multi_agent_explicit_host_namespace_overrides_configuration() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(
+        &product,
+        &endpoint,
+        "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"agents\"\n",
+    );
+    let (host, settings, builder) = product.parts();
+    let script = Arc::new(Script::default());
+    script.answer("bare");
+    let server = build(
+        Options {
+            store: Some(Arc::new(InMemoryThreadStore::new())),
+            factory: Some(Arc::new(
+                CodingThreadFactory::new(
+                    host.with_collaboration().with_collaboration_namespace(None),
+                    Arc::new(Resolver(Arc::clone(&script))),
+                    settings,
+                )
+                .with_product_config(builder),
+            )),
+            unload_delay: None,
+        },
+        None,
+    )
+    .0;
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    server.run_turn(&mut connection, &thread, "Delegate").await;
+    let request = script.last_request();
+    let mut names = request
+        .tools()
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.name(),
+                "spawn_agent"
+                    | "send_message"
+                    | "followup_task"
+                    | "interrupt_agent"
+                    | "wait_agent"
+                    | "list_agents"
+            )
+        })
+        .map(|tool| (tool.namespace().map(str::to_owned), tool.name().to_owned()))
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names.len(), 6, "{names:?}");
+    assert!(
+        names.iter().all(|(namespace, _)| namespace.is_none()),
+        "{names:?}"
+    );
+}
+
 #[tokio::test]
 async fn multi_agent_fork_before_first_turn_preserves_model_selected_version() {
     let endpoint = responses_endpoint().await;

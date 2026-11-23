@@ -67,7 +67,13 @@ pub(crate) fn agent_control(
     cache_session_id: Option<SessionId>,
     services: ThreadServices,
 ) -> Result<AgentControl> {
-    AgentControl::new().with_spawned_agent_factory(Arc::new(CodingSpawnedAgents {
+    // A product thread's tree runs Codex's `effective_agent_max_threads` spawned agents at once.
+    let control = host
+        .product_collaboration()
+        .map_or_else(AgentControl::new, |product| {
+            AgentControl::with_max_concurrent_threads(product.max_spawned_threads())
+        });
+    control.with_spawned_agent_factory(Arc::new(CodingSpawnedAgents {
         host: host.clone(),
         id,
         name,

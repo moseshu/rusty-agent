@@ -447,6 +447,39 @@ async fn assert_child_tools(fixture: &Hooked, call: usize, expected: bool) {
     );
 }
 
+/// A product tree runs `max_concurrent_threads_per_session - 1` spawned agents at once, as Codex's
+/// `effective_agent_max_threads` does; one thread per session leaves no room for a child.
+#[tokio::test]
+async fn multi_agent_v2_session_thread_limit_bounds_spawned_agents() {
+    let mut fixture = hooked(&[]).await;
+    let config_path = fixture.home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 1\n",
+            config.replace("multi_agent_v2 = true", "")
+        ),
+    )
+    .unwrap();
+    let thread = fixture
+        .server
+        .start_thread(&mut fixture.connection, ThreadStartParams::new())
+        .await;
+    fixture.script.push(Step::Respond(collab(
+        "spawn_agent",
+        json!({"task_name": "worker", "message": "worker task", "fork_turns": "none"}),
+    )));
+    fixture.script.answer("not delegated");
+    fixture
+        .server
+        .run_turn(&mut fixture.connection, thread.id(), "delegate")
+        .await;
+    let last = format!("{:?}", fixture.script.last_request());
+    assert!(last.contains("agent thread limit reached"), "{last}");
+    assert!(fixture.agents.child_requests.lock().unwrap().is_empty());
+}
+
 /// The worker records into a rollout of its own, created through the server's store with Codex's
 /// `ThreadSpawn` metadata, and the default `thread/list` leaves it out.
 #[tokio::test]
