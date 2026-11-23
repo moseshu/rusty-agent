@@ -24,7 +24,7 @@ use ra_core::{
         ContentHash, PromptSection, PromptSectionName, PromptSource, SectionPosition,
         SectionStability,
     },
-    tool::Tool,
+    tool::{Tool, ToolAvailability},
 };
 use ra_runtime::tool::profile::ToolSurface;
 
@@ -76,7 +76,7 @@ impl ToolSurfacePromptBuilder {
         surface: &ToolSurface,
         turn_selected: &BTreeSet<String>,
     ) -> Result<(BTreeMap<String, ContentHash>, bool)> {
-        let rendered = advertised_entries(surface.tools())?;
+        let rendered = advertised_entries_with_availability(surface.tools())?;
         let mut inventoried: BTreeSet<&str> = rendered.keys().map(String::as_str).collect();
         for tool in surface.hosted_tools() {
             if !inventoried.insert(tool.name()) {
@@ -90,22 +90,14 @@ impl ToolSurfacePromptBuilder {
             // These tools are described by the request once the turn selects them. They still
             // count toward inventory validation and schema digests.
             let mut dynamic_collaboration = false;
-            let turn_names: BTreeSet<_> = surface
-                .tools()
-                .iter()
-                .map(|tool| (tool.model_definition().qualified_name(), tool.options()))
-                .filter(|(name, options)| {
-                    let selected = turn_selected.contains(name);
-                    dynamic_collaboration |= selected;
-                    selected
-                        || options.availability()
-                            == ra_core::tool::ToolAvailability::DynamicForProtocol
-                })
-                .map(|(name, _)| name)
-                .collect();
             let stable = rendered
                 .into_iter()
-                .filter(|(name, _)| !turn_names.contains(name))
+                .filter_map(|(name, (fingerprint, availability))| {
+                    let selected = turn_selected.contains(&name);
+                    dynamic_collaboration |= selected;
+                    (!selected && availability != ToolAvailability::DynamicForProtocol)
+                        .then_some((name, fingerprint))
+                })
                 .collect();
             return Ok((stable, dynamic_collaboration));
         }
@@ -180,13 +172,23 @@ impl ToolSurfacePromptBuilder {
 
 /// Collects the advertised tools, keyed and therefore sorted by model-facing name.
 pub(super) fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<String, ContentHash>> {
+    Ok(advertised_entries_with_availability(tools)?
+        .into_iter()
+        .map(|(name, (fingerprint, _))| (name, fingerprint))
+        .collect())
+}
+
+fn advertised_entries_with_availability(
+    tools: &[Arc<dyn Tool>],
+) -> Result<BTreeMap<String, (ContentHash, ToolAvailability)>> {
     let mut entries = BTreeMap::new();
     for tool in tools {
         // The same rule the surface budget applies, read from the one place that owns it, so the
         // prompt cannot come to name a set the request does not carry. A `Dynamic` tool is listed
         // even though a per-run callback may withhold it from a given turn: the prefix has to hold
         // still across runs, so it describes the surface as declared.
-        if !tool.options().is_advertised_to_model() {
+        let options = tool.options();
+        if !options.is_advertised_to_model() {
             continue;
         }
 
@@ -194,7 +196,10 @@ pub(super) fn advertised_entries(tools: &[Arc<dyn Tool>]) -> Result<BTreeMap<Str
         // Qualified, as the model calls it: a namespaced tool is `namespace.name`.
         let name = definition.qualified_name();
         let fingerprint = definition_fingerprint(&definition)?;
-        if entries.insert(name.clone(), fingerprint).is_some() {
+        if entries
+            .insert(name.clone(), (fingerprint, options.availability()))
+            .is_some()
+        {
             return Err(Error::config(format!(
                 "tool prompt surface advertises model-facing name `{name}` more than once"
             )));
