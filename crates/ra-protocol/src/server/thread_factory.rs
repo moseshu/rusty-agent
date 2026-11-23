@@ -94,6 +94,8 @@ pub struct ThreadFactoryRequest {
     thread_spawn: Option<RolloutThreadSpawn>,
     ephemeral: bool,
     initial_model: Option<String>,
+    recorded_multi_agent_version: Option<String>,
+    has_sampled_history: bool,
     policy: super::protocol::ThreadPolicyOverrides,
     fork_session_id: Option<SessionId>,
     parent_transcript: Option<ThreadTranscriptLookup>,
@@ -108,6 +110,8 @@ impl ThreadFactoryRequest {
             thread_spawn: None,
             ephemeral: false,
             initial_model: None,
+            recorded_multi_agent_version: None,
+            has_sampled_history: false,
             policy: super::protocol::ThreadPolicyOverrides::new(),
             fork_session_id: None,
             parent_transcript: None,
@@ -148,6 +152,28 @@ impl ThreadFactoryRequest {
     #[must_use]
     pub fn initial_model(&self) -> Option<&str> {
         self.initial_model.as_deref()
+    }
+
+    pub(crate) fn with_rollout_context(
+        mut self,
+        version: Option<String>,
+        has_sampled_history: bool,
+    ) -> Self {
+        self.recorded_multi_agent_version = version;
+        self.has_sampled_history = has_sampled_history;
+        self
+    }
+
+    /// The version recorded by the resumed thread or the fork source, before any cutoff.
+    #[must_use]
+    pub fn recorded_multi_agent_version(&self) -> Option<&str> {
+        self.recorded_multi_agent_version.as_deref()
+    }
+
+    /// Whether the resumed thread or the fork source recorded a sampling context or model output.
+    #[must_use]
+    pub const fn has_sampled_history(&self) -> bool {
+        self.has_sampled_history
     }
 
     pub(crate) fn with_policy(mut self, policy: super::protocol::ThreadPolicyOverrides) -> Self {
@@ -210,6 +236,7 @@ pub struct PreparedThread {
     terminals: Option<Arc<dyn ThreadBackgroundTerminals>>,
     product: Option<Arc<dyn ThreadProductRuntime>>,
     policy_applied: bool,
+    multi_agent_version: Option<String>,
 }
 
 impl std::fmt::Debug for PreparedThread {
@@ -220,6 +247,7 @@ impl std::fmt::Debug for PreparedThread {
             .field("has_terminals", &self.terminals.is_some())
             .field("has_product_runtime", &self.product.is_some())
             .field("policy_applied", &self.policy_applied)
+            .field("multi_agent_version", &self.multi_agent_version)
             .finish()
     }
 }
@@ -233,6 +261,7 @@ impl PreparedThread {
             terminals: None,
             product: None,
             policy_applied: false,
+            multi_agent_version: None,
         }
     }
 
@@ -269,6 +298,12 @@ impl PreparedThread {
         self
     }
 
+    /// Records the product version resolved during preparation for the fork's session metadata.
+    pub fn with_multi_agent_version(mut self, version: impl Into<String>) -> Self {
+        self.multi_agent_version = Some(version.into());
+        self
+    }
+
     pub(crate) fn into_parts(self) -> PreparedParts {
         PreparedParts {
             builder: self.builder,
@@ -276,6 +311,7 @@ impl PreparedThread {
             terminals: self.terminals,
             product: self.product,
             policy_applied: self.policy_applied,
+            multi_agent_version: self.multi_agent_version,
         }
     }
 }
@@ -349,6 +385,7 @@ pub(crate) struct PreparedParts {
     pub(crate) product: Option<Arc<dyn ThreadProductRuntime>>,
     /// Whether the factory already applied the request's policy.
     pub(crate) policy_applied: bool,
+    pub(crate) multi_agent_version: Option<String>,
 }
 
 /// Prepares the threads the server loads (see the module's documentation).

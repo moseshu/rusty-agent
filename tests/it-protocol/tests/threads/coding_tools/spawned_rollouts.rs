@@ -78,7 +78,7 @@ async fn hooked_with(
     extra: &[String],
     faults: Option<Arc<ra_session::rollout::faults::RolloutFaults>>,
 ) -> Hooked {
-    hooked_unloading_after(extra, faults, Duration::ZERO, None).await
+    hooked_unloading_after(extra, faults, Duration::ZERO, None, false).await
 }
 
 /// A hooked fixture whose server unloads a thread `unload_delay` after its last subscriber left,
@@ -88,6 +88,7 @@ async fn hooked_unloading_after(
     faults: Option<Arc<ra_session::rollout::faults::RolloutFaults>>,
     unload_delay: Duration,
     close_timeout: Option<Duration>,
+    spawned_collaboration: bool,
 ) -> Hooked {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().canonicalize().unwrap();
@@ -114,7 +115,7 @@ async fn hooked_unloading_after(
     std::fs::write(
         home.join("config.toml"),
         format!(
-            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\n\n{}",
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\nmulti_agent_v2 = true\n\n{}",
             sections.join("\n")
         ),
     )
@@ -134,7 +135,10 @@ async fn hooked_unloading_after(
     let script = Arc::new(Script::default());
     let agents = Agents::new(&script);
     let services = Arc::new(configured_host::Services::default());
-    let host = services.install(CodingHost::open(&root).unwrap());
+    let mut host = services.install(CodingHost::open(&root).unwrap());
+    if spawned_collaboration {
+        host = host.with_spawned_agent_collaboration();
+    }
     let settings = CodingThreadSettingsAdapter::new(
         &root,
         SandboxPolicy::ReadOnly {
@@ -242,6 +246,205 @@ async fn list(fixture: &mut Hooked, params: Value) -> Vec<String> {
         .iter()
         .map(|thread| thread["id"].as_str().unwrap().to_owned())
         .collect()
+}
+
+#[tokio::test]
+async fn multi_agent_child_delegation_requires_catalog_v2() {
+    for (model, expected) in [("mock-model", false), ("catalog-child", true)] {
+        let mut fixture = hooked(&[]).await;
+        let catalog = fixture.home.join("collaboration-models.json");
+        let entry = crate::product_models::multi_agent::catalog_model("catalog-child", Some("v2"));
+        std::fs::write(&catalog, json!({"models": [entry]}).to_string()).unwrap();
+        let config_path = fixture.home.join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            format!("model_catalog_json = {catalog:?}\n{config}"),
+        )
+        .unwrap();
+        delegate_with_params(
+            &mut fixture,
+            json!({}),
+            ThreadStartParams::new().with_model(model),
+        )
+        .await;
+
+        let requests = fixture.agents.child_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .tools()
+                .iter()
+                .any(|tool| tool.namespace() == Some(COLLABORATION) && tool.name() == "spawn_agent"),
+            expected,
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_legacy_host_with_collaboration_migrates_to_v2() {
+    let mut fixture = hooked(&[]).await;
+    let config_path = fixture.home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, config.replace("multi_agent_v2 = true", "")).unwrap();
+    let id = "legacy-host-collaboration";
+    let recorder = fixture.server.store_thread(id, "old turn").await;
+    recorder.shutdown().await.unwrap();
+
+    fixture
+        .server
+        .call(
+            &mut fixture.connection,
+            "thread/resume",
+            json!({"threadId": id}),
+        )
+        .await;
+    fixture.script.answer("Done");
+    fixture
+        .server
+        .run_turn(&mut fixture.connection, id, "Continue")
+        .await;
+    assert!(
+        fixture.script.last_request().tools().iter().any(|tool| {
+            tool.namespace() == Some(COLLABORATION) && tool.name() == "spawn_agent"
+        })
+    );
+    unload(&fixture.server, &mut fixture.connection, id).await;
+    let rollout =
+        std::fs::read_to_string(fixture.store.rollout_path(&SessionId::new(id)).unwrap()).unwrap();
+    assert!(
+        rollout.contains(r#""multi_agent_version":"v2""#),
+        "{rollout}"
+    );
+}
+
+/// Migration settles a thread's own tools only. Its children follow Codex's V2 rule whatever the
+/// host's spawned-agent setting: a child whose model declares V2 gains the tools without it, and a
+/// child whose model declares nothing loses them with it. The rule holds across a second cold
+/// resume, an empty fork, and a child resumed on its own.
+#[tokio::test]
+async fn multi_agent_migrated_thread_children_follow_catalog_v2() {
+    for (host_spawned, model) in [(false, "catalog-child"), (true, "mock-model")] {
+        let expected = model == "catalog-child";
+        let mut fixture =
+            hooked_unloading_after(&[], None, Duration::ZERO, None, host_spawned).await;
+        let catalog = fixture.home.join("collaboration-models.json");
+        let entry = crate::product_models::multi_agent::catalog_model("catalog-child", Some("v2"));
+        std::fs::write(&catalog, json!({"models": [entry]}).to_string()).unwrap();
+        let config_path = fixture.home.join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_catalog_json = {catalog:?}\n{}",
+                config.replace("multi_agent_v2 = true", "")
+            ),
+        )
+        .unwrap();
+        let id = "legacy-host-children";
+        let recorder = fixture.server.store_thread(id, "old turn").await;
+        recorder.shutdown().await.unwrap();
+
+        for call in 1..=2 {
+            fixture
+                .server
+                .call(
+                    &mut fixture.connection,
+                    "thread/resume",
+                    json!({"threadId": id, "model": model}),
+                )
+                .await;
+            assert_child_delegation(&mut fixture, id, call, expected).await;
+            unload(&fixture.server, &mut fixture.connection, id).await;
+        }
+
+        let fork = fixture
+            .server
+            .call(
+                &mut fixture.connection,
+                "thread/fork",
+                json!({
+                    "threadId": id, "beforeTurnId": "turn-1", "model": model,
+                    "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": "read-only",
+                }),
+            )
+            .await;
+        assert_eq!(fork["thread"]["turns"], json!([]));
+        let fork_id = fork["thread"]["id"].as_str().unwrap();
+        unload(&fixture.server, &mut fixture.connection, fork_id).await;
+        fixture
+            .server
+            .call(
+                &mut fixture.connection,
+                "thread/resume",
+                json!({"threadId": fork_id, "model": model}),
+            )
+            .await;
+        assert_child_delegation(&mut fixture, fork_id, 3, expected).await;
+        unload(&fixture.server, &mut fixture.connection, fork_id).await;
+
+        let children = spawned_children(&fixture.store, fork_id).await;
+        assert_eq!(children.len(), 1);
+        let child_id = children[0].session_id();
+        let child = std::fs::read_to_string(fixture.store.rollout_path(child_id).unwrap()).unwrap();
+        assert!(child.contains(r#""multi_agent_version":"v2""#), "{child}");
+        fixture
+            .server
+            .call(
+                &mut fixture.connection,
+                "thread/resume",
+                json!({"threadId": child_id, "model": model}),
+            )
+            .await;
+        fixture
+            .server
+            .run_turn(
+                &mut fixture.connection,
+                child_id.as_str(),
+                "continue worker task",
+            )
+            .await;
+        assert_child_tools(&fixture, 4, expected).await;
+    }
+}
+
+async fn assert_child_delegation(fixture: &mut Hooked, id: &str, call: usize, expected: bool) {
+    fixture.script.push(Step::Respond(collab(
+        "spawn_agent",
+        json!({"task_name": "worker", "message": "worker task", "fork_turns": "none"}),
+    )));
+    fixture.script.push(Step::Respond(collab(
+        "wait_agent",
+        json!({"timeout_ms": 10000}),
+    )));
+    fixture.script.answer("delegated");
+    fixture
+        .server
+        .run_turn(&mut fixture.connection, id, "delegate")
+        .await;
+    assert!(
+        fixture
+            .script
+            .last_request()
+            .tools()
+            .iter()
+            .any(|tool| tool.namespace() == Some(COLLABORATION))
+    );
+    assert_child_tools(fixture, call, expected).await;
+}
+
+async fn assert_child_tools(fixture: &Hooked, call: usize, expected: bool) {
+    fixture.agents.wait_for_child_calls(call).await;
+    let requests = fixture.agents.child_requests.lock().unwrap();
+    assert_eq!(requests.len(), call);
+    assert_eq!(
+        requests[call - 1]
+            .tools()
+            .iter()
+            .any(|tool| tool.namespace() == Some(COLLABORATION)),
+        expected,
+        "child request {call}",
+    );
 }
 
 /// The worker records into a rollout of its own, created through the server's store with Codex's
@@ -855,6 +1058,7 @@ async fn resuming_with_other_settings_after_a_failed_close_reports_it_and_the_ne
         Some(Arc::clone(&faults)),
         Duration::from_secs(3600),
         None,
+        false,
     )
     .await;
     let parent = delegate(&mut fixture, json!({})).await;
@@ -922,6 +1126,7 @@ async fn a_resume_waits_for_a_stuck_close_only_so_long_and_other_threads_go_on()
         Some(Arc::clone(&faults)),
         Duration::from_secs(3600),
         Some(Duration::from_millis(300)),
+        false,
     )
     .await;
     let parent = delegate(&mut fixture, json!({})).await;

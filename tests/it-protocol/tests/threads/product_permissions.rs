@@ -1398,7 +1398,11 @@ async fn spawned_network_turn(
     wait_for_request: bool,
 ) -> SpawnedNetworkRequest {
     let home = ProductHome::new();
-    home.write_mock_config("on-request", "", "[features]\nnetwork_proxy = true\n");
+    home.write_mock_config(
+        "on-request",
+        "",
+        "[features]\nnetwork_proxy = true\nmulti_agent_v2 = true\n",
+    );
     home.write_requirements(
         r#"
 [experimental_network]

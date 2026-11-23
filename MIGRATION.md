@@ -1290,6 +1290,52 @@ constructors preserve Default mode. Existing `AgentControl::with_max_depth` stil
 and hides collaboration tools at the limit. Without that opt-in the pinned Codex v2 path, and
 Rusty's existing control, impose no depth limit; this change does not add a new depth default.
 
+### Collaboration versions in coding product threads
+
+New product threads select their collaboration version when the first model request is ready
+to send. Models outside the catalog or without a declared version fall back to `[features].multi_agent`,
+which is enabled by default and selects V1. V1 is stored as `v1`. Its tools are pending, so these
+new threads have no collaboration tools. Existing threads with a sampling context or model output
+and no recorded version initially use the former host configuration, then record `v2` or
+`disabled`. Resume and fork recover the recorded version, including a fork before the first
+turn. This migration covers the resumed thread's own tools only. A recorded value this release
+does not recognize is kept as recorded, including in a fork. The thread is offered no
+collaboration tools unless `[features].multi_agent_v2` overrides it.
+
+Children in product V2 threads, including the children of a migrated thread and a spawned thread
+resumed on its own, follow Codex's V2 rule: a child can delegate only if its current model's
+catalog entry explicitly declares V2. `CodingHost::with_spawned_agent_collaboration()` no longer
+affects product-configured threads. A child whose model declares V2 can gain collaboration tools
+even if the host never opted spawned agents in, and a child whose model does not declare V2 loses
+them even if the host did.
+
+Product-configured thread factories now offer the six collaboration tools to eligible V2 threads
+on the default `Core` tier, including when the host omitted `CodingHost::with_collaboration()`.
+Product version selection controls availability. For these threads, `with_collaboration()`
+establishes a host namespace choice and contributes to migration of old threads with no recorded
+version. Direct assembly and thread factories without product configuration still use the host
+opt-in and the selected profile.
+
+Product presets can set `[features].multi_agent_v2 = true` to enable V2 for root threads whose
+model is outside the catalog. This overrides a recorded version and takes precedence over
+`[agents].enabled = false`. To disable collaboration on product threads, remove or turn off the
+V2 feature override and set `[agents].enabled = false`.
+
+At the Codex baseline, a new thread locks its version when the full turn context is built,
+before input hooks. Rusty Agent locks when the first sampling request has been prepared, at
+the point where the runtime writes the rollout turn context. If `UserPromptSubmit` blocks the
+first turn, or preparation fails before that point, the next turn can select a version with a
+different model. This also applies after unload and resume if the rollout contains only run
+boundaries and input or hook context. During preparation, the tool gate reads the model
+name from `RunContext::resolved_model_name()`. The lock uses the model selector of the prepared
+request. If the names differ, tool availability for that turn can differ from the stored version.
+
+Providers constructed from product configuration use the Responses wire protocol. The feature
+selects the collaboration version. For Chat Completions or Anthropic through an explicit resolver,
+choose bare names by calling `CodingHost::with_collaboration()` followed by
+`CodingHost::with_collaboration_namespace(None)`, including for product-configured threads.
+These adapters reject namespaced tool definitions.
+
 ### Explicit Host skill discovery
 
 Host disk discovery is disabled by default. Enable it with

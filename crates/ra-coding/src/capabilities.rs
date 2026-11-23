@@ -15,7 +15,7 @@ use ra_core::{
     capability::{Capability, CapabilityFamily},
     error::{Error, Result},
     prompt::{PromptRole, PromptSection},
-    tool::{Tool, ToolLookupKey, ToolNamespace},
+    tool::{Tool, ToolLookupKey},
 };
 use ra_runtime::{capability::CapabilityPlan, tool::profile::ToolSurface};
 use ra_tools::{
@@ -98,13 +98,11 @@ impl RoleCapabilities {
             declared.push(contributor);
         }
         declared.extend(host.capabilities().iter().cloned());
-        // A spawned agent is assembled without the collaboration tools unless the host says its
-        // model takes them, as Codex plans a sub-agent session's tools; the family is then
-        // withheld, so the tier's band shrinks with it rather than failing its floor.
+        // Known exclusions withhold the family and narrow the tier's budget. Product threads
+        // that can select V2 keep the tools available for per-turn model checks.
         let mut not_offered: Vec<Arc<dyn Capability>> = Vec::new();
         if host.collaboration_enabled() {
-            let capability =
-                ControlCapability::collaboration(host.collaboration_namespace()?.as_ref())?;
+            let capability = ControlCapability::collaboration(host)?;
             if host.collaboration_offered() {
                 declared.push(Arc::new(capability));
             } else {
@@ -390,14 +388,20 @@ impl ControlCapability {
 
     /// The six tools, in `namespace` when the host gives one, as Codex's configuration places
     /// them.
-    fn collaboration(namespace: Option<&ToolNamespace>) -> Result<Self> {
+    fn collaboration(host: &CodingHost) -> Result<Self> {
+        let namespace = host.collaboration_namespace()?;
         let tools = collaboration_tools()?
             .into_iter()
-            .map(|tool| match namespace {
-                Some(namespace) => tool.in_namespace(namespace.clone()),
-                None => Ok(tool),
+            .map(|tool| {
+                let tool = match &namespace {
+                    Some(namespace) => tool.in_namespace(namespace.clone())?,
+                    None => tool,
+                };
+                Ok(match host.product_collaboration() {
+                    Some(product) => product.tool(tool, host.is_spawned_agent()),
+                    None => Arc::new(tool) as Arc<dyn Tool>,
+                })
             })
-            .map(|tool| tool.map(|tool| Arc::new(tool) as Arc<dyn Tool>))
             .collect::<Result<_>>()?;
         Ok(Self {
             family: CapabilityFamily::new(COLLABORATION_FAMILY)?,

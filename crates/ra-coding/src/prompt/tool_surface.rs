@@ -68,9 +68,14 @@ impl ToolSurfacePromptBuilder {
     /// They are resolved against each turn's protocol and may be omitted from a request, while
     /// this inventory is a stable prefix fixed at assembly. Like both upstreams, the model learns
     /// about a hosted tool from the request's tool table rather than from instruction text.
+    ///
+    /// `turn_selected` names tools whose availability each turn decides, such as product
+    /// collaboration tools. They are validated with the rest but left out of the returned prefix
+    /// inventory; the returned flag says whether any of them was on the surface.
     pub(crate) fn reconcile_with_surface(
         surface: &ToolSurface,
-    ) -> Result<BTreeMap<String, ContentHash>> {
+        turn_selected: &BTreeSet<String>,
+    ) -> Result<(BTreeMap<String, ContentHash>, bool)> {
         let rendered = advertised_entries(surface.tools())?;
         let mut inventoried: BTreeSet<&str> = rendered.keys().map(String::as_str).collect();
         for tool in surface.hosted_tools() {
@@ -82,21 +87,27 @@ impl ToolSurfacePromptBuilder {
         }
         let charged: BTreeSet<&str> = surface.advertised_names().collect();
         if inventoried == charged {
-            // Protocol-selected candidates are described by the request's tool table. Retain
-            // them in inventory validation and schema digests, but not in the stable prefix.
-            let protocol_names: BTreeSet<_> = surface
+            // These tools are described by the request once the turn selects them. They still
+            // count toward inventory validation and schema digests.
+            let mut dynamic_collaboration = false;
+            let turn_names: BTreeSet<_> = surface
                 .tools()
                 .iter()
-                .filter(|tool| {
-                    tool.options().availability()
-                        == ra_core::tool::ToolAvailability::DynamicForProtocol
+                .map(|tool| (tool.model_definition().qualified_name(), tool.options()))
+                .filter(|(name, options)| {
+                    let selected = turn_selected.contains(name);
+                    dynamic_collaboration |= selected;
+                    selected
+                        || options.availability()
+                            == ra_core::tool::ToolAvailability::DynamicForProtocol
                 })
-                .map(|tool| tool.model_definition().qualified_name())
+                .map(|(name, _)| name)
                 .collect();
-            return Ok(rendered
+            let stable = rendered
                 .into_iter()
-                .filter(|(name, _)| !protocol_names.contains(name))
-                .collect());
+                .filter(|(name, _)| !turn_names.contains(name))
+                .collect();
+            return Ok((stable, dynamic_collaboration));
         }
 
         Err(Error::config(format!(

@@ -3,10 +3,12 @@
 //! Codex starts each spawned agent as a session of its own: the session gets its own unified-exec
 //! process manager and plans its own tools for a sub-agent session source. The tree's factory here
 //! does the same with the coding product's assembly — the spawned agent is assembled from the same
-//! host for the same role and tier, with a process manager of its own, and offered the
-//! collaboration tools only when the host says its model takes them (see
-//! [`CodingHost::with_spawned_agent_collaboration`]). Its background terminals are stopped once it
-//! is closed or the tree shuts down, as Codex's session shutdown stops a thread's processes.
+//! host for the same role and tier, with a process manager of its own. In product-configured
+//! threads a child is offered collaboration when the inherited version is V2 and its current model's
+//! catalog entry declares V2, as Codex plans a V2 sub-agent's tools; this includes the children of a
+//! thread migrated from the former host assembly. Hosts without product configuration enable child
+//! collaboration with [`CodingHost::with_spawned_agent_collaboration`]. Closing the child or tree
+//! stops its background terminals, as in Codex.
 //! A planner child returns its plan and unresolved questions to the parent; its prompt does not
 //! encourage root-only user questions. This is a product adaptation of inherited planner roles.
 //!

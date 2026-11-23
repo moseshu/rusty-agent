@@ -1278,3 +1278,6 @@ mod sampling_retry;
 
 #[path = "product_models/web_search.rs"]
 mod web_search;
+
+#[path = "product_models/multi_agent.rs"]
+pub(super) mod multi_agent;

@@ -412,6 +412,7 @@ pub trait StepExecutionObserver: Send + Sync {
 pub struct RunConfig {
     app_context: Option<Arc<dyn Any + Send + Sync>>,
     snapshot_factory: Option<snapshot::Factory>,
+    turn_context_enricher: Option<Arc<TurnContextEnricher>>,
     budget: BudgetLimit,
     max_function_tool_concurrency: Option<usize>,
     model: Option<String>,
@@ -450,6 +451,9 @@ pub struct RunConfig {
     interrupt_message: bool,
 }
 
+type TurnContextEnricher =
+    dyn Fn(&RunContext, RolloutTurnContext) -> RolloutTurnContext + Send + Sync;
+
 impl Default for RunConfig {
     fn default() -> Self {
         Self::new()
@@ -462,6 +466,7 @@ impl RunConfig {
         Self {
             app_context: None,
             snapshot_factory: None,
+            turn_context_enricher: None,
             budget: BudgetLimit::new().with_max_turns(DEFAULT_MAX_TURNS),
             max_function_tool_concurrency: DEFAULT_MAX_FUNCTION_TOOL_CONCURRENCY,
             model: None,
@@ -499,6 +504,16 @@ impl RunConfig {
             session_settings: None,
             interrupt_message: true,
         }
+    }
+
+    /// Enriches the first model call's rollout context. The callback also runs for a thread
+    /// without a recorder so it can establish the same per-thread product state.
+    pub fn with_turn_context_enricher(
+        mut self,
+        enrich: impl Fn(&RunContext, RolloutTurnContext) -> RolloutTurnContext + Send + Sync + 'static,
+    ) -> Self {
+        self.turn_context_enricher = Some(Arc::new(enrich));
+        self
     }
 
     /// Sets the host callback that captures immutable state before model resolution and context
@@ -5604,16 +5619,22 @@ async fn run_one_turn(
     let selector = prepared.selector().clone();
     let server_manages_conversation = prepared.request().continuation().is_server_managed()
         || context.session.is_some_and(Session::manages_server_history);
-    if let Some(rollout) = context.events.rollout
-        && !progress.turn_context_recorded
+    if !progress.turn_context_recorded
+        && (context.events.rollout.is_some() || config.turn_context_enricher.is_some())
     {
         progress.turn_context_recorded = true;
-        rollout.record(RolloutItem::TurnContext(turn_context(
+        let mut record = turn_context(
             context.run_id,
             progress,
             &selector,
             prepared.request().model_settings().effort(),
-        )));
+        );
+        if let Some(enrich) = &config.turn_context_enricher {
+            record = enrich(&preparation_context, record);
+        }
+        if let Some(rollout) = context.events.rollout {
+            rollout.record(RolloutItem::TurnContext(record));
+        }
     }
     // Announced once for the whole logical call rather than once per physical request. Retries and
     // a provider fallback happen inside it, and are already on the generation spans underneath; a

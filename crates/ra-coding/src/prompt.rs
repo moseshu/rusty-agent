@@ -135,7 +135,13 @@ pub fn assemble_stable_prefix_for_surface(
     surface: &ToolSurface,
     capability_sections: &[PromptSection],
 ) -> Result<StablePrefix> {
-    assemble_stable_prefix_for_session(role, surface, capability_sections, false)
+    assemble_stable_prefix_for_session(
+        role,
+        surface,
+        capability_sections,
+        false,
+        &std::collections::BTreeSet::new(),
+    )
 }
 
 /// Assembles root or spawned-agent guidance from the same validated tool inventory.
@@ -144,14 +150,17 @@ pub(crate) fn assemble_stable_prefix_for_session(
     surface: &ToolSurface,
     capability_sections: &[PromptSection],
     spawned_agent: bool,
+    turn_selected: &std::collections::BTreeSet<String>,
 ) -> Result<StablePrefix> {
-    let entries = ToolSurfacePromptBuilder::reconcile_with_surface(surface)?;
+    let (entries, dynamic_collaboration) =
+        ToolSurfacePromptBuilder::reconcile_with_surface(surface, turn_selected)?;
     assemble_stable_prefix_with_inventory(
         role,
         &entries.keys().map(String::as_str).collect::<Vec<_>>(),
         ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
         capability_sections,
         spawned_agent,
+        dynamic_collaboration,
     )
 }
 
@@ -182,6 +191,7 @@ pub fn assemble_stable_prefix_for_tools(
         ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
         &[],
         false,
+        false,
     )
 }
 
@@ -197,6 +207,7 @@ fn assemble_stable_prefix_with_inventory(
     tool_surface: Option<PromptSection>,
     capability_sections: &[PromptSection],
     spawned_agent: bool,
+    dynamic_collaboration: bool,
 ) -> Result<StablePrefix> {
     let mut sections = vec![
         IdentityPromptBuilder::build_identity_section()?,
@@ -206,7 +217,12 @@ fn assemble_stable_prefix_with_inventory(
         ChannelsPromptBuilder::build_channels_section()?,
         FormattingPromptBuilder::build_formatting_section()?,
         PersonalityPromptBuilder::build_personality_section()?,
-        RolePromptBuilder::build_role_section_for_session(role, tool_names, spawned_agent)?,
+        RolePromptBuilder::build_role_section_for_session(
+            role,
+            tool_names,
+            spawned_agent,
+            dynamic_collaboration,
+        )?,
     ];
     // One condition for both, read from the inventory builder rather than restated here. Added on
     // its own, the selection rules would tell an agent whose request carries no tools to choose

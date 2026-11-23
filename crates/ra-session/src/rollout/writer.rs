@@ -292,6 +292,8 @@ pub struct RolloutSessionMeta {
     git_info: Option<crate::store::GitInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_tools: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multi_agent_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     selected_capability_roots: Vec<serde_json::Value>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
@@ -316,9 +318,23 @@ impl RolloutSessionMeta {
             source: None,
             git_info: None,
             dynamic_tools: None,
+            multi_agent_version: None,
             selected_capability_roots: Vec::new(),
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records the product's collaboration version as opaque metadata.
+    #[must_use]
+    pub fn with_multi_agent_version(mut self, version: impl Into<String>) -> Self {
+        self.multi_agent_version = Some(version.into());
+        self
+    }
+
+    /// The recorded product collaboration version.
+    #[must_use]
+    pub fn multi_agent_version(&self) -> Option<&str> {
+        self.multi_agent_version.as_deref()
     }
 
     /// Records that the session is the thread of a spawned agent, and where it was spawned from.

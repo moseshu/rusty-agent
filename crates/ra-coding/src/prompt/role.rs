@@ -42,7 +42,7 @@ impl RolePromptBuilder {
         role: &PromptRole,
         custom_text: Option<&str>,
     ) -> Result<PromptSection> {
-        Self::build(role, custom_text, &[], false)
+        Self::build(role, custom_text, &[], false, false)
     }
 
     /// Builds root-agent guidance from names advertised by the assembled tool surface.
@@ -51,15 +51,16 @@ impl RolePromptBuilder {
         role: &PromptRole,
         tool_names: &[&str],
     ) -> Result<PromptSection> {
-        Self::build_role_section_for_session(role, tool_names, false)
+        Self::build_role_section_for_session(role, tool_names, false, false)
     }
 
     pub(crate) fn build_role_section_for_session(
         role: &PromptRole,
         tool_names: &[&str],
         spawned_agent: bool,
+        dynamic_collaboration: bool,
     ) -> Result<PromptSection> {
-        Self::build(role, None, tool_names, spawned_agent)
+        Self::build(role, None, tool_names, spawned_agent, dynamic_collaboration)
     }
 
     fn build(
@@ -67,6 +68,7 @@ impl RolePromptBuilder {
         custom_text: Option<&str>,
         tool_names: &[&str],
         spawned_agent: bool,
+        dynamic_collaboration: bool,
     ) -> Result<PromptSection> {
         let builtin: Option<&str> = match role {
             PromptRole::Main => Some(
@@ -118,7 +120,9 @@ impl RolePromptBuilder {
             } else {
                 content.push_str(" The dedicated file editing tool is not advertised.");
             }
-            if !tool_names.iter().any(|name| {
+            if dynamic_collaboration {
+                content.push_str(" Collaboration tools are offered only in turns whose request lists them; when they are absent, do not delegate tasks or direct other agents.");
+            } else if !tool_names.iter().any(|name| {
                 matches!(
                     name.rsplit('.').next(),
                     Some(

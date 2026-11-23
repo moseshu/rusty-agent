@@ -336,6 +336,38 @@ impl ProductModelRuntime {
         )
     }
 
+    pub(crate) fn multi_agent_version_override(&self) -> Option<super::MultiAgentVersion> {
+        if self.config.features.enabled(Feature::MultiAgentV2) {
+            Some(super::MultiAgentVersion::V2)
+        } else if !self.config.agents_enabled {
+            Some(super::MultiAgentVersion::Disabled)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn multi_agent_version_for_model(
+        &self,
+        model_version: Option<super::MultiAgentVersion>,
+    ) -> super::MultiAgentVersion {
+        self.multi_agent_version_override()
+            .or(model_version)
+            .unwrap_or_else(|| {
+                if self.config.features.enabled(Feature::Collab) {
+                    super::MultiAgentVersion::V1
+                } else {
+                    super::MultiAgentVersion::Disabled
+                }
+            })
+    }
+
+    pub(crate) fn catalog_multi_agent_version(
+        &self,
+        model: &str,
+    ) -> Option<super::MultiAgentVersion> {
+        self.model_info(model)?.multi_agent_version
+    }
+
     fn model_info(&self, model: &str) -> Option<ModelInfo> {
         if let Some(remote) = &self.remote {
             let models = match RunConfig::current_run_snapshot::<TurnCatalog>() {

@@ -22,6 +22,7 @@ use crate::{
         model_runtime::ProductModelRuntime,
     },
     host::CodingHost,
+    multi_agent::ThreadCollaboration,
     profile::CodingProfile,
     spawned,
     thread_hooks::CodingThreadHooks,
@@ -205,6 +206,24 @@ impl CodingThreadFactory {
         Ok((settings, models, hooks))
     }
 
+    fn configure_product_host(
+        &self,
+        host: CodingHost,
+        runtime: &Arc<ProductModelRuntime>,
+        request: &ThreadFactoryRequest,
+    ) -> CodingHost {
+        let legacy_collaboration_offered = host.collaboration_offered()
+            && self.profile != CodingProfile::Core
+            && !self.role.is_one_off()
+            && !(self.role.is_read_only() && host.read_only_role_restrictions());
+        let collaboration = Arc::new(ThreadCollaboration::new(
+            Arc::clone(runtime),
+            request,
+            legacy_collaboration_offered,
+        ));
+        runtime.install_web_search(host.with_product_collaboration(collaboration))
+    }
+
     /// The thread's agent tree. Its root is the thread: its session is what the agents' hooks and
     /// spawn records name as their parent's, whether or not the server records them, and a thread
     /// that was itself spawned continues its lineage.
@@ -246,7 +265,7 @@ impl ThreadFactory for CodingThreadFactory {
                 let (settings, runtime, hooks) = self
                     .load_product_configuration(builder.clone(), &host, request)
                     .await?;
-                host = runtime.install_web_search(host);
+                host = self.configure_product_host(host, &runtime, request);
                 (settings, Some(runtime), Some(hooks))
             }
             None => (self.settings.clone().for_new_thread(), None, None),
@@ -285,6 +304,9 @@ impl ThreadFactory for CodingThreadFactory {
                 .with_prompt_cache_key_override(crate::prompt_cache_key::for_thread(request))
                 .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
         );
+        if let Some(collaboration) = host.product_collaboration() {
+            config = collaboration.install(config);
+        }
         if let Some(hooks) = &hooks {
             config = hooks.install(config);
             let mut selection = ra_protocol::server::protocol::ThreadPolicyOverrides::new();
@@ -322,6 +344,11 @@ impl ThreadFactory for CodingThreadFactory {
         let mut prepared = PreparedThread::new(builder)
             .with_settings_adapter(Arc::new(settings))
             .with_background_terminals(Arc::new(host.background_terminals()));
+        if let Some(collaboration) = host.product_collaboration()
+            && let Some(version) = collaboration.recorded_version()
+        {
+            prepared = prepared.with_multi_agent_version(version);
+        }
         if let Some(hooks) = hooks {
             prepared = prepared.with_product_runtime(hooks);
         }

@@ -686,7 +686,7 @@ async fn ending_a_thread_with_spawned_agents_runs_session_end_once_for_the_root(
     std::fs::write(
         home_path.join("config.toml"),
         format!(
-            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\n\n{}{}",
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\nmulti_agent_v2 = true\n\n{}{}",
             section("SessionEnd", &log),
             section("SubagentStop", &stops)
         ),
@@ -799,7 +799,7 @@ async fn collaboration_tools_are_hooked_under_codexs_flat_names() {
     std::fs::write(
         home_path.join("config.toml"),
         format!(
-            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\n\n{}{}{}",
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n[features]\ncodex_hooks = true\nmulti_agent_v2 = true\n\n{}{}{}",
             section("^collaboration(list_agents|spawn_agent)$", &flat),
             section("^collaboration\\.", &other),
             section("^Agent$", &other)

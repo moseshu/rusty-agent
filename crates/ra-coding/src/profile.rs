@@ -93,7 +93,7 @@ const COLLABORATION: [&str; 6] = [
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CodingProfile {
-    /// Editing, execution, and structured search only: six entries, no orchestration.
+    /// Editing, execution, and structured search. Configured product threads can add collaboration.
     Core,
     /// The standard surface: seventeen entries with hosted search, eighteen with the web extension.
     #[default]
@@ -131,6 +131,7 @@ impl CodingProfile {
             &BTreeSet::new(),
             Some(&default_collaboration_namespace()?),
             SkillToolSurface::Merged,
+            false,
         )
     }
 
@@ -157,12 +158,13 @@ impl CodingProfile {
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
+        product_collaboration: bool,
     ) -> Result<ToolProfile> {
         // A narrowed tier is a different profile and says so. The identity reaches assembly errors
         // and the surface's own record, and `core` naming three entries would read there as the
         // tier having quietly shrunk.
         let narrowed = self
-            .declared_keys(collaboration_namespace, skills)?
+            .declared_keys(collaboration_namespace, skills, product_collaboration)?
             .map_or_else(
                 || !withheld.is_empty(),
                 |keys| keys.iter().any(|key| withheld.contains(key)),
@@ -178,6 +180,7 @@ impl CodingProfile {
             withheld_advertised,
             collaboration_namespace,
             skills,
+            product_collaboration,
         )
     }
 
@@ -218,9 +221,16 @@ impl CodingProfile {
         self,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
+        product_collaboration: bool,
     ) -> Result<Option<Vec<ToolLookupKey>>> {
         Ok(match self {
-            Self::Core => Some(lookup_keys(&CORE)?),
+            Self::Core => {
+                let mut keys = lookup_keys(&CORE)?;
+                if product_collaboration {
+                    keys.extend(collaboration_keys(collaboration_namespace)?);
+                }
+                Some(keys)
+            }
             Self::CodexLike => {
                 Some(
                     lookup_keys(&CORE)?
@@ -258,10 +268,16 @@ impl CodingProfile {
         withheld_advertised: &BTreeSet<ToolLookupKey>,
         collaboration_namespace: Option<&ToolNamespace>,
         skills: SkillToolSurface,
+        product_collaboration: bool,
     ) -> Result<ToolProfile> {
-        let declared = self.declared_keys(collaboration_namespace, skills)?;
-        let (mut floor, ceiling) = self.band();
-        if self != Self::Core {
+        let declared =
+            self.declared_keys(collaboration_namespace, skills, product_collaboration)?;
+        let (mut floor, mut ceiling) = self.band();
+        // Product threads make collaboration a per-turn choice, including on the core tier.
+        if self == Self::Core && product_collaboration {
+            floor += COLLABORATION.len();
+            ceiling += COLLABORATION.len();
+        } else if self != Self::Core {
             match skills {
                 SkillToolSurface::Namespace => floor += 1,
                 SkillToolSurface::Host => floor = floor.saturating_sub(1),

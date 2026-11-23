@@ -132,6 +132,7 @@ pub struct CodingHost {
     user_input: Option<Arc<dyn UserInputPort>>,
     request_user_input: bool,
     collaboration: Option<Collaboration>,
+    product_collaboration: Option<Arc<crate::multi_agent::ThreadCollaboration>>,
     read_only_role_restrictions: bool,
     /// Set on the host a spawned agent is assembled from.
     spawned_agent: bool,
@@ -199,6 +200,7 @@ impl CodingHost {
             user_input: None,
             request_user_input: false,
             collaboration: None,
+            product_collaboration: None,
             read_only_role_restrictions: false,
             spawned_agent: false,
             capabilities: Vec::new(),
@@ -449,7 +451,13 @@ impl CodingHost {
         self.read_only_role_restrictions
     }
 
-    /// Enables the six collaboration tools in Codex's default `collaboration` namespace.
+    /// Configures collaboration with Codex's default `collaboration` namespace.
+    ///
+    /// Direct assembly and thread factories without product configuration use this as the
+    /// host opt-in, subject to the selected profile. Product-configured threads select tools by
+    /// collaboration version, including on the core profile. For those threads this method
+    /// initializes the host namespace choice and supplies the host opt-in used to migrate
+    /// legacy threads with no recorded version.
     ///
     /// The tools act on an agent tree. The thread factory gives each thread a tree of its own;
     /// a standalone caller builds the agent with
@@ -465,12 +473,13 @@ impl CodingHost {
         self
     }
 
-    /// Advertises the collaboration tools in `namespace`, or under their bare names with `None`:
-    /// Codex's `multi_agent_v2.tool_namespace`.
+    /// Sets the namespace for collaboration tools, or uses bare names with `None`.
     ///
     /// Namespaces are an `OpenAI` Responses feature. Chat Completions and Anthropic adapters
     /// refuse a namespaced tool, so a host serving those providers selects bare names here.
-    /// Has no effect until collaboration is enabled with [`Self::with_collaboration`].
+    /// Call [`Self::with_collaboration`] first to initialize the host namespace choice.
+    /// Product-configured threads require the same call order to select bare names or a custom
+    /// namespace.
     #[must_use]
     pub fn with_collaboration_namespace(mut self, namespace: Option<ToolNamespace>) -> Self {
         if let Some(collaboration) = &mut self.collaboration {
@@ -481,11 +490,11 @@ impl CodingHost {
 
     /// Offers the collaboration tools to spawned agents too.
     ///
-    /// Codex offers them to a spawned agent only when the agent's model declares native support
-    /// for its second multi-agent version in the model catalog. This framework has no model
-    /// catalog, so the host states that fact here; without it a spawned agent is assembled without
-    /// the tools, as Codex assembles one whose model declares nothing. Has no effect until
-    /// collaboration is enabled with [`Self::with_collaboration`].
+    /// Hosts that assemble agents directly or use a thread factory without product configuration
+    /// state model support here. Product-configured threads ignore this setter: every child,
+    /// including one spawned by a thread migrated from the former host assembly, is offered the
+    /// tools only when its current model's catalog entry declares V2. This setter requires
+    /// [`Self::with_collaboration`].
     #[must_use]
     pub fn with_spawned_agent_collaboration(mut self) -> Self {
         if let Some(collaboration) = &mut self.collaboration {
@@ -506,15 +515,33 @@ impl CodingHost {
         self.spawned_agent
     }
 
+    pub(crate) fn with_product_collaboration(
+        mut self,
+        product: Arc<crate::multi_agent::ThreadCollaboration>,
+    ) -> Self {
+        self.product_collaboration = Some(product);
+        self
+    }
+
+    pub(crate) fn product_collaboration(
+        &self,
+    ) -> Option<&Arc<crate::multi_agent::ThreadCollaboration>> {
+        self.product_collaboration.as_ref()
+    }
+
     pub(crate) const fn collaboration_enabled(&self) -> bool {
-        self.collaboration.is_some()
+        self.product_collaboration.is_some() || self.collaboration.is_some()
     }
 
     /// Whether the agent assembled from this host is offered the collaboration tools.
     pub(crate) fn collaboration_offered(&self) -> bool {
-        self.collaboration
-            .as_ref()
-            .is_some_and(|collaboration| !self.spawned_agent || collaboration.spawned_agents)
+        match &self.product_collaboration {
+            Some(product) => product.can_offer_tools(),
+            None => self
+                .collaboration
+                .as_ref()
+                .is_some_and(|collaboration| !self.spawned_agent || collaboration.spawned_agents),
+        }
     }
 
     /// The namespace the collaboration tools are advertised in, if any.

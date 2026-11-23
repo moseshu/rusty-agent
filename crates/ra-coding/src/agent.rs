@@ -235,11 +235,23 @@ pub(crate) async fn assemble_agent(
     profile: CodingProfile,
 ) -> Result<AssembledAgent> {
     let assembled = host_backed_surface(role, host, profile).await?;
+    // Product threads decide collaboration per turn, so the request's tool table describes it.
+    let turn_selected = if host.product_collaboration().is_some() {
+        assembled
+            .installed()
+            .iter()
+            .filter(|capability| capability.family().as_str() == COLLABORATION_FAMILY)
+            .flat_map(|capability| capability.advertised().iter().cloned())
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let prefix = assemble_stable_prefix_for_session(
         role,
         assembled.tool_surface(),
         assembled.capability_sections(),
         host.is_spawned_agent(),
+        &turn_selected,
     )?;
     // Read off the families installed on the surface rather than a tool's model-facing name,
     // which the host's namespace choice changes.
@@ -451,6 +463,7 @@ pub async fn host_backed_surface(
         &capabilities.withheld_advertised_tool_keys(),
         host.collaboration_namespace()?.as_ref(),
         host.skill_tool_surface(),
+        host.product_collaboration().is_some(),
     )?;
     let budget = *profile.budget();
     let tool_surface =

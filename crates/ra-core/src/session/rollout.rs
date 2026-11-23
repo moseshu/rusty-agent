@@ -623,6 +623,8 @@ pub struct RolloutTurnContext {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multi_agent_version: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "Unknown::is_empty")]
     unknown: Unknown,
 }
@@ -640,8 +642,22 @@ impl RolloutTurnContext {
             sandbox_policy: None,
             model: None,
             effort: None,
+            multi_agent_version: None,
             unknown: Unknown::new(),
         }
+    }
+
+    /// Records the product's collaboration version as opaque metadata.
+    #[must_use]
+    pub fn with_multi_agent_version(mut self, version: impl Into<String>) -> Self {
+        self.multi_agent_version = Some(version.into());
+        self
+    }
+
+    /// The recorded product collaboration version.
+    #[must_use]
+    pub fn multi_agent_version(&self) -> Option<&str> {
+        self.multi_agent_version.as_deref()
     }
 
     /// Sets the working directory.

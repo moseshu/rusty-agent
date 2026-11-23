@@ -55,6 +55,7 @@ use std::{sync::Arc, time::Duration};
 use ra_core::{
     error::SessionErrorKind,
     event::{EventTimestamp, HostEventBody},
+    item::{MessageRole, RunItemKind},
     session::{SessionId, rollout::RolloutRecorder},
 };
 use ra_runtime::thread::{AgentThread, AgentThreadBuilder};
@@ -193,6 +194,7 @@ impl ThreadRequestProcessor {
             terminals,
             product,
             policy_applied,
+            ..
         } = prepared.into_parts();
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
@@ -369,6 +371,10 @@ impl ThreadRequestProcessor {
                     false,
                     None,
                 )
+                .with_rollout_context(
+                    recorded_multi_agent_version(&thread_id, &records),
+                    has_sampled_history(&records),
+                )
                 .with_policy(restore_persisted_policy(
                     to_policy_overrides(&params.policy),
                     &records,
@@ -397,6 +403,7 @@ impl ThreadRequestProcessor {
             terminals,
             product,
             policy_applied,
+            ..
         } = prepared.into_parts();
         let (model, effort) = if params.model.is_some() {
             (params.model.clone(), None)
@@ -536,6 +543,8 @@ impl ThreadRequestProcessor {
         let persisted_policy =
             restore_persisted_policy(to_policy_overrides(&params.policy), &records, true);
         let dynamic_tools = dynamic_tools_from_records(&records);
+        let source_version = recorded_multi_agent_version(&source_id, &records);
+        let source_has_sampled_history = has_sampled_history(&records);
         let records = match (&params.last_turn_id, &params.before_turn_id) {
             (Some(last_turn_id), None) => {
                 truncate_records_after_turn_id(records, last_turn_id, tool_items.as_deref())?
@@ -564,6 +573,7 @@ impl ThreadRequestProcessor {
                         |spawn| spawn.root_session_id().clone(),
                     )),
                 )
+                .with_rollout_context(source_version.clone(), source_has_sampled_history)
                 .with_policy(persisted_policy.clone())
                 .with_initial_model(params.model.clone()),
             )
@@ -575,6 +585,7 @@ impl ThreadRequestProcessor {
             terminals,
             product,
             policy_applied,
+            multi_agent_version,
         } = prepared.into_parts();
         let policy = if policy_applied {
             ThreadPolicyOverrides::new()
@@ -613,7 +624,7 @@ impl ThreadRequestProcessor {
                 fork_records,
             )
         } else {
-            let meta = new_session_meta(
+            let mut meta = new_session_meta(
                 &thread_id,
                 &builder,
                 adapter.as_deref(),
@@ -625,6 +636,9 @@ impl ThreadRequestProcessor {
                     .as_deref()
                     .unwrap_or_default(),
             );
+            if let Some(version) = multi_agent_version.or(source_version) {
+                meta = meta.with_multi_agent_version(version);
+            }
             let forked = ForkedThread::fork_from_history(
                 store.as_ref(),
                 StoredThreadHistory::new(source_id.clone(), records),
@@ -1459,6 +1473,63 @@ fn run_started(record: &RolloutRecord) -> Option<String> {
         Ok(RolloutPayload::RunStarted(started)) => Some(started.run_id().as_str().to_owned()),
         _ => None,
     }
+}
+
+/// Codex prefers the newest present value in metadata for this session, then turn context.
+fn recorded_multi_agent_version(
+    session_id: &SessionId,
+    records: &[RolloutRecord],
+) -> Option<String> {
+    records
+        .iter()
+        .rev()
+        .filter(|record| record.type_name() == "session_meta")
+        .find_map(|record| match record.payload().ok()? {
+            RolloutPayload::SessionMeta(meta) if meta.session_id() == session_id => {
+                meta.multi_agent_version().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            records
+                .iter()
+                .rev()
+                .filter(|record| record.type_name() == "turn_context")
+                .find_map(|record| match record.payload().ok()? {
+                    RolloutPayload::TurnContext(context) => {
+                        context.multi_agent_version().map(str::to_owned)
+                    }
+                    _ => None,
+                })
+        })
+}
+
+/// An input hook can leave run boundaries and messages even when sampling never starts.
+/// Older rollouts without a turn context can still establish sampling through model output.
+fn has_sampled_history(records: &[RolloutRecord]) -> bool {
+    records.iter().any(|record| match record.type_name() {
+        "turn_context" => true,
+        "item" => {
+            let Ok(RolloutPayload::Item(item)) = record.payload() else {
+                return false;
+            };
+            match item.kind() {
+                RunItemKind::Message(message) => message.role() == MessageRole::Assistant,
+                RunItemKind::Reasoning(_)
+                | RunItemKind::ToolCall(_)
+                | RunItemKind::HostedToolCall(_)
+                | RunItemKind::ToolSearchCall(_)
+                | RunItemKind::ToolSearchOutput(_)
+                | RunItemKind::HandoffCall(_)
+                | RunItemKind::McpListTools(_)
+                | RunItemKind::McpCall(_)
+                | RunItemKind::McpApprovalRequest(_)
+                | RunItemKind::ProviderCompaction(_) => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    })
 }
 
 /// The records up to the end of the turn `last_turn_id`: Codex's `truncate_rollout_after_turn_id`.

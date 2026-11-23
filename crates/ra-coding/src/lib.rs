@@ -34,6 +34,7 @@ pub mod hook_mcp_executor;
 pub mod hooks;
 pub mod host;
 pub mod mcp;
+mod multi_agent;
 #[cfg(feature = "test-api")]
 #[doc(hidden)]
 pub mod network_approval;
