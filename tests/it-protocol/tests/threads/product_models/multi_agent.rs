@@ -162,6 +162,13 @@ async fn multi_agent_first_turn_model_selects_and_locks_version() {
         let (thread, _) = start(&server, &mut connection, json!({"model": "catalog-v1"})).await;
         run_on_model(&server, &mut connection, &thread, first_model).await;
         assert_latest_tools(&endpoint, first_model, enabled).await;
+        let body = latest_body(&endpoint).await;
+        assert_eq!(
+            developer_texts(&body)
+                .iter()
+                .any(|text| text.starts_with("You are `/root`, the primary agent")),
+            enabled,
+        );
         run_on_model(&server, &mut connection, &thread, next_model).await;
         assert_latest_tools(&endpoint, next_model, enabled).await;
         assert_eq!(
@@ -619,6 +626,13 @@ tool_namespace = "spawn_agent"
             .await
             .is_none()
     );
+    let body = latest_body(&endpoint).await;
+    let hint = developer_texts(&body)
+        .into_iter()
+        .find(|text| text.starts_with("You are `/root`, the primary agent"))
+        .expect("disabling native tools preserves the V2 role");
+    assert!(!hint.contains("only as direct tool calls"), "{hint}");
+    assert!(!hint.contains("When calling `wait_agent`"), "{hint}");
     assert_eq!(
         version_records(&server, &thread).await,
         [("turn_context".to_owned(), "v2".to_owned())]
@@ -681,6 +695,12 @@ async fn multi_agent_explicit_host_namespace_overrides_configuration() {
         names.iter().all(|(namespace, _)| namespace.is_none()),
         "{names:?}"
     );
+    assert!(request.input().iter().any(|item| {
+        matches!(item, ModelInputItem::Message(message) if {
+            let text = message.text_content();
+            text.contains("`to=functions.spawn_agent`") && !text.contains("agents.spawn_agent")
+        })
+    }));
 }
 
 #[tokio::test]
@@ -719,5 +739,305 @@ async fn multi_agent_fork_before_first_turn_preserves_model_selected_version() {
             .await;
         run_on_model(&server, &mut connection, child, "catalog-v1").await;
         assert_latest_tools(&endpoint, "catalog-v1", true).await;
+    }
+}
+
+fn developer_texts(body: &Value) -> Vec<&str> {
+    body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .flat_map(|item| item["content"].as_array().unwrap())
+        .filter_map(|content| content["text"].as_str())
+        .collect()
+}
+
+async fn latest_body(endpoint: &MockServer) -> Value {
+    endpoint
+        .received_requests()
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .body_json()
+        .unwrap()
+}
+
+/// A role text the bundled catalog ships, which carries Codex's stock prose.
+fn bundled_role(model: &str, role: &str) -> String {
+    let catalog: Value = serde_json::from_str(include_str!(
+        "../../../../../crates/ra-coding/src/config/models.json"
+    ))
+    .unwrap();
+    catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["slug"] == model)
+        .and_then(|entry| entry["model_messages"]["multi_agent"]["role"][role].as_str())
+        .unwrap()
+        .to_owned()
+}
+
+/// Codex's composed role body: the base kept verbatim, then the shared hint naming the offered
+/// tools and their recipient, the `wait_agent` advice when offered, and the concurrency slots.
+fn composed_role(base: &str, listed: &str, recipient: &str, wait: bool, slots: usize) -> String {
+    let wait = if wait {
+        "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.\n\n"
+    } else {
+        ""
+    };
+    format!(
+        "{base}\nCall {listed} only as direct tool calls using the recipient shown in their tool definitions, such as `to={recipient}`.\n\nAll agents share the same directory. In detail:\n- All agents have access to the same container and filesystem as you.\n- All agents use the same current working directory.\n- As a result, edits made by one agent are immediately visible to all other agents.\n\n{wait}There are {slots} available concurrency slots, meaning that up to {slots} agents can be active at once, including you."
+    )
+}
+
+#[tokio::test]
+async fn multi_agent_role_prompt_follows_the_current_catalog_and_tools() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(
+        &product,
+        &endpoint,
+        r#"
+[features.multi_agent_v2]
+tool_namespace = "agents"
+disable_direct_message = true
+wait_agent_enabled = false
+max_concurrent_threads_per_session = 2
+"#,
+    );
+    let mut v2 = catalog_model("catalog-v2", Some("v2"));
+    let root_role = bundled_role("gpt-6-astra", "root");
+    v2["model_messages"] = json!({"multi_agent": {"role": {"root": root_role}}});
+    let mut v1 = catalog_model("catalog-v1", Some("v1"));
+    v1["model_messages"] = json!({"multi_agent": {"role": {"root": ""}}});
+    product.write(
+        "collaboration-models.json",
+        &json!({"models": [v2, v1]}).to_string(),
+    );
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+    run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+    let body = latest_body(&endpoint).await;
+    let texts = developer_texts(&body);
+    // The catalog's stock prose stays verbatim, as Codex sends it; only the shared hint follows
+    // the configured tool table.
+    let expected = format!(
+        "<multi_agent_role>{}</multi_agent_role>",
+        composed_role(
+            &root_role,
+            "`spawn_agent`, `interrupt_agent`, and `list_agents`",
+            "functions.agents.spawn_agent",
+            false,
+            2,
+        )
+    );
+    assert!(texts.contains(&expected.as_str()), "{texts:?}");
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.contains("functions.exec") && !text.contains("reasoning_effort")),
+        "{texts:?}"
+    );
+
+    run_on_model(&server, &mut connection, &thread, "catalog-v1").await;
+    let body = latest_body(&endpoint).await;
+    assert!(developer_texts(&body).iter().all(|text| {
+        !text.contains("<multi_agent_role>") && !text.contains("primary agent in a team")
+    }));
+    assert!(
+        latest_collaboration_tools(&endpoint, "agents")
+            .await
+            .is_some()
+    );
+
+    run_on_model(&server, &mut connection, &thread, "outside-catalog").await;
+    let body = latest_body(&endpoint).await;
+    assert!(developer_texts(&body).iter().any(|text| {
+        text.starts_with("You are `/root`, the primary agent")
+            && !text.contains("<multi_agent_role>")
+    }));
+}
+
+#[tokio::test]
+async fn multi_agent_role_prompt_respects_verbatim_empty_and_non_root_sources() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    for (source, configured, expected) in [
+        (
+            ra_protocol::server::SessionSource::Mcp,
+            "  Configured root role.  ",
+            true,
+        ),
+        (ra_protocol::server::SessionSource::Mcp, "", false),
+        (
+            ra_protocol::server::SessionSource::SubAgent(
+                ra_protocol::server::SubAgentSource::Review,
+            ),
+            "  Configured root role.  ",
+            false,
+        ),
+    ] {
+        setup_catalog(
+            &product,
+            &endpoint,
+            &format!(
+                "[features.multi_agent_v2]\nenabled = true\nroot_agent_usage_hint_text = {configured:?}\n"
+            ),
+        );
+        let mut model = catalog_model("catalog-v2", Some("v2"));
+        model["model_messages"] = json!({"multi_agent": {"role": {"root": "Catalog role."}}});
+        product.write(
+            "collaboration-models.json",
+            &json!({"models": [model]}).to_string(),
+        );
+        let (host, settings, builder) = product.parts();
+        let (server, _) = build_with_session_source(
+            Options {
+                store: Some(Arc::new(InMemoryThreadStore::new())),
+                factory: Some(Arc::new(CodingThreadFactory::from_product_config(
+                    host, settings, builder,
+                ))),
+                unload_delay: None,
+            },
+            None,
+            Some(source),
+        );
+        let mut connection = server.connect(1).await;
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+        run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+        let body = latest_body(&endpoint).await;
+        let texts = developer_texts(&body);
+        assert_eq!(texts.contains(&configured), expected, "{texts:?}");
+        assert!(texts.iter().all(|text| !text.contains("<multi_agent_role>")
+            && !text.contains("primary agent in a team")));
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_spawn_projects_child_role_and_developer_instructions() {
+    for (fork_turns, override_line, expected) in [
+        (
+            "all",
+            "subagent_developer_instructions = \"  Child instructions.  \"",
+            Some("Child instructions."),
+        ),
+        ("none", "subagent_developer_instructions = \"   \"", None),
+        ("all", "", Some("Parent instructions.")),
+    ] {
+        let endpoint = responses_endpoint().await;
+        let product = ProductModels::new();
+        setup_catalog(
+            &product,
+            &endpoint,
+            &format!(
+                "[features.multi_agent_v2]\nenabled = true\ndisable_direct_message = true\nroot_agent_usage_hint_text = \"Parent role.\"\n{override_line}"
+            ),
+        );
+        let config = std::fs::read_to_string(product.home.path().join("config.toml")).unwrap();
+        product.write(
+            "config.toml",
+            &format!("developer_instructions = \"Parent instructions.\"\n{config}"),
+        );
+        let mut model = catalog_model("catalog-v2", Some("v2"));
+        model["model_messages"] =
+            json!({"multi_agent": {"role": {"subagent": bundled_role("gpt-6-astra", "subagent")}}});
+        product.write(
+            "collaboration-models.json",
+            &json!({"models": [model]}).to_string(),
+        );
+
+        let server = product.server(None);
+        let mut connection = server.connect(1).await;
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+        run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+
+        let mut response = websocket_completion(0);
+        response["response"]["output"] = json!([{
+            "id": "spawn", "type": "function_call", "call_id": "spawn-child",
+            "namespace": "collaboration", "name": "spawn_agent",
+            "arguments": json!({"task_name": "worker", "message": "Child task.", "fork_turns": fork_turns}).to_string()
+        }]);
+        Mock::given(method("POST"))
+            .and(path("/product/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&endpoint)
+            .await;
+        run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+        let (parent, child) = timeout(PATIENCE, async {
+            loop {
+                let requests = endpoint.received_requests().await.unwrap();
+                let parent: Value = requests[1].body_json().unwrap();
+                if let Some(child) = requests.iter().skip(2).find_map(|request| {
+                    let body: Value = request.body_json().unwrap();
+                    body["input"]
+                        .as_array()?
+                        .iter()
+                        .any(|item| {
+                            item["role"] == "user" && item.to_string().contains("Child task.")
+                        })
+                        .then_some(body)
+                }) {
+                    break (parent, child);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the child samples its task");
+
+        let parent_texts = developer_texts(&parent);
+        assert!(parent_texts.contains(&"Parent role."), "{parent_texts:?}");
+        assert!(
+            parent_texts.contains(&"Parent instructions."),
+            "{parent_texts:?}"
+        );
+
+        let child_texts = developer_texts(&child);
+        // The bundled child prose stays verbatim; the shared hint names only the offered tools.
+        let child_role = format!(
+            "<multi_agent_role>{}</multi_agent_role>",
+            composed_role(
+                &bundled_role("gpt-6-astra", "subagent"),
+                "`spawn_agent`, `wait_agent`, `interrupt_agent`, and `list_agents`",
+                "functions.collaboration.spawn_agent",
+                true,
+                4,
+            )
+        );
+        assert!(
+            child_texts.contains(&child_role.as_str()),
+            "{child_texts:?}"
+        );
+        assert!(!child_texts.contains(&"Parent role."), "{child_texts:?}");
+        let actual = child_texts
+            .iter()
+            .copied()
+            .filter(|text| matches!(*text, "Parent instructions." | "Child instructions."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            expected.into_iter().collect::<Vec<_>>(),
+            "{child_texts:?}"
+        );
+        assert!(!child_texts.contains(&""), "{child_texts:?}");
+        assert_eq!(
+            child["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "user" && item["content"][0]["text"] == "Hello"),
+            fork_turns == "all",
+        );
     }
 }

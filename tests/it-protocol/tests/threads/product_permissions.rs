@@ -1343,7 +1343,16 @@ struct SplitModel {
 impl Model for SplitModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         // The parent's own requests carry the task too, in its spawn call; the child's do not.
-        let input = serde_json::to_string(request.input()).unwrap();
+        // Developer messages are left out: the child's role instructions name `spawn_agent`.
+        let conversation = request
+            .input()
+            .iter()
+            .filter(|item| {
+                !matches!(item, ra_core::item::ModelInputItem::Message(message)
+                    if message.role() == ra_core::item::MessageRole::Developer)
+            })
+            .collect::<Vec<_>>();
+        let input = serde_json::to_string(&conversation).unwrap();
         let child = input.contains("spawned worker task") && !input.contains("spawn_agent");
         let script = if child { &self.child } else { &self.parent };
         ScriptedModel(Arc::clone(script))

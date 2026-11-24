@@ -281,8 +281,7 @@ impl ThreadFactory for CodingThreadFactory {
         let (run_config, models): (_, Arc<dyn ModelResolver>) = match model_runtime {
             Some(runtime) => (
                 runtime.configure_run(
-                    CodingHost::build_run_config_with_compaction(runtime.clone())
-                        .with_context_filter(runtime.clone()),
+                    CodingHost::build_run_config_with_compaction(runtime.clone()),
                     matches!(
                         request.session_source(),
                         ra_protocol::server::SessionSource::Internal(_)
@@ -305,7 +304,11 @@ impl ThreadFactory for CodingThreadFactory {
                 .with_prepared_capabilities(assembled.capabilities, assembled.capability_tools),
         );
         if let Some(collaboration) = host.product_collaboration() {
-            config = collaboration.install(config);
+            config = collaboration.install(
+                config,
+                host.collaboration_namespace()?,
+                assembled.collaborates,
+            );
         }
         if let Some(hooks) = &hooks {
             config = hooks.install(config);

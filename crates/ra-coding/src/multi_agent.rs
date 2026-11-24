@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use ra_core::{
     context::RunContext,
     error::{Error, Result},
+    session::SessionId,
     tool::{
-        DecodedToolInput, FuncSchema, Tool, ToolContext, ToolOptions, ToolOrigin, ToolOutput,
-        ToolSchema, ToolServices,
+        DecodedToolInput, FuncSchema, Tool, ToolContext, ToolNamespace, ToolOptions, ToolOrigin,
+        ToolOutput, ToolSchema, ToolServices,
     },
 };
 use ra_protocol::server::{SessionSource, SubAgentSource, ThreadFactoryRequest};
@@ -18,6 +19,10 @@ use ra_runtime::runner::RunConfig;
 use ra_tools::agent_ns::{CollaborationKind, CollaborationTool, WaitAgentTimeoutOptions};
 
 use crate::config::{MultiAgentVersion, model_runtime::ProductModelRuntime};
+
+mod role;
+
+use role::{Role, ThreadModelContext};
 
 pub(crate) const COLLABORATION_KINDS: [CollaborationKind; 6] = [
     CollaborationKind::SpawnAgent,
@@ -35,6 +40,8 @@ pub(crate) struct ThreadCollaboration {
     /// by a migrated value, and the thread is offered no collaboration tools.
     unrecognized: Option<String>,
     spawned: bool,
+    session_id: SessionId,
+    role: Option<Role>,
     tools: ToolTable,
 }
 
@@ -107,6 +114,21 @@ impl ThreadCollaboration {
             tools,
             version: version.map(OnceLock::from).unwrap_or_default(),
             unrecognized,
+            session_id: request.thread_id().clone(),
+            role: match request.session_source() {
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => Some(Role::Subagent),
+                SessionSource::Cli
+                | SessionSource::VSCode
+                | SessionSource::Exec
+                | SessionSource::Mcp
+                | SessionSource::Custom(_)
+                | SessionSource::Unknown => Some(if request.thread_spawn().is_some() {
+                    Role::Subagent
+                } else {
+                    Role::Root
+                }),
+                _ => None,
+            },
             spawned: request.thread_spawn().is_some()
                 || matches!(
                     request.session_source(),
@@ -160,23 +182,52 @@ impl ThreadCollaboration {
         self.tools.max_spawned_threads
     }
 
-    pub(crate) fn install(self: &Arc<Self>, config: RunConfig) -> RunConfig {
+    pub(crate) fn install(
+        self: &Arc<Self>,
+        config: RunConfig,
+        namespace: Option<ToolNamespace>,
+        collaborates: bool,
+    ) -> RunConfig {
         let thread = Arc::clone(self);
-        config.with_turn_context_enricher(move |_, record| {
-            let version = *thread.version.get_or_init(|| {
-                thread
-                    .runtime
-                    .multi_agent_version_for_model(thread.model_version(record.model()))
-            });
-            match &thread.unrecognized {
-                Some(recorded) => record.with_multi_agent_version(recorded.clone()),
-                None => record.with_multi_agent_version(version_name(version)),
-            }
-        })
+        config
+            .with_context_filter(Arc::new(ThreadModelContext {
+                thread: Arc::clone(self),
+                namespace,
+                collaborates,
+            }))
+            .with_turn_context_enricher(move |_, record| {
+                let version = *thread.version.get_or_init(|| {
+                    thread
+                        .runtime
+                        .multi_agent_version_for_model(thread.model_version(record.model()))
+                });
+                match &thread.unrecognized {
+                    Some(recorded) => record.with_multi_agent_version(recorded.clone()),
+                    None => record.with_multi_agent_version(version_name(version)),
+                }
+            })
     }
 
     fn model_version(&self, model: Option<&str>) -> Option<MultiAgentVersion> {
         model.and_then(|model| self.runtime.catalog_multi_agent_version(model))
+    }
+
+    fn version_for_model(&self, model_version: Option<MultiAgentVersion>) -> MultiAgentVersion {
+        self.version
+            .get()
+            .copied()
+            .unwrap_or_else(|| self.runtime.multi_agent_version_for_model(model_version))
+    }
+
+    /// Codex gates V2 delegation separately from the session's role instructions.
+    fn tools_enabled_for_model(
+        &self,
+        model_version: Option<MultiAgentVersion>,
+        spawned_in_tree: bool,
+    ) -> bool {
+        self.tools.native_tools
+            && self.version_for_model(model_version) == MultiAgentVersion::V2
+            && (!(spawned_in_tree || self.spawned) || model_version == Some(MultiAgentVersion::V2))
     }
 
     pub(crate) fn tool(
@@ -250,22 +301,15 @@ impl Tool for ProductCollaborationTool {
     }
 
     async fn is_enabled(&self, context: &RunContext) -> Result<bool> {
-        let locked = self.thread.version.get().copied();
-        // Codex's V2 rule for any agent with an agent path, including a migrated thread's
-        // children and a spawned thread loaded on its own: its current model must declare V2.
-        let spawned = self.spawned_in_tree || self.thread.spawned;
-        let model_version = if spawned || locked.is_none() {
-            self.thread.model_version(context.resolved_model_name())
-        } else {
-            None
-        };
-        let version = locked.unwrap_or_else(|| {
-            self.thread
-                .runtime
-                .multi_agent_version_for_model(model_version)
-        });
-        Ok(version == MultiAgentVersion::V2
-            && (!spawned || model_version == Some(MultiAgentVersion::V2)))
+        let model_version =
+            if self.spawned_in_tree || self.thread.spawned || self.thread.version.get().is_none() {
+                self.thread.model_version(context.resolved_model_name())
+            } else {
+                None
+            };
+        Ok(self
+            .thread
+            .tools_enabled_for_model(model_version, self.spawned_in_tree))
     }
 
     async fn is_enabled_with_services(

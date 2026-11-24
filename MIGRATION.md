@@ -1344,6 +1344,25 @@ Product V2 threads now read Codex's `[features.multi_agent_v2]` tool table:
   agent at once. The default of 4 allows 3, where product threads previously allowed 4; hosts
   without product configuration keep `AgentControl::new()`'s 4.
 
+Product V2 threads also send Codex's multi-agent role instructions as a developer message before
+each sampling request:
+
+- Root sessions (CLI, VS Code, exec, MCP, custom and unknown sources) receive the root role;
+  `ThreadSpawn` children receive the sub-agent role. Internal sessions and other sub-agent sources
+  receive none.
+- `root_agent_usage_hint_text` and `subagent_usage_hint_text` replace the role text verbatim, and
+  an empty value suppresses it. Otherwise the current model's catalog role text is used, wrapped
+  in `<multi_agent_role>` markers, and then the built-in text. An empty catalog text also
+  suppresses the role.
+- Composed role text keeps Codex's prose verbatim apart from the standard checklist-tool filter.
+  The appended direct-call guidance and wait advice follow the coding product's tool configuration
+  and per-model delegation gate. The recipient example uses the effective namespace. Codex's
+  `functions.exec` sentences are omitted because there is no code mode.
+- The message is rebuilt for every request from the request's model rather than recorded in
+  history, so switching models replaces or removes it.
+- `subagent_developer_instructions` replaces `developer_instructions` for V2 spawned children; an
+  empty value removes them, and leaving it unset keeps the parent's.
+
 Providers constructed from product configuration use the Responses wire protocol. The feature
 selects the collaboration version. For Chat Completions or Anthropic through an explicit resolver,
 choose bare names by calling `CodingHost::with_collaboration()` followed by

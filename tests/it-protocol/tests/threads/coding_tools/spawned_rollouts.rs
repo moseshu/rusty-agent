@@ -269,15 +269,7 @@ async fn multi_agent_child_delegation_requires_catalog_v2() {
         )
         .await;
 
-        let requests = fixture.agents.child_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0]
-                .tools()
-                .iter()
-                .any(|tool| tool.namespace() == Some(COLLABORATION) && tool.name() == "spawn_agent"),
-            expected,
-        );
+        assert_child_tools(&fixture, 1, expected).await;
     }
 }
 
@@ -437,13 +429,52 @@ async fn assert_child_tools(fixture: &Hooked, call: usize, expected: bool) {
     fixture.agents.wait_for_child_calls(call).await;
     let requests = fixture.agents.child_requests.lock().unwrap();
     assert_eq!(requests.len(), call);
+    let request = &requests[call - 1];
+    for name in ["spawn_agent", "wait_agent"] {
+        assert_eq!(
+            request
+                .tools()
+                .iter()
+                .any(|tool| tool.namespace() == Some(COLLABORATION) && tool.name() == name),
+            expected,
+            "child request {call}: {name}",
+        );
+    }
+    let developer_texts = request
+        .input()
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message(message)
+                if message.role() == ra_core::item::MessageRole::Developer =>
+            {
+                Some(message.text_content())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let hint = developer_texts
+        .iter()
+        .find(|text| text.starts_with("You are an agent in a team of agents"))
+        .expect("V2 children receive their role even when the model cannot delegate");
     assert_eq!(
-        requests[call - 1]
-            .tools()
-            .iter()
-            .any(|tool| tool.namespace() == Some(COLLABORATION)),
+        hint.contains("only as direct tool calls"),
         expected,
-        "child request {call}",
+        "{hint}"
+    );
+    assert_eq!(
+        hint.contains("`to=functions.collaboration.spawn_agent`"),
+        expected,
+        "{hint}",
+    );
+    assert_eq!(
+        hint.contains("When calling `wait_agent`"),
+        expected,
+        "{hint}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains("primary agent in a team"))
     );
 }
 

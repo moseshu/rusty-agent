@@ -20,7 +20,7 @@ use ra_core::{
         ContextProcessorResult, ContextSummarizer,
     },
     error::{Error, Result},
-    filter::{ContextFilter, ContextFilterRequest, ModelInputData},
+    filter::{ContextFilterRequest, ModelInputData},
     item::{Message, ModelInputItem},
     model::{
         ApiProtocol, ModelProvider, ModelRequest, ModelResolver, ModelSettings, ProviderKey,
@@ -373,7 +373,7 @@ impl ProductModelRuntime {
         self.model_info(model)?.multi_agent_version
     }
 
-    fn model_info(&self, model: &str) -> Option<ModelInfo> {
+    pub(crate) fn model_info(&self, model: &str) -> Option<ModelInfo> {
         if let Some(remote) = &self.remote {
             let models = match RunConfig::current_run_snapshot::<TurnCatalog>() {
                 Some(snapshot) if Arc::ptr_eq(&snapshot.source, remote) => snapshot.models.clone(),
@@ -866,15 +866,17 @@ fn strip_personality_section(instructions: &str) -> String {
     instructions[..section_start.unwrap_or(instructions.len())].to_owned()
 }
 
-impl ContextFilter for ProductModelRuntime {
-    fn name(&self) -> &'static str {
-        "product_model_context"
+impl ProductModelRuntime {
+    pub(crate) fn omit_role_update_plan_instructions(&self) -> bool {
+        !self.config.update_plan_enabled && self.config.model_catalog.is_none()
     }
 
-    fn filter_model_input(
+    pub(crate) fn project_model_input(
         &self,
         request: &ContextFilterRequest<'_>,
         data: ModelInputData,
+        role_hint: Option<String>,
+        subagent: bool,
     ) -> Result<ModelInputData> {
         let (mut input, instructions) = data.into_parts();
         if let Some(limit) = self.config.tool_output_token_limit {
@@ -897,7 +899,14 @@ impl ContextFilter for ProductModelRuntime {
                 }
             }
         }
-        if let Some(developer) = &self.config.developer_instructions {
+        if let Some(hint) = role_hint {
+            input.insert(0, ModelInputItem::Message(Message::developer(hint)));
+        }
+        let developer = match &self.config.multi_agent_v2.subagent_developer_instructions {
+            Some(override_text) if subagent => (!override_text.is_empty()).then_some(override_text),
+            _ => self.config.developer_instructions.as_ref(),
+        };
+        if let Some(developer) = developer {
             input.insert(0, ModelInputItem::Message(Message::developer(developer)));
         }
         if let Some(base) = self
