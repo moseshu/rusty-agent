@@ -324,7 +324,18 @@ async fn scripted_provider_advice_drives_runtime_retry_and_captures_both_attempt
     assert_eq!(result.usage().requests(), 2);
     let calls = model.calls();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], calls[1]);
+    // As the Agents SDK does, the first attempt keeps the provider's own retries and the replay
+    // the runner scheduled turns them off; otherwise the two attempts send the same request.
+    assert!(!calls[0].request().should_disable_provider_managed_retries());
+    assert!(calls[1].request().should_disable_provider_managed_retries());
+    assert_eq!(
+        calls[0]
+            .request()
+            .clone()
+            .with_provider_managed_retries_disabled(true),
+        *calls[1].request()
+    );
+    assert_eq!(calls[0].streamed(), calls[1].streamed());
     model.assert_complete().unwrap();
     registry.close().await.unwrap();
 }
