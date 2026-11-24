@@ -10,7 +10,7 @@ use ra_core::{
 };
 use ra_tools::agent_ns::CollaborationKind;
 
-use super::{MultiAgentVersion, ThreadCollaboration};
+use super::{MultiAgentVersion, ThreadCollaboration, mode};
 
 #[derive(Clone, Copy)]
 pub(super) enum Role {
@@ -51,11 +51,11 @@ impl ContextFilter for ThreadModelContext {
         let model_version = model.as_ref().and_then(|info| info.multi_agent_version);
         let role =
             role.filter(|_| thread.version_for_model(model_version) == MultiAgentVersion::V2);
-        let catalog_role = model
+        let catalog = model
             .as_ref()
             .and_then(|info| info.model_messages.as_ref())
-            .and_then(|messages| messages.multi_agent.as_ref())
-            .and_then(|messages| messages.role.as_ref());
+            .and_then(|messages| messages.multi_agent.as_ref());
+        let catalog_role = catalog.and_then(|messages| messages.role.as_ref());
         let config = thread.runtime.multi_agent_v2();
         let hint = role.and_then(|role| {
             let (configured, catalog, builtin) = match role {
@@ -94,10 +94,19 @@ impl ContextFilter for ThreadModelContext {
                 hint
             })
         });
+        let mode_hint = role.and_then(|_| {
+            mode::instructions(
+                config.multi_agent_mode_hint_text.as_deref(),
+                catalog.and_then(|messages| messages.mode.as_ref()),
+                request.effort().is_none()
+                    && thread.runtime.configured_reasoning_effort(model.as_ref())
+                        == Some(&ra_config::ReasoningEffort::Ultra),
+            )
+        });
         thread.runtime.project_model_input(
             request,
             data,
-            hint,
+            hint.into_iter().chain(mode_hint),
             matches!(role, Some(Role::Subagent)),
         )
     }

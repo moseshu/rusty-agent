@@ -1363,12 +1363,32 @@ each sampling request:
 - `subagent_developer_instructions` replaces `developer_instructions` for V2 spawned children; an
   empty value removes them, and leaving it unset keeps the parent's.
 
+The same V2 sessions receive a separate `<multi_agent_mode>` developer message. Set
+`features.multi_agent_v2.multi_agent_mode_hint_text` to override both mode branches. If unset, the
+current model's `mode.hint_text` takes precedence over its branch text and the bundled text.
+Effective Ultra reasoning selects the proactive branch. Other efforts select the explicit-request
+branch. Empty overrides suppress the message, and custom text has a 400-token limit. An explicit
+supported turn effort overrides a configured or catalog Ultra default. Set
+`model_reasoning_effort = "ultra"` in product configuration to select Ultra. The app server's
+existing experimental `multiAgentMode` fields are accepted and ignored.
+
 Providers constructed from product configuration use the Responses wire protocol. The feature
 selects the collaboration version. For Chat Completions or Anthropic through an explicit resolver,
 choose bare names by calling `CodingHost::with_collaboration()` followed by
 `CodingHost::with_collaboration_namespace(None)`, including for product-configured threads. That
 explicit host choice takes precedence over `tool_namespace`, because these adapters reject
 namespaced tool definitions.
+
+### Context filters see the request's resolved effort
+
+`ContextFilterRequest` gains `with_effort` and `effort`. The runner attaches the request's resolved
+`Effort` from its merged model settings (provider, model, agent and run layers), so a filter can
+tell an explicit effort from a product default. The value is `None` when no layer sets an effort.
+Settings a provider adapter carries outside `ModelSettings::effort`, such as product reasoning
+extensions, are not reflected. This is an addition beyond the Agents SDK, whose
+`CallModelData` carries `model_data`, `agent` and `context`. Code that constructs
+`ContextFilterRequest` itself is unaffected; `effort()` returns `None` until `with_effort` is
+called.
 
 ### Explicit Host skill discovery
 

@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Result,
     item::{ModelInputItem, estimate},
+    model::Effort,
     session::SessionId,
     state::{RunId, ToolOutputReferenceTracker},
 };
@@ -144,6 +145,7 @@ pub struct ContextFilterRequest<'a> {
     run_id: &'a RunId,
     current_turn: u64,
     model: Option<&'a str>,
+    effort: Option<Effort>,
     session_id: Option<&'a SessionId>,
     tool_output_references: &'a ToolOutputReferenceTracker,
 }
@@ -160,6 +162,7 @@ impl<'a> ContextFilterRequest<'a> {
             run_id,
             current_turn,
             model: None,
+            effort: None,
             session_id: None,
             tool_output_references,
         }
@@ -192,6 +195,19 @@ impl<'a> ContextFilterRequest<'a> {
     #[must_use]
     pub const fn model(&self) -> Option<&str> {
         self.model
+    }
+
+    /// Attaches the effort selected by the resolved model settings.
+    #[must_use]
+    pub const fn with_effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Resolved provider-neutral effort for this request, when set.
+    #[must_use]
+    pub const fn effort(&self) -> Option<Effort> {
+        self.effort
     }
 
     /// Attaches the owning session identity for projections that persist across runs.

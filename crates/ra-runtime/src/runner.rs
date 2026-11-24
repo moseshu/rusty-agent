@@ -7160,6 +7160,7 @@ fn apply_context_filters(
 
     let request = ContextFilterRequest::new(state.run_id(), turn, state.tool_output_references())
         .with_model(prepared.selector().model())
+        .with_effort(prepared.request().model_settings().effort())
         .with_session_id(session_id);
     let before_instructions = prepared.request().system_instructions().map(str::to_owned);
     let data = ModelInputData::new(

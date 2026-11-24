@@ -406,12 +406,7 @@ impl ProductModelRuntime {
         let info = info.as_ref();
         let mut settings = ModelSettings::new();
         let mut reasoning = Map::new();
-        if let Some(effort) = self
-            .config
-            .model_reasoning_effort
-            .as_ref()
-            .or_else(|| info.and_then(|info| info.default_reasoning_level.as_ref()))
-        {
+        if let Some(effort) = self.configured_reasoning_effort(info) {
             let effort = resolve_reasoning_effort(info, effort);
             reasoning.insert("effort".to_owned(), json!(effort.as_str()));
         }
@@ -465,6 +460,16 @@ impl ProductModelRuntime {
             );
         }
         settings
+    }
+
+    pub(crate) fn configured_reasoning_effort<'a>(
+        &'a self,
+        info: Option<&'a ModelInfo>,
+    ) -> Option<&'a ReasoningEffort> {
+        self.config
+            .model_reasoning_effort
+            .as_ref()
+            .or_else(|| info.and_then(|info| info.default_reasoning_level.as_ref()))
     }
 
     fn base_instructions(&self, model: Option<&str>) -> Option<String> {
@@ -875,7 +880,7 @@ impl ProductModelRuntime {
         &self,
         request: &ContextFilterRequest<'_>,
         data: ModelInputData,
-        role_hint: Option<String>,
+        multi_agent_hints: impl IntoIterator<Item = String>,
         subagent: bool,
     ) -> Result<ModelInputData> {
         let (mut input, instructions) = data.into_parts();
@@ -899,9 +904,12 @@ impl ProductModelRuntime {
                 }
             }
         }
-        if let Some(hint) = role_hint {
-            input.insert(0, ModelInputItem::Message(Message::developer(hint)));
-        }
+        input.splice(
+            ..0,
+            multi_agent_hints
+                .into_iter()
+                .map(|hint| ModelInputItem::Message(Message::developer(hint))),
+        );
         let developer = match &self.config.multi_agent_v2.subagent_developer_instructions {
             Some(override_text) if subagent => (!override_text.is_empty()).then_some(override_text),
             _ => self.config.developer_instructions.as_ref(),

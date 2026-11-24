@@ -867,18 +867,20 @@ max_concurrent_threads_per_session = 2
 async fn multi_agent_role_prompt_respects_verbatim_empty_and_non_root_sources() {
     let endpoint = responses_endpoint().await;
     let product = ProductModels::new();
-    for (source, configured, expected) in [
+    for (source, configured, expected, expect_mode) in [
         (
             ra_protocol::server::SessionSource::Mcp,
             "  Configured root role.  ",
             true,
+            true,
         ),
-        (ra_protocol::server::SessionSource::Mcp, "", false),
+        (ra_protocol::server::SessionSource::Mcp, "", false, true),
         (
             ra_protocol::server::SessionSource::SubAgent(
                 ra_protocol::server::SubAgentSource::Review,
             ),
             "  Configured root role.  ",
+            false,
             false,
         ),
     ] {
@@ -913,6 +915,7 @@ async fn multi_agent_role_prompt_respects_verbatim_empty_and_non_root_sources() 
         let body = latest_body(&endpoint).await;
         let texts = developer_texts(&body);
         assert_eq!(texts.contains(&configured), expected, "{texts:?}");
+        assert_eq!(mode_texts(&body).len(), usize::from(expect_mode));
         assert!(texts.iter().all(|text| !text.contains("<multi_agent_role>")
             && !text.contains("primary agent in a team")));
     }
@@ -1020,6 +1023,7 @@ async fn multi_agent_spawn_projects_child_role_and_developer_instructions() {
             "{child_texts:?}"
         );
         assert!(!child_texts.contains(&"Parent role."), "{child_texts:?}");
+        assert_eq!(mode_texts(&child).len(), 1);
         let actual = child_texts
             .iter()
             .copied()
@@ -1039,5 +1043,253 @@ async fn multi_agent_spawn_projects_child_role_and_developer_instructions() {
                 .any(|item| item["role"] == "user" && item["content"][0]["text"] == "Hello"),
             fork_turns == "all",
         );
+    }
+}
+
+fn mode_texts(body: &Value) -> Vec<&str> {
+    developer_texts(body)
+        .into_iter()
+        .filter_map(|text| {
+            text.strip_prefix("<multi_agent_mode>")?
+                .strip_suffix("</multi_agent_mode>")
+        })
+        .collect()
+}
+
+fn configure_mode_effort(product: &ProductModels, effort: &str) {
+    let config = std::fs::read_to_string(product.home.path().join("config.toml")).unwrap();
+    product.write(
+        "config.toml",
+        &format!("model_reasoning_effort = {effort:?}\n{config}"),
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_mode_follows_effective_effort_and_ignores_deprecated_rpc_fields() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "");
+    configure_mode_effort(&product, "ultra");
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(
+        &server,
+        &mut connection,
+        json!({
+            "multiAgentMode": "explicitRequestOnly",
+        }),
+    )
+    .await;
+    run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+    let body = latest_body(&endpoint).await;
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    let texts = mode_texts(&body);
+    assert!(
+        matches!(texts.as_slice(), [text] if text.starts_with("Proactive multi-agent delegation is active.")),
+        "{texts:?}"
+    );
+
+    server
+        .call(
+            &mut connection,
+            "thread/settings/update",
+            json!({
+                "threadId": thread, "multiAgentMode": "proactive",
+            }),
+        )
+        .await;
+    server
+        .call(
+            &mut connection,
+            "turn/start",
+            json!({
+                "threadId": thread, "input": [{"type": "text", "text": "Continue"}],
+                "effort": "low", "multiAgentMode": "proactive",
+            }),
+        )
+        .await;
+    assert_eq!(
+        connection.notification("turn/completed").await["turn"]["status"],
+        "completed",
+    );
+    let body = latest_body(&endpoint).await;
+    assert_eq!(body["reasoning"]["effort"], "low");
+    let texts = mode_texts(&body);
+    assert!(
+        matches!(texts.as_slice(), [text] if text.starts_with("Any earlier instruction enabling proactive multi-agent delegation")),
+        "{texts:?}"
+    );
+
+    let (v1, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &v1, "catalog-v1").await;
+    let body = latest_body(&endpoint).await;
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    assert!(mode_texts(&body).is_empty());
+}
+
+#[tokio::test]
+async fn multi_agent_mode_honors_catalog_and_configuration_precedence() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+
+    let mut with_branches = catalog_model("catalog-v2", Some("v2"));
+    with_branches["default_reasoning_level"] = json!("ultra");
+    with_branches["model_messages"] = json!({"multi_agent": {
+        "role": {"root": "First model role."},
+        "mode": {"explicit": "Catalog explicit.", "proactive": "Catalog proactive."}
+    }});
+    let mut with_hint = catalog_model("catalog-hint", Some("v2"));
+    with_hint["model_messages"] = json!({"multi_agent": {
+        "role": {"root": "Second model role."},
+        "mode": {"explicit": "Ignored branch.", "hint_text": "Catalog override."}
+    }});
+    let mut with_empty = catalog_model("catalog-empty", Some("v2"));
+    with_empty["model_messages"] = json!({"multi_agent": {
+        "mode": {"explicit": "Ignored branch.", "hint_text": ""}
+    }});
+
+    for configured in [None, Some(""), Some("Configured override.")] {
+        let feature = configured.map_or_else(String::new, |text| {
+            format!("[features.multi_agent_v2]\nmulti_agent_mode_hint_text = {text:?}")
+        });
+        setup_catalog(&product, &endpoint, &feature);
+        product.write(
+            "collaboration-models.json",
+            &json!({"models": [with_branches, with_hint, with_empty]}).to_string(),
+        );
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+        for (model, catalog) in [
+            ("catalog-v2", "Catalog proactive."),
+            ("catalog-hint", "Catalog override."),
+            ("catalog-empty", ""),
+        ] {
+            run_on_model(&server, &mut connection, &thread, model).await;
+            let body = latest_body(&endpoint).await;
+            let expected = configured.unwrap_or(catalog);
+            let expected = (!expected.is_empty())
+                .then_some(expected)
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(mode_texts(&body), expected, "{model}");
+            if model == "catalog-hint" {
+                let texts = developer_texts(&body);
+                assert!(
+                    texts
+                        .iter()
+                        .any(|text| text.starts_with("<multi_agent_role>Second model role."))
+                );
+                assert!(!texts.iter().any(|text| text.contains("First model role.")));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_mode_bounds_custom_text() {
+    use ra_core::sandbox::token_truncation::{TruncationPolicy, truncate_text};
+
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    let text = format!("Start {} end.", "é ".repeat(1500));
+    setup_catalog(
+        &product,
+        &endpoint,
+        &format!("[features.multi_agent_v2]\nmulti_agent_mode_hint_text = {text:?}"),
+    );
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
+    let body = latest_body(&endpoint).await;
+    let truncated = truncate_text(&text, TruncationPolicy::tokens(400));
+    assert_ne!(text, truncated);
+    assert_eq!(mode_texts(&body), [truncated.as_str()]);
+}
+
+/// A spawned child takes its mode from the effort it inherits, as Codex's child configuration
+/// carries the parent turn's effort: an Ultra default stays proactive, and a turn that selects a
+/// lower effort spawns an explicit-request child.
+#[tokio::test]
+async fn multi_agent_spawned_child_mode_follows_inherited_effort() {
+    for (turn_effort, proactive) in [(None, true), (Some("low"), false)] {
+        let endpoint = responses_endpoint().await;
+        let product = ProductModels::new();
+        setup_catalog(
+            &product,
+            &endpoint,
+            "[features.multi_agent_v2]\nenabled = true\n",
+        );
+        configure_mode_effort(&product, "ultra");
+        let server = product.server(None);
+        let mut connection = server.connect(1).await;
+        let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+        let mut response = websocket_completion(0);
+        response["response"]["output"] = json!([{
+            "id": "spawn", "type": "function_call", "call_id": "spawn-child",
+            "namespace": "collaboration", "name": "spawn_agent",
+            "arguments": json!({"task_name": "worker", "message": "Child task.", "fork_turns": "none"}).to_string()
+        }]);
+        Mock::given(method("POST"))
+            .and(path("/product/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&endpoint)
+            .await;
+        let mut params = json!({
+            "threadId": thread, "input": [{"type": "text", "text": "Delegate"}],
+            "model": "catalog-v2",
+        });
+        if let Some(effort) = turn_effort {
+            params["effort"] = json!(effort);
+        }
+        server.call(&mut connection, "turn/start", params).await;
+        assert_eq!(
+            connection.notification("turn/completed").await["turn"]["status"],
+            "completed",
+        );
+        let (parent, child) = timeout(PATIENCE, async {
+            loop {
+                let requests = endpoint.received_requests().await.unwrap();
+                let bodies = requests
+                    .iter()
+                    .map(|request| request.body_json::<Value>().unwrap())
+                    .collect::<Vec<_>>();
+                let is_child = |body: &Value| {
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["role"] == "user" && item.to_string().contains("Child task.")
+                        })
+                    })
+                };
+                if let Some(child) = bodies.iter().find(|body| is_child(body)) {
+                    let parent = bodies.iter().find(|body| !is_child(body)).unwrap().clone();
+                    break (parent, child.clone());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the child samples its task");
+
+        let expected = if proactive {
+            "Proactive multi-agent delegation is active."
+        } else {
+            "Any earlier instruction enabling proactive multi-agent delegation"
+        };
+        for (who, body) in [("parent", &parent), ("child", &child)] {
+            let texts = mode_texts(body);
+            assert!(
+                matches!(texts.as_slice(), [text] if text.starts_with(expected)),
+                "{who} {turn_effort:?}: {texts:?}"
+            );
+        }
     }
 }

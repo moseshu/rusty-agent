@@ -20,6 +20,7 @@ use ra_tools::agent_ns::{CollaborationKind, CollaborationTool, WaitAgentTimeoutO
 
 use crate::config::{MultiAgentVersion, model_runtime::ProductModelRuntime};
 
+mod mode;
 mod role;
 
 use role::{Role, ThreadModelContext};
