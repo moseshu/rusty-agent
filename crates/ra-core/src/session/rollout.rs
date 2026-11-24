@@ -242,8 +242,50 @@ pub trait RolloutThreadStore: Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Lists spawned children whose edges have not been explicitly closed.
-    async fn open_spawned_children(&self, _parent: &SessionId) -> Result<Vec<SessionId>> {
+    /// Inserts or replaces the directional parent/child edge of a spawned thread: Codex's
+    /// `AgentGraphStore::upsert_thread_spawn_edge`.
+    ///
+    /// A child has at most one persisted parent; upserting it again replaces both the parent and
+    /// the status. A store without spawn edges accepts the call and keeps nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edge cannot be persisted.
+    async fn upsert_thread_spawn_edge(
+        &self,
+        _parent: &SessionId,
+        _child: &SessionId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Updates the status of a spawned thread's incoming edge: Codex's
+    /// `AgentGraphStore::set_thread_spawn_edge_status`. A child with no edge is a successful
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the status cannot be persisted.
+    async fn set_thread_spawn_edge_status(
+        &self,
+        _child: &SessionId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Lists the direct spawned children of `parent` in a stable order, only those whose edge has
+    /// `status_filter` when it is given: Codex's `AgentGraphStore::list_thread_spawn_children`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edges cannot be read.
+    async fn list_thread_spawn_children(
+        &self,
+        _parent: &SessionId,
+        _status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> Result<Vec<SessionId>> {
         Ok(Vec::new())
     }
 
@@ -256,6 +298,17 @@ pub trait RolloutThreadStore: Send + Sync + 'static {
             "spawned thread recovery is unavailable",
         ))
     }
+}
+
+/// Lifecycle status of a directional thread-spawn edge: Codex's `ThreadSpawnEdgeStatus`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSpawnEdgeStatus {
+    /// The child thread is still live or resumable as an open spawned agent.
+    Open,
+    /// The child thread has been closed from the parent/child graph's perspective.
+    Closed,
 }
 
 /// Where a spawned agent's thread comes from: Codex's `SubAgentSource::ThreadSpawn`, with the
@@ -369,8 +422,6 @@ pub enum RolloutItem {
     ModelUsage(RolloutModelUsage),
     /// A run, or the segment of it that started last, ended.
     RunEnded(RolloutRunEnded),
-    /// Records whether this spawned thread's own edge was explicitly closed.
-    AgentClosed(bool),
     /// Explicit local trace observation; it does not contribute conversation history or usage.
     Trace(RolloutTraceRecord),
 }

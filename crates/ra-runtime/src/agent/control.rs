@@ -2758,9 +2758,6 @@ impl AgentNode {
         if self.rollout_shut_down.load(Ordering::Acquire) {
             return Ok(());
         }
-        if self.explicitly_closed.load(Ordering::Acquire) {
-            rollout.record(RolloutItem::AgentClosed(true));
-        }
         // Codex's `shutdown_live_agent` materializes and flushes the thread before shutting it
         // down, so an agent that recorded nothing still leaves its rollout behind.
         match rollout.shutdown_materialized().await {

@@ -15,10 +15,7 @@ use ra_core::{
     cancel::{CancelReason, ScopeKind},
     error::Result,
     item::{Message, ModelInputItem},
-    session::{
-        SessionId,
-        rollout::{PersistContext, RolloutItem},
-    },
+    session::{SessionId, rollout::ThreadSpawnEdgeStatus},
 };
 
 use super::{
@@ -233,6 +230,15 @@ impl AgentHandle {
         }
         let previous = node.snapshot();
         node.explicitly_closed.store(true, Ordering::Release);
+        // As Codex's `close_agent`, the edge is marked closed in the store before the shutdown,
+        // apart from the agent's own rollout, so a close already in progress cannot lose it.
+        if let Some(store) = tree.rollout_store.get()
+            && let Err(error) = store
+                .set_thread_spawn_edge_status(target, ThreadSpawnEdgeStatus::Closed)
+                .await
+        {
+            tracing::warn!(%target, %error, "failed to persist thread-spawn edge status");
+        }
         let report = tree.close_subtree(&node, true).finished().await;
         if let Some((_, error)) = report.failed().first() {
             return Err(AgentControlError::Unsupported(error.clone()));
@@ -331,7 +337,9 @@ impl Tree {
         path: &AgentPath,
     ) -> Result<Vec<SessionId>> {
         if let Some(store) = self.rollout_store.get() {
-            store.open_spawned_children(id).await
+            store
+                .list_thread_spawn_children(id, Some(ThreadSpawnEdgeStatus::Open))
+                .await
         } else {
             Ok(lock(&self.closed_history)
                 .iter()
@@ -420,16 +428,7 @@ impl Tree {
         } else {
             (None, 0)
         };
-        // Keep the reservation until the open edge is durable. A concurrent operation must
-        // not see an available agent before it can be recovered after another restart.
         guard.reopened_recorder.clone_from(&rollout);
-        if explicitly_resumed && let Some(rollout) = &rollout {
-            rollout.record(RolloutItem::AgentClosed(false));
-            rollout
-                .persist(PersistContext::Standard)
-                .await
-                .map_err(|error| AgentControlError::Unsupported(error.to_string()))?;
-        }
         if let (Some(resources), Some(rollout)) = (&resources, &rollout) {
             resources.rollout_created(rollout);
         }
@@ -458,6 +457,9 @@ impl Tree {
         match self.commit(&reservation, &node) {
             Commit::Admitted => {
                 guard.disarm();
+                if explicitly_resumed {
+                    self.persist_spawn_edge(caller, target).await;
+                }
                 Ok(node)
             }
             Commit::AdmittedClosed(error) => {
@@ -465,6 +467,25 @@ impl Tree {
                 Err(error)
             }
             Commit::Refused(error) => Err(error),
+        }
+    }
+}
+
+impl Tree {
+    /// Records `caller` as the open parent of the resumed `child`, as Codex's
+    /// `persist_thread_spawn_edge_for_source` does after a resume: a child resumed under another
+    /// agent than the one that spawned it is then restored below that agent. A failure leaves the
+    /// resumed agent running and is only logged, as in Codex.
+    async fn persist_spawn_edge(&self, caller: &AgentNode, child: &SessionId) {
+        let (Some(store), Some(parent)) = (self.rollout_store.get(), caller.session_id.get())
+        else {
+            return;
+        };
+        if let Err(error) = store
+            .upsert_thread_spawn_edge(parent, child, ThreadSpawnEdgeStatus::Open)
+            .await
+        {
+            tracing::warn!(%child, %error, "failed to persist thread-spawn edge");
         }
     }
 }

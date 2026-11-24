@@ -13,6 +13,7 @@ use ra_core::{
         SessionId,
         rollout::{
             RolloutCompacted, RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore,
+            ThreadSpawnEdgeStatus,
         },
     },
 };
@@ -25,6 +26,7 @@ use super::{
 };
 use crate::rollout::{
     RolloutPayload, RolloutRecord, RolloutSessionMeta, recorder::is_persisted_rollout_item,
+    spawn_edges::SpawnEdges,
 };
 
 /// A [`ThreadStore`] that keeps every thread's records in memory, for tests and for hosts that do
@@ -52,6 +54,7 @@ use crate::rollout::{
 pub struct InMemoryThreadStore {
     threads: Arc<Mutex<HashMap<SessionId, Vec<RolloutRecord>>>>,
     metadata: Arc<Mutex<HashMap<SessionId, ThreadMetadataPatch>>>,
+    spawn_edges: Arc<Mutex<SpawnEdges>>,
 }
 
 impl InMemoryThreadStore {
@@ -63,6 +66,12 @@ impl InMemoryThreadStore {
 
     fn threads(&self) -> MutexGuard<'_, HashMap<SessionId, Vec<RolloutRecord>>> {
         self.threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn spawn_edges(&self) -> MutexGuard<'_, SpawnEdges> {
+        self.spawn_edges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -128,8 +137,36 @@ impl RolloutThreadStore for InMemoryThreadStore {
         Ok(thread.thread_spawn().cloned())
     }
 
-    async fn open_spawned_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
-        crate::store::open_spawned_children(self, parent).await
+    async fn upsert_thread_spawn_edge(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        self.spawn_edges()
+            .insert(child.clone(), (parent.clone(), status));
+        Ok(())
+    }
+
+    async fn set_thread_spawn_edge_status(
+        &self,
+        child: &SessionId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        let edges = self.spawn_edges().clone();
+        if let Some(parent) = crate::store::thread_spawn_parent(self, &edges, child).await? {
+            self.spawn_edges().insert(child.clone(), (parent, status));
+        }
+        Ok(())
+    }
+
+    async fn list_thread_spawn_children(
+        &self,
+        parent: &SessionId,
+        status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> Result<Vec<SessionId>> {
+        let edges = self.spawn_edges().clone();
+        crate::store::list_thread_spawn_children(self, &edges, parent, status_filter).await
     }
 
     async fn reopen_spawned_thread(
@@ -269,6 +306,9 @@ impl ThreadStore for InMemoryThreadStore {
 
     async fn delete_thread(&self, params: &DeleteThreadParams) -> Result<()> {
         let existed = self.threads().remove(params.session_id()).is_some();
+        self.spawn_edges().retain(|child, (parent, _)| {
+            child != params.session_id() && parent != params.session_id()
+        });
         let had_metadata = self.metadata().remove(params.session_id()).is_some();
         if existed || had_metadata {
             Ok(())

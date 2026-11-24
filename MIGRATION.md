@@ -1310,9 +1310,11 @@ children at depth 1 have no collaboration tools under the default. The default
 agent holds its slot until it is closed. `close_agent` shuts down the selected subtree.
 `resume_agent` reopens the original session and its open descendants. The first V1 collaboration
 operation after a cold root resume restores that root's open spawned threads. A lower depth limit
-applies to new delegation and the tools offered to restored agents. In persistent sessions, a
-reopened agent becomes available after its open edge is written. With no rollout store, recovery
-uses history held by the live tree.
+applies to new delegation and the tools offered to restored agents. As in Codex, `close_agent`
+marks the target's spawn edge closed before shutting it down, and `resume_agent` records the
+caller as the reopened agent's open parent. A resume whose edge cannot be written still succeeds
+and is logged. Its edge stays closed, so a later cold resume does not restore it. With no rollout
+store, recovery uses history held by the live tree.
 
 V1 uses its native namespace unless the host explicitly chooses bare names for its adapter.
 The parent receives a model-only `<subagent_notification>` fragment for the child's first final
@@ -1346,16 +1348,18 @@ services. Other Codex role-layer consumers remain separate.
   `with_reasoning_effort_label` with corresponding accessors.
   `InterAgentCommunication::from_user_input` carries structured messages.
   `ModelSettings::without_effort` clears the run-layer effort override.
-- `RolloutThreadStore` adds `spawned_thread_lineage`, `open_spawned_children`, and
-  `reopen_spawned_thread`. These opt-in methods support V1 recovery on existing stores.
-  `RolloutItem::AgentClosed` and `RolloutPayload::AgentClosed` write a new
-  `agent_closed` record with a Boolean payload. With no marker the spawn edge is open. The
-  latest marker decides whether automatic recovery should reopen the child. The marker does
-  not contribute to conversational history or carry into a fork. Older readers see an
-  unknown record type and require a V1-aware reader to restore spawn-edge state.
+- `RolloutThreadStore` adds `spawned_thread_lineage` and `reopen_spawned_thread`, plus
+  Codex's agent graph operations `upsert_thread_spawn_edge`, `set_thread_spawn_edge_status`,
+  and `list_thread_spawn_children` with the new `ThreadSpawnEdgeStatus`. These opt-in methods
+  default to keeping no edges and support V1 recovery on existing stores.
+- `RolloutThreadDirectory` keeps each child's latest edge in `thread_spawn_edges.jsonl`
+  beside the rollouts, one appended line per change. Codex keeps these edges in its state
+  database, which is optional here. A spawned thread with no line has the open edge that its
+  session metadata records, matching Codex's backfill of edges from spawn sources. Deleting a
+  thread removes its edges. Rollout files gain no new record type.
 - `ra-runtime` adds `AgentControl::with_resident_agent_limits`. `SpawnedAgentFactory` adds
   default `owns_agent_type` and `configure_spawn` methods for host-owned declarations and
-  settings. `ra-session` adds the test-only `RolloutFaults::fail_persist_for_rollout`.
+  settings.
 - `ra-tools` adds `MULTI_AGENT_V1_NAMESPACE` and the `CollaborationKind` variants
   `SpawnAgentV1`, `SendInput`, `WaitAgentV1`, `ResumeAgent`, and `CloseAgent`. The
   `is_v1` accessor identifies these variants. `CollaborationTool` adds the
@@ -1363,9 +1367,9 @@ services. Other Codex role-layer consumers remain separate.
 
 The product protocol regressions exercise the exact V1 parameter descriptions and item shape,
 usage-hint replacement, the shared ID between spawn, wait and notification, model and effort
-validation before invoking a child, model-only effort reset, role precedence, and reopen after
-a targeted rollout persistence failure. Runtime and session regressions cover the V2 control
-path and rollout recovery.
+validation before invoking a child, model-only effort reset, role precedence, a resume whose
+edge cannot be written, and a descendant resumed under a new parent across a cold resume.
+Runtime and session regressions cover the V2 control path and rollout recovery.
 
 Children in product V2 threads, including the children of a migrated thread and a spawned thread
 resumed on its own, follow Codex's V2 rule: a child can delegate only if its current model's

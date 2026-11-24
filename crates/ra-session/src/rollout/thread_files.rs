@@ -197,6 +197,7 @@ impl ThreadFiles {
             remove_file(&sidecar_path_for(&path), session_id)?;
         }
         session_index::remove_thread_name_entries(&self.dir, session_id)?;
+        super::spawn_edges::remove_spawn_edges(&self.dir, session_id)?;
         if found {
             Ok(())
         } else {

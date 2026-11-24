@@ -8,10 +8,7 @@
 //!
 //! [`RolloutThreadDirectory`]: super::RolloutThreadDirectory
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use ra_core::{
@@ -42,7 +39,6 @@ pub enum RolloutFaultPoint {
 #[derive(Debug, Default)]
 pub struct RolloutFaults {
     failures: Mutex<Vec<(RolloutFaultPoint, usize)>>,
-    persist_failures: Mutex<Vec<PathBuf>>,
     holds: Mutex<Vec<(RolloutFaultPoint, watch::Receiver<bool>)>>,
     calls: Mutex<Vec<(RolloutFaultPoint, usize)>>,
 }
@@ -80,26 +76,6 @@ impl RolloutFaults {
             Some((_, remaining)) => *remaining += count,
             None => failures.push((point, count)),
         }
-    }
-
-    /// Fails the next persist of the writer for `path`.
-    pub fn fail_persist_for_rollout(&self, path: PathBuf) {
-        self.persist_failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(path);
-    }
-
-    fn take_persist_failure(&self, path: &Path) -> bool {
-        let mut failures = self
-            .persist_failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(index) = failures.iter().position(|armed| armed == path) {
-            failures.swap_remove(index);
-            return true;
-        }
-        false
     }
 
     /// Holds every operation at `point` until the returned handle is released or dropped.
@@ -208,16 +184,6 @@ impl RolloutRecorder for FaultyRecorder {
 
     async fn persist(&self, context: PersistContext) -> Result<()> {
         self.faults.enter(RolloutFaultPoint::Persist).await?;
-        if self
-            .inner
-            .local_path()
-            .is_some_and(|path| self.faults.take_persist_failure(&path))
-        {
-            return Err(Error::session(
-                SessionErrorKind::Io,
-                "injected Persist failure",
-            ));
-        }
         self.inner.persist(context).await
     }
 

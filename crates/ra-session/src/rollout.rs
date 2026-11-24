@@ -8,6 +8,7 @@ pub mod reader;
 pub mod reconstruction;
 pub mod recorder;
 pub(crate) mod session_index;
+pub(crate) mod spawn_edges;
 pub(crate) mod thread_files;
 pub mod threads;
 pub mod truncation;

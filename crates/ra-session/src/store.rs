@@ -67,7 +67,10 @@ use ra_core::{
     event::EventTimestamp,
     session::{
         SessionId,
-        rollout::{RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore},
+        rollout::{
+            RolloutItem, RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore,
+            ThreadSpawnEdgeStatus,
+        },
     },
 };
 
@@ -871,29 +874,52 @@ pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<Rol
     Ok(meta)
 }
 
-/// Projects the persistently open spawn edges for a store used by the local agent tree.
-pub(crate) async fn open_spawned_children(
+/// Lists `parent`'s direct spawned children from the persisted `edges`: Codex's
+/// `list_thread_spawn_children`. A spawned thread with no persisted edge has the open edge its
+/// session metadata records, as Codex backfills one from a thread's spawn source.
+pub(crate) async fn list_thread_spawn_children(
     store: &impl ThreadStore,
+    edges: &crate::rollout::spawn_edges::SpawnEdges,
     parent: &SessionId,
+    status_filter: Option<ThreadSpawnEdgeStatus>,
 ) -> Result<Vec<SessionId>> {
-    let mut open = Vec::new();
-    for id in store.list_spawn_children(parent).await? {
-        let history = store
-            .load_history(&LoadThreadHistoryParams::new(id.clone()).including_archived())
-            .await?;
-        let closed = history
-            .records()
-            .iter()
-            .rev()
-            .find(|record| record.type_name() == "agent_closed");
-        if let Some(record) = closed
-            && matches!(record.payload()?, RolloutPayload::AgentClosed(true))
-        {
-            continue;
-        }
-        open.push(id);
+    let mut children: std::collections::BTreeSet<SessionId> = edges
+        .iter()
+        .filter(|(_, (edge_parent, status))| {
+            edge_parent == parent && status_filter.is_none_or(|filter| filter == *status)
+        })
+        .map(|(child, _)| child.clone())
+        .collect();
+    if status_filter.is_none_or(|filter| filter == ThreadSpawnEdgeStatus::Open) {
+        children.extend(
+            store
+                .list_spawn_children(parent)
+                .await?
+                .into_iter()
+                .filter(|child| !edges.contains_key(child)),
+        );
     }
-    Ok(open)
+    Ok(children.into_iter().collect())
+}
+
+/// The parent of `child`'s incoming edge: its persisted edge's, else the one its session metadata
+/// records. A thread the store does not hold has none.
+pub(crate) async fn thread_spawn_parent(
+    store: &impl ThreadStore,
+    edges: &crate::rollout::spawn_edges::SpawnEdges,
+    child: &SessionId,
+) -> Result<Option<SessionId>> {
+    if let Some((parent, _)) = edges.get(child) {
+        return Ok(Some(parent.clone()));
+    }
+    match store
+        .read_thread(&ReadThreadParams::new(child.clone()).including_archived())
+        .await
+    {
+        Ok(thread) => Ok(thread.parent_session_id().cloned()),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// What a thread created with `history` writes after its session metadata: each record's payload,
@@ -905,9 +931,7 @@ pub(crate) fn initial_payloads(history: &[RolloutRecord]) -> Result<Vec<RolloutP
     for record in history {
         match record.payload()? {
             // A fork starts fresh diagnostic capture; the source's IDs and sequence stay there.
-            RolloutPayload::Checkpoint(_)
-            | RolloutPayload::Trace(_)
-            | RolloutPayload::AgentClosed(_) => {}
+            RolloutPayload::Checkpoint(_) | RolloutPayload::Trace(_) => {}
             RolloutPayload::Event(event) => {
                 let item = RolloutItem::Event(event);
                 if is_persisted_rollout_item(&item) {

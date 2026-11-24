@@ -47,7 +47,7 @@ use ra_core::{
     error::{Error, Result, SessionErrorKind},
     session::{
         SessionId,
-        rollout::{RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore},
+        rollout::{RolloutRecorder, RolloutThreadSpawn, RolloutThreadStore, ThreadSpawnEdgeStatus},
     },
 };
 
@@ -327,8 +327,36 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         Ok(thread.thread_spawn().cloned())
     }
 
-    async fn open_spawned_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
-        crate::store::open_spawned_children(self, parent).await
+    async fn upsert_thread_spawn_edge(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        super::spawn_edges::append_spawn_edge(&self.dir, parent, child, status)
+    }
+
+    async fn set_thread_spawn_edge_status(
+        &self,
+        child: &SessionId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> Result<()> {
+        let edges = super::spawn_edges::load_spawn_edges(&self.dir).await?;
+        match crate::store::thread_spawn_parent(self, &edges, child).await? {
+            Some(parent) => {
+                super::spawn_edges::append_spawn_edge(&self.dir, &parent, child, status)
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn list_thread_spawn_children(
+        &self,
+        parent: &SessionId,
+        status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> Result<Vec<SessionId>> {
+        let edges = super::spawn_edges::load_spawn_edges(&self.dir).await?;
+        crate::store::list_thread_spawn_children(self, &edges, parent, status_filter).await
     }
 
     async fn reopen_spawned_thread(

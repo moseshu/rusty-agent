@@ -1,9 +1,6 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 use super::*;
-use ra_session::{
-    rollout::{RolloutPayload, faults::RolloutFaults},
-    store::{LoadThreadHistoryParams, ReadThreadParams},
-};
+use ra_session::{rollout::RolloutPayload, store::LoadThreadHistoryParams};
 
 fn setup_catalog(product: &ProductModels, endpoint: &MockServer, features: &str) {
     product.write(
@@ -50,20 +47,13 @@ pub(crate) fn catalog_model(slug: &str, version: Option<&str>) -> Value {
 }
 
 fn server_with_disk(product: &ProductModels) -> Server {
-    server_with_disk_faults(product, None)
-}
-
-fn server_with_disk_faults(product: &ProductModels, faults: Option<Arc<RolloutFaults>>) -> Server {
     let (host, settings, builder) = product.parts();
     let builder = builder.harness_overrides(ra_coding::config::ConfigOverrides {
         bypass_hook_trust: Some(true),
         ..Default::default()
     });
-    let mut directory =
+    let directory =
         ra_session::rollout::RolloutThreadDirectory::new(product.home.path().join("rollouts"));
-    if let Some(faults) = faults {
-        directory = directory.with_faults(faults);
-    }
     build(
         Options {
             store: Some(Arc::new(directory)),
@@ -653,8 +643,7 @@ async fn multi_agent_v1_resident_limit_and_closed_thread_resume() {
         &endpoint,
         "[agents]\nmax_concurrent_threads_per_session = 1",
     );
-    let faults = RolloutFaults::new();
-    let server = server_with_disk_faults(&product, Some(Arc::clone(&faults)));
+    let server = server_with_disk(&product);
     let mut connection = server.connect(1).await;
     let (thread, _) = start(&server, &mut connection, json!({})).await;
 
@@ -770,36 +759,16 @@ async fn multi_agent_v1_resident_limit_and_closed_thread_resume() {
         )
         .await;
 
-    let child_rollout = server
-        .store
-        .read_thread(&ReadThreadParams::new(SessionId::new(child)))
-        .await
-        .unwrap();
-    faults.fail_persist_for_rollout(child_rollout.rollout_path().unwrap().to_owned());
-    let failure = v1_call(
-        &endpoint,
-        &server,
-        &mut connection,
-        &thread,
-        "resume_agent",
-        json!({"id": child}),
-    )
-    .await;
-    assert!(failure.contains("injected Persist failure"), "{failure}");
-    let unavailable = v1_call(
-        &endpoint,
-        &server,
-        &mut connection,
-        &thread,
-        "wait_agent",
-        json!({"targets": [child]}),
-    )
-    .await;
-    assert_eq!(
-        serde_json::from_str::<Value>(&unavailable).unwrap(),
-        json!({"status": {(child): "not_found"}, "timed_out": false})
-    );
-
+    // As in Codex, a resume whose spawn edge cannot be written still succeeds. The edge stays
+    // closed, so a later cold resume does not bring the agent back.
+    let edges = product
+        .home
+        .path()
+        .join("rollouts")
+        .join("thread_spawn_edges.jsonl");
+    let kept = edges.with_extension("jsonl.kept");
+    std::fs::rename(&edges, &kept).unwrap();
+    std::fs::create_dir(&edges).unwrap();
     let resumed = v1_call(
         &endpoint,
         &server,
@@ -809,6 +778,8 @@ async fn multi_agent_v1_resident_limit_and_closed_thread_resume() {
         json!({"id": child}),
     )
     .await;
+    std::fs::remove_dir(&edges).unwrap();
+    std::fs::rename(&kept, &edges).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&resumed)
             .unwrap_or_else(|error| panic!("{error}: {resumed}")),
@@ -851,6 +822,28 @@ async fn multi_agent_v1_resident_limit_and_closed_thread_resume() {
             text.contains(&"V1 original task") && text.contains(&"V1 next task")
         }),
         "resumed agent kept its history"
+    );
+
+    unload(&server, &mut connection, &thread).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread}),
+        )
+        .await;
+    let unrestored = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&unrestored).unwrap(),
+        json!({"status": {(child): "not_found"}, "timed_out": false})
     );
 }
 
@@ -1180,6 +1173,124 @@ async fn multi_agent_v1_close_and_resume_restores_only_open_descendants() {
             .await;
         }
     }
+}
+
+/// Resuming a descendant by ID moves its spawn edge under the caller, as Codex's resume upserts
+/// the edge from the caller's spawn source, so a cold resume restores it below the caller even
+/// though the agent that spawned it stays closed.
+#[tokio::test]
+async fn multi_agent_v1_resumed_descendant_is_restored_under_its_new_parent() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "[agents]\nmax_depth = 2");
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+    let mut response = websocket_completion(0);
+    response["response"]["output"] = json!([{
+        "id": "adopted", "type": "function_call", "call_id": "adopted",
+        "namespace": "multi_agent_v1", "name": "spawn_agent",
+        "arguments": json!({"message": "V1 adopted leaf"}).to_string(),
+    }]);
+    Mock::given(method("POST"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body["input"].as_array().unwrap().iter().any(|item| {
+                item["role"] == "user" && item["content"][0]["text"] == "V1 adopting branch"
+            })
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+        )
+        .with_priority(2)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let (endpoint, server, thread) = (&endpoint, &server, thread.as_str());
+    let call = |tool: &'static str, args: Value| (tool, args);
+    let mut run = async |(tool, args): (&str, Value)| {
+        v1_call(endpoint, server, &mut connection, thread, tool, args).await
+    };
+    let branch = run(call(
+        "spawn_agent",
+        json!({"message": "V1 adopting branch"}),
+    ))
+    .await;
+    let branch: Value = serde_json::from_str(&branch).unwrap();
+    let branch = branch["agent_id"].as_str().unwrap().to_owned();
+    run(call("wait_agent", json!({"targets": [branch]}))).await;
+    let leaf: Value = endpoint
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|request| {
+            let body: Value = request.body_json().ok()?;
+            let output = body["input"].as_array()?.iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "adopted"
+            })?;
+            serde_json::from_str(output["output"][0]["text"].as_str()?).ok()
+        })
+        .expect("the branch spawns a leaf within the configured depth");
+    let leaf = leaf["agent_id"].as_str().unwrap().to_owned();
+
+    // Closing the branch also stops the leaf, whose own edge stays open below the branch.
+    let closed = run(call("close_agent", json!({"target": branch}))).await;
+    assert!(
+        serde_json::from_str::<Value>(&closed)
+            .unwrap()
+            .get("previous_status")
+            .is_some(),
+        "{closed}"
+    );
+    let resumed = run(call("resume_agent", json!({"id": leaf}))).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&resumed).unwrap()["status"],
+        "pending_init",
+        "{resumed}"
+    );
+    drop(run);
+
+    unload(server, &mut connection, thread).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread}),
+        )
+        .await;
+    let sent = v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "send_input",
+        json!({"target": leaf, "message": "Reach the adopted leaf"}),
+    )
+    .await;
+    assert!(
+        serde_json::from_str::<Value>(&sent)
+            .ok()
+            .is_some_and(|sent| sent["submission_id"].is_string()),
+        "the leaf is restored below the root: {sent}"
+    );
+    let branch_status = v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "wait_agent",
+        json!({"targets": [branch]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&branch_status).unwrap(),
+        json!({"status": {(branch): "not_found"}, "timed_out": false})
+    );
 }
 
 #[tokio::test]

@@ -32,8 +32,8 @@
 //! applies. Those are its product's; a host here reads the last turn context and the usage totals
 //! from the records if it wants them.
 //!
-//! The store reconstructs a single conversation. The product's V1 agent tree restores its open
-//! descendants using spawn lineage and close markers stored in their own rollouts.
+//! The store reconstructs a single conversation. The agents a thread spawned are restored by the
+//! agent tree, which lists the open spawn edges below the thread and reopens each child.
 
 use std::sync::Arc;
 
