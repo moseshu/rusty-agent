@@ -1,6 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Resolve a product model against its catalog and build the selected Responses provider.
 
+mod v1_spawn;
+
 use std::{
     sync::{Arc, LazyLock, OnceLock, Weak},
     time::Duration,
@@ -341,6 +343,15 @@ impl ProductModelRuntime {
         &self.config.multi_agent_v2
     }
 
+    pub(crate) fn v1_agent_limits(&self) -> (usize, i32) {
+        (
+            self.config
+                .effective_agent_max_threads(super::MultiAgentVersion::V1)
+                .unwrap_or(usize::MAX),
+            self.config.agent_max_depth,
+        )
+    }
+
     pub(crate) fn multi_agent_version_override(&self) -> Option<super::MultiAgentVersion> {
         if self.config.features.enabled(Feature::MultiAgentV2) {
             Some(super::MultiAgentVersion::V2)
@@ -403,10 +414,19 @@ impl ProductModelRuntime {
 
     fn product_settings(&self, model: &str, provider: &ProviderKey) -> ModelSettings {
         let info = self.model_info(model);
-        let info = info.as_ref();
+        let effort = self.configured_reasoning_effort(info.as_ref());
+        self.product_settings_with_effort(info.as_ref(), provider, effort)
+    }
+
+    fn product_settings_with_effort(
+        &self,
+        info: Option<&ModelInfo>,
+        provider: &ProviderKey,
+        effort: Option<&ReasoningEffort>,
+    ) -> ModelSettings {
         let mut settings = ModelSettings::new();
         let mut reasoning = Map::new();
-        if let Some(effort) = self.configured_reasoning_effort(info) {
+        if let Some(effort) = effort {
             let effort = resolve_reasoning_effort(info, effort);
             reasoning.insert("effort".to_owned(), json!(effort.as_str()));
         }

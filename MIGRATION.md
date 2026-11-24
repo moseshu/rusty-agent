@@ -1294,13 +1294,78 @@ Rusty's existing control, impose no depth limit; this change does not add a new 
 
 New product threads select their collaboration version when the first model request is ready
 to send. Models outside the catalog or without a declared version fall back to `[features].multi_agent`,
-which is enabled by default and selects V1. V1 is stored as `v1`. Its tools are pending, so these
-new threads have no collaboration tools. Existing threads with a sampling context or model output
-and no recorded version initially use the former host configuration, then record `v2` or
+which is enabled by default and selects V1. Threads recorded as `v1` use the `multi_agent_v1`
+namespace with `spawn_agent`, `send_input`, `wait_agent`, `resume_agent`, and `close_agent`.
+Existing threads with a sampling context or model output and no recorded version initially use
+the former host configuration, then record `v2` or
 `disabled`. Resume and fork recover the recorded version, including a fork before the first
 turn. This migration covers the resumed thread's own tools only. A recorded value this release
 does not recognize is kept as recorded, including in a fork. The thread is offered no
 collaboration tools unless `[features].multi_agent_v2` overrides it.
+
+V1 uses session IDs for targeting and waits for the final status of any requested agent. The
+default `[agents].max_depth` is 1. The next spawn depth controls the entire V1 tool table, so
+children at depth 1 have no collaboration tools under the default. The default
+`[agents].max_concurrent_threads_per_session` admits six resident spawned agents. A completed
+agent holds its slot until it is closed. `close_agent` shuts down the selected subtree.
+`resume_agent` reopens the original session and its open descendants. The first V1 collaboration
+operation after a cold root resume restores that root's open spawned threads. A lower depth limit
+applies to new delegation and the tools offered to restored agents. In persistent sessions, a
+reopened agent becomes available after its open edge is written. With no rollout store, recovery
+uses history held by the live tree.
+
+V1 uses its native namespace unless the host explicitly chooses bare names for its adapter.
+The parent receives a model-only `<subagent_notification>` fragment for the child's first final
+status after spawn or reopen. Its `agent_path` field carries the same session ID that
+`spawn_agent` returned. Delivery adds context without starting another turn.
+
+The V1 tool schemas follow the Codex parameter structure and descriptions. The flat `items`
+schema represents all seven input types. This runtime accepts text, URL images, skill selections,
+and mentions. It refuses `local_image`, `audio`, and `local_audio` at execution. Workspace images
+can be opened with `view_image` and shared via a full-history fork.
+
+The spawn description lists up to five picker-visible models in catalog priority order and
+describes inherited-model behavior. A configured `[features.multi_agent_v2].usage_hint_text`
+replaces the built-in V1 delegation rules. With configured roles, the schema includes
+`agent_type` and shows the configured roles followed by the remaining built-in roles.
+
+The coding product checks requested or configured default models and reasoning efforts against
+its catalog before creating a child. A model-only override resets reasoning to that model's
+default, including a default with no effort. Model and effort settings from a role file take
+precedence when starting a fresh child. A role whose model is not in the catalog skips the
+reasoning effort check, as Codex does for fallback model metadata. Registered SDK declarations can also supply role model
+settings. Full-history forks inherit the caller's role. This port applies the role's model and
+reasoning fields through the existing coding model resolver and inherits the parent's runtime
+services. Other Codex role-layer consumers remain separate.
+
+#### V1 collaboration API and rollout format
+
+- `ra-core` adds `AgentControlPort::{send_input, wait_for_agents, close_agent, resume_agent}`
+  with default unavailable responses for existing implementations. `SpawnAgentRequest` adds
+  `with_input`, `with_model`, `with_reasoning_effort`, `with_invoking_model`, and
+  `with_reasoning_effort_label` with corresponding accessors.
+  `InterAgentCommunication::from_user_input` carries structured messages.
+  `ModelSettings::without_effort` clears the run-layer effort override.
+- `RolloutThreadStore` adds `spawned_thread_lineage`, `open_spawned_children`, and
+  `reopen_spawned_thread`. These opt-in methods support V1 recovery on existing stores.
+  `RolloutItem::AgentClosed` and `RolloutPayload::AgentClosed` write a new
+  `agent_closed` record with a Boolean payload. With no marker the spawn edge is open. The
+  latest marker decides whether automatic recovery should reopen the child. The marker does
+  not contribute to conversational history or carry into a fork. Older readers see an
+  unknown record type and require a V1-aware reader to restore spawn-edge state.
+- `ra-runtime` adds `AgentControl::with_resident_agent_limits`. `SpawnedAgentFactory` adds
+  default `owns_agent_type` and `configure_spawn` methods for host-owned declarations and
+  settings. `ra-session` adds the test-only `RolloutFaults::fail_persist_for_rollout`.
+- `ra-tools` adds `MULTI_AGENT_V1_NAMESPACE` and the `CollaborationKind` variants
+  `SpawnAgentV1`, `SendInput`, `WaitAgentV1`, `ResumeAgent`, and `CloseAgent`. The
+  `is_v1` accessor identifies these variants. `CollaborationTool` adds the
+  `with_spawn_defaults` and `with_v1_spawn_description` builders.
+
+The product protocol regressions exercise the exact V1 parameter descriptions and item shape,
+usage-hint replacement, the shared ID between spawn, wait and notification, model and effort
+validation before invoking a child, model-only effort reset, role precedence, and reopen after
+a targeted rollout persistence failure. Runtime and session regressions cover the V2 control
+path and rollout recovery.
 
 Children in product V2 threads, including the children of a migrated thread and a spawned thread
 resumed on its own, follow Codex's V2 rule: a child can delegate only if its current model's
@@ -1309,8 +1374,8 @@ affects product-configured threads. A child whose model declares V2 can gain col
 even if the host never opted spawned agents in, and a child whose model does not declare V2 loses
 them even if the host did.
 
-Product-configured thread factories now offer the six collaboration tools to eligible V2 threads
-on the default `Core` tier, including when the host omitted `CodingHost::with_collaboration()`.
+Product-configured thread factories offer the selected version's collaboration tools to eligible
+threads on the default `Core` tier, including when the host omitted `CodingHost::with_collaboration()`.
 Product version selection controls availability. For these threads, `with_collaboration()`
 establishes a host namespace choice and contributes to migration of old threads with no recorded
 version. Direct assembly and thread factories without product configuration still use the host

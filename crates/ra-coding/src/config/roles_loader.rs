@@ -222,7 +222,7 @@ async fn agent_role_config_from_toml(
     })
 }
 
-async fn read_resolved_agent_role_file(
+pub(super) async fn read_resolved_agent_role_file(
     fs: &dyn ExecutorFileSystem,
     path: &AbsolutePathBuf,
     role_name_hint: Option<&str>,

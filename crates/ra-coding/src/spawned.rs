@@ -4,9 +4,9 @@
 //! process manager and plans its own tools for a sub-agent session source. The tree's factory here
 //! does the same with the coding product's assembly — the spawned agent is assembled from the same
 //! host for the same role and tier, with a process manager of its own. In product-configured
-//! threads a child is offered collaboration when the inherited version is V2 and its current model's
-//! catalog entry declares V2, as Codex plans a V2 sub-agent's tools; this includes the children of a
-//! thread migrated from the former host assembly. Hosts without product configuration enable child
+//! threads a V1 child can delegate within the configured spawn depth. A V2 child can delegate when
+//! its current model's catalog entry declares V2, including after migration from the former host
+//! assembly. Hosts without product configuration enable child
 //! collaboration with [`CodingHost::with_spawned_agent_collaboration`]. Closing the child or tree
 //! stops its background terminals, as in Codex.
 //! A planner child returns its plan and unresolved questions to the parent; its prompt does not
@@ -32,8 +32,13 @@ use std::{
 
 use async_trait::async_trait;
 use ra_core::{
-    agent::AgentId, error::Result, hook::SessionStartSource, prompt::PromptRole,
-    session::SessionId, session::rollout::RolloutRecorder, state::RunId,
+    agent::{AgentId, AgentSpec, control::SpawnAgentRequest},
+    error::Result,
+    hook::SessionStartSource,
+    prompt::PromptRole,
+    session::SessionId,
+    session::rollout::RolloutRecorder,
+    state::RunId,
 };
 use ra_exec::session::ProcessManager;
 use ra_runtime::{
@@ -71,7 +76,10 @@ pub(crate) fn agent_control(
     let control = host
         .product_collaboration()
         .map_or_else(AgentControl::new, |product| {
+            let (max_threads, max_depth) = product.v1_limits();
+            let product = Arc::clone(product);
             AgentControl::with_max_concurrent_threads(product.max_spawned_threads())
+                .with_resident_agent_limits(max_threads, max_depth, move || product.is_v1())
         });
     control.with_spawned_agent_factory(Arc::new(CodingSpawnedAgents {
         host: host.clone(),
@@ -177,8 +185,36 @@ impl CodingSpawnedAgents {
 
 #[async_trait]
 impl SpawnedAgentFactory for CodingSpawnedAgents {
+    fn owns_agent_type(&self, agent_type: &AgentId) -> bool {
+        self.host.product_collaboration().is_some_and(|thread| {
+            thread.is_v1() && thread.runtime().owns_v1_agent_type(agent_type.as_str())
+        })
+    }
+
+    async fn configure_spawn(
+        &self,
+        request: &SpawnAgentRequest,
+        agent: &AgentSpec,
+        parent: &RunConfig,
+    ) -> Result<Option<RunConfig>> {
+        if let Some(thread) = self
+            .host
+            .product_collaboration()
+            .filter(|thread| thread.is_v1())
+        {
+            return thread
+                .runtime()
+                .configure_v1_spawn(request, agent, parent)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     async fn prepare(&self, request: SpawnedAgentRequest<'_>) -> Result<PreparedSpawnedAgent> {
-        let (prepared, processes) = if request.agent_type().is_some()
+        let (prepared, processes) = if request
+            .agent_type()
+            .is_some_and(|kind| !self.owns_agent_type(kind))
             || request.agent().id() != &self.id
         {
             (

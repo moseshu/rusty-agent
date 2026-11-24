@@ -233,6 +233,29 @@ pub trait RolloutThreadStore: Send + Sync + 'static {
         session_id: &SessionId,
         spawn: &RolloutThreadSpawn,
     ) -> Result<Arc<dyn RolloutRecorder>>;
+
+    /// Loads a previously spawned thread's lineage.
+    async fn spawned_thread_lineage(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<RolloutThreadSpawn>> {
+        Ok(None)
+    }
+
+    /// Lists spawned children whose edges have not been explicitly closed.
+    async fn open_spawned_children(&self, _parent: &SessionId) -> Result<Vec<SessionId>> {
+        Ok(Vec::new())
+    }
+
+    /// Reopens a spawned thread and reconstructs its model-visible history.
+    async fn reopen_spawned_thread(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(Arc<dyn RolloutRecorder>, Vec<ModelInputItem>)> {
+        Err(crate::error::Error::config(
+            "spawned thread recovery is unavailable",
+        ))
+    }
 }
 
 /// Where a spawned agent's thread comes from: Codex's `SubAgentSource::ThreadSpawn`, with the
@@ -346,6 +369,8 @@ pub enum RolloutItem {
     ModelUsage(RolloutModelUsage),
     /// A run, or the segment of it that started last, ended.
     RunEnded(RolloutRunEnded),
+    /// Records whether this spawned thread's own edge was explicitly closed.
+    AgentClosed(bool),
     /// Explicit local trace observation; it does not contribute conversation history or usage.
     Trace(RolloutTraceRecord),
 }

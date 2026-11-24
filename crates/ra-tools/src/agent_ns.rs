@@ -33,7 +33,11 @@
 //! - In a tree given a depth limit, an agent at the limit is not offered the tools, as Codex's first
 //!   multi-agent version hides them; the version these tools port has no depth limit.
 
+mod v1;
+
 use std::{fmt, time::Duration};
+
+pub use v1::MULTI_AGENT_V1_NAMESPACE;
 
 use async_trait::async_trait;
 use ra_core::{
@@ -169,6 +173,16 @@ pub enum CollaborationKind {
     WaitAgent,
     /// `list_agents`.
     ListAgents,
+    /// V1 `spawn_agent`.
+    SpawnAgentV1,
+    /// V1 `send_input`.
+    SendInput,
+    /// V1 `wait_agent`.
+    WaitAgentV1,
+    /// V1 `resume_agent`.
+    ResumeAgent,
+    /// V1 `close_agent`.
+    CloseAgent,
 }
 
 impl CollaborationKind {
@@ -176,13 +190,28 @@ impl CollaborationKind {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::SpawnAgent => "spawn_agent",
+            Self::SpawnAgent | Self::SpawnAgentV1 => "spawn_agent",
             Self::SendMessage => "send_message",
             Self::FollowupTask => "followup_task",
             Self::InterruptAgent => "interrupt_agent",
-            Self::WaitAgent => "wait_agent",
+            Self::WaitAgent | Self::WaitAgentV1 => "wait_agent",
             Self::ListAgents => "list_agents",
+            Self::SendInput => "send_input",
+            Self::ResumeAgent => "resume_agent",
+            Self::CloseAgent => "close_agent",
         }
+    }
+    /// Whether this entry implements the V1 tool contract.
+    #[must_use]
+    pub const fn is_v1(self) -> bool {
+        matches!(
+            self,
+            Self::SpawnAgentV1
+                | Self::SendInput
+                | Self::WaitAgentV1
+                | Self::ResumeAgent
+                | Self::CloseAgent
+        )
     }
 }
 
@@ -309,6 +338,8 @@ pub struct CollaborationTool {
     schema: ToolSchema,
     options: ToolOptions,
     wait: WaitAgentTimeoutOptions,
+    default_spawn_model: Option<String>,
+    default_spawn_effort: Option<ra_core::model::Effort>,
 }
 
 impl CollaborationTool {
@@ -344,8 +375,11 @@ impl CollaborationTool {
                 FuncSchema::for_input::<ListAgentsInput>(name)?,
                 LIST_AGENTS_DESCRIPTION.to_owned(),
             ),
+            _ => v1::schema(kind)?,
         };
-        let schema = if kind == CollaborationKind::WaitAgent {
+        let schema = if kind.is_v1() {
+            ToolSchema::loose(name, v1::parameters(kind, None))?.with_description(description)
+        } else if kind == CollaborationKind::WaitAgent {
             // Preserve Codex's native schema and configurable field description while retaining
             // the existing typed decoder for execution.
             ToolSchema::loose(
@@ -369,12 +403,12 @@ impl CollaborationTool {
         // Observing the tree changes nothing; starting or steering an agent sets work in motion
         // that can run any of that agent's tools.
         let action_class = match kind {
-            CollaborationKind::WaitAgent | CollaborationKind::ListAgents => {
-                crate::action_classes::READ
-            }
+            CollaborationKind::WaitAgent
+            | CollaborationKind::WaitAgentV1
+            | CollaborationKind::ListAgents => crate::action_classes::READ,
             _ => crate::action_classes::EXECUTE,
         };
-        Ok(Self {
+        let tool = Self {
             kind,
             origin: ToolOrigin::new(name)?,
             func_schema,
@@ -385,7 +419,14 @@ impl CollaborationTool {
                 .with_failure_handling(ToolFailureHandling::Custom)
                 .with_action_classes([action_class]),
             wait,
-        })
+            default_spawn_model: None,
+            default_spawn_effort: None,
+        };
+        tool.with_v1_spawn_description(
+            "No picker-visible model overrides are currently loaded.",
+            None,
+            None,
+        )
     }
 
     /// Advertises the tool in `namespace`, as Codex's configuration wraps each collaboration
@@ -401,6 +442,18 @@ impl CollaborationTool {
             .schema
             .with_namespace_description(COLLABORATION_NAMESPACE_DESCRIPTION);
         Ok(self)
+    }
+
+    /// Supplies product defaults for a fresh V1 spawn.
+    #[must_use]
+    pub fn with_spawn_defaults(
+        mut self,
+        model: Option<String>,
+        effort: Option<ra_core::model::Effort>,
+    ) -> Self {
+        self.default_spawn_model = model;
+        self.default_spawn_effort = effort;
+        self
     }
 
     /// Which tool this is.
@@ -547,6 +600,7 @@ impl CollaborationTool {
                     agents: agents.into_iter().map(ListedAgent::from).collect(),
                 })
             }
+            _ => self.run_v1(context, port).await,
         }
     }
 }
@@ -563,11 +617,20 @@ fn record_activity(
     agent: &AgentPath,
     activity: SubAgentActivityKind,
 ) {
+    record_activity_for_session(context, agent, port.agent_session_id(agent), activity);
+}
+
+fn record_activity_for_session(
+    context: &ToolContext<'_>,
+    agent: &AgentPath,
+    session_id: Option<ra_core::session::SessionId>,
+    activity: SubAgentActivityKind,
+) {
     let Some(emitter) = context.event_emitter() else {
         return;
     };
     let mut event = SubAgentActivityEvent::new(context.call_id().as_str(), agent.clone(), activity);
-    if let Some(session_id) = port.agent_session_id(agent) {
+    if let Some(session_id) = session_id {
         event = event.with_agent_session_id(session_id);
     }
     if let Err(error) = emitter.emit_agent(AgentEvent::SubAgentActivity(event)) {

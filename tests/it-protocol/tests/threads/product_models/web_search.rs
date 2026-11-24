@@ -304,7 +304,9 @@ async fn product_web_search_checks_native_image_declarations_against_the_schema_
     configure(
         &product,
         &endpoint,
-        &format!("[tools.web_search]\nallowed_domains = [{domain:?}]"),
+        &format!(
+            "[features]\nmulti_agent_v2 = true\n[tools.web_search]\nallowed_domains = [{domain:?}]"
+        ),
         "",
     );
     let (server, _services) = product.standard_server();

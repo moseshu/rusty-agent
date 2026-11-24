@@ -871,6 +871,31 @@ pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<Rol
     Ok(meta)
 }
 
+/// Projects the persistently open spawn edges for a store used by the local agent tree.
+pub(crate) async fn open_spawned_children(
+    store: &impl ThreadStore,
+    parent: &SessionId,
+) -> Result<Vec<SessionId>> {
+    let mut open = Vec::new();
+    for id in store.list_spawn_children(parent).await? {
+        let history = store
+            .load_history(&LoadThreadHistoryParams::new(id.clone()).including_archived())
+            .await?;
+        let closed = history
+            .records()
+            .iter()
+            .rev()
+            .find(|record| record.type_name() == "agent_closed");
+        if let Some(record) = closed
+            && matches!(record.payload()?, RolloutPayload::AgentClosed(true))
+        {
+            continue;
+        }
+        open.push(id);
+    }
+    Ok(open)
+}
+
 /// What a thread created with `history` writes after its session metadata: each record's payload,
 /// in order, without another file's checkpoints or diagnostic traces and without host events the
 /// persistence policy drops, as Codex's `append_items` applies its policy. Diagnostics stay with
@@ -880,7 +905,9 @@ pub(crate) fn initial_payloads(history: &[RolloutRecord]) -> Result<Vec<RolloutP
     for record in history {
         match record.payload()? {
             // A fork starts fresh diagnostic capture; the source's IDs and sequence stay there.
-            RolloutPayload::Checkpoint(_) | RolloutPayload::Trace(_) => {}
+            RolloutPayload::Checkpoint(_)
+            | RolloutPayload::Trace(_)
+            | RolloutPayload::AgentClosed(_) => {}
             RolloutPayload::Event(event) => {
                 let item = RolloutItem::Event(event);
                 if is_persisted_rollout_item(&item) {

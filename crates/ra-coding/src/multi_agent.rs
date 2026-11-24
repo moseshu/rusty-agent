@@ -2,7 +2,10 @@
 //! The coding product's per-thread collaboration version, per-model delegation gate, and the
 //! collaboration tool table that `[features.multi_agent_v2]` configures.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
 use ra_core::{
@@ -11,12 +14,14 @@ use ra_core::{
     session::SessionId,
     tool::{
         DecodedToolInput, FuncSchema, Tool, ToolContext, ToolNamespace, ToolOptions, ToolOrigin,
-        ToolOutput, ToolSchema, ToolServices,
+        ToolOutput, ToolResolver, ToolSchema, ToolServices,
     },
 };
 use ra_protocol::server::{SessionSource, SubAgentSource, ThreadFactoryRequest};
 use ra_runtime::runner::RunConfig;
-use ra_tools::agent_ns::{CollaborationKind, CollaborationTool, WaitAgentTimeoutOptions};
+use ra_tools::agent_ns::{
+    CollaborationKind, CollaborationTool, MULTI_AGENT_V1_NAMESPACE, WaitAgentTimeoutOptions,
+};
 
 use crate::config::{MultiAgentVersion, model_runtime::ProductModelRuntime};
 
@@ -34,6 +39,14 @@ pub(crate) const COLLABORATION_KINDS: [CollaborationKind; 6] = [
     CollaborationKind::ListAgents,
 ];
 
+const COLLABORATION_V1_KINDS: [CollaborationKind; 5] = [
+    CollaborationKind::SpawnAgentV1,
+    CollaborationKind::SendInput,
+    CollaborationKind::WaitAgentV1,
+    CollaborationKind::ResumeAgent,
+    CollaborationKind::CloseAgent,
+];
+
 pub(crate) struct ThreadCollaboration {
     runtime: Arc<ProductModelRuntime>,
     version: OnceLock<MultiAgentVersion>,
@@ -41,6 +54,7 @@ pub(crate) struct ThreadCollaboration {
     /// by a migrated value, and the thread is offered no collaboration tools.
     unrecognized: Option<String>,
     spawned: bool,
+    spawn_depth: i32,
     session_id: SessionId,
     role: Option<Role>,
     tools: ToolTable,
@@ -130,6 +144,12 @@ impl ThreadCollaboration {
                 }),
                 _ => None,
             },
+            spawn_depth: match request.session_source() {
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => *depth,
+                _ => request
+                    .thread_spawn()
+                    .map_or(0, |spawn| i32::try_from(spawn.depth()).unwrap_or(i32::MAX)),
+            },
             spawned: request.thread_spawn().is_some()
                 || matches!(
                     request.session_source(),
@@ -148,13 +168,62 @@ impl ThreadCollaboration {
             .or_else(|| self.version.get().copied().map(version_name))
     }
 
-    /// Whether an agent assembled for this thread keeps the tools for per-turn checks.
+    /// Whether the static inventory reserves entries for V2 per-turn selection.
     pub(crate) fn can_offer_tools(&self) -> bool {
-        self.tools.native_tools
+        self.can_register_version(MultiAgentVersion::V2)
+    }
+
+    fn can_register_version(&self, version: MultiAgentVersion) -> bool {
+        (version != MultiAgentVersion::V2 || self.tools.native_tools)
             && self
                 .version
                 .get()
-                .is_none_or(|version| *version == MultiAgentVersion::V2)
+                .is_none_or(|selected| *selected == version)
+    }
+
+    pub(crate) fn is_v1(&self) -> bool {
+        self.version.get() == Some(&MultiAgentVersion::V1)
+    }
+
+    pub(crate) fn v1_tools(
+        self: &Arc<Self>,
+        spawned: bool,
+        namespaced: bool,
+    ) -> Result<Vec<Arc<dyn Tool>>> {
+        if !self.can_register_version(MultiAgentVersion::V1) {
+            return Ok(Vec::new());
+        }
+        let namespace = namespaced
+            .then(|| ToolNamespace::new(MULTI_AGENT_V1_NAMESPACE))
+            .transpose()?;
+        COLLABORATION_V1_KINDS
+            .into_iter()
+            .map(|kind| {
+                let tool = CollaborationTool::new(kind, WaitAgentTimeoutOptions::new())?;
+                let tool = match &namespace {
+                    Some(namespace) => tool.in_namespace(namespace.clone())?,
+                    None => tool,
+                };
+                let tool = if kind == CollaborationKind::SpawnAgentV1 {
+                    tool.with_v1_spawn_description(
+                        &self.runtime.v1_spawn_models_description(),
+                        self.runtime.v1_spawn_roles_description().as_deref(),
+                        self.tools.usage_hint.clone(),
+                    )?
+                } else {
+                    tool
+                };
+                Ok(self.tool(tool, spawned))
+            })
+            .collect()
+    }
+
+    pub(crate) fn runtime(&self) -> &ProductModelRuntime {
+        &self.runtime
+    }
+
+    pub(crate) fn v1_limits(&self) -> (usize, i32) {
+        self.runtime.v1_agent_limits()
     }
 
     /// The configured namespace, before any explicit host choice.
@@ -168,14 +237,15 @@ impl ThreadCollaboration {
     }
 
     /// Whether the configured tool table offers `kind`.
-    pub(crate) const fn offers(&self, kind: CollaborationKind) -> bool {
-        match kind {
-            CollaborationKind::SendMessage | CollaborationKind::FollowupTask => {
-                self.tools.direct_message
+    pub(crate) fn offers(&self, kind: CollaborationKind) -> bool {
+        self.can_register_version(MultiAgentVersion::V2)
+            && match kind {
+                CollaborationKind::SendMessage | CollaborationKind::FollowupTask => {
+                    self.tools.direct_message
+                }
+                CollaborationKind::WaitAgent => self.tools.wait_agent,
+                _ => true,
             }
-            CollaborationKind::WaitAgent => self.tools.wait_agent,
-            _ => true,
-        }
     }
 
     /// How many spawned agents the thread's tree runs at once.
@@ -272,6 +342,43 @@ const fn version_name(version: MultiAgentVersion) -> &'static str {
     }
 }
 
+pub(crate) struct LegacyCollaborationResolver {
+    pub(crate) tools: Vec<Arc<dyn Tool>>,
+    pub(crate) external: Option<Arc<dyn ToolResolver>>,
+}
+
+#[async_trait]
+impl ToolResolver for LegacyCollaborationResolver {
+    fn requires_reserved_tool_names(&self) -> bool {
+        self.external
+            .as_ref()
+            .is_some_and(|resolver| resolver.requires_reserved_tool_names())
+    }
+
+    async fn get_tools(
+        &self,
+        context: &RunContext,
+        reserved: &BTreeSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>> {
+        let mut tools = Vec::new();
+        for tool in &self.tools {
+            if tool.is_enabled(context).await? {
+                tools.push(Arc::clone(tool));
+            }
+        }
+        if let Some(external) = &self.external {
+            let mut reserved = reserved.clone();
+            reserved.extend(
+                tools
+                    .iter()
+                    .map(|tool| tool.model_definition().qualified_name()),
+            );
+            tools.extend(external.get_tools(context, &reserved).await?);
+        }
+        Ok(tools)
+    }
+}
+
 struct ProductCollaborationTool {
     tool: CollaborationTool,
     schema: ToolSchema,
@@ -308,6 +415,9 @@ impl Tool for ProductCollaborationTool {
             } else {
                 None
             };
+        if self.tool.kind().is_v1() {
+            return Ok(self.thread.version_for_model(model_version) == MultiAgentVersion::V1);
+        }
         Ok(self
             .thread
             .tools_enabled_for_model(model_version, self.spawned_in_tree))
@@ -318,7 +428,22 @@ impl Tool for ProductCollaborationTool {
         context: &RunContext,
         services: &ToolServices,
     ) -> Result<bool> {
-        Ok(services.agent_control().is_some() && self.is_enabled(context).await?)
+        let Some(port) = services.agent_control() else {
+            return Ok(false);
+        };
+        if self.tool.kind().is_v1() {
+            // For the first request there is no locked version yet. Check the V1 limit while
+            // preparing the table without committing the version of an unsampled request.
+            let next_local_depth =
+                i32::try_from(port.caller().as_str().split('/').count() - 1).unwrap_or(i32::MAX);
+            if port.spawn_depth_exceeded()
+                || self.thread.spawn_depth.saturating_add(next_local_depth)
+                    > self.thread.v1_limits().1
+            {
+                return Ok(false);
+            }
+        }
+        self.is_enabled(context).await
     }
 
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {

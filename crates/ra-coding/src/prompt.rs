@@ -141,6 +141,7 @@ pub fn assemble_stable_prefix_for_surface(
         capability_sections,
         false,
         &std::collections::BTreeSet::new(),
+        false,
     )
 }
 
@@ -151,6 +152,7 @@ pub(crate) fn assemble_stable_prefix_for_session(
     capability_sections: &[PromptSection],
     spawned_agent: bool,
     turn_selected: &std::collections::BTreeSet<String>,
+    legacy_collaboration_offered: bool,
 ) -> Result<StablePrefix> {
     let (entries, dynamic_collaboration) =
         ToolSurfacePromptBuilder::reconcile_with_surface(surface, turn_selected)?;
@@ -160,7 +162,7 @@ pub(crate) fn assemble_stable_prefix_for_session(
         ToolSurfacePromptBuilder::build_tool_surface_section_from_entries(&entries)?,
         capability_sections,
         spawned_agent,
-        dynamic_collaboration,
+        dynamic_collaboration || legacy_collaboration_offered,
     )
 }
 

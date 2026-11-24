@@ -16,7 +16,9 @@ use std::sync::Arc;
 use ra_core::agent::{AgentId, AgentSpec};
 use ra_core::capability::{Capability, CapabilityFamily};
 use ra_core::error::{Error, Result};
+use ra_core::model::ModelToolDefinition;
 use ra_core::prompt::{PromptRole, PromptSection};
+use ra_core::tool::{Tool, ToolResolver};
 use ra_runtime::{
     agent::control::AgentControl,
     runner::{RunConfig, RunRequest},
@@ -29,6 +31,7 @@ use ra_runtime::{
 use crate::{
     capabilities::{COLLABORATION_FAMILY, RoleCapabilities},
     host::CodingHost,
+    multi_agent::LegacyCollaborationResolver,
     profile::CodingProfile,
     prompt::{assemble_stable_prefix, assemble_stable_prefix_for_session},
 };
@@ -252,12 +255,15 @@ pub(crate) async fn assemble_agent(
         assembled.capability_sections(),
         host.is_spawned_agent(),
         &turn_selected,
+        !assembled.legacy_collaboration_tools.is_empty(),
     )?;
     // Read off the families installed on the surface rather than a tool's model-facing name,
     // which the host's namespace choice changes.
-    let collaborates = assembled.installed().iter().any(|capability| {
-        capability.family().as_str() == COLLABORATION_FAMILY && !capability.advertised().is_empty()
-    });
+    let collaborates = !assembled.legacy_collaboration_tools.is_empty()
+        || assembled.installed().iter().any(|capability| {
+            capability.family().as_str() == COLLABORATION_FAMILY
+                && !capability.advertised().is_empty()
+        });
     let capabilities = assembled.runtime_capabilities.clone();
     let capability_tools = assembled.tool_surface().tools().to_vec();
     let hosted = assembled.tool_surface().hosted_tools().to_vec();
@@ -274,6 +280,7 @@ pub(crate) async fn assemble_agent(
                 .cloned()
         })
         .flatten();
+    let legacy_collaboration_tools = assembled.legacy_collaboration_tools.clone();
     let mut builder = AgentSpec::builder()
         .id(id)
         .name(name)
@@ -297,9 +304,17 @@ pub(crate) async fn assemble_agent(
             Arc::new(crate::web_search::SearchResolver { config, standalone }),
         );
     }
-    if let Some(runtime) = host.mcp_runtime() {
+    let external = host.mcp_runtime().map(|runtime| {
         runtime.start_background();
-        builder = builder.tool_resolver(runtime.clone());
+        Arc::clone(runtime) as Arc<dyn ToolResolver>
+    });
+    if !legacy_collaboration_tools.is_empty() {
+        builder = builder.tool_resolver(Arc::new(LegacyCollaborationResolver {
+            tools: legacy_collaboration_tools,
+            external,
+        }));
+    } else if let Some(external) = external {
+        builder = builder.tool_resolver(external);
     }
     Ok(AssembledAgent {
         agent: builder.build()?,
@@ -329,6 +344,7 @@ pub struct HostBackedSurface {
     withheld: Vec<CapabilityFamily>,
     budget: ToolSurfaceBudget,
     runtime_capabilities: Vec<Arc<dyn Capability>>,
+    legacy_collaboration_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl std::fmt::Debug for HostBackedSurface {
@@ -457,17 +473,84 @@ pub async fn host_backed_surface(
     let registry = ToolRegistry::builder()
         .register_all(capabilities.tools())
         .build()?;
+    let namespace = host.collaboration_namespace()?;
     let profile = profile.to_tool_profile_for_role(
         role,
         &capabilities.withheld_tool_keys(),
         &capabilities.withheld_advertised_tool_keys(),
-        host.collaboration_namespace()?.as_ref(),
+        namespace.as_ref(),
         host.skill_tool_surface(),
         capabilities.product_collaboration_keys(),
     )?;
     let budget = *profile.budget();
     let tool_surface =
         registry.assemble_with_hosted_tools(&profile, &capabilities.hosted_tools()?)?;
+    let legacy_collaboration_tools = match host.product_collaboration() {
+        Some(product)
+            if !(role.is_one_off()
+                || role.is_read_only() && host.read_only_role_restrictions()) =>
+        {
+            product.v1_tools(host.is_spawned_agent(), namespace.is_some())?
+        }
+        _ => Vec::new(),
+    };
+    let mut tool_tables = vec![tool_surface.model_definitions()];
+    if !legacy_collaboration_tools.is_empty() {
+        let v2_keys = capabilities
+            .product_collaboration_keys()
+            .unwrap_or_default();
+        let mut v1_table = tool_tables[0].clone();
+        v1_table.retain(|definition| {
+            definition
+                .lookup_key()
+                .map_or(true, |key| !v2_keys.contains(&key))
+        });
+        v1_table.extend(
+            legacy_collaboration_tools
+                .iter()
+                .map(|tool| tool.model_definition()),
+        );
+        if exceeds_tool_budget(&v1_table, &budget)? {
+            return Err(Error::config(
+                "V1 collaboration exceeds the coding profile's schema budget",
+            ));
+        }
+        tool_tables.push(v1_table);
+    }
+    check_search_budget(host, &tool_surface, &tool_tables, &budget)?;
+    let contributions = capabilities.contributions_for(&tool_surface).await?;
+    Ok(HostBackedSurface {
+        tool_surface,
+        capability_sections: contributions.sections,
+        installed: contributions.installed,
+        withheld: capabilities.withheld_families(),
+        budget,
+        runtime_capabilities: contributions.runtime,
+        legacy_collaboration_tools,
+    })
+}
+
+fn exceeds_tool_budget(
+    definitions: &[ModelToolDefinition],
+    budget: &ToolSurfaceBudget,
+) -> Result<bool> {
+    let bytes = ModelToolDefinition::advertised_table_bytes(definitions)?;
+    let name_chars: usize = definitions
+        .iter()
+        .map(|tool| tool.qualified_name().chars().count())
+        .sum();
+    Ok(budget.max_advertised_bytes().is_some_and(|max| bytes > max)
+        || budget
+            .max_advertised_name_chars()
+            .is_some_and(|max| name_chars > max))
+}
+
+fn check_search_budget(
+    host: &CodingHost,
+    tool_surface: &ToolSurface,
+    tool_tables: &[Vec<ModelToolDefinition>],
+    budget: &ToolSurfaceBudget,
+) -> Result<()> {
     // A fallback uses one search slot, but either backend can determine its largest wire cost.
     // Check the hosted projections independently rather than charging both candidates together.
     // A turn's model can also widen the hosted declaration with image results.
@@ -489,35 +572,24 @@ pub async fn host_backed_surface(
             .flat_map(|config| [(config, false), (config, true)])
         {
             if let Some(hosted) = config.definition_for_turn(sandbox_disabled)? {
-                let mut definitions = tool_surface.model_definitions();
-                definitions.retain(|tool| {
-                    if fallback_selected {
-                        !matches!(tool.name(), "web_search" | "web_fetch")
-                    } else {
-                        !(tool.is_hosted() && tool.name() == "web_search")
+                for table in tool_tables {
+                    let mut definitions = table.clone();
+                    definitions.retain(|tool| {
+                        if fallback_selected {
+                            !matches!(tool.name(), "web_search" | "web_fetch")
+                        } else {
+                            !(tool.is_hosted() && tool.name() == "web_search")
+                        }
+                    });
+                    definitions.push(hosted.clone());
+                    if exceeds_tool_budget(&definitions, budget)? {
+                        return Err(Error::config(
+                            "hosted search alternative exceeds the coding profile's schema-byte budget",
+                        ));
                     }
-                });
-                definitions.push(hosted);
-                let bytes =
-                    ra_core::model::ModelToolDefinition::advertised_table_bytes(&definitions)?;
-                if budget
-                    .max_advertised_bytes()
-                    .is_some_and(|maximum| bytes > maximum)
-                {
-                    return Err(ra_core::error::Error::config(
-                        "hosted search alternative exceeds the coding profile's schema-byte budget",
-                    ));
                 }
             }
         }
     }
-    let contributions = capabilities.contributions_for(&tool_surface).await?;
-    Ok(HostBackedSurface {
-        tool_surface,
-        capability_sections: contributions.sections,
-        installed: contributions.installed,
-        withheld: capabilities.withheld_families(),
-        budget,
-        runtime_capabilities: contributions.runtime,
-    })
+    Ok(())
 }

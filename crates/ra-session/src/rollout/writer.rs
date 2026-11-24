@@ -650,6 +650,8 @@ pub enum RolloutPayload {
     RunStarted(RolloutRunStarted),
     /// A run, or its latest segment, ended.
     RunEnded(RolloutRunEnded),
+    /// Whether this spawned thread's own edge was explicitly closed.
+    AgentClosed(bool),
     /// Explicit local trace observation, excluded from conversation and usage reconstruction.
     Trace(RolloutTraceRecord),
     /// Forward-compatible unknown payload.
@@ -725,6 +727,7 @@ impl From<RolloutItem> for RolloutPayload {
             RolloutItem::Event(event) => Self::Event(event),
             RolloutItem::ModelUsage(usage) => Self::ModelUsage(usage),
             RolloutItem::RunEnded(ended) => Self::RunEnded(ended),
+            RolloutItem::AgentClosed(closed) => Self::AgentClosed(closed),
             RolloutItem::Trace(trace) => Self::Trace(trace),
             // A kind this build cannot name has no payload to be written as.
             other => Self::Unknown {
@@ -762,6 +765,7 @@ impl RolloutRecord {
     )]
     pub fn new(timeline_seq: u64, at: EventTimestamp, payload: RolloutPayload) -> Result<Self> {
         let (type_name, payload_val) = match payload {
+            RolloutPayload::AgentClosed(closed) => ("agent_closed".to_owned(), closed.into()),
             RolloutPayload::Trace(trace) => (
                 "trace".to_owned(),
                 serde_json::to_value(trace).map_err(|error| {
@@ -917,8 +921,22 @@ impl RolloutRecord {
     /// # Errors
     ///
     /// Returns [`Error`] if deserialization of a known type fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep rollout wire names and their deserialization together."
+    )]
     pub fn payload(&self) -> Result<RolloutPayload> {
         match self.type_name.as_str() {
+            "agent_closed" => self
+                .payload
+                .as_bool()
+                .map(RolloutPayload::AgentClosed)
+                .ok_or_else(|| {
+                    Error::session(
+                        SessionErrorKind::Corrupted,
+                        "corrupted agent_closed payload",
+                    )
+                }),
             "trace" => serde_json::from_value::<RolloutTraceRecord>(self.payload.clone())
                 .map(RolloutPayload::Trace)
                 .map_err(|error| {

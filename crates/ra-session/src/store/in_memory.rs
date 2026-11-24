@@ -116,6 +116,35 @@ impl InMemoryThreadStore {
 
 #[async_trait]
 impl RolloutThreadStore for InMemoryThreadStore {
+    async fn spawned_thread_lineage(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<RolloutThreadSpawn>> {
+        let thread = self
+            .read_thread(
+                &crate::store::ReadThreadParams::new(session_id.clone()).including_archived(),
+            )
+            .await?;
+        Ok(thread.thread_spawn().cloned())
+    }
+
+    async fn open_spawned_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
+        crate::store::open_spawned_children(self, parent).await
+    }
+
+    async fn reopen_spawned_thread(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(Arc<dyn RolloutRecorder>, Vec<ra_core::item::ModelInputItem>)> {
+        let resumed = crate::resume::ResumedThread::resume(
+            self,
+            &crate::store::ResumeThreadParams::new(session_id.clone()),
+        )
+        .await?;
+        let (recorder, _, reconstruction) = resumed.into_parts();
+        Ok((recorder, reconstruction.into_history()))
+    }
+
     async fn create_thread(
         &self,
         session_id: &SessionId,

@@ -32,9 +32,8 @@
 //! applies. Those are its product's; a host here reads the last turn context and the usage totals
 //! from the records if it wants them.
 //!
-//! The agents a thread spawned are not resumed with it. Codex restores them from its agent graph
-//! store, listing the spawn edges still open below the thread, and reloads each through its loaded
-//! parent; that store is not ported yet.
+//! The store reconstructs a single conversation. The product's V1 agent tree restores its open
+//! descendants using spawn lineage and close markers stored in their own rollouts.
 
 use std::sync::Arc;
 

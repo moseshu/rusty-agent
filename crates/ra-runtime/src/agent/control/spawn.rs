@@ -14,7 +14,10 @@ use std::sync::Arc;
 use crate::runner::RunConfig;
 use async_trait::async_trait;
 use ra_core::{
-    agent::{AgentId, AgentSpec, control::AgentPath},
+    agent::{
+        AgentId, AgentSpec,
+        control::{AgentPath, SpawnAgentRequest},
+    },
     capability::Capability,
     error::Result,
     session::{SessionId, rollout::RolloutRecorder},
@@ -25,6 +28,22 @@ use ra_core::{
 /// Prepares each agent a tree spawns, as Codex's thread manager prepares each spawned thread.
 #[async_trait]
 pub trait SpawnedAgentFactory: Send + Sync {
+    /// Whether the host resolves this agent type using the caller's declaration as its base.
+    fn owns_agent_type(&self, _agent_type: &AgentId) -> bool {
+        false
+    }
+
+    /// Resolves host-specific spawn settings before allocating the child.
+    /// Returning `None` uses the runtime's ordinary model and effort overrides.
+    async fn configure_spawn(
+        &self,
+        _request: &SpawnAgentRequest,
+        _agent: &AgentSpec,
+        _parent: &RunConfig,
+    ) -> Result<Option<RunConfig>> {
+        Ok(None)
+    }
+
     /// Prepares the agent about to be spawned at [`SpawnedAgentRequest::path`].
     ///
     /// Called once per spawn, after the agent's path is reserved and before its rollout is created

@@ -15,7 +15,7 @@
 //! reaches the port through [`ToolServices`](crate::tool::ToolServices), already bound to the agent
 //! the tool is running for, so every operation is attributed to that caller.
 
-use std::{fmt, ops::Deref, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, fmt, ops::Deref, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -289,6 +289,8 @@ pub struct InterAgentCommunication {
     recipient: AgentPath,
     content: String,
     trigger_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input: Option<Message>,
 }
 
 impl InterAgentCommunication {
@@ -305,6 +307,7 @@ impl InterAgentCommunication {
             recipient,
             content: content.into(),
             trigger_turn,
+            input: None,
         }
     }
 
@@ -328,6 +331,14 @@ impl InterAgentCommunication {
             content,
             mode == MessageDeliveryMode::TriggerTurn,
         )
+    }
+
+    /// Queues a structured user input that starts a turn when the recipient is idle.
+    #[must_use]
+    pub fn from_user_input(author: AgentPath, recipient: AgentPath, input: Message) -> Self {
+        let mut communication = Self::new(author, recipient, "", true);
+        communication.input = Some(input);
+        communication
     }
 
     /// Sender.
@@ -362,7 +373,9 @@ impl InterAgentCommunication {
     /// injected text (hook continuations) already uses, and the envelope says who wrote it.
     #[must_use]
     pub fn to_message(&self) -> Message {
-        Message::text(MessageRole::User, self.content.clone())
+        self.input
+            .clone()
+            .unwrap_or_else(|| Message::text(MessageRole::User, self.content.clone()))
     }
 }
 
@@ -494,6 +507,11 @@ pub struct SpawnAgentRequest {
     message: String,
     agent_type: Option<AgentId>,
     fork_mode: Option<SpawnAgentForkMode>,
+    input: Option<Message>,
+    model: Option<String>,
+    reasoning_effort: Option<crate::model::Effort>,
+    reasoning_effort_label: Option<String>,
+    invoking_model: Option<String>,
 }
 
 impl SpawnAgentRequest {
@@ -505,7 +523,77 @@ impl SpawnAgentRequest {
             message: message.into(),
             agent_type: None,
             fork_mode: None,
+            input: None,
+            model: None,
+            reasoning_effort: None,
+            reasoning_effort_label: None,
+            invoking_model: None,
         }
+    }
+
+    /// Supplies structured input for the first run.
+    #[must_use]
+    pub fn with_input(mut self, input: Message) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Overrides the model selector for the spawned agent's runs.
+    #[must_use]
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Requests a reasoning effort for the spawned agent's model.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: crate::model::Effort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Supplies the model selector resolved for the step invoking the spawn.
+    #[must_use]
+    pub fn with_invoking_model(mut self, model: String) -> Self {
+        self.invoking_model = Some(model);
+        self
+    }
+
+    /// Supplies an effort label for the host adapter to validate against its model catalog.
+    #[must_use]
+    pub fn with_reasoning_effort_label(mut self, label: String) -> Self {
+        self.reasoning_effort_label = Some(label);
+        self
+    }
+
+    /// The invoking step's resolved model selector.
+    #[must_use]
+    pub fn invoking_model(&self) -> Option<&str> {
+        self.invoking_model.as_deref()
+    }
+
+    /// The host adapter's requested effort label.
+    #[must_use]
+    pub fn reasoning_effort_label(&self) -> Option<&str> {
+        self.reasoning_effort_label.as_deref()
+    }
+
+    /// The structured initial input, when supplied.
+    #[must_use]
+    pub const fn input(&self) -> Option<&Message> {
+        self.input.as_ref()
+    }
+
+    /// The requested model selector, when supplied.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The requested reasoning effort, when supplied.
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<crate::model::Effort> {
+        self.reasoning_effort
     }
 
     /// Starts the new agent from the caller's history, projected by `fork_mode`. Without one the
@@ -735,6 +823,35 @@ pub trait AgentControlPort: Send + Sync {
     /// Waits for mail, new input steered into the active run, or the timeout. Returns at once when
     /// input is already pending. Waiting leaves the input for the caller's next model call.
     async fn wait_for_mailbox(&self, timeout: Duration) -> WaitOutcome;
+
+    /// Sends structured input by session ID, optionally interrupting the current run first.
+    async fn send_input(
+        &self,
+        _target: &SessionId,
+        _input: Message,
+        _interrupt: bool,
+    ) -> Result<(String, AgentPath), AgentControlError> {
+        Err(AgentControlError::Unavailable)
+    }
+
+    /// Waits for any targeted agent to reach a final status, returning all ready statuses.
+    async fn wait_for_agents(
+        &self,
+        _targets: &[SessionId],
+        _timeout: Duration,
+    ) -> Result<BTreeMap<String, AgentStatus>, AgentControlError> {
+        Err(AgentControlError::Unavailable)
+    }
+
+    /// Closes a spawned agent by session ID, returning the status observed before shutdown.
+    async fn close_agent(&self, _target: &SessionId) -> Result<LiveAgent, AgentControlError> {
+        Err(AgentControlError::Unavailable)
+    }
+
+    /// Reopens a closed agent by session ID, preserving its conversation history.
+    async fn resume_agent(&self, _target: &SessionId) -> Result<LiveAgent, AgentControlError> {
+        Err(AgentControlError::Unavailable)
+    }
 
     /// Whether an agent the caller spawned would be deeper than the tree allows.
     ///

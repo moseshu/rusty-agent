@@ -772,6 +772,9 @@ impl AgentThreadBuilder {
             }),
         };
         let _ = handle.set(Arc::downgrade(&thread.inner));
+        if let Some(control) = &thread.inner.agent_control {
+            control.bind_root_thread(WeakAgentThread(handle));
+        }
         thread
     }
 }
@@ -942,23 +945,34 @@ impl AgentThread {
     /// `inject_no_new_turn`. Messages that arrive while the running turn ends join the history
     /// once it has ended, as Codex waits for a finishing turn before it records them.
     pub async fn inject_context(&self, messages: Vec<Message>) {
+        if self.stage_context(messages) {
+            persist_injected_context(&self.inner).await;
+        }
+    }
+
+    pub(crate) fn inject_context_background(&self, message: Message) {
+        if self.stage_context(vec![message]) {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move { persist_injected_context(&inner).await });
+        }
+    }
+
+    fn stage_context(&self, messages: Vec<Message>) -> bool {
         if messages.is_empty() {
-            return;
+            return false;
         }
-        {
-            let mut state = self.inner.lock();
-            if let Some(turn) = &state.active_turn {
-                if let Err(unread) = turn.context.push(messages) {
-                    state.pending_context.extend(unread);
-                }
-                return;
+        let mut state = self.inner.lock();
+        if let Some(turn) = &state.active_turn {
+            if let Err(unread) = turn.context.push(messages) {
+                state.pending_context.extend(unread);
             }
-            state
-                .history
-                .extend(messages.iter().cloned().map(ModelInputItem::Message));
-            queue_injected_context(&self.inner, messages);
+            return false;
         }
-        persist_injected_context(&self.inner).await;
+        state
+            .history
+            .extend(messages.iter().cloned().map(ModelInputItem::Message));
+        queue_injected_context(&self.inner, messages);
+        true
     }
 
     /// A handle to this thread that does not keep it alive.

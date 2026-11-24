@@ -382,6 +382,13 @@ impl ModelSettings {
         self
     }
 
+    /// Clears the effort override at this settings layer.
+    #[must_use]
+    pub const fn without_effort(mut self) -> Self {
+        self.effort = None;
+        self
+    }
+
     /// Sets model effort.
     #[must_use]
     pub const fn with_effort(mut self, effort: Effort) -> Self {

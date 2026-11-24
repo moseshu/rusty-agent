@@ -1,6 +1,9 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 use super::*;
-use ra_session::{rollout::RolloutPayload, store::LoadThreadHistoryParams};
+use ra_session::{
+    rollout::{RolloutPayload, faults::RolloutFaults},
+    store::{LoadThreadHistoryParams, ReadThreadParams},
+};
 
 fn setup_catalog(product: &ProductModels, endpoint: &MockServer, features: &str) {
     product.write(
@@ -47,13 +50,20 @@ pub(crate) fn catalog_model(slug: &str, version: Option<&str>) -> Value {
 }
 
 fn server_with_disk(product: &ProductModels) -> Server {
+    server_with_disk_faults(product, None)
+}
+
+fn server_with_disk_faults(product: &ProductModels, faults: Option<Arc<RolloutFaults>>) -> Server {
     let (host, settings, builder) = product.parts();
     let builder = builder.harness_overrides(ra_coding::config::ConfigOverrides {
         bypass_hook_trust: Some(true),
         ..Default::default()
     });
-    let directory =
+    let mut directory =
         ra_session::rollout::RolloutThreadDirectory::new(product.home.path().join("rollouts"));
+    if let Some(faults) = faults {
+        directory = directory.with_faults(faults);
+    }
     build(
         Options {
             store: Some(Arc::new(directory)),
@@ -162,6 +172,7 @@ async fn multi_agent_first_turn_model_selects_and_locks_version() {
         let (thread, _) = start(&server, &mut connection, json!({"model": "catalog-v1"})).await;
         run_on_model(&server, &mut connection, &thread, first_model).await;
         assert_latest_tools(&endpoint, first_model, enabled).await;
+        assert_v1_tools(&endpoint, version == "v1").await;
         let body = latest_body(&endpoint).await;
         assert_eq!(
             developer_texts(&body)
@@ -171,6 +182,7 @@ async fn multi_agent_first_turn_model_selects_and_locks_version() {
         );
         run_on_model(&server, &mut connection, &thread, next_model).await;
         assert_latest_tools(&endpoint, next_model, enabled).await;
+        assert_v1_tools(&endpoint, version == "v1").await;
         assert_eq!(
             version_records(&server, &thread).await,
             vec![("turn_context".to_owned(), version.to_owned()); 2]
@@ -204,6 +216,7 @@ async fn multi_agent_resume_honors_feature_overrides_and_legacy_history() {
     )
     .await;
     assert_latest_tools(&endpoint, "catalog-v2", false).await;
+    assert_v1_tools(&endpoint, false).await;
     assert_eq!(
         version_records(&server, "legacy-collaboration").await,
         [("turn_context".to_owned(), "disabled".to_owned())]
@@ -222,6 +235,7 @@ async fn multi_agent_resume_honors_feature_overrides_and_legacy_history() {
         .await;
     run_on_model(&server, &mut connection, &thread, "catalog-v2").await;
     assert_latest_tools(&endpoint, "catalog-v2", false).await;
+    assert_v1_tools(&endpoint, true).await;
     unload(&server, &mut connection, &thread).await;
 
     setup_catalog(
@@ -491,6 +505,792 @@ async fn latest_collaboration_tools(
                 .map(|tool| (tool["name"].as_str().unwrap().to_owned(), tool.clone()))
                 .collect()
         })
+}
+
+async fn assert_v1_tools(endpoint: &MockServer, enabled: bool) {
+    let tools = latest_collaboration_tools(endpoint, "multi_agent_v1").await;
+    assert_eq!(tools.is_some(), enabled);
+    if let Some(tools) = tools {
+        assert_eq!(
+            tools.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        );
+        assert_eq!(
+            tools["wait_agent"]["parameters"]["required"],
+            json!(["targets"])
+        );
+        assert!(
+            tools["spawn_agent"]["parameters"]["properties"]
+                .get("fork_context")
+                .is_some()
+        );
+        let description = tools["spawn_agent"]["description"].as_str().unwrap();
+        assert!(description.contains(
+            "Available model overrides (optional; inherited parent model is preferred):"
+        ));
+        assert!(description.contains("Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask"));
+        assert!(
+            tools["spawn_agent"]["parameters"]["properties"]
+                .get("agent_type")
+                .is_none()
+        );
+        assert_eq!(
+            tools["send_input"]["description"],
+            "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
+        );
+        let fields = &tools["send_input"]["parameters"]["properties"];
+        assert_eq!(
+            fields["target"]["description"],
+            "Agent id to message (from spawn_agent)."
+        );
+        assert_eq!(fields["items"]["items"]["type"], "object");
+        assert_eq!(
+            fields["items"]["items"]["properties"]["type"]["type"],
+            "string"
+        );
+        assert!(
+            fields["items"]["items"]["properties"]
+                .get("audio_url")
+                .is_some()
+        );
+    }
+}
+
+async fn v1_call(
+    endpoint: &MockServer,
+    server: &Server,
+    connection: &mut Connection,
+    thread: &str,
+    name: &str,
+    arguments: Value,
+) -> String {
+    let call_id = format!(
+        "call-{name}-{}",
+        endpoint.received_requests().await.unwrap().len()
+    );
+    let mut response = websocket_completion(0);
+    response["response"]["output"] = json!([{
+        "id": call_id, "type": "function_call", "call_id": call_id,
+        "namespace": "multi_agent_v1", "name": name, "arguments": arguments.to_string()
+    }]);
+    let prompt = call_id.clone();
+    Mock::given(method("POST"))
+        .and(path("/product/v1/responses"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "user" && item["content"][0]["text"] == prompt)
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(endpoint)
+        .await;
+    server
+        .call(
+            connection,
+            "turn/start",
+            serde_json::to_value(
+                TurnStartParams::new(thread, vec![UserInput::text(&call_id)])
+                    .with_model("catalog-v1"),
+            )
+            .unwrap(),
+        )
+        .await;
+    let completed = connection.notification("turn/completed").await;
+    assert_eq!(completed["turn"]["status"], "completed", "{completed}");
+    let requests = endpoint.received_requests().await.unwrap();
+    requests
+        .iter()
+        .rev()
+        .find_map(|request| {
+            let body: Value = request.body_json().ok()?;
+            let output = body["input"].as_array()?.iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == call_id
+            })?;
+            output["output"][0]["text"].as_str().map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            let last_inputs: Vec<_> = requests
+                .iter()
+                .rev()
+                .take(3)
+                .map(|request| {
+                    let body: Value = request.body_json().unwrap();
+                    body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            panic!("missing V1 result for {call_id}. Recent inputs: {last_inputs:?}")
+        })
+}
+
+#[tokio::test]
+async fn multi_agent_v1_resident_limit_and_closed_thread_resume() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(
+        &product,
+        &endpoint,
+        "[agents]\nmax_concurrent_threads_per_session = 1",
+    );
+    let faults = RolloutFaults::new();
+    let server = server_with_disk_faults(&product, Some(Arc::clone(&faults)));
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+    let spawned = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "spawn_agent",
+        json!({"items": [{"type": "text", "text": "V1 original task"}]}),
+    )
+    .await;
+    let spawned: Value =
+        serde_json::from_str(&spawned).unwrap_or_else(|error| panic!("{error}: {spawned}"));
+    let child = spawned["agent_id"].as_str().unwrap();
+    assert_eq!(spawned["nickname"], Value::Null);
+    let waited = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap(),
+        json!({
+            "status": { (child): {"completed": "Done"} }, "timed_out": false
+        })
+    );
+
+    let requests = endpoint.received_requests().await.unwrap();
+    let notification = format!(
+        "<subagent_notification>\n{}\n</subagent_notification>",
+        json!({"agent_path": child, "status": {"completed": "Done"}})
+    );
+    let bodies: Vec<Value> = requests
+        .iter()
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .flat_map(|body| body["input"].as_array().unwrap())
+            .any(|item| {
+                item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["text"] == notification)
+                    })
+            })
+    );
+    assert!(!bodies.iter().any(|body| {
+        body["input"]
+            .to_string()
+            .contains("Message Type: FINAL_ANSWER")
+    }));
+    let child_body = requests
+        .iter()
+        .find_map(|request| {
+            let body: Value = request.body_json().ok()?;
+            body["input"]
+                .as_array()?
+                .iter()
+                .any(|item| {
+                    item["role"] == "user" && item["content"][0]["text"] == "V1 original task"
+                })
+                .then_some(body)
+        })
+        .expect("the child takes the original task");
+    assert!(
+        child_body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| { tool["name"] != "multi_agent_v1" && tool["name"] != "collaboration" })
+    );
+    assert_eq!(
+        version_records(&server, child).await.last().unwrap().1,
+        "v1"
+    );
+
+    let refused = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "spawn_agent",
+        json!({"message": "Extra task"}),
+    )
+    .await;
+    assert!(refused.contains("agent thread limit reached"), "{refused}");
+
+    let closed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "close_agent",
+        json!({"target": child}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&closed).unwrap(),
+        json!({"previous_status": {"completed": "Done"}})
+    );
+    unload(&server, &mut connection, &thread).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": thread}),
+        )
+        .await;
+
+    let child_rollout = server
+        .store
+        .read_thread(&ReadThreadParams::new(SessionId::new(child)))
+        .await
+        .unwrap();
+    faults.fail_persist_for_rollout(child_rollout.rollout_path().unwrap().to_owned());
+    let failure = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "resume_agent",
+        json!({"id": child}),
+    )
+    .await;
+    assert!(failure.contains("injected Persist failure"), "{failure}");
+    let unavailable = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&unavailable).unwrap(),
+        json!({"status": {(child): "not_found"}, "timed_out": false})
+    );
+
+    let resumed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "resume_agent",
+        json!({"id": child}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&resumed)
+            .unwrap_or_else(|error| panic!("{error}: {resumed}")),
+        json!({"status": "pending_init"})
+    );
+    let sent = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "send_input",
+        json!({"target": child, "message": "V1 next task"}),
+    )
+    .await;
+    assert!(serde_json::from_str::<Value>(&sent).unwrap()["submission_id"].is_string());
+    let waited = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &thread,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap()["timed_out"],
+        false
+    );
+    let requests = endpoint.received_requests().await.unwrap();
+    assert!(
+        requests.iter().any(|request| {
+            let body: Value = request.body_json().unwrap();
+            let text: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["role"] == "user")
+                .filter_map(|item| item["content"][0]["text"].as_str())
+                .collect();
+            text.contains(&"V1 original task") && text.contains(&"V1 next task")
+        }),
+        "resumed agent kept its history"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v1_spawn_validates_overrides_and_applies_role_last() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(
+        &product,
+        &endpoint,
+        r#"
+[features.multi_agent_v2]
+enabled = false
+usage_hint_text = "Delegate only after planning."
+[agents.worker]
+description = "Runs the configured worker model."
+config_file = "worker.toml"
+[agents.worker_external]
+description = "Runs a model outside the catalog."
+config_file = "worker_external.toml"
+"#,
+    );
+    let config = std::fs::read_to_string(product.home.path().join("config.toml")).unwrap();
+    product.write(
+        "config.toml",
+        &format!("model_reasoning_effort = \"high\"\n{config}"),
+    );
+    product.write(
+        "worker.toml",
+        "model = \"catalog-unspecified\"\nmodel_reasoning_effort = \"medium\"\n",
+    );
+    product.write(
+        "worker_external.toml",
+        "model = \"outside-catalog\"\nmodel_reasoning_effort = \"high\"\n",
+    );
+    let mut models = ["catalog-v1", "catalog-v2", "catalog-unspecified"]
+        .into_iter()
+        .map(|model| catalog_model(model, Some("v1")))
+        .collect::<Vec<_>>();
+    for model in &mut models {
+        model["supported_reasoning_levels"] = json!([
+            {"effort":"low", "description":"Low"},
+            {"effort":"medium", "description":"Medium"},
+            {"effort":"high", "description":"High"}
+        ]);
+    }
+    product.write(
+        "collaboration-models.json",
+        &json!({"models": models}).to_string(),
+    );
+
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "catalog-v1").await;
+    let tools = latest_collaboration_tools(&endpoint, "multi_agent_v1")
+        .await
+        .unwrap();
+    let description = tools["spawn_agent"]["description"].as_str().unwrap();
+    assert!(description.contains("- `catalog-v2`:"));
+    assert!(description.contains("Reasoning efforts: low (default), medium, high."));
+    assert!(description.ends_with("Delegate only after planning."));
+    assert!(!description.contains("Do not spawn sub-agents"));
+    let roles = tools["spawn_agent"]["parameters"]["properties"]["agent_type"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(roles.starts_with("Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.\nAvailable roles:\nworker: {\nRuns the configured worker model."));
+    assert!(roles.contains("This role's model is set to `catalog-unspecified` and its reasoning effort is set to `medium`. These settings cannot be changed."));
+    assert!(roles.contains("default: {\nDefault agent.\n}"));
+
+    for (args, expected) in [
+        (
+            json!({"message":"Unknown model task", "model":"missing"}),
+            "Unknown model `missing` for spawn_agent. Available models: catalog-v1, catalog-v2, catalog-unspecified",
+        ),
+        (
+            json!({"message":"Unsupported effort task", "model":"catalog-v2", "reasoning_effort":"ultra"}),
+            "Reasoning effort `ultra` is not supported for model `catalog-v2`. Supported reasoning efforts: low, medium, high",
+        ),
+    ] {
+        let refusal = v1_call(
+            &endpoint,
+            &server,
+            &mut connection,
+            &thread,
+            "spawn_agent",
+            args,
+        )
+        .await;
+        assert_eq!(refusal, expected);
+    }
+    for (prompt, args, model, effort) in [
+        (
+            "Fresh model task",
+            json!({"model":"catalog-v2"}),
+            "catalog-v2",
+            "low",
+        ),
+        (
+            "Role priority task",
+            json!({"model":"catalog-v2","reasoning_effort":"high","agent_type":"worker"}),
+            "catalog-unspecified",
+            "medium",
+        ),
+        // Codex validates a role's effort only against catalog metadata, so a role may name a
+        // model the catalog does not list.
+        (
+            "Uncataloged role task",
+            json!({"agent_type":"worker_external"}),
+            "outside-catalog",
+            "high",
+        ),
+    ] {
+        let mut args = args;
+        args["message"] = json!(prompt);
+        let output = v1_call(
+            &endpoint,
+            &server,
+            &mut connection,
+            &thread,
+            "spawn_agent",
+            args,
+        )
+        .await;
+        let child: Value =
+            serde_json::from_str(&output).unwrap_or_else(|error| panic!("{error}: {output}"));
+        v1_call(
+            &endpoint,
+            &server,
+            &mut connection,
+            &thread,
+            "wait_agent",
+            json!({"targets":[child["agent_id"]]}),
+        )
+        .await;
+        let body: Value = endpoint
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|request| {
+                let body: Value = request.body_json().ok()?;
+                body["input"]
+                    .as_array()?
+                    .iter()
+                    .any(|item| item["role"] == "user" && item["content"][0]["text"] == prompt)
+                    .then_some(body)
+            })
+            .expect("valid spawn made a child model request");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["reasoning"]["effort"], effort);
+    }
+
+    let config = std::fs::read_to_string(product.home.path().join("config.toml")).unwrap();
+    product.write(
+        "config.toml",
+        &format!(
+            "{config}\n[agents]\ndefault_subagent_reasoning_effort = \"unsupported-default\"\n"
+        ),
+    );
+    let (default_thread, _) = start(&server, &mut connection, json!({})).await;
+    let refused = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &default_thread,
+        "spawn_agent",
+        json!({"message": "Invalid configured default task"}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        "Reasoning effort `unsupported-default` is not supported for model `catalog-v1`. Supported reasoning efforts: low, medium, high"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v1_close_and_resume_restores_only_open_descendants() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "[agents]\nmax_depth = 2");
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+    let mut response = websocket_completion(0);
+    response["response"]["output"] = json!([{
+        "id": "descendant", "type": "function_call", "call_id": "descendant",
+        "namespace": "multi_agent_v1", "name": "spawn_agent",
+        "arguments": json!({"message": "V1 leaf"}).to_string(),
+    }]);
+    Mock::given(method("POST"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "user" && item["content"][0]["text"] == "V1 branch")
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(format!("data: {response}\n\n"), "text/event-stream"),
+        )
+        .with_priority(2)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let (endpoint, server, thread) = (&endpoint, &server, thread.as_str());
+    let branch = v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "spawn_agent",
+        json!({"message": "V1 branch"}),
+    )
+    .await;
+    let branch: Value = serde_json::from_str(&branch).unwrap();
+    let branch = branch["agent_id"].as_str().unwrap();
+    v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "wait_agent",
+        json!({"targets": [branch]}),
+    )
+    .await;
+    let requests = endpoint.received_requests().await.unwrap();
+    let leaf: Value = requests
+        .iter()
+        .find_map(|request| {
+            let body: Value = request.body_json().ok()?;
+            let output = body["input"].as_array()?.iter().find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "descendant"
+            })?;
+            serde_json::from_str(output["output"][0]["text"].as_str()?).ok()
+        })
+        .expect("the branch spawns a leaf within the configured depth");
+    let leaf = leaf["agent_id"].as_str().unwrap();
+
+    for permanently_closed in [false, true] {
+        if permanently_closed {
+            let result = v1_call(
+                endpoint,
+                server,
+                &mut connection,
+                thread,
+                "close_agent",
+                json!({"target": leaf}),
+            )
+            .await;
+            assert!(
+                serde_json::from_str::<Value>(&result)
+                    .unwrap()
+                    .get("previous_status")
+                    .is_some()
+            );
+        } else {
+            // An ordinary thread unload shuts down its agents. The open edges are recovered on
+            // the first collaboration operation after cold resume.
+            unload(server, &mut connection, thread).await;
+            setup_catalog(&product, endpoint, "[agents]\nmax_depth = 1");
+            server
+                .call(
+                    &mut connection,
+                    "thread/resume",
+                    json!({"threadId": thread}),
+                )
+                .await;
+        }
+        let closed = v1_call(
+            endpoint,
+            server,
+            &mut connection,
+            thread,
+            "close_agent",
+            json!({"target": branch}),
+        )
+        .await;
+        assert!(
+            serde_json::from_str::<Value>(&closed)
+                .unwrap()
+                .get("previous_status")
+                .is_some()
+        );
+        let resumed = v1_call(
+            endpoint,
+            server,
+            &mut connection,
+            thread,
+            "resume_agent",
+            json!({"id": branch}),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&resumed).unwrap()["status"],
+            "pending_init"
+        );
+        let sent = v1_call(
+            endpoint,
+            server,
+            &mut connection,
+            thread,
+            "send_input",
+            json!({"target": leaf, "message": "Follow the open edge"}),
+        )
+        .await;
+        if permanently_closed {
+            assert!(sent.contains("not found"), "{sent}");
+        } else {
+            assert!(
+                serde_json::from_str::<Value>(&sent).unwrap()["submission_id"].is_string(),
+                "{sent}"
+            );
+            v1_call(
+                endpoint,
+                server,
+                &mut connection,
+                thread,
+                "wait_agent",
+                json!({"targets": [leaf]}),
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v1_send_input_interrupt_redirects_the_running_agent() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "");
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+
+    Mock::given(method("POST"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|item| item["role"] == "user")
+                .is_some_and(|item| item["content"][0]["text"] == "V1 long-running task")
+        })
+        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_secs(30)))
+        .with_priority(2)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+
+    let (endpoint, server, thread) = (&endpoint, &server, thread.as_str());
+    let spawned = v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "spawn_agent",
+        json!({"message": "V1 long-running task"}),
+    )
+    .await;
+    let spawned: Value = serde_json::from_str(&spawned).unwrap();
+    let child = spawned["agent_id"].as_str().unwrap();
+    timeout(PATIENCE, async {
+        loop {
+            if endpoint
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    let body: Value = request.body_json().unwrap();
+                    body["input"].as_array().unwrap().iter().any(|item| {
+                        item["role"] == "user"
+                            && item["content"][0]["text"] == "V1 long-running task"
+                    })
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the child starts its original request");
+    let sent = v1_call(endpoint, server, &mut connection, thread, "send_input", json!({
+        "target": child, "items": [{"type": "text", "text": "V1 replacement task"}], "interrupt": true
+    })).await;
+    assert!(serde_json::from_str::<Value>(&sent).unwrap()["submission_id"].is_string());
+    let waited = v1_call(
+        endpoint,
+        server,
+        &mut connection,
+        thread,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap(),
+        json!({
+            "status": { (child): {"completed": "Done"} }, "timed_out": false
+        })
+    );
+    assert!(
+        endpoint
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| {
+                let body: Value = request.body_json().unwrap();
+                body["input"].as_array().unwrap().iter().any(|item| {
+                    item["role"] == "user" && item["content"][0]["text"] == "V1 replacement task"
+                })
+            })
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v1_depth_zero_omits_tools_on_first_sample() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "[agents]\nmax_depth = 0");
+    let server = product.server(None);
+    let mut connection = server.connect(1).await;
+    let (thread, _) = start(&server, &mut connection, json!({})).await;
+    run_on_model(&server, &mut connection, &thread, "catalog-v1").await;
+    assert_v1_tools(&endpoint, false).await;
+    assert_eq!(
+        version_records(&server, &thread).await.last().unwrap().1,
+        "v1"
+    );
 }
 
 /// Codex's `[features.multi_agent_v2]` tool table: the namespace, the direct-message and

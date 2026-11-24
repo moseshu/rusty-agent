@@ -12,8 +12,10 @@ use crate::item::{Message, MessageRole};
 /// case-insensitively. Text merely containing these tags is not a fragment.
 #[must_use]
 pub fn is_skill_prompt_fragment(text: &str) -> bool {
-    let start_marker = "<skill>";
-    let end_marker = "</skill>";
+    matches_fragment(text, "<skill>", "</skill>")
+}
+
+fn matches_fragment(text: &str, start_marker: &str, end_marker: &str) -> bool {
     let trimmed = text.trim_start();
     let starts_with_marker = trimmed
         .get(..start_marker.len())
@@ -25,7 +27,7 @@ pub fn is_skill_prompt_fragment(text: &str) -> bool {
     starts_with_marker && ends_with_marker
 }
 
-/// Whether a user-role message contains model-only skill or interruption context.
+/// Whether a user-role message contains model-only skill, interruption, or subagent context.
 /// A matching text block hides the entire message, as in Codex's user-message projection.
 #[must_use]
 pub fn is_contextual_user_message(message: &Message) -> bool {
@@ -35,5 +37,12 @@ pub fn is_contextual_user_message(message: &Message) -> bool {
                 .content()
                 .iter()
                 .filter_map(|block| block.as_text())
-                .any(is_skill_prompt_fragment))
+                .any(|text| {
+                    is_skill_prompt_fragment(text)
+                        || matches_fragment(
+                            text,
+                            "<subagent_notification>",
+                            "</subagent_notification>",
+                        )
+                }))
 }
