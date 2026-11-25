@@ -337,12 +337,13 @@ impl CreateThreadParams {
 /// local directory resolves paths by session id and only supports legacy history; its writer
 /// resumes the persisted file. The in-memory store replaces its records with supplied history,
 /// preserving the distinction between absent history and an explicitly empty history.
-/// Archived selection and metadata for derived write projections are not implemented yet.
+/// Metadata for derived write projections is not implemented yet.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeThreadParams {
     session_id: SessionId,
     history: Option<Arc<Vec<RolloutRecord>>>,
+    include_archived: bool,
 }
 
 impl ResumeThreadParams {
@@ -352,7 +353,17 @@ impl ResumeThreadParams {
         Self {
             session_id,
             history: None,
+            include_archived: false,
         }
+    }
+
+    pub(crate) const fn including_archived(mut self) -> Self {
+        self.include_archived = true;
+        self
+    }
+
+    pub(crate) const fn include_archived(&self) -> bool {
+        self.include_archived
     }
 
     /// Supplies already loaded replay history, replacing the in-memory store's current records.

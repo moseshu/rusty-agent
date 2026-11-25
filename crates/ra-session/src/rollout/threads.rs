@@ -415,7 +415,7 @@ impl RolloutThreadStore for RolloutThreadDirectory {
     ) -> Result<(Arc<dyn RolloutRecorder>, Vec<ra_core::item::ModelInputItem>)> {
         let resumed = crate::resume::ResumedThread::resume(
             self,
-            &crate::store::ResumeThreadParams::new(session_id.clone()),
+            &ResumeThreadParams::new(session_id.clone()).including_archived(),
         )
         .await?;
         let (recorder, _, reconstruction) = resumed.into_parts();
@@ -495,7 +495,9 @@ impl ThreadStore for RolloutThreadDirectory {
     /// discarded and the error returned.
     async fn resume_thread(&self, params: &ResumeThreadParams) -> Result<Arc<dyn RolloutRecorder>> {
         let ownership = self.writer_locks.acquire(params.session_id())?;
-        let path = self.existing_rollout(params.session_id()).await?;
+        let (path, _) = self
+            .locate(params.session_id(), params.include_archived())
+            .await?;
         let writer = RolloutWriter::open_with_ownership(
             path.clone(),
             params.session_id().clone(),
@@ -678,9 +680,21 @@ impl ThreadStore for RolloutThreadDirectory {
             return self.update_thread_metadata(params).await.map(|_| ());
         }
         if let Some(index) = &self.index {
-            let active_path = self.rollout_path(params.session_id())?;
+            let session_id = params.session_id();
+            let live_path = self
+                .live_recorders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .and_then(Weak::upgrade)
+                .and_then(|recorder| recorder.local_path());
+            let path = match live_path {
+                Some(path) => path,
+                None => self.rollout_path(session_id)?,
+            };
+            let archived = path.starts_with(self.archived_dir());
             index
-                .record_thread_metadata(params.session_id(), params.patch(), active_path)
+                .record_thread_metadata(session_id, params.patch(), path, archived)
                 .await;
         }
         Ok(())

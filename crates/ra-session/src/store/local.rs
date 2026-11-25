@@ -134,11 +134,12 @@ impl ThreadIndex for StateRuntime {
         &self,
         session_id: &SessionId,
         patch: &ThreadMetadataPatch,
-        active_path: PathBuf,
+        rollout_path: PathBuf,
+        archived: bool,
     ) {
         let located = match self.get_thread(session_id).await {
             Ok(Some(row)) => (row.rollout_path, row.archived_at.is_some()),
-            Ok(None) => (active_path, false),
+            Ok(None) => (rollout_path, archived),
             Err(error) => {
                 tracing::warn!(%session_id, %error, "the state database could not record a thread's metadata");
                 return;

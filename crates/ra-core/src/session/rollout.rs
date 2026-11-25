@@ -289,7 +289,7 @@ pub trait RolloutThreadStore: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
-    /// Reopens a spawned thread and reconstructs its model-visible history.
+    /// Reopens a stored thread as an agent and reconstructs its model-visible history.
     async fn reopen_spawned_thread(
         &self,
         _session_id: &SessionId,

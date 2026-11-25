@@ -29,13 +29,13 @@ pub(crate) trait ThreadIndex: Send + Sync + std::fmt::Debug {
     /// Adds what the index knows of `thread` to what its rollout says.
     async fn overlay(&self, thread: &mut StoredThread);
 
-    /// Writes metadata a live thread derived, for a thread whose rollout is or will be
-    /// `active_path` unless the index already knows where it is.
+    /// Writes metadata a live thread derived, using its rollout location to initialize a row.
     async fn record_thread_metadata(
         &self,
         session_id: &SessionId,
         patch: &ThreadMetadataPatch,
-        active_path: PathBuf,
+        rollout_path: PathBuf,
+        archived: bool,
     );
 
     /// Writes metadata a caller set on the thread whose rollout is `path`, archived when

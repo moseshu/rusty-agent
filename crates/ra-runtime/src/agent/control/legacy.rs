@@ -13,7 +13,7 @@ use ra_core::{
         control::{AgentControlError, AgentPath, AgentStatus, InterAgentCommunication, LiveAgent},
     },
     cancel::{CancelReason, ScopeKind},
-    error::Result,
+    error::{Error, Result, SessionErrorKind},
     item::{Message, ModelInputItem},
     session::{SessionId, rollout::ThreadSpawnEdgeStatus},
 };
@@ -28,6 +28,8 @@ pub(super) struct ResidentLimits {
     pub(super) max_depth: i32,
     enabled: Box<dyn Fn() -> bool + Send + Sync>,
 }
+
+pub(super) type LiveAgentLookup = dyn Fn(&SessionId) -> Option<LiveAgent> + Send + Sync;
 
 impl ResidentLimits {
     pub(super) fn new(
@@ -81,11 +83,15 @@ impl Tree {
         }
     }
 
-    fn legacy_agent(&self, id: &SessionId) -> Option<Arc<AgentNode>> {
+    pub(super) fn legacy_agent(&self, id: &SessionId) -> Option<Arc<AgentNode>> {
         if self.root.session_id.get() == Some(id) {
             return Some(Arc::clone(&self.root));
         }
         self.node_of_session(id)
+    }
+
+    fn lookup_live_agent(&self, id: &SessionId) -> Option<LiveAgent> {
+        self.live_agent_lookup.get().and_then(|lookup| lookup(id))
     }
 }
 
@@ -264,10 +270,17 @@ impl AgentHandle {
                 Ok(node.snapshot())
             };
         }
+        if let Some(agent) = tree.lookup_live_agent(target) {
+            return Ok(agent);
+        }
         let parent = ParentRun::current().ok_or(AgentControlError::Unavailable)?;
-        let node = tree
+        let node = match tree
             .reopen_legacy_agent(&self.node, target, &parent, true)
-            .await?;
+            .await
+        {
+            Ok(node) => node,
+            Err(error) => return tree.lookup_live_agent(target).ok_or(error),
+        };
         tree.restore_descendants(Arc::clone(&node), &parent).await;
         Ok(node.snapshot())
     }
@@ -356,24 +369,29 @@ impl Tree {
         target: &SessionId,
     ) -> Result<(String, Option<AgentId>, Vec<ModelInputItem>), AgentControlError> {
         Ok(if let Some(store) = self.rollout_store.get() {
-            let lineage = store
-                .spawned_thread_lineage(target)
-                .await
-                .map_err(|error| AgentControlError::Unsupported(error.to_string()))?
-                .ok_or_else(|| missing(target))?;
-            let root = self
-                .root_lineage
-                .get()
-                .map(|lineage| &lineage.root_session_id)
-                .or_else(|| self.root.session_id.get());
-            if root != Some(lineage.root_session_id()) {
-                return Err(missing(target));
-            }
-            (
-                lineage.agent_path().name().to_owned(),
-                lineage.agent_type().cloned(),
-                Vec::new(),
-            )
+            let lineage =
+                store
+                    .spawned_thread_lineage(target)
+                    .await
+                    .map_err(|error| match error {
+                        Error::Session {
+                            kind: SessionErrorKind::NotFound,
+                            ..
+                        } => missing(target),
+                        other => AgentControlError::Unsupported(other.to_string()),
+                    })?;
+            // A standalone thread has no agent path or role. Allocate an agent name for it,
+            // as a fresh V1 spawn does, and keep its existing session ID and history.
+            let (name, role) = lineage.map_or_else(
+                || (uuid::Uuid::now_v7().simple().to_string(), None),
+                |lineage| {
+                    (
+                        lineage.agent_path().name().to_owned(),
+                        lineage.agent_type().cloned(),
+                    )
+                },
+            );
+            (name, role, Vec::new())
         } else {
             let closed = lock(&self.closed_history)
                 .get(target)

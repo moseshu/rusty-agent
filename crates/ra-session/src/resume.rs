@@ -68,9 +68,11 @@ impl ResumedThread {
     {
         let recorder = store.resume_thread(params).await?;
         let loaded = async {
-            let history = store
-                .load_history(&LoadThreadHistoryParams::new(params.session_id().clone()))
-                .await?;
+            let mut load = LoadThreadHistoryParams::new(params.session_id().clone());
+            if params.include_archived() {
+                load = load.including_archived();
+            }
+            let history = store.load_history(&load).await?;
             let reconstruction = reconstruct_history(history.records())?;
             Ok::<_, ra_core::error::Error>((history, reconstruction))
         }

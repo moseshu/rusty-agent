@@ -1332,6 +1332,287 @@ async fn multi_agent_v1_resumed_descendant_is_restored_under_its_new_parent() {
 }
 
 #[tokio::test]
+async fn multi_agent_v1_resumes_an_archived_child_under_a_different_root() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "");
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (original, _) = start(&server, &mut connection, json!({})).await;
+    let (adopter, _) = start(&server, &mut connection, json!({})).await;
+
+    let spawned = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &original,
+        "spawn_agent",
+        json!({"message": "Task before archiving"}),
+    )
+    .await;
+    let spawned: Value = serde_json::from_str(&spawned).unwrap();
+    let child = spawned["agent_id"].as_str().unwrap();
+    let waited = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &original,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap()["status"][child],
+        json!({"completed": "Done"})
+    );
+    server
+        .call(
+            &mut connection,
+            "thread/archive",
+            json!({"threadId": child}),
+        )
+        .await;
+    let read = ReadThreadParams::new(SessionId::new(child)).including_archived();
+    let archived = server.store.read_thread(&read).await.unwrap();
+    assert!(archived.archived_at().is_some());
+
+    let resumed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &adopter,
+        "resume_agent",
+        json!({"id": child}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&resumed).unwrap()["status"],
+        "pending_init",
+        "{resumed}"
+    );
+    unload(&server, &mut connection, &adopter).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": adopter}),
+        )
+        .await;
+    let sent = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &adopter,
+        "send_input",
+        json!({"target": child, "message": "Task after cold recovery"}),
+    )
+    .await;
+    assert!(
+        serde_json::from_str::<Value>(&sent).unwrap()["submission_id"].is_string(),
+        "{sent}"
+    );
+    let waited = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &adopter,
+        "wait_agent",
+        json!({"targets": [child]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap()["status"][child],
+        json!({"completed": "Done"})
+    );
+    unload(&server, &mut connection, &adopter).await;
+    let after = server.store.read_thread(&read).await.unwrap();
+    assert_eq!(after.rollout_path(), archived.rollout_path());
+    assert!(after.archived_at().is_some());
+
+    assert!(
+        endpoint
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| {
+                let body: Value = request.body_json().unwrap();
+                let input = body["input"].as_array().unwrap();
+                ["Task before archiving", "Task after cold recovery"]
+                    .iter()
+                    .all(|text| {
+                        input.iter().any(|item| {
+                            item["role"] == "user" && item["content"][0]["text"] == *text
+                        })
+                    })
+            }),
+        "the archived rollout supplies the child's previous task to the model"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v1_resume_reports_an_agent_alive_in_another_tree() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "");
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (owner, _) = start(&server, &mut connection, json!({})).await;
+    let (caller, _) = start(&server, &mut connection, json!({})).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let child_request = Arc::clone(&started);
+    Mock::given(method("POST"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body["input"].as_array().unwrap().iter().any(|item| {
+                item["role"] == "user" && item["content"][0]["text"] == "Task in the original tree"
+            })
+        })
+        .respond_with(move |_: &wiremock::Request| {
+            child_request.notify_one();
+            ResponseTemplate::new(500).set_delay(Duration::from_secs(30))
+        })
+        .with_priority(2)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    let spawned = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &owner,
+        "spawn_agent",
+        json!({"message": "Task in the original tree"}),
+    )
+    .await;
+    let spawned: Value = serde_json::from_str(&spawned).unwrap();
+    let child = spawned["agent_id"].as_str().unwrap();
+    timeout(PATIENCE, started.notified()).await.unwrap();
+
+    let resumed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &caller,
+        "resume_agent",
+        json!({"id": child}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&resumed).unwrap(),
+        json!({"status": "running"})
+    );
+    assert_eq!(
+        server
+            .store
+            .list_spawn_children(&SessionId::new(&owner))
+            .await
+            .unwrap(),
+        [SessionId::new(child)]
+    );
+    assert!(
+        server
+            .store
+            .list_spawn_children(&SessionId::new(caller))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let closed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &owner,
+        "close_agent",
+        json!({"target": child}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&closed).unwrap(),
+        json!({"previous_status": "running"})
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v1_resumes_a_standalone_thread_by_id() {
+    let endpoint = responses_endpoint().await;
+    let product = ProductModels::new();
+    setup_catalog(&product, &endpoint, "");
+    let server = server_with_disk(&product);
+    let mut connection = server.connect(1).await;
+    let (target, _) = start(&server, &mut connection, json!({})).await;
+    server
+        .run_turn(&mut connection, &target, "Initial standalone task")
+        .await;
+    unload(&server, &mut connection, &target).await;
+    let (caller, _) = start(&server, &mut connection, json!({})).await;
+
+    let resumed = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &caller,
+        "resume_agent",
+        json!({"id": target}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&resumed).unwrap(),
+        json!({"status": "pending_init"})
+    );
+    unload(&server, &mut connection, &caller).await;
+    server
+        .call(
+            &mut connection,
+            "thread/resume",
+            json!({"threadId": caller}),
+        )
+        .await;
+    let sent = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &caller,
+        "send_input",
+        json!({"target": target, "message": "Continue the standalone task"}),
+    )
+    .await;
+    assert!(serde_json::from_str::<Value>(&sent).unwrap()["submission_id"].is_string());
+    let waited = v1_call(
+        &endpoint,
+        &server,
+        &mut connection,
+        &caller,
+        "wait_agent",
+        json!({"targets": [target]}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&waited).unwrap()["status"][&target],
+        json!({"completed": "Done"})
+    );
+    assert!(
+        endpoint
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| {
+                let body: Value = request.body_json().unwrap();
+                let input = body["input"].as_array().unwrap();
+                ["Initial standalone task", "Continue the standalone task"]
+                    .iter()
+                    .all(|text| {
+                        input.iter().any(|item| {
+                            item["role"] == "user" && item["content"][0]["text"] == *text
+                        })
+                    })
+            })
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v1_send_input_interrupt_redirects_the_running_agent() {
     let endpoint = responses_endpoint().await;
     let product = ProductModels::new();

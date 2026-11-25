@@ -205,7 +205,7 @@ pub(crate) struct ThreadManager {
 impl ThreadManager {
     /// Makes `thread` reachable by its id, in place of any thread loaded under the same id.
     pub(crate) fn add_thread(
-        &self,
+        self: &Arc<Self>,
         thread: AgentThread,
         info: LoadedThreadInfo,
         adapter: Option<Arc<dyn ThreadSettingsAdapter>>,
@@ -213,6 +213,16 @@ impl ThreadManager {
         product: Option<Arc<dyn super::ThreadProductRuntime>>,
         dynamic_tool_calls: Arc<DynamicToolCalls>,
     ) -> LoadedThread {
+        if let Some(control) = thread.agent_control() {
+            let manager = Arc::downgrade(self);
+            control.set_live_agent_lookup(move |session_id| {
+                let manager = manager.upgrade()?;
+                manager
+                    .threads()
+                    .iter()
+                    .find_map(|loaded| loaded.thread.agent_control()?.live_agent(session_id))
+            });
+        }
         let loaded = LoadedThread {
             thread,
             info,

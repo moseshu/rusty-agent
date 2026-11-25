@@ -236,6 +236,7 @@ impl AgentControl {
             resident_limits: OnceLock::new(),
             closed_history: Mutex::new(HashMap::new()),
             legacy_children_loaded: tokio::sync::OnceCell::new(),
+            live_agent_lookup: OnceLock::new(),
             rollout_budget: OnceLock::new(),
             rollout_store: OnceLock::new(),
             root_lineage: OnceLock::new(),
@@ -438,6 +439,23 @@ impl AgentControl {
     #[must_use]
     pub fn agents(&self) -> Vec<LiveAgent> {
         self.tree.list(None)
+    }
+
+    /// Finds a live agent in this tree by its session ID, including the root.
+    #[must_use]
+    pub fn live_agent(&self, session_id: &SessionId) -> Option<LiveAgent> {
+        self.tree
+            .legacy_agent(session_id)
+            .map(|node| node.snapshot())
+    }
+
+    /// Installs the host's lookup for V1 resume to find agents in other loaded trees.
+    /// Subsequent calls keep the first lookup.
+    pub fn set_live_agent_lookup(
+        &self,
+        lookup: impl Fn(&SessionId) -> Option<LiveAgent> + Send + Sync + 'static,
+    ) {
+        let _ = self.tree.live_agent_lookup.set(Box::new(lookup));
     }
 
     /// The current status of the agent at `path`.
@@ -1571,6 +1589,7 @@ struct Tree {
     resident_limits: OnceLock<legacy::ResidentLimits>,
     closed_history: Mutex<HashMap<SessionId, legacy::ClosedAgent>>,
     legacy_children_loaded: tokio::sync::OnceCell<()>,
+    live_agent_lookup: OnceLock<Box<legacy::LiveAgentLookup>>,
     rollout_budget: OnceLock<Arc<RolloutBudget>>,
     /// Where the spawned agents' rollouts are created, once the host has given the tree a store.
     rollout_store: OnceLock<Arc<dyn RolloutThreadStore>>,

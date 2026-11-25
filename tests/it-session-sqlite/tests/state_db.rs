@@ -523,6 +523,42 @@ async fn a_name_is_kept_in_the_title_and_survives_a_rebuild() {
     assert_eq!(page.items()[0].name(), None);
 }
 
+#[tokio::test]
+async fn reopening_an_archived_child_can_index_its_original_rollout_path() {
+    let dir = temp_dir("resume-archived-child");
+    let store = RolloutThreadDirectory::new(&dir);
+    let root = SessionId::new("root");
+    let child = SessionId::new("child");
+    let spawn = RolloutThreadSpawn::new(
+        root.clone(),
+        root,
+        1,
+        AgentPath::root().join("worker").unwrap(),
+    );
+    let recorder = store.create_thread(&child, &spawn).await.unwrap();
+    recorder.shutdown_materialized().await.unwrap();
+    store
+        .archive_thread(&ArchiveThreadParams::new(child.clone()))
+        .await
+        .unwrap();
+
+    let db = Arc::new(StateRuntime::init(&dir).await.unwrap());
+    assert!(db.get_thread(&child).await.unwrap().is_none());
+    let store = store.with_state_db(Arc::clone(&db));
+    let (recorder, _) = store.reopen_spawned_thread(&child).await.unwrap();
+    recorder.record(RolloutItem::TurnContext(
+        RolloutTurnContext::new(RunId::new("resumed"), 0).with_model("updated-model"),
+    ));
+    recorder.shutdown().await.unwrap();
+
+    let row = db.get_thread(&child).await.unwrap().unwrap();
+    assert!(row.archived_at().is_some());
+    assert!(
+        row.rollout_path()
+            .ends_with("archived_sessions/rollout-child.jsonl")
+    );
+}
+
 /// Codex's archive and unarchive tests that update its state database, and its deletion of a
 /// thread's state: the row follows the rollout, and goes with it.
 #[tokio::test]

@@ -1308,7 +1308,11 @@ default `[agents].max_depth` is 1. The next spawn depth controls the entire V1 t
 children at depth 1 have no collaboration tools under the default. The default
 `[agents].max_concurrent_threads_per_session` admits six resident spawned agents. A completed
 agent holds its slot until it is closed. `close_agent` shuts down the selected subtree.
-`resume_agent` reopens the original session and its open descendants. The first V1 collaboration
+`resume_agent` reopens a stored session by ID, including its archived rollout if present, and
+restores its open descendants. An explicit resume can adopt a standalone session or a child
+from another root in the same store. Subsequent cold recovery follows the new parent edge.
+If the app server already has the target loaded in another tree, the call returns its current
+status and leaves ownership with that tree. The first V1 collaboration
 operation after a cold root resume restores that root's open spawned threads. A lower depth limit
 applies to new delegation and the tools offered to restored agents. As in Codex, `close_agent`
 marks the target's spawn edge closed before shutting it down, and `resume_agent` records the
@@ -1362,7 +1366,8 @@ services. Other Codex role-layer consumers remain separate.
   earlier parents. Rollout files gain no new record type.
 - `ra-runtime` adds `AgentControl::with_resident_agent_limits`. `SpawnedAgentFactory` adds
   default `owns_agent_type` and `configure_spawn` methods for host-owned declarations and
-  settings.
+  settings. `AgentControl::live_agent` reads a tree's current status by session ID.
+  `AgentControl::set_live_agent_lookup` connects V1 resume to the host's loaded-thread lookup.
 - `ra-tools` adds `MULTI_AGENT_V1_NAMESPACE` and the `CollaborationKind` variants
   `SpawnAgentV1`, `SendInput`, `WaitAgentV1`, `ResumeAgent`, and `CloseAgent`. The
   `is_v1` accessor identifies these variants. `CollaborationTool` adds the
