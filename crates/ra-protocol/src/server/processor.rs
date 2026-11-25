@@ -549,7 +549,9 @@ impl MessageProcessor {
             | ClientRequest::ConfigRead { .. }
             | ClientRequest::ConfigValueWrite { .. }
             | ClientRequest::ConfigBatchWrite { .. }
-            | ClientRequest::ConfigRequirementsRead { .. } => {
+            | ClientRequest::ConfigRequirementsRead { .. }
+            | ClientRequest::ExperimentalFeatureList { .. }
+            | ClientRequest::ExperimentalFeatureEnablementSet { .. } => {
                 unreachable!("plugin operations are delegated before internal dispatch")
             }
             ClientRequest::Initialize { .. } => {

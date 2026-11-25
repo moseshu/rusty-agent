@@ -312,7 +312,7 @@ impl ProductModelRuntime {
         config.with_run_snapshot(move || {
             let source = Arc::clone(&source);
             async move {
-                source.refresh_after_auth_change().await;
+                source.refresh_for_turn(internal_session).await;
                 let models = source.snapshot();
                 TurnCatalog { source, models }
             }
@@ -681,14 +681,17 @@ async fn remote_catalog(
         .clone()
         .map(CommandBearerToken::new)
         .map(Arc::new);
-    let api_key_disabled = command.is_none()
-        && key.is_some()
-        && !config
-            .features
-            .enabled(ra_config::Feature::ApiKeyModelDiscovery);
     let directory = catalogs.share(
-        RemoteModelCatalog::new(config, url, &auth, key, command, gateway, api_key_disabled)
-            .map_err(Error::config)?,
+        RemoteModelCatalog::new(
+            config,
+            url,
+            &auth,
+            key,
+            command,
+            gateway,
+            catalogs.api_key_discovery.clone(),
+        )
+        .map_err(Error::config)?,
     );
     directory.load(offline).await;
     Ok((auth, directory))

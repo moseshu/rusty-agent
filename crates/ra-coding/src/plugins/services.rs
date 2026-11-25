@@ -4,26 +4,32 @@
     missing_docs,
     reason = "Preserve the source plugin-management service operations."
 )]
+use super::experimental_feature::{apply_runtime_feature_enablement, feature_config_error};
 use super::marketplace::MarketplaceListError;
 use super::marketplace_add::{MarketplaceAddOutcome, MarketplaceAddRequest, add_marketplace};
 use super::marketplace_remove::{
     MarketplaceRemoveOutcome, MarketplaceRemoveRequest, remove_marketplace,
 };
 use super::marketplace_upgrade::{ConfigLayerReload, ConfiguredMarketplaceUpgradeOutcome};
+use super::protocol::internal;
 use super::{
     EffectivePluginsChangedCallback, PluginInstallOutcome, PluginInstallRequest, PluginLoadOutcome,
     PluginMarketplaceContext, PluginMarketplaceScope, PluginReadOutcome, PluginReadRequest,
     PluginRuntimeConfig, PluginsManager,
 };
+use crate::config::model_catalog_remote::ApiKeyModelDiscovery;
 use crate::skills::{HostSkillsLoadInput, HostSkillsService, HostSkillsSnapshot};
 use futures::StreamExt;
+use ra_config::{ConfigLayerSource, Feature, ManagedFeatures};
 use ra_config::{ConfigLayerStack, ConfigLoadOptions, McpServerConfig, ThreadConfigLoader};
 use ra_filesystem::ExecutorFileSystem;
 use ra_http::HttpClientFactory;
 use ra_paths::AbsolutePathBuf;
+use ra_protocol::frame::JsonRpcErrorObject;
+use std::collections::BTreeMap;
 use std::{
     io,
-    sync::{Arc, Weak},
+    sync::{Arc, RwLock, Weak},
 };
 use tokio::sync::{Mutex, watch};
 
@@ -37,6 +43,7 @@ pub struct PluginConfigManager {
     options: ConfigLoadOptions,
     thread_config_loader: Arc<dyn ThreadConfigLoader>,
     http_client_factory: HttpClientFactory,
+    runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
 }
 impl PluginConfigManager {
     pub fn new(
@@ -55,6 +62,7 @@ impl PluginConfigManager {
             options,
             thread_config_loader,
             http_client_factory,
+            runtime_feature_enablement: Arc::default(),
         }
     }
     #[must_use]
@@ -113,17 +121,76 @@ impl PluginConfigManager {
         let layers = self.load_config_layers_for_cwd(None).await?;
         self.project(layers, self.cwd.clone())
     }
+    /// Refreshes on-disk and managed layers while retaining the loaded thread's session flags.
+    pub(super) async fn load_with_session_layers(
+        &self,
+        cwd: AbsolutePathBuf,
+        session: &ConfigLayerStack,
+    ) -> io::Result<PluginRuntimeConfig> {
+        let refreshed = self.load_config_layers_for_cwd(Some(cwd.clone())).await?;
+        let mut layers: Vec<_> = refreshed
+            .all_layers_low_to_high()
+            .filter(|layer| layer.name != ConfigLayerSource::SessionFlags)
+            .chain(
+                session
+                    .all_layers_low_to_high()
+                    .filter(|layer| layer.name == ConfigLayerSource::SessionFlags),
+            )
+            .cloned()
+            .collect();
+        layers.sort_by_key(|layer| layer.name.precedence());
+        let layers = ConfigLayerStack::new(
+            layers,
+            refreshed.requirements().clone(),
+            refreshed.requirements_toml().clone(),
+        )?
+        .with_cloud_config_binding(refreshed.cloud_config_binding().cloned())
+        .with_user_and_project_exec_policy_rules_ignored(
+            refreshed.ignore_user_and_project_exec_policy_rules(),
+        );
+        self.project(layers, cwd)
+    }
+
+    fn extend_runtime_feature_enablement(
+        &self,
+        enablement: &BTreeMap<String, bool>,
+    ) -> Result<(), ()> {
+        self.runtime_feature_enablement
+            .write()
+            .map_err(|_| ())?
+            .extend(
+                enablement
+                    .iter()
+                    .map(|(key, enabled)| (key.clone(), *enabled)),
+            );
+        Ok(())
+    }
+
+    pub(crate) fn apply_runtime_feature_enablement(
+        &self,
+        features: &mut ManagedFeatures,
+        layers: &ConfigLayerStack,
+    ) {
+        if let Ok(enablement) = self.runtime_feature_enablement.read()
+            && !enablement.is_empty()
+        {
+            apply_runtime_feature_enablement(features, layers, &enablement);
+        }
+    }
+
     fn project(
         &self,
         layers: ConfigLayerStack,
         cwd: AbsolutePathBuf,
     ) -> io::Result<PluginRuntimeConfig> {
-        PluginRuntimeConfig::from_layer_stack(
+        let mut config = PluginRuntimeConfig::from_layer_stack(
             layers,
             self.home.clone(),
             cwd,
             self.http_client_factory.clone(),
-        )
+        )?;
+        self.apply_runtime_feature_enablement(&mut config.features, &config.config_layer_stack);
+        Ok(config)
     }
     /// Adapts the same loader to the source blocking Git/activation worker.
     #[must_use]
@@ -247,6 +314,7 @@ pub struct PluginServices {
     writes: Mutex<()>,
     // Loaded threads' hook refreshes, which a write asking to reload user config waits for.
     hook_reloads: std::sync::Mutex<Vec<Weak<crate::thread_hooks::HookRefresh>>>,
+    pub(crate) api_key_model_discovery: ApiKeyModelDiscovery,
 }
 impl PluginServices {
     pub fn new(config_manager: PluginConfigManager, skills: Arc<HostSkillsService>) -> Arc<Self> {
@@ -262,6 +330,7 @@ impl PluginServices {
             hook_generation: std::sync::atomic::AtomicU64::new(0),
             writes: Mutex::new(()),
             hook_reloads: std::sync::Mutex::new(Vec::new()),
+            api_key_model_discovery: ApiKeyModelDiscovery::default(),
         })
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -421,13 +490,47 @@ impl PluginServices {
         let response = Box::pin(self.config_manager.batch_write(params)).await?;
         if !session_defaults_only {
             if reload {
-                self.invalidate();
-                self.reload_loaded_thread_hooks().await;
+                self.reload_user_config().await;
             } else {
                 self.invalidate_caches();
             }
         }
         Ok(response)
+    }
+
+    pub(super) async fn update_runtime_feature_enablement(
+        &self,
+        enablement: &BTreeMap<String, bool>,
+    ) -> Result<(), JsonRpcErrorObject> {
+        let _write = self.writes.lock().await;
+        if enablement.is_empty() {
+            self.clear_source_caches();
+            return Ok(());
+        }
+        self.config_manager
+            .extend_runtime_feature_enablement(enablement)
+            .map_err(|()| internal("failed to update feature enablement"))?;
+        let config = self
+            .config_manager
+            .load_latest_config()
+            .await
+            .map_err(|err| feature_config_error(&err))?;
+        self.api_key_model_discovery
+            .set_enabled(config.features.enabled(Feature::ApiKeyModelDiscovery));
+        self.reload_user_config().await;
+        Ok(())
+    }
+
+    pub(super) fn loaded_hook_refresh(
+        &self,
+        thread_id: &str,
+    ) -> Option<Arc<crate::thread_hooks::HookRefresh>> {
+        self.hook_reloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|refresh| refresh.is_bound_to(thread_id))
     }
 
     /// Registers a loaded thread's hook refresh for writes that reload user configuration.
@@ -443,7 +546,8 @@ impl PluginServices {
     /// Codex's `reload_user_config` refreshes every loaded thread before the write responds, so
     /// the next hook a thread runs, including the `SessionEnd` of an idle thread unloaded right
     /// after the write, already uses the written handlers.
-    async fn reload_loaded_thread_hooks(&self) {
+    async fn reload_user_config(&self) {
+        self.invalidate();
         let reloads: Vec<_> = self
             .hook_reloads
             .lock()

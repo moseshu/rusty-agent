@@ -566,3 +566,70 @@ async fn user_refresh_preserves_project_and_managed_hook_layers() {
     assert_eq!(lines, ["managed-initial", "project-initial", "user-new"]);
     fixture.hooks.close().await;
 }
+
+#[tokio::test]
+async fn experimental_enablement_waits_for_the_loaded_thread_refresh() {
+    use ra_protocol::server::protocol::{
+        ExperimentalFeatureEnablementSetParams, PluginManagementRequest,
+    };
+
+    let loader = Arc::new(GatedLoader::default());
+    let fixture = Fixture::with_loader(vec![], loader.clone()).await;
+    let control = fixture.plugins.protocol_adapter();
+    let changes = fixture.plugins.subscribe();
+    let generation = fixture.hooks.refresh_generation_for_test().await;
+    let loads = loader.loads.load(Ordering::SeqCst);
+    let no_op = PluginManagementRequest::ExperimentalFeatureEnablementSet(
+        ExperimentalFeatureEnablementSetParams::default(),
+    );
+    assert_eq!(
+        control.handle(no_op).await.unwrap(),
+        serde_json::json!({"enablement": {}})
+    );
+    assert_eq!(
+        fixture.hooks.refresh_generation_for_test().await,
+        generation
+    );
+    assert_eq!(loader.loads.load(Ordering::SeqCst), loads);
+    assert!(!changes.has_changed().unwrap());
+
+    fixture.write(&format!(
+        "[features]\ncodex_hooks = true\n{}",
+        section("SessionEnd", "true")
+    ));
+    loader.armed.store(true, Ordering::SeqCst);
+    let request = PluginManagementRequest::ExperimentalFeatureEnablementSet(
+        ExperimentalFeatureEnablementSetParams {
+            enablement: [("auth_elicitation".to_owned(), false)].into(),
+        },
+    );
+    let mut response = tokio::spawn(async move { control.handle(request).await });
+    tokio::time::timeout(Duration::from_secs(5), loader.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut response)
+            .await
+            .is_err()
+    );
+    loader.release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({"enablement": {"auth_elicitation": false}})
+    );
+    assert_eq!(
+        fixture
+            .hooks
+            .runtime()
+            .current()
+            .preview_session_end()
+            .len(),
+        1
+    );
+    fixture.hooks.close().await;
+}

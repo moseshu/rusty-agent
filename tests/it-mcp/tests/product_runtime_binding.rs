@@ -190,3 +190,6 @@ async fn connection_identity_tracks_transport_and_referenced_environment() {
 
 #[path = "product_runtime_binding/policy.rs"]
 mod policy;
+
+#[path = "product_runtime_binding/tool_catalog_cache.rs"]
+mod tool_catalog_cache;

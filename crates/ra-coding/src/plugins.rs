@@ -146,6 +146,7 @@ pub use services::{
 mod skill_provider;
 pub use skill_provider::PluginSkillProvider;
 
+mod experimental_feature;
 mod protocol;
 
 pub(crate) mod input_contributor;

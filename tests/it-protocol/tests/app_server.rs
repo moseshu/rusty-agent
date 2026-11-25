@@ -515,6 +515,7 @@ async fn unknown_methods_and_unfit_parameters_are_invalid_requests() {
                    `plugin/installed`, `plugin/read`, `plugin/install`, `plugin/uninstall`, \
                    `skills/config/write`, `config/read`, `config/value/write`, \
                    `config/batchWrite`, `configRequirements/read`, \
+                   `experimentalFeature/list`, `experimentalFeature/enablement/set`, \
                    `mcpServerStatus/list`, `config/mcpServer/reload`, \
                    `mcpServer/reconnect`, `mcpServer/toggle`, \
                    `initialize`, `thread/start`, `thread/resume`, `thread/fork`, \

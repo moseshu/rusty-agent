@@ -9,11 +9,11 @@ use std::{
 use async_trait::async_trait;
 use futures::FutureExt;
 use ra_core::error::Result;
-use ra_mcp::tool::McpToolClientSource;
+use ra_mcp::tool::{McpToolCatalog, McpToolClientSource};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::{Entry, EntryState, StartupAttempt, StartupResult, Status};
+use super::{BindingView, Entry, EntryState, StartupAttempt, StartupResult, Status};
 
 use ra_core::error::{Error, ProtocolErrorKind, ToolErrorKind};
 
@@ -74,6 +74,7 @@ impl Entry {
         state.startup_cancel.cancel();
         state.startup_cancel = CancellationToken::new();
         state.pending = None;
+        state.catalog_ticket = None;
         state.stopped = stopped;
         state.consecutive_failures = 0;
         state.retry_not_before = None;
@@ -102,13 +103,24 @@ impl Entry {
         }
     }
 
-    pub(super) async fn wait_for_catalog(self: &Arc<Self>) {
+    pub(super) async fn wait_for_catalog(
+        self: &Arc<Self>,
+        view: &BindingView,
+    ) -> Option<McpToolCatalog> {
         self.retry_background();
         self.start_background();
         let pending = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if !state.enabled || state.stopped || state.cached_catalog.is_some() {
-                return;
+                return None;
+            }
+            if view.startup_readiness == ra_config::McpStartupReadiness::Catalog
+                && matches!(state.status, Status::NotStarted | Status::Starting)
+                && let Some(cache) = &self.shared_catalog
+                && let Some(catalog) = cache.current_catalog()
+                && catalog.allows_deferred_startup(&view.filter)
+            {
+                return Some(catalog);
             }
             state.pending.clone()
         };
@@ -119,6 +131,7 @@ impl Entry {
                 }
             }
         }
+        None
     }
 
     pub(super) fn launch_startup(

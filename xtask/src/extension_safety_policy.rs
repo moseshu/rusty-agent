@@ -77,6 +77,11 @@ const EXHAUSTIVE_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-protocol/src/server/protocol/config.rs",
         "ConfigWriteErrorCode",
     ),
+    // Codex's experimental feature catalog has a closed wire lifecycle.
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeatureStage",
+    ),
     // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/{config,application,windows_sandbox}.rs.
     // The `configRequirements/read` wire unions; clients match their closed variant sets.
     (
@@ -542,6 +547,27 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/ra-protocol/src/server/protocol/config.rs",
         "SkillsConfigWriteResponse",
+    ),
+    // Codex's experimental feature RPC records retain their public fields and serde shapes.
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeature",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeatureListParams",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeatureListResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeatureEnablementSetParams",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/experimental_feature.rs",
+        "ExperimentalFeatureEnablementSetResponse",
     ),
     // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/{config,application}.rs.
     // `configRequirements/read` records. ConfigRequirements omits allowed_login_methods,

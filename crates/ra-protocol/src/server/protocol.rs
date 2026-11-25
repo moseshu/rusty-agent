@@ -40,6 +40,7 @@
 
 mod config;
 mod dynamic_tools;
+mod experimental_feature;
 mod gateway_oauth;
 mod hook_notifications;
 mod hooks;
@@ -77,6 +78,11 @@ pub use self::config::{
     ConfigWriteErrorCode, ConfigWriteResponse, MergeStrategy, OverriddenMetadata,
     SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse, ToolsV2,
     WriteStatus,
+};
+pub use self::experimental_feature::{
+    ExperimentalFeature, ExperimentalFeatureEnablementSetParams,
+    ExperimentalFeatureEnablementSetResponse, ExperimentalFeatureListParams,
+    ExperimentalFeatureListResponse, ExperimentalFeatureStage,
 };
 /// The managed requirement records `configRequirements/read` answers with.
 pub mod config_requirements {
@@ -369,6 +375,25 @@ pub enum ClientRequest {
         /// Takes no parameters.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<()>,
+    },
+
+    /// Lists feature metadata and effective enablement.
+    #[serde(rename = "experimentalFeature/list")]
+    ExperimentalFeatureList {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Pagination and optional loaded thread.
+        params: ExperimentalFeatureListParams,
+    },
+    /// Updates feature defaults for the server process.
+    #[serde(rename = "experimentalFeature/enablement/set")]
+    ExperimentalFeatureEnablementSet {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Named feature defaults to update.
+        params: ExperimentalFeatureEnablementSetParams,
     },
 
     /// Lists configured servers and their current inventory.
@@ -696,6 +721,8 @@ impl ClientRequest {
             | Self::ConfigValueWrite { request_id, .. }
             | Self::ConfigBatchWrite { request_id, .. }
             | Self::ConfigRequirementsRead { request_id, .. }
+            | Self::ExperimentalFeatureList { request_id, .. }
+            | Self::ExperimentalFeatureEnablementSet { request_id, .. }
             | Self::McpServerStatusList { request_id, .. }
             | Self::McpServerRefresh { request_id, .. }
             | Self::McpServerReconnect { request_id, .. }
@@ -750,6 +777,8 @@ impl ClientRequest {
             Self::SkillsConfigWrite { .. } => "skills/config/write",
             Self::ConfigRead { .. } => "config/read",
             Self::ConfigRequirementsRead { .. } => "configRequirements/read",
+            Self::ExperimentalFeatureList { .. } => "experimentalFeature/list",
+            Self::ExperimentalFeatureEnablementSet { .. } => "experimentalFeature/enablement/set",
             Self::ConfigValueWrite { .. } => "config/value/write",
             Self::ConfigBatchWrite { .. } => "config/batchWrite",
 
@@ -816,6 +845,8 @@ impl ClientRequest {
             | Self::ConfigValueWrite { .. }
             | Self::ConfigBatchWrite { .. }
             | Self::ConfigRequirementsRead { .. }
+            | Self::ExperimentalFeatureList { .. }
+            | Self::ExperimentalFeatureEnablementSet { .. }
             | Self::McpServerStatusList { .. }
             | Self::McpServerRefresh { .. }
             | Self::McpServerReconnect { .. }
@@ -890,7 +921,9 @@ impl ClientRequest {
             | Self::PluginUninstall { .. }
             | Self::SkillsConfigWrite { .. }
             | Self::ConfigValueWrite { .. }
-            | Self::ConfigBatchWrite { .. } => {
+            | Self::ConfigBatchWrite { .. }
+            | Self::ExperimentalFeatureList { .. }
+            | Self::ExperimentalFeatureEnablementSet { .. } => {
                 return Some(ClientRequestSerializationScope::Global("config"));
             }
             // Codex runs catalog reads unserialized.
@@ -1316,6 +1349,12 @@ impl ClientRequest {
             Self::ConfigRequirementsRead { .. } => {
                 Some(PluginManagementRequest::ConfigRequirementsRead)
             }
+            Self::ExperimentalFeatureList { params, .. } => Some(
+                PluginManagementRequest::ExperimentalFeatureList(params.clone()),
+            ),
+            Self::ExperimentalFeatureEnablementSet { params, .. } => Some(
+                PluginManagementRequest::ExperimentalFeatureEnablementSet(params.clone()),
+            ),
             _ => None,
         }
     }
@@ -1357,6 +1396,10 @@ pub enum PluginManagementRequest {
     ConfigBatchWrite(ConfigBatchWriteParams),
     /// `configRequirements/read`.
     ConfigRequirementsRead,
+    /// `experimentalFeature/list`.
+    ExperimentalFeatureList(ExperimentalFeatureListParams),
+    /// `experimentalFeature/enablement/set`.
+    ExperimentalFeatureEnablementSet(ExperimentalFeatureEnablementSetParams),
 }
 
 mod environments;

@@ -7,6 +7,60 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Coding MCP reuses startup tool catalogs
+
+The coding product keeps up to 32 shared startup tool catalogs per MCP runtime for 30 minutes. A
+configured server with `startup_readiness = "catalog"` can reuse a shared snapshot while a new
+registry entry connects. The default `startup_readiness = "connection"` waits for live discovery
+on a new entry. When an existing entry reconnects, its last live catalog remains available in
+either mode, including for servers that opt out of sharing. Tool calls wait for the current
+connection.
+
+Catalogs are partitioned by server name, transport and credential policy. Host-resolved HTTP
+bearer environment values participate in the existing connection fingerprint, as in Codex. HTTP
+route changes retain the existing connection reuse rules. OAuth and header-helper connections
+remain outside this cache.
+
+The first successful live model discovery on a connection also seeds its startup cache. The
+handshake sends no extra `tools/list`, and stop or replacement cancels in-flight discovery.
+Shared snapshots omit tool annotations and use the current filters and approval policy. Servers
+can opt out with `codex/tool-catalog-cache: { "cacheable": false }`. An older connection cannot
+replace a newer published catalog.
+
+Codex gates cross-connection invalidation by `mcp_tool_list_changed`. Rusty Agent has no matching
+configuration switch or notification-driven live refresh yet. It invalidates startup snapshots
+on any received `notifications/tools/list_changed` so announced changes do not survive into a
+new connection. The framework's explicit `cache_tools_list` option keeps its existing semantics.
+
+### Experimental feature catalog and runtime defaults
+
+App servers with `PluginServices` now answer Codex's `experimentalFeature/list` and
+`experimentalFeature/enablement/set`. Both use the exclusive `config` queue and are available
+without opting into the experimental API. The list reports metadata and effective state from the
+local feature registry, in registry order. The optional `threadId` scopes the list to a loaded
+coding thread's working directory and retains its session flags over freshly loaded disk and
+managed layers. A list without `threadId` uses configuration without project discovery.
+
+Set merges the supplied canonical, supported keys into process-local defaults. It logs and skips
+other keys and returns the accepted entries. Explicit configuration and managed requirements take
+precedence. The defaults also appear in `config/read` without changing the reported file layers
+or origins. As in Codex, `config/read` uses a non-project scope unless the client provides a
+`cwd`. A nonempty update refreshes the live API-key model discovery policy for explicit provider
+catalogs and waits for loaded threads to apply the product's existing user-config
+refresh for hooks. Other plugin and MCP consumers use their existing invalidation path. Catalog
+discovery uses the live policy on subsequent lookups and refreshes. A running turn retains its
+captured catalog snapshot.
+
+The background rollout migration flag has a local registry entry and accepts a runtime
+default. Its upstream one-shot worker requires Codex's paginated rollout migration, for which
+rusty-agent has no corresponding worker. Keys such as `mcp_connection_sharing`,
+`mcp_lazy_stdio_startup`, and `daybreak_program_propagation` are absent from the local registry
+and receive the same warning and skip as other unsupported keys.
+
+`ClientRequest` and `PluginManagementRequest` gain `ExperimentalFeatureList` and
+`ExperimentalFeatureEnablementSet` variants. Their parameter, response, and feature metadata
+records are exported from `ra_protocol::server::protocol`.
+
 ### `configRequirements/read` reports managed requirements
 
 App servers with PluginServices now answer Codex's `configRequirements/read`. It is a shared read

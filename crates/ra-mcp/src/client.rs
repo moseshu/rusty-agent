@@ -33,6 +33,9 @@ pub mod http;
 #[cfg(feature = "stdio")]
 pub mod stdio;
 
+mod tool_list_changes;
+pub use tool_list_changes::McpToolListRevision;
+
 #[cfg(any(feature = "stdio", feature = "http"))]
 /// Configured transport selection. Wire-specific options stay in this adapter crate.
 #[derive(Clone)]
@@ -200,6 +203,7 @@ impl McpClientOptions {
 struct ClientSessionServer {
     cleanup_unconfirmed: AtomicBool,
     initialize_result: Arc<ServerPeerInfo>,
+    tool_list_revision: McpToolListRevision,
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
     options: McpClientOptions,
     request_lock: Option<Mutex<()>>,
@@ -264,6 +268,8 @@ impl McpClient {
     {
         let name = server_name.into();
         validate_server_name(&name)?;
+        let tool_list_revision = McpToolListRevision::default();
+        let transport = tool_list_changes::track_tool_list_changes(transport, &tool_list_revision);
         let initialize = rmcp::service::serve_client(ClientConfig::default(), transport);
         let service = match options.session_timeout {
             Some(timeout) => tokio::time::timeout(timeout, initialize)
@@ -285,6 +291,7 @@ impl McpClient {
             )),
             session: Arc::new(ClientSessionServer {
                 initialize_result,
+                tool_list_revision,
                 service: Mutex::new(Some(service)),
                 cleanup_unconfirmed: AtomicBool::new(false),
                 options,
@@ -308,6 +315,11 @@ impl McpClient {
     #[must_use]
     pub fn server_initialize_result(&self) -> &ServerPeerInfo {
         &self.session.initialize_result
+    }
+    /// Captures the revision independently of session ownership and transport cleanup.
+    #[must_use]
+    pub fn tool_list_revision(&self) -> McpToolListRevision {
+        self.session.tool_list_revision.clone()
     }
     /// Whether the owned SDK service is still running.
     pub async fn is_connected(&self) -> bool {

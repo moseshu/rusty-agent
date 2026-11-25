@@ -84,12 +84,17 @@ impl CodingThreadFactory {
         settings: CodingThreadSettingsAdapter,
         builder: ConfigBuilder,
     ) -> Self {
+        let model_catalogs = Arc::new(RemoteModelCatalogs::new(
+            host.plugin_services()
+                .map(|plugins| plugins.api_key_model_discovery.clone())
+                .unwrap_or_default(),
+        ));
         Self {
             host,
             models: None,
             settings,
             product_config: Some(builder),
-            model_catalogs: Arc::default(),
+            model_catalogs,
             role: PromptRole::Main,
             profile: HOST_BACKED_PROFILE,
             agent_id: AgentId::new("coding"),
@@ -161,11 +166,17 @@ impl CodingThreadFactory {
         builder.harness_overrides_mut().cwd = Some(host.workspace_root().to_path_buf());
         ProductPermissionSource::apply_initial_policy(&mut builder, request.policy())
             .map_err(ra_core::error::Error::config)?;
-        let config = Arc::new(builder.clone().build().await.map_err(|error| {
+        let mut config = builder.clone().build().await.map_err(|error| {
             ra_core::error::Error::config(format!(
                 "failed to load the product configuration: {error}"
             ))
-        })?);
+        })?;
+        if let Some(plugins) = host.plugin_services() {
+            plugins
+                .config_manager
+                .apply_runtime_feature_enablement(&mut config.features, &config.config_layer_stack);
+        }
+        let config = Arc::new(config);
         let models = Arc::new(
             ProductModelRuntime::new(
                 Arc::clone(&config),
@@ -262,9 +273,9 @@ impl ThreadFactory for CodingThreadFactory {
         let mut host = self.host.with_new_process_manager();
         let (settings, model_runtime, hooks) = match &self.product_config {
             Some(builder) => {
-                let (settings, runtime, hooks) = self
-                    .load_product_configuration(builder.clone(), &host, request)
-                    .await?;
+                let (settings, runtime, hooks) =
+                    Box::pin(self.load_product_configuration(builder.clone(), &host, request))
+                        .await?;
                 host = self.configure_product_host(host, &runtime, request);
                 (settings, Some(runtime), Some(hooks))
             }

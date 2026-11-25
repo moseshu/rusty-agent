@@ -48,7 +48,8 @@ pub(super) struct RemoteModelCatalog {
     static_key: Option<String>,
     command: Option<Arc<CommandBearerToken>>,
     gateway: Option<Arc<GatewayAuthHeaders>>,
-    disabled: bool,
+    api_key_discovery: ApiKeyModelDiscovery,
+    api_key_discovery_default: bool,
     client: HttpClient,
     client_factory: HttpClientFactory,
     request_max_retries: u64,
@@ -57,13 +58,37 @@ pub(super) struct RemoteModelCatalog {
     refresh: Mutex<()>,
 }
 
+/// Live catalog policy shared by a product server's active model runtimes.
+#[derive(Clone, Default)]
+pub(crate) struct ApiKeyModelDiscovery(Arc<StdMutex<Option<bool>>>);
+
+impl ApiKeyModelDiscovery {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(enabled);
+    }
+
+    fn enabled(&self) -> Option<bool> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Shares catalog state and credentials across active threads with equivalent discovery settings.
 #[derive(Default)]
-pub(crate) struct RemoteModelCatalogs(StdMutex<Vec<Weak<RemoteModelCatalog>>>);
+pub(crate) struct RemoteModelCatalogs {
+    catalogs: StdMutex<Vec<Weak<RemoteModelCatalog>>>,
+    pub(super) api_key_discovery: ApiKeyModelDiscovery,
+}
 
 impl RemoteModelCatalogs {
+    pub(crate) fn new(api_key_discovery: ApiKeyModelDiscovery) -> Self {
+        Self {
+            api_key_discovery,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn share(&self, candidate: RemoteModelCatalog) -> Arc<RemoteModelCatalog> {
-        let mut catalogs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
         catalogs.retain(|catalog| catalog.strong_count() != 0);
         if let Some(existing) = catalogs.iter().filter_map(Weak::upgrade).find(|catalog| {
             catalog.path == candidate.path
@@ -71,7 +96,7 @@ impl RemoteModelCatalogs {
                     == candidate.identity(candidate.static_key.as_deref())
                 && catalog.command.as_deref().map(CommandBearerToken::config)
                     == candidate.command.as_deref().map(CommandBearerToken::config)
-                && catalog.disabled == candidate.disabled
+                && catalog.api_key_discovery_default == candidate.api_key_discovery_default
                 && catalog.client_factory == candidate.client_factory
                 && catalog.request_max_retries == candidate.request_max_retries
         }) {
@@ -97,7 +122,7 @@ impl RemoteModelCatalog {
         static_key: Option<String>,
         command: Option<Arc<CommandBearerToken>>,
         gateway: Option<Arc<GatewayAuthHeaders>>,
-        disabled: bool,
+        api_key_discovery: ApiKeyModelDiscovery,
     ) -> Result<Self, &'static str> {
         let mut url = Url::parse(url).map_err(|_| "model_catalog_url must be an absolute URL")?;
         if !matches!(url.scheme(), "https" | "http") {
@@ -149,7 +174,10 @@ impl RemoteModelCatalog {
             static_key,
             command,
             gateway,
-            disabled,
+            api_key_discovery,
+            api_key_discovery_default: config
+                .features
+                .enabled(ra_config::Feature::ApiKeyModelDiscovery),
             client: RouteAwareClientPool::new_without_redirects_or_request_logging(
                 client_factory.clone(),
                 ClientRouteClass::Api,
@@ -177,7 +205,22 @@ impl RemoteModelCatalog {
         format!("{:x}", digest.finalize())
     }
 
+    fn uses_api_key(&self) -> bool {
+        self.command.is_none() && self.static_key.is_some()
+    }
+
+    fn api_key_discovery_disabled(&self) -> bool {
+        self.uses_api_key()
+            && !self
+                .api_key_discovery
+                .enabled()
+                .unwrap_or(self.api_key_discovery_default)
+    }
+
     pub(super) fn snapshot(&self) -> Option<Arc<ModelsResponse>> {
+        if self.api_key_discovery_disabled() {
+            return None;
+        }
         let identity = match &self.command {
             Some(command) => self.identity(Some(&command.last_resolved_token()?)),
             None => self.identity(self.static_key.as_deref()),
@@ -196,7 +239,17 @@ impl RemoteModelCatalog {
         self.refresh_catalog(Refresh::Startup { offline }).await;
     }
 
-    pub(super) async fn refresh_after_auth_change(&self) {
+    pub(super) async fn refresh_for_turn(&self, offline: bool) {
+        if self.uses_api_key()
+            && self.api_key_discovery.enabled() == Some(true)
+            && self.snapshot().is_none()
+        {
+            self.load(offline).await;
+        }
+        self.refresh_after_auth_change().await;
+    }
+
+    async fn refresh_after_auth_change(&self) {
         if self.command.is_some()
             && timeout(REFRESH_TIMEOUT, self.refresh_catalog(Refresh::AuthChanged))
                 .await
@@ -207,10 +260,10 @@ impl RemoteModelCatalog {
     }
 
     async fn refresh_catalog(&self, reason: Refresh<'_>) {
-        if self.disabled {
+        let _guard = self.refresh.lock().await;
+        if self.api_key_discovery_disabled() {
             return;
         }
-        let _guard = self.refresh.lock().await;
         let key = match &self.command {
             Some(command) => {
                 if matches!(reason, Refresh::Etag(_)) {

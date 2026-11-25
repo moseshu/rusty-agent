@@ -32,7 +32,7 @@ use ra_mcp::{
 };
 use sha2::{Digest, Sha256};
 
-use super::McpServerConfig;
+use super::{McpServerConfig, tool_catalog_cache::CacheKey};
 
 /// Source default for a server's startup handshake.
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -178,8 +178,29 @@ fn product_mcp_server(
         .with_lifecycle_options(lifecycle)
         .with_binding_options(binding_options)
         .with_connection_identity(connection_identity(server, local_process_cwd));
+    registration.startup_readiness = config.startup_readiness;
+    registration.shared_catalog_key =
+        tool_catalog_key(name, config, registration.connection_identity());
     registration.product_policy = Some(Arc::new(super::approval::ProductMcpPolicy::new(server)));
     Ok(registration)
+}
+
+fn tool_catalog_key(
+    name: &str,
+    config: &ProductServerConfig,
+    identity: Option<&str>,
+) -> Option<CacheKey> {
+    if matches!(
+        config.transport,
+        McpServerTransportConfig::StreamableHttp { .. }
+    ) && (config.oauth.is_some() || config.scopes.is_some() || config.oauth_resource.is_some())
+    {
+        return None;
+    }
+    Some(CacheKey {
+        server: name.to_owned(),
+        connection_identity: identity?.to_owned(),
+    })
 }
 
 fn approval_policy(config: &ProductServerConfig) -> ra_mcp::approval::RequireApprovalSetting {

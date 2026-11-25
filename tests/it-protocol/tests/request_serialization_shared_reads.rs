@@ -346,3 +346,71 @@ async fn later_shared_reads_do_not_jump_ahead_of_queued_write() {
         .expect("later read should start after the write")
         .expect("sender should be open");
 }
+
+#[tokio::test]
+async fn experimental_feature_methods_use_the_exclusive_config_queue() {
+    use ra_protocol::server::protocol::{
+        ExperimentalFeatureEnablementSetParams, ExperimentalFeatureListParams,
+    };
+
+    let queues = SerializationQueues::default();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let list = ClientRequest::ExperimentalFeatureList {
+        request_id: RequestId::Integer(1),
+        params: ExperimentalFeatureListParams::default(),
+    };
+    assert!(
+        queues
+            .enqueue_request(&list, async move {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.await;
+            })
+            .await
+    );
+    timeout(queue_drain_timeout(), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (set_tx, mut set_rx) = oneshot::channel();
+    let (set_release_tx, set_release_rx) = oneshot::channel::<()>();
+    let set = ClientRequest::ExperimentalFeatureEnablementSet {
+        request_id: RequestId::Integer(2),
+        params: ExperimentalFeatureEnablementSetParams::default(),
+    };
+    assert!(
+        queues
+            .enqueue_request(&set, async move {
+                set_tx.send(()).unwrap();
+                let _ = set_release_rx.await;
+            })
+            .await
+    );
+    let (read_tx, mut read_rx) = oneshot::channel();
+    queues
+        .enqueue("config", SerializationAccess::SharedRead, async move {
+            read_tx.send(()).unwrap();
+        })
+        .await;
+    timeout(shutdown_wait_timeout(), &mut set_rx)
+        .await
+        .expect_err("enablement must wait for the feature list");
+    assert!(matches!(
+        read_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    release_tx.send(()).unwrap();
+    timeout(queue_drain_timeout(), set_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(shutdown_wait_timeout(), &mut read_rx)
+        .await
+        .expect_err("config reads must wait for enablement");
+    set_release_tx.send(()).unwrap();
+    timeout(queue_drain_timeout(), read_rx)
+        .await
+        .unwrap()
+        .unwrap();
+}

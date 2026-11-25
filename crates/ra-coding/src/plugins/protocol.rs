@@ -1,5 +1,8 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! App-server lowering for source-backed non-account plugin and capability operations.
+use super::experimental_feature::{
+    SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT, feature_config_error,
+};
 use super::marketplace::MarketplacePluginSource;
 use super::{ConfiguredMarketplacePlugin, PluginReadOutcome, PluginServices};
 use ra_protocol::{
@@ -20,7 +23,7 @@ impl PluginServices {
         })
     }
 }
-fn internal(err: impl std::fmt::Display) -> JsonRpcErrorObject {
+pub(super) fn internal(err: impl std::fmt::Display) -> JsonRpcErrorObject {
     JsonRpcErrorObject::internal_error(err.to_string())
 }
 fn invalid(err: impl std::fmt::Display) -> JsonRpcErrorObject {
@@ -363,19 +366,14 @@ impl PluginManagement for PluginRequestProcessor {
                     .map_err(config_error)?;
                 let config = match fallback_cwd {
                     Some(cwd) => {
-                        ra_paths::AbsolutePathBuf::from_absolute_path(cwd).map_err(internal)?
+                        let cwd =
+                            ra_paths::AbsolutePathBuf::try_from(std::path::PathBuf::from(cwd))
+                                .map_err(internal)?;
+                        services.config_manager.load_for_cwd(cwd).await
                     }
-                    None => services.config_manager.cwd().clone(),
-                };
-                let config = services
-                    .config_manager
-                    .load_for_cwd(config)
-                    .await
-                    .map_err(|err| {
-                        internal(format!(
-                            "failed to resolve feature override precedence: {err}"
-                        ))
-                    })?;
+                    None => services.config_manager.load_latest_config().await,
+                }
+                .map_err(|err| feature_config_error(&err))?;
                 for feature_key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
                     let Some(feature) = ra_config::features::feature_for_key(feature_key) else {
                         continue;
@@ -396,6 +394,12 @@ impl PluginManagement for PluginRequestProcessor {
                     }
                 }
                 json(response)
+            }
+            wire::PluginManagementRequest::ExperimentalFeatureList(params) => {
+                json(Box::pin(services.experimental_feature_list(params)).await?)
+            }
+            wire::PluginManagementRequest::ExperimentalFeatureEnablementSet(params) => {
+                json(Box::pin(services.experimental_feature_enablement_set(params)).await?)
             }
             wire::PluginManagementRequest::ConfigRequirementsRead => {
                 let requirements = services
@@ -676,21 +680,6 @@ fn hook_metadata(value: crate::hooks::HookListEntry) -> wire::HookMetadata {
     }
 }
 
-/// Features whose effective value `config/read` reports even when no layer sets them.
-const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
-    "api_key_cyber_access_programs",
-    "api_key_model_discovery",
-    "auth_elicitation",
-    "background_paginated_rollout_migration",
-    "codex_apps_mcp_2026_07_28",
-    "mcp_2026_07_28",
-    "memories",
-    "mentions_v2",
-    "remote_control",
-    "remote_plugin",
-    "tool_suggest",
-    "windows_sandbox_service",
-];
 fn config_error(err: crate::config_manager_service::ConfigManagerError) -> JsonRpcErrorObject {
     if let Some(code) = err.write_error_code() {
         return JsonRpcErrorObject::invalid_request(err.to_string())

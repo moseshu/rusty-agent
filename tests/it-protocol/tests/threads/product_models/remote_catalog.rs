@@ -520,3 +520,69 @@ async fn remote_catalog_is_shared_across_threads_and_stays_fixed_during_a_turn()
     }
     endpoint.verify().await;
 }
+
+#[tokio::test]
+async fn experimental_feature_toggle_updates_catalog_discovery_for_loaded_threads() {
+    let endpoint = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/catalog"))
+        .and(header("authorization", "Bearer catalog-key"))
+        .respond_with(catalog_response(
+            "\"v1\"",
+            vec![catalog_model("catalog-model", 1, "high")],
+        ))
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    mount_sse(&endpoint, "\"v1\"").await;
+
+    let product = ProductModels::new();
+    configure_catalog(
+        &product,
+        &endpoint.uri(),
+        &format!("{}/catalog", endpoint.uri()),
+        Some("catalog-key"),
+        "model = 'catalog-model'",
+    );
+    let server = product.server_with_feature_config(product.parts().2).await;
+    let mut client = server.connect(1).await;
+    let update = |enabled| json!({"enablement": {"api_key_model_discovery": enabled}});
+    let method_name = "experimentalFeature/enablement/set";
+    assert_eq!(
+        server.call(&mut client, method_name, update(false)).await,
+        update(false)
+    );
+    let (thread, _) = start(&server, &mut client, json!({})).await;
+    assert!(endpoint.received_requests().await.unwrap().is_empty());
+
+    assert_eq!(
+        server.call(&mut client, method_name, update(true)).await,
+        update(true)
+    );
+    assert_eq!(
+        completed_turn(&server, &mut client, &thread, "Discovery enabled").await["turn"]["status"],
+        "completed"
+    );
+    let requests = endpoint.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let discovered: Value = requests[1].body_json().unwrap();
+    assert_developer_prefix(&discovered, "Instructions for catalog-model");
+
+    assert_eq!(
+        server.call(&mut client, method_name, update(false)).await,
+        update(false)
+    );
+    assert_eq!(
+        completed_turn(&server, &mut client, &thread, "Discovery disabled").await["turn"]["status"],
+        "completed"
+    );
+    let requests = endpoint.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let undiscovered: Value = requests[2].body_json().unwrap();
+    assert!(
+        !undiscovered
+            .to_string()
+            .contains("Instructions for catalog-model")
+    );
+    endpoint.verify().await;
+}

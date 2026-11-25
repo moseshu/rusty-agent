@@ -191,6 +191,7 @@ impl CodingThreadHooks {
             runtime: Arc::clone(&self.runtime),
             plugins,
             builder,
+            loaded_thread_id: Mutex::new(None),
             state: tokio::sync::Mutex::new(HookRefreshState { config, generation }),
         });
         refresh.plugins.register_hook_reload(&refresh);
@@ -377,6 +378,12 @@ impl ThreadProductRuntime for CodingThreadHooks {
         }
         self.runtime.bind_thread_events(events);
         self.runtime.bind_transcript(binding.thread_handle());
+        if let Some(refresh) = self.refresh.get() {
+            *refresh
+                .loaded_thread_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(binding.thread_id().clone());
+        }
     }
 
     async fn activate_turn(&self) {
@@ -394,6 +401,13 @@ impl ThreadProductRuntime for CodingThreadHooks {
     }
 
     async fn close(&self) {
+        if let Some(refresh) = self.refresh.get() {
+            refresh
+                .loaded_thread_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+        }
         let task = self
             .refresh_task
             .lock()
@@ -434,10 +448,29 @@ pub(crate) struct HookRefresh {
     runtime: Arc<ProductHookRuntime>,
     plugins: Arc<crate::plugins::PluginServices>,
     builder: ConfigBuilder,
+    loaded_thread_id: Mutex<Option<SessionId>>,
     state: tokio::sync::Mutex<HookRefreshState>,
 }
 
 impl HookRefresh {
+    pub(crate) fn is_bound_to(&self, thread_id: &str) -> bool {
+        self.loaded_thread_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|id| id.as_str() == thread_id)
+    }
+
+    pub(crate) async fn feature_config_context(
+        &self,
+    ) -> (ra_paths::AbsolutePathBuf, ra_config::ConfigLayerStack) {
+        let state = self.state.lock().await;
+        (
+            state.config.cwd.clone(),
+            state.config.config_layer_stack.clone(),
+        )
+    }
+
     pub(crate) async fn reconcile(&self, activate: bool) {
         let mut state = self.state.lock().await;
         loop {

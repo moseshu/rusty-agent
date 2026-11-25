@@ -53,6 +53,49 @@ impl ProductModels {
         .0
     }
 
+    async fn server_with_feature_config(&self, builder: ConfigBuilder) -> Server {
+        use ra_coding::{
+            plugins::{PluginConfigManager, PluginServices},
+            skills::HostSkillsService,
+        };
+        use ra_paths::AbsolutePathBuf;
+
+        let (host, settings, _) = self.parts();
+        let home =
+            AbsolutePathBuf::from_absolute_path(self.home.path().canonicalize().unwrap()).unwrap();
+        let cwd =
+            AbsolutePathBuf::from_absolute_path(self.workspace.path().canonicalize().unwrap())
+                .unwrap();
+        let manager = PluginConfigManager::new(
+            ra_executor::LOCAL_FS.clone(),
+            home.clone(),
+            cwd,
+            ra_config::ConfigLoadOptions::from(LoaderOverrides {
+                system_requirements_path: Some(home.join("requirements.toml").to_path_buf()),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            }),
+            Arc::new(ra_config::NoopThreadConfigLoader),
+            builder.clone().build().await.unwrap().http_client_factory(),
+        );
+        let services = PluginServices::new(
+            manager,
+            Arc::new(HostSkillsService::new(home.clone(), false)),
+        );
+        let factory = CodingThreadFactory::from_product_config(
+            host.with_plugin_skills(services.clone()),
+            settings,
+            builder,
+        );
+        let store: Arc<dyn ThreadStore> = Arc::new(InMemoryThreadStore::new());
+        let server = AppServer::new(home.to_path_buf())
+            .unwrap()
+            .with_thread_store(store.clone())
+            .with_thread_unload_delay(Duration::ZERO)
+            .with_thread_factory(Arc::new(factory))
+            .with_plugin_management(services.protocol_adapter());
+        Server::run(server, store)
+    }
+
     /// A server whose threads assemble the standard tier with native search, and the services that
     /// tier requires.
     fn standard_server(&self) -> (Server, Arc<crate::coding_tools::configured_host::Services>) {
@@ -1281,3 +1324,6 @@ mod web_search;
 
 #[path = "product_models/multi_agent.rs"]
 pub(super) mod multi_agent;
+
+#[path = "product_models/experimental_features.rs"]
+mod experimental_features;
