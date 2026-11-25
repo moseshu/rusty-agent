@@ -4,7 +4,7 @@
 //! writer is refused until the first is shut down, discarding lets go of the writer, and shutting
 //! down a thread that recorded nothing does not create its rollout.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use ra_core::{
     agent::control::AgentPath,
@@ -14,15 +14,15 @@ use ra_core::{
         SessionId,
         rollout::{
             RolloutItem, RolloutRecorder, RolloutRunEnd, RolloutRunEnded, RolloutRunStarted,
-            RolloutThreadSpawn, RolloutThreadStore,
+            RolloutThreadSpawn, RolloutThreadStore, ThreadSpawnEdgeStatus,
         },
     },
     state::RunId,
 };
 use ra_session::{
-    InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams, ResumeThreadParams,
-    ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta, RolloutThreadDirectory,
-    RolloutWriter, ThreadStore,
+    DeleteThreadParams, InMemoryThreadStore, LoadThreadHistoryParams, ReadThreadParams,
+    ResumeThreadParams, ResumedThread, RolloutFileRecorder, RolloutReader, RolloutSessionMeta,
+    RolloutThreadDirectory, RolloutWriter, ThreadStore,
 };
 use serde_json::json;
 
@@ -248,6 +248,130 @@ async fn the_rollout_directory_keeps_the_thread_store_contract() {
 #[tokio::test]
 async fn the_in_memory_store_keeps_the_thread_store_contract() {
     contract(&InMemoryThreadStore::new()).await;
+}
+
+async fn deleting_a_new_parent_does_not_restore_a_previous_edge(store: &dyn ThreadStore) {
+    let root = SessionId::new("root");
+    let parent = SessionId::new("new-parent");
+    let child = SessionId::new("child");
+    for id in [&parent, &child] {
+        let recorder = store.create_thread(id, &spawn()).await.unwrap();
+        record_run(recorder.as_ref(), "initial", "materialize the rollout");
+        recorder.shutdown().await.unwrap();
+    }
+    store
+        .upsert_thread_spawn_edge(&root, &child, ThreadSpawnEdgeStatus::Open)
+        .await
+        .unwrap();
+    store
+        .upsert_thread_spawn_edge(&parent, &child, ThreadSpawnEdgeStatus::Open)
+        .await
+        .unwrap();
+    store
+        .set_thread_spawn_edge_status(&child, ThreadSpawnEdgeStatus::Closed)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_thread_spawn_children(&parent, Some(ThreadSpawnEdgeStatus::Closed))
+            .await
+            .unwrap(),
+        [child.clone()]
+    );
+    assert_eq!(
+        store.list_spawn_children(&parent).await.unwrap(),
+        [child.clone()]
+    );
+    assert_eq!(
+        store.list_spawn_children(&root).await.unwrap(),
+        [parent.clone()]
+    );
+
+    store
+        .delete_thread(&DeleteThreadParams::new(parent.clone()))
+        .await
+        .unwrap();
+    store
+        .set_thread_spawn_edge_status(&child, ThreadSpawnEdgeStatus::Open)
+        .await
+        .unwrap();
+    for former_parent in [&root, &parent] {
+        assert!(
+            store
+                .list_spawn_children(former_parent)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    store
+        .read_thread(&ReadThreadParams::new(child))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_new_parent_keeps_the_child_detached_in_both_stores() {
+    deleting_a_new_parent_does_not_restore_a_previous_edge(&InMemoryThreadStore::new()).await;
+    let store = RolloutThreadDirectory::new(temp_dir("remove-spawn-edge"));
+    deleting_a_new_parent_does_not_restore_a_previous_edge(&store).await;
+}
+
+#[tokio::test]
+async fn replay_closes_the_current_edge_even_with_a_stale_metadata_parent() {
+    let dir = temp_dir("replay-spawn-edge");
+    let store = RolloutThreadDirectory::new(&dir);
+    let original = SessionId::new("original");
+    let parent = SessionId::new("new-parent");
+    let child = SessionId::new("child");
+    store
+        .upsert_thread_spawn_edge(&parent, &child, ThreadSpawnEdgeStatus::Open)
+        .await
+        .unwrap();
+
+    // A status update resolved the metadata parent before the reparent was recorded.
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("thread_spawn_edges.jsonl"))
+        .unwrap();
+    writeln!(
+        log,
+        "{}",
+        json!({
+            "child_thread_id": child,
+            "status": ThreadSpawnEdgeStatus::Closed,
+            "implicit_parent": original,
+        })
+    )
+    .unwrap();
+    log.write_all(b"{\xff").unwrap();
+    drop(log);
+    let sibling = SessionId::new("sibling");
+    store
+        .upsert_thread_spawn_edge(&parent, &sibling, ThreadSpawnEdgeStatus::Open)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_thread_spawn_children(&parent, Some(ThreadSpawnEdgeStatus::Closed))
+            .await
+            .unwrap(),
+        [child]
+    );
+    assert_eq!(
+        store
+            .list_thread_spawn_children(&parent, Some(ThreadSpawnEdgeStatus::Open))
+            .await
+            .unwrap(),
+        [sibling]
+    );
+    assert!(
+        store
+            .list_spawn_children(&original)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -144,7 +144,7 @@ impl RolloutThreadStore for InMemoryThreadStore {
         status: ThreadSpawnEdgeStatus,
     ) -> Result<()> {
         self.spawn_edges()
-            .insert(child.clone(), (parent.clone(), status));
+            .upsert(parent.clone(), child.clone(), status);
         Ok(())
     }
 
@@ -153,10 +153,14 @@ impl RolloutThreadStore for InMemoryThreadStore {
         child: &SessionId,
         status: ThreadSpawnEdgeStatus,
     ) -> Result<()> {
-        let edges = self.spawn_edges().clone();
-        if let Some(parent) = crate::store::thread_spawn_parent(self, &edges, child).await? {
-            self.spawn_edges().insert(child.clone(), (parent, status));
-        }
+        let needs_metadata = self.spawn_edges().needs_metadata(child);
+        let implicit_parent = if needs_metadata {
+            crate::store::metadata_spawn_parent(self, child).await?
+        } else {
+            None
+        };
+        self.spawn_edges()
+            .set_status(child.clone(), status, implicit_parent);
         Ok(())
     }
 
@@ -165,8 +169,18 @@ impl RolloutThreadStore for InMemoryThreadStore {
         parent: &SessionId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> Result<Vec<SessionId>> {
-        let edges = self.spawn_edges().clone();
-        crate::store::list_thread_spawn_children(self, &edges, parent, status_filter).await
+        let metadata_children =
+            if status_filter.is_none_or(|filter| filter == ThreadSpawnEdgeStatus::Open) {
+                crate::store::list_metadata_spawn_children(self, parent).await?
+            } else {
+                Vec::new()
+            };
+        Ok(crate::store::list_thread_spawn_children(
+            &self.spawn_edges(),
+            parent,
+            status_filter,
+            metadata_children,
+        ))
     }
 
     async fn reopen_spawned_thread(
@@ -281,6 +295,10 @@ impl ThreadStore for InMemoryThreadStore {
         Ok(ThreadPage::new(items, None))
     }
 
+    async fn list_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
+        self.list_thread_spawn_children(parent, None).await
+    }
+
     async fn update_thread_metadata(
         &self,
         params: &UpdateThreadMetadataParams,
@@ -306,9 +324,7 @@ impl ThreadStore for InMemoryThreadStore {
 
     async fn delete_thread(&self, params: &DeleteThreadParams) -> Result<()> {
         let existed = self.threads().remove(params.session_id()).is_some();
-        self.spawn_edges().retain(|child, (parent, _)| {
-            child != params.session_id() && parent != params.session_id()
-        });
+        self.spawn_edges().remove_thread(params.session_id());
         let had_metadata = self.metadata().remove(params.session_id()).is_some();
         if existed || had_metadata {
             Ok(())

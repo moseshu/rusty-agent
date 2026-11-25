@@ -158,37 +158,15 @@ pub trait ThreadStore: RolloutThreadStore {
     async fn list_threads(&self, params: &ListThreadsParams) -> Result<ThreadPage>;
 
     /// Lists direct spawned children, including archived threads and threads without a preview.
-    /// Codex's subtree lifecycle walks spawn edges; stores without an edge index can derive them
-    /// from session metadata. The default pages listings; directory stores override it to include
+    /// Codex's subtree lifecycle walks current spawn edges. Stores without an edge index derive
+    /// them from session metadata. The default pages listings; directory stores override it to include
     /// rollouts not visible in interactive listings.
     ///
     /// # Errors
     ///
     /// Returns a storage error if children cannot be listed.
     async fn list_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
-        let mut children = std::collections::BTreeSet::new();
-        for archived in [false, true] {
-            let mut params = ListThreadsParams::new(100);
-            if archived {
-                params = params.archived();
-            }
-            loop {
-                let page = self.list_threads(&params).await?;
-                children.extend(
-                    page.items()
-                        .iter()
-                        .filter(|thread| thread.parent_session_id() == Some(parent))
-                        .map(|thread| thread.session_id().clone()),
-                );
-                match page.next_cursor() {
-                    Some(cursor) if Some(cursor) != params.cursor() => {
-                        params = params.with_cursor(cursor);
-                    }
-                    _ => break,
-                }
-            }
-        }
-        Ok(children.into_iter().collect())
+        list_metadata_spawn_children(self, parent).await
     }
 
     /// Changes a thread's metadata and returns the thread as it now reads: Codex's
@@ -874,44 +852,58 @@ pub(crate) fn first_session_meta(records: &[RolloutRecord]) -> Result<Option<Rol
     Ok(meta)
 }
 
-/// Lists `parent`'s direct spawned children from the persisted `edges`: Codex's
-/// `list_thread_spawn_children`. A spawned thread with no persisted edge has the open edge its
-/// session metadata records, as Codex backfills one from a thread's spawn source.
-pub(crate) async fn list_thread_spawn_children(
-    store: &impl ThreadStore,
-    edges: &crate::rollout::spawn_edges::SpawnEdges,
+/// Lists implicit edges from a store's thread metadata.
+pub(crate) async fn list_metadata_spawn_children(
+    store: &(impl ThreadStore + ?Sized),
     parent: &SessionId,
-    status_filter: Option<ThreadSpawnEdgeStatus>,
 ) -> Result<Vec<SessionId>> {
-    let mut children: std::collections::BTreeSet<SessionId> = edges
-        .iter()
-        .filter(|(_, (edge_parent, status))| {
-            edge_parent == parent && status_filter.is_none_or(|filter| filter == *status)
-        })
-        .map(|(child, _)| child.clone())
-        .collect();
-    if status_filter.is_none_or(|filter| filter == ThreadSpawnEdgeStatus::Open) {
-        children.extend(
-            store
-                .list_spawn_children(parent)
-                .await?
-                .into_iter()
-                .filter(|child| !edges.contains_key(child)),
-        );
+    let mut children = std::collections::BTreeSet::new();
+    for archived in [false, true] {
+        let mut params = ListThreadsParams::new(100);
+        if archived {
+            params = params.archived();
+        }
+        loop {
+            let page = store.list_threads(&params).await?;
+            children.extend(
+                page.items()
+                    .iter()
+                    .filter(|thread| thread.parent_session_id() == Some(parent))
+                    .map(|thread| thread.session_id().clone()),
+            );
+            match page.next_cursor() {
+                Some(cursor) if Some(cursor) != params.cursor() => {
+                    params = params.with_cursor(cursor);
+                }
+                _ => break,
+            }
+        }
     }
     Ok(children.into_iter().collect())
 }
 
-/// The parent of `child`'s incoming edge: its persisted edge's, else the one its session metadata
-/// records. A thread the store does not hold has none.
-pub(crate) async fn thread_spawn_parent(
-    store: &impl ThreadStore,
+/// Projects the graph and the remaining implicit edges used by older threads.
+pub(crate) fn list_thread_spawn_children(
     edges: &crate::rollout::spawn_edges::SpawnEdges,
+    parent: &SessionId,
+    status_filter: Option<ThreadSpawnEdgeStatus>,
+    metadata_children: impl IntoIterator<Item = SessionId>,
+) -> Vec<SessionId> {
+    let mut children: std::collections::BTreeSet<SessionId> =
+        edges.children(parent, status_filter).cloned().collect();
+    children.extend(
+        metadata_children
+            .into_iter()
+            .filter(|child| edges.can_use_metadata(parent, child)),
+    );
+    children.into_iter().collect()
+}
+
+/// The original parent from a child's spawn metadata.
+pub(crate) async fn metadata_spawn_parent(
+    store: &impl ThreadStore,
     child: &SessionId,
 ) -> Result<Option<SessionId>> {
-    if let Some((parent, _)) = edges.get(child) {
-        return Ok(Some(parent.clone()));
-    }
     match store
         .read_thread(&ReadThreadParams::new(child.clone()).including_archived())
         .await

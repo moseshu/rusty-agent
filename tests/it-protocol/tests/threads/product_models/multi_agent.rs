@@ -1256,6 +1256,44 @@ async fn multi_agent_v1_resumed_descendant_is_restored_under_its_new_parent() {
     drop(run);
 
     unload(server, &mut connection, thread).await;
+    for filter in ["parentThreadId", "ancestorThreadId"] {
+        let current = server
+            .call(&mut connection, "thread/list", json!({(filter): thread}))
+            .await;
+        assert!(
+            current["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["id"] == leaf && entry["parentThreadId"] == thread })
+        );
+        let former = server
+            .call(&mut connection, "thread/list", json!({(filter): branch}))
+            .await;
+        assert!(former["data"].as_array().unwrap().is_empty());
+    }
+    server
+        .call(
+            &mut connection,
+            "thread/archive",
+            json!({"threadId": branch}),
+        )
+        .await;
+    let leaf_read = ReadThreadParams::new(SessionId::new(&leaf));
+    let branch_read = ReadThreadParams::new(SessionId::new(&branch));
+    assert!(server.store.read_thread(&branch_read).await.is_err());
+    let branch_read = branch_read.including_archived();
+    server.store.read_thread(&branch_read).await.unwrap();
+    server.store.read_thread(&leaf_read).await.unwrap();
+    server
+        .call(
+            &mut connection,
+            "thread/delete",
+            json!({"threadId": branch}),
+        )
+        .await;
+    assert!(server.store.read_thread(&branch_read).await.is_err());
+    server.store.read_thread(&leaf_read).await.unwrap();
     server
         .call(
             &mut connection,

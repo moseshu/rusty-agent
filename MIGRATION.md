@@ -1352,11 +1352,14 @@ services. Other Codex role-layer consumers remain separate.
   Codex's agent graph operations `upsert_thread_spawn_edge`, `set_thread_spawn_edge_status`,
   and `list_thread_spawn_children` with the new `ThreadSpawnEdgeStatus`. These opt-in methods
   default to keeping no edges and support V1 recovery on existing stores.
-- `RolloutThreadDirectory` keeps each child's latest edge in `thread_spawn_edges.jsonl`
-  beside the rollouts, one appended line per change. Codex keeps these edges in its state
-  database, which is optional here. A spawned thread with no line has the open edge that its
-  session metadata records, matching Codex's backfill of edges from spawn sources. Deleting a
-  thread removes its edges. Rollout files gain no new record type.
+- `RolloutThreadDirectory` reconstructs the current spawn graph from
+  `thread_spawn_edges.jsonl` beside the rollouts. Codex keeps these edges in its state
+  database, which is optional here. A spawned thread with no explicit edge or removal
+  inherits the open edge from its session metadata, matching Codex's backfill from spawn
+  sources. A status update applies to the child's current edge, preserving its parent.
+  Archiving, deleting, and listing by parent or ancestor follow the current graph. A
+  deletion records the removal of the thread's current edges and prevents fallback to
+  earlier parents. Rollout files gain no new record type.
 - `ra-runtime` adds `AgentControl::with_resident_agent_limits`. `SpawnedAgentFactory` adds
   default `owns_agent_type` and `configure_spawn` methods for host-owned declarations and
   settings.

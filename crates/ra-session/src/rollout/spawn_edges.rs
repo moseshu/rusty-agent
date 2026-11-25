@@ -3,21 +3,27 @@
 //! `agent-graph-store` and the `thread_spawn_edges` table of its state database.
 //!
 //! An edge is kept apart from both rollouts, in `thread_spawn_edges.jsonl` beside them: one line
-//! per change, appended, so closing or re-parenting a thread never needs its live writer. The
-//! newest line for a child is its edge, as the table keys an edge by its child.
+//! per change, appended, so closing or re-parenting a thread never needs its live writer.
+//! Replaying the operations reconstructs the current edge keyed by each child.
 //!
 //! # Differences from Codex
 //!
 //! Codex keeps the edges in its state database. That database is optional here, so the edges
-//! follow the session index into a JSONL file every directory has. Codex backfills an open edge
-//! from a thread's spawn source when it indexes the thread; here a spawned thread with no line
-//! has that edge implicitly, read from its session metadata when the edges are listed.
+//! follow the session index into a JSONL file every directory has.
+//!
+//! Codex updates a row in place; this file is an operation log instead. A status update applies,
+//! on replay, to whatever edge the child has at that point, so it keeps a parent recorded after
+//! the update was prepared. A deletion appends a removal of the thread's incoming and outgoing
+//! edges rather than deleting rows. The log is never compacted.
+//!
+//! Codex backfills an open edge from a thread's spawn source when it indexes the thread. Here a
+//! spawned thread with no recorded edge has that edge implicitly, read from its session metadata
+//! when the edges are listed, unless that parent has since been deleted.
 
 use std::{
-    collections::HashMap,
-    io::{ErrorKind, Write},
+    collections::{HashMap, HashSet},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
 };
 
 use ra_core::{
@@ -27,119 +33,203 @@ use ra_core::{
 use serde::{Deserialize, Serialize};
 
 const SPAWN_EDGES_FILE: &str = "thread_spawn_edges.jsonl";
+const SPAWN_EDGES_LOCK_FILE: &str = "thread_spawn_edges.lock";
 
-/// Serializes this process's writers of every edge file.
-static SPAWN_EDGES_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-/// The latest persisted edge of each child: its parent and status.
-pub(crate) type SpawnEdges = HashMap<SessionId, (SessionId, ThreadSpawnEdgeStatus)>;
-
-/// One line of the file: a row of Codex's `thread_spawn_edges`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SpawnEdgeEntry {
-    parent_thread_id: SessionId,
-    child_thread_id: SessionId,
-    status: ThreadSpawnEdgeStatus,
+/// The current graph, including removals that suppress fallback to spawn metadata.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpawnEdges {
+    edges: HashMap<SessionId, Option<(SessionId, ThreadSpawnEdgeStatus)>>,
+    removed_threads: HashSet<SessionId>,
 }
 
-/// Records the edge from `parent` to `child` with `status`, replacing any earlier edge of
-/// `child`.
-pub(crate) fn append_spawn_edge(
-    dir: &Path,
-    parent: &SessionId,
-    child: &SessionId,
-    status: ThreadSpawnEdgeStatus,
-) -> Result<()> {
-    let entry = SpawnEdgeEntry {
-        parent_thread_id: parent.clone(),
-        child_thread_id: child.clone(),
-        status,
-    };
-    let mut line = serde_json::to_string(&entry).map_err(|error| {
+impl SpawnEdges {
+    pub(crate) fn children(
+        &self,
+        parent: &SessionId,
+        filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> impl Iterator<Item = &SessionId> {
+        self.edges.iter().filter_map(move |(child, edge)| {
+            let (current_parent, status) = edge.as_ref()?;
+            (current_parent == parent && filter.is_none_or(|filter| filter == *status))
+                .then_some(child)
+        })
+    }
+
+    pub(crate) fn needs_metadata(&self, child: &SessionId) -> bool {
+        !self.edges.contains_key(child)
+    }
+
+    pub(crate) fn can_use_metadata(&self, parent: &SessionId, child: &SessionId) -> bool {
+        self.needs_metadata(child) && !self.removed_threads.contains(parent)
+    }
+
+    pub(crate) fn upsert(
+        &mut self,
+        parent: SessionId,
+        child: SessionId,
+        status: ThreadSpawnEdgeStatus,
+    ) {
+        self.edges.insert(child, Some((parent, status)));
+    }
+
+    pub(crate) fn set_status(
+        &mut self,
+        child: SessionId,
+        status: ThreadSpawnEdgeStatus,
+        implicit_parent: Option<SessionId>,
+    ) {
+        if let Some(edge) = self.edges.get_mut(&child) {
+            if let Some((_, current)) = edge {
+                *current = status;
+            }
+        } else if let Some(parent) =
+            implicit_parent.filter(|parent| self.can_use_metadata(parent, &child))
+        {
+            self.upsert(parent, child, status);
+        }
+    }
+
+    pub(crate) fn remove_thread(&mut self, thread: &SessionId) {
+        self.removed_threads.insert(thread.clone());
+        self.edges.insert(thread.clone(), None);
+        for edge in self.edges.values_mut() {
+            if edge.as_ref().is_some_and(|(parent, _)| parent == thread) {
+                *edge = None;
+            }
+        }
+    }
+}
+
+/// Replay applies a status change to the edge present at that position in the log. The original
+/// parent is only a fallback when no prior operation established or removed the edge.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum SpawnEdgeEntry {
+    Upsert {
+        parent_thread_id: SessionId,
+        child_thread_id: SessionId,
+        status: ThreadSpawnEdgeStatus,
+    },
+    SetStatus {
+        child_thread_id: SessionId,
+        status: ThreadSpawnEdgeStatus,
+        implicit_parent: Option<SessionId>,
+    },
+    RemoveThread {
+        removed_thread_id: SessionId,
+    },
+}
+
+impl SpawnEdgeEntry {
+    fn apply(self, graph: &mut SpawnEdges) {
+        match self {
+            Self::Upsert {
+                parent_thread_id,
+                child_thread_id,
+                status,
+            } => {
+                graph.upsert(parent_thread_id, child_thread_id, status);
+            }
+            Self::SetStatus {
+                child_thread_id,
+                status,
+                implicit_parent,
+            } => {
+                graph.set_status(child_thread_id, status, implicit_parent);
+            }
+            Self::RemoveThread { removed_thread_id } => {
+                graph.remove_thread(&removed_thread_id);
+            }
+        }
+    }
+}
+
+pub(crate) fn append_spawn_edge(dir: &Path, entry: &SpawnEdgeEntry) -> Result<()> {
+    let mut line = serde_json::to_vec(entry).map_err(|error| {
         Error::session(
             SessionErrorKind::Corrupted,
             format!("failed to serialize a thread spawn edge: {error}"),
         )
     })?;
-    line.push('\n');
-    let _guard = lock();
+    line.push(b'\n');
     std::fs::create_dir_all(dir)
         .map_err(|error| io_error("create the thread spawn edges", &error))?;
+    // Keep the writer lock separate so readers can replay complete records during an append.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(SPAWN_EDGES_LOCK_FILE))
+        .map_err(|error| io_error("open the thread spawn edges lock", &error))?;
+    lock.lock()
+        .map_err(|error| io_error("lock the thread spawn edges", &error))?;
     let mut file = std::fs::OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .open(edges_path(dir))
         .map_err(|error| io_error("open the thread spawn edges", &error))?;
-    file.write_all(line.as_bytes())
+    append_record(&mut file, &line)
         .and_then(|()| file.sync_data())
         .map_err(|error| io_error("append to the thread spawn edges", &error))
 }
 
-/// Every child's latest edge.
-pub(crate) async fn load_spawn_edges(dir: &Path) -> Result<SpawnEdges> {
-    let contents = match tokio::fs::read_to_string(edges_path(dir)).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(io_error("read the thread spawn edges", &error)),
-    };
-    Ok(contents
-        .lines()
-        .filter_map(parse)
-        .map(|entry| {
-            (
-                entry.child_thread_id,
-                (entry.parent_thread_id, entry.status),
-            )
-        })
-        .collect())
-}
-
-/// Removes every edge into or out of `session_id`, as Codex's thread deletion does.
-pub(crate) fn remove_spawn_edges(dir: &Path, session_id: &SessionId) -> Result<()> {
-    let _guard = lock();
-    let path = edges_path(dir);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error("read the thread spawn edges", &error)),
-    };
-    let mut removed = false;
-    let mut remaining = String::with_capacity(contents.len());
-    for line in contents.lines() {
-        if parse(line).is_some_and(|entry| {
-            entry.parent_thread_id == *session_id || entry.child_thread_id == *session_id
-        }) {
-            removed = true;
-        } else {
-            remaining.push_str(line);
-            remaining.push('\n');
+fn append_record(file: &mut std::fs::File, line: &[u8]) -> std::io::Result<()> {
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        // Separate a partial final record left by an interrupted write from the next operation.
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
         }
     }
-    if !removed {
-        return Ok(());
-    }
-    let temp_path = path.with_extension("jsonl.tmp");
-    std::fs::write(&temp_path, remaining)
-        .and_then(|()| std::fs::rename(&temp_path, &path))
-        .map_err(|error| io_error("rewrite the thread spawn edges", &error))
+    file.write_all(line)
 }
 
-fn parse(line: &str) -> Option<SpawnEdgeEntry> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
+pub(crate) async fn write_spawn_edge(dir: &Path, entry: SpawnEdgeEntry) -> Result<()> {
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || append_spawn_edge(&dir, &entry))
+        .await
+        .map_err(|error| {
+            Error::session(
+                SessionErrorKind::Io,
+                format!("thread spawn edge write failed: {error}"),
+            )
+        })?
+}
+
+/// Replays the complete records of the edge log.
+pub(crate) async fn load_spawn_edges(dir: &Path) -> Result<SpawnEdges> {
+    let contents = match tokio::fs::read(edges_path(dir)).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(SpawnEdges::default()),
+        Err(error) => return Err(io_error("read the thread spawn edges", &error)),
+    };
+    let mut graph = SpawnEdges::default();
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(line) = line.strip_suffix(b"\n")
+            && let Ok(entry) = serde_json::from_slice::<SpawnEdgeEntry>(line)
+        {
+            entry.apply(&mut graph);
+        }
     }
-    serde_json::from_str(line).ok()
+    Ok(graph)
+}
+
+/// Removes the thread's current edges and prevents older edges from being backfilled.
+pub(crate) fn remove_spawn_edges(dir: &Path, session_id: &SessionId) -> Result<()> {
+    append_spawn_edge(
+        dir,
+        &SpawnEdgeEntry::RemoveThread {
+            removed_thread_id: session_id.clone(),
+        },
+    )
 }
 
 fn edges_path(dir: &Path) -> PathBuf {
     dir.join(SPAWN_EDGES_FILE)
-}
-
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    SPAWN_EDGES_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn io_error(action: &str, error: &std::io::Error) -> Error {

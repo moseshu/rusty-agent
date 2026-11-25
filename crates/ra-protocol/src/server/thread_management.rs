@@ -397,17 +397,26 @@ impl ThreadRequestProcessor {
             ));
         }
         let store = require_store(history, "thread/list")?;
-        let ancestors = if let Some(id) = &params.ancestor_thread_id {
-            Some(
-                spawn_subtree(store.as_ref(), &SessionId::new(id))
-                    .await?
-                    .into_iter()
-                    .skip(1)
-                    .collect::<HashSet<_>>(),
-            )
-        } else {
-            None
-        };
+        let relations: Option<HashMap<_, _>> =
+            match (&params.parent_thread_id, &params.ancestor_thread_id) {
+                (Some(id), _) => {
+                    let parent = SessionId::new(id);
+                    let children = spawn_children(store.as_ref(), &parent, &parent).await?;
+                    Some(
+                        children
+                            .into_iter()
+                            .map(|child| (child, parent.clone()))
+                            .collect(),
+                    )
+                }
+                (_, Some(id)) => Some(
+                    spawn_descendants(store.as_ref(), &SessionId::new(id))
+                        .await?
+                        .into_iter()
+                        .collect(),
+                ),
+                (None, None) => None,
+            };
         let sort_key = match params.sort_key.unwrap_or(ThreadSortKey::CreatedAt) {
             ThreadSortKey::CreatedAt => StoreSortKey::CreatedAt,
             ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => StoreSortKey::UpdatedAt,
@@ -478,21 +487,16 @@ impl ThreadRequestProcessor {
                 if excluded_thread_ids.contains(thread.session_id()) {
                     continue;
                 }
-                if params.parent_thread_id.as_ref().is_some_and(|id| {
-                    thread.parent_session_id().map(SessionId::as_str) != Some(id.as_str())
-                }) {
-                    continue;
-                }
-                if ancestors
+                if relations
                     .as_ref()
-                    .is_some_and(|ids| !ids.contains(thread.session_id()))
+                    .is_some_and(|parents| !parents.contains_key(thread.session_id()))
                 {
                     continue;
                 }
                 if !source_filter_admits(
                     thread,
                     params.source_kinds.as_deref(),
-                    params.parent_thread_id.is_some() || params.ancestor_thread_id.is_some(),
+                    relations.is_some(),
                 ) {
                     continue;
                 }
@@ -528,7 +532,16 @@ impl ThreadRequestProcessor {
         });
         let data: Vec<_> = items
             .iter()
-            .map(|thread| self.describe_stored_thread(thread))
+            .map(|stored| {
+                let mut thread = self.describe_stored_thread(stored);
+                if let Some(parent) = relations
+                    .as_ref()
+                    .and_then(|parents| parents.get(stored.session_id()))
+                {
+                    thread.parent_thread_id = Some(parent.to_string());
+                }
+                thread
+            })
             .collect();
         let read_states = read_state_snapshots(history, &data).await;
         super::thread_processor::response(ThreadListResponse {
@@ -577,22 +590,49 @@ async fn spawn_subtree(
     store: &dyn ThreadStore,
     root: &SessionId,
 ) -> Result<Vec<SessionId>, JsonRpcErrorObject> {
-    let mut threads = vec![root.clone()];
+    Ok(std::iter::once(root.clone())
+        .chain(
+            spawn_descendants(store, root)
+                .await?
+                .into_iter()
+                .map(|(child, _)| child),
+        )
+        .collect())
+}
+
+async fn spawn_children(
+    store: &dyn ThreadStore,
+    parent: &SessionId,
+    root: &SessionId,
+) -> Result<Vec<SessionId>, JsonRpcErrorObject> {
+    store.list_spawn_children(parent).await.map_err(|error| {
+        JsonRpcErrorObject::internal_error(format!(
+            "failed to list spawned descendants for thread id {root}: {error}"
+        ))
+    })
+}
+
+async fn spawn_descendants(
+    store: &dyn ThreadStore,
+    root: &SessionId,
+) -> Result<Vec<(SessionId, SessionId)>, JsonRpcErrorObject> {
+    let mut descendants = Vec::new();
     let mut seen = HashSet::from([root.clone()]);
-    let mut index = 0;
-    while index < threads.len() {
-        let children = store
-            .list_spawn_children(&threads[index])
-            .await
-            .map_err(|error| {
-                JsonRpcErrorObject::internal_error(format!(
-                    "failed to list spawned descendants for thread id {root}: {error}"
-                ))
-            })?;
-        threads.extend(children.into_iter().filter(|id| seen.insert(id.clone())));
-        index += 1;
+    let mut parent = root.clone();
+    for index in 0.. {
+        let children = spawn_children(store, &parent, root).await?;
+        descendants.extend(
+            children
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .map(|id| (id, parent.clone())),
+        );
+        let Some((next, _)) = descendants.get(index) else {
+            break;
+        };
+        parent.clone_from(next);
     }
-    Ok(threads)
+    Ok(descendants)
 }
 
 /// Closes everything of a stored subtree that still writes, before its storage is moved or

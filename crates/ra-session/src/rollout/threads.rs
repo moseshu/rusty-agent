@@ -161,6 +161,26 @@ impl RolloutThreadDirectory {
         session_rollout_path(&self.dir, session_id)
     }
 
+    async fn metadata_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
+        let mut children = self
+            .children(parent)
+            .await?
+            .into_iter()
+            .map(|(_, meta)| meta.session_id().clone())
+            .collect::<Vec<_>>();
+        let archived = Self::new(self.archived_dir());
+        children.extend(
+            archived
+                .children(parent)
+                .await?
+                .into_iter()
+                .map(|(_, meta)| meta.session_id().clone()),
+        );
+        children.sort();
+        children.dedup();
+        Ok(children)
+    }
+
     /// The threads spawned from `parent`, oldest first, each with its session metadata: Codex's
     /// direct children of a thread.
     ///
@@ -333,7 +353,15 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         child: &SessionId,
         status: ThreadSpawnEdgeStatus,
     ) -> Result<()> {
-        super::spawn_edges::append_spawn_edge(&self.dir, parent, child, status)
+        super::spawn_edges::write_spawn_edge(
+            &self.dir,
+            super::spawn_edges::SpawnEdgeEntry::Upsert {
+                parent_thread_id: parent.clone(),
+                child_thread_id: child.clone(),
+                status,
+            },
+        )
+        .await
     }
 
     async fn set_thread_spawn_edge_status(
@@ -342,12 +370,23 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         status: ThreadSpawnEdgeStatus,
     ) -> Result<()> {
         let edges = super::spawn_edges::load_spawn_edges(&self.dir).await?;
-        match crate::store::thread_spawn_parent(self, &edges, child).await? {
-            Some(parent) => {
-                super::spawn_edges::append_spawn_edge(&self.dir, &parent, child, status)
-            }
-            None => Ok(()),
-        }
+        let implicit_parent = if edges.needs_metadata(child) {
+            let Some(parent) = crate::store::metadata_spawn_parent(self, child).await? else {
+                return Ok(());
+            };
+            Some(parent)
+        } else {
+            None
+        };
+        super::spawn_edges::write_spawn_edge(
+            &self.dir,
+            super::spawn_edges::SpawnEdgeEntry::SetStatus {
+                child_thread_id: child.clone(),
+                status,
+                implicit_parent,
+            },
+        )
+        .await
     }
 
     async fn list_thread_spawn_children(
@@ -355,8 +394,19 @@ impl RolloutThreadStore for RolloutThreadDirectory {
         parent: &SessionId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> Result<Vec<SessionId>> {
+        let metadata_children =
+            if status_filter.is_none_or(|filter| filter == ThreadSpawnEdgeStatus::Open) {
+                self.metadata_spawn_children(parent).await?
+            } else {
+                Vec::new()
+            };
         let edges = super::spawn_edges::load_spawn_edges(&self.dir).await?;
-        crate::store::list_thread_spawn_children(self, &edges, parent, status_filter).await
+        Ok(crate::store::list_thread_spawn_children(
+            &edges,
+            parent,
+            status_filter,
+            metadata_children,
+        ))
     }
 
     async fn reopen_spawned_thread(
@@ -546,23 +596,7 @@ impl ThreadStore for RolloutThreadDirectory {
     }
 
     async fn list_spawn_children(&self, parent: &SessionId) -> Result<Vec<SessionId>> {
-        let mut children = self
-            .children(parent)
-            .await?
-            .into_iter()
-            .map(|(_, meta)| meta.session_id().clone())
-            .collect::<Vec<_>>();
-        let archived = Self::new(self.archived_dir());
-        children.extend(
-            archived
-                .children(parent)
-                .await?
-                .into_iter()
-                .map(|(_, meta)| meta.session_id().clone()),
-        );
-        children.sort();
-        children.dedup();
-        Ok(children)
+        self.list_thread_spawn_children(parent, None).await
     }
 
     /// Keeps names in the session index and Git updates in canonical session metadata markers.
