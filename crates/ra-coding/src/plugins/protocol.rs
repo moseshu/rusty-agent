@@ -397,6 +397,16 @@ impl PluginManagement for PluginRequestProcessor {
                 }
                 json(response)
             }
+            wire::PluginManagementRequest::ConfigRequirementsRead => {
+                let requirements = services
+                    .config_manager
+                    .read_requirements()
+                    .await
+                    .map_err(config_error)?;
+                json(super::config_requirements::requirements_read_response(
+                    requirements,
+                ))
+            }
             wire::PluginManagementRequest::ConfigValueWrite(params) => json(
                 services
                     .write_config_value(params)

@@ -77,6 +77,32 @@ const EXHAUSTIVE_ALLOWED: &[(&str, &str)] = &[
         "crates/ra-protocol/src/server/protocol/config.rs",
         "ConfigWriteErrorCode",
     ),
+    // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/{config,application,windows_sandbox}.rs.
+    // The `configRequirements/read` wire unions; clients match their closed variant sets.
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "WindowsSandboxImplementation",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "BrowserUseAccessApprovalLifetime",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ConfiguredHookHandler",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "NetworkDomainPermission",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "NetworkUnixSocketPermission",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ResidencyRequirement",
+    ),
     // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/plugin.rs.
     // PluginListMarketplaceKind retains Local, omitting Vertical, WorkspaceDirectory,
     // SharedWithMe and CreatedByMeRemote; PluginSource omits Remote (remote catalog/sharing).
@@ -516,6 +542,90 @@ const PUBLIC_FIELDS_ALLOWED: &[(&str, &str)] = &[
     (
         "crates/ra-protocol/src/server/protocol/config.rs",
         "SkillsConfigWriteResponse",
+    ),
+    // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/{config,application}.rs.
+    // `configRequirements/read` records. ConfigRequirements omits allowed_login_methods,
+    // cli_auth_credentials_store and chatgpt_base_url (account settings); the rest keep Codex's
+    // fields, defaults and serde rules.
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ConfigRequirementsReadResponse",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ConfigRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "AutoReviewRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ModelsRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "NewThreadModelDefaults",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "FeedbackRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ComputerUseRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ComputerUseMacosRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ComputerUseWindowsRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ComputerUseWindowsExeRequirement",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "BrowserUseRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "BrowserUseExtensionRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "RequestHeader",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "BrowserUseOriginPolicy",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "InAppBrowserRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ManagedHooksRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ConfiguredHookMatcherGroup",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "NetworkRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ApplicationRequirements",
+    ),
+    (
+        "crates/ra-protocol/src/server/protocol/config.rs",
+        "ApplicationNetworkRequirements",
     ),
     // Codex @ 815ef9bb: app-server-protocol/src/protocol/v2/plugin.rs.
     // Remote catalog/sharing projection: PluginReadParams and PluginInstallParams omit

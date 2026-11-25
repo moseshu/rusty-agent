@@ -11,6 +11,7 @@
 //! registration and dispatch consumers. URI descriptors preserve the source environment identity.
 
 mod bundled_hooks;
+mod config_requirements;
 mod executor_hook_source;
 mod executor_hooks;
 mod executor_mcp;

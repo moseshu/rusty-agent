@@ -613,3 +613,532 @@ async fn hook_trusted_hash_write_targets_only_the_escaped_leaf() {
     );
     assert_eq!(config["hooks"]["state"].as_table().unwrap().len(), 2);
 }
+
+// Codex's `configRequirements/read` cases from `app-server/tests/suite/v2/config_rpc.rs` and the
+// `map_requirements_to_api` tests of `config_processor.rs`, driven through the RPC with a
+// `requirements.toml` fixture.
+//
+// Source tests not carried over:
+// - `managed_auth_settings_are_exposed_enforced_and_read_only`: the CLI credential store and the
+//   ChatGPT backend URL are account settings this product does not report.
+
+/// Answers one `configRequirements/read` against `requirements`, or none when it is `None`.
+async fn read_requirements(
+    requirements: Option<&str>,
+) -> ra_protocol::server::protocol::ConfigRequirementsReadResponse {
+    let response = read_requirements_json(requirements).await;
+    serde_json::from_value(response.clone()).unwrap_or_else(|error| panic!("{error}: {response}"))
+}
+
+/// The raw result of one `configRequirements/read` against `requirements`.
+async fn read_requirements_json(requirements: Option<&str>) -> Value {
+    let response = read_requirements_rpc(requirements).await;
+    assert!(response.get("result").is_some(), "{response}");
+    response["result"].clone()
+}
+
+async fn read_requirements_rpc(requirements: Option<&str>) -> Value {
+    let home = TempDir::new().unwrap();
+    let requirements_path = home.path().join("requirements.toml");
+    if let Some(requirements) = requirements {
+        write(&requirements_path, requirements);
+    }
+    let manager = PluginConfigManager::new(
+        ra_executor::LOCAL_FS.clone(),
+        absolute(home.path()),
+        absolute(home.path()),
+        ConfigLoadOptions::from(LoaderOverrides {
+            system_requirements_path: Some(requirements_path),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        }),
+        Arc::new(NoopThreadConfigLoader),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let skills = Arc::new(HostSkillsService::new(absolute(home.path()), false));
+    let services = PluginServices::new(manager, skills);
+    let server = AppServer::new(home.path())
+        .unwrap()
+        .with_plugin_management(services.protocol_adapter());
+    let (events, receiver) = mpsc::channel(128);
+    let task = tokio::spawn(server.run(receiver));
+    let (writer, mut messages) = mpsc::channel(128);
+    events
+        .send(connection_opened(
+            ConnectionId::new(1),
+            ConnectionOrigin::WebSocket,
+            writer,
+            None,
+        ))
+        .await
+        .unwrap();
+    let (response, _) = call(
+        &events,
+        &mut messages,
+        1,
+        "initialize",
+        json!({"clientInfo":{"name":"requirements-test","version":"1"}}),
+    )
+    .await;
+    assert!(response.get("result").is_some(), "{response}");
+    let (response, _) = call(
+        &events,
+        &mut messages,
+        2,
+        "configRequirements/read",
+        Value::Null,
+    )
+    .await;
+    drop(events);
+    task.await.unwrap();
+    response
+}
+
+/// The wire names Codex's clients read, which a round trip through the same records would not
+/// catch.
+#[tokio::test]
+async fn config_requirements_read_uses_codex_wire_names() {
+    let response = read_requirements_json(Some(
+        r#"allow_remote_control = false
+chatgpt_base_url = "https://managed.example.com/backend-api/"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo managed"
+timeout = 5
+additionalContextLimit = 4096
+"#,
+    ))
+    .await;
+    assert_eq!(response["supportsIndependentSpeedModes"], true);
+    let requirements = &response["requirements"];
+    assert_eq!(requirements["allowRemoteControl"], false);
+    assert_eq!(
+        requirements["hooks"]["SessionStart"][0]["hooks"][0],
+        json!({
+            "type": "command",
+            "command": "echo managed",
+            "commandWindows": null,
+            "timeoutSec": 5,
+            "async": false,
+            "statusMessage": null,
+            "additionalContextLimit": 4096,
+        })
+    );
+    assert!(requirements.get("allowedLoginMethods").is_none());
+    assert!(requirements.get("chatgptBaseUrl").is_none());
+}
+
+#[tokio::test]
+async fn config_requirements_read_is_null_without_requirements() {
+    let response = read_requirements(None).await;
+    assert_eq!(response.supports_independent_speed_modes, Some(true));
+    assert_eq!(response.requirements, None);
+}
+
+#[tokio::test]
+async fn config_requirements_read_is_null_with_only_account_requirements() {
+    let response = read_requirements_json(Some(
+        r#"chatgpt_base_url = "https://managed.example.com/backend-api/""#,
+    ))
+    .await;
+    assert_eq!(
+        response,
+        json!({"requirements": null, "supportsIndependentSpeedModes": true})
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_keeps_application_and_agent_network_policies_separate() {
+    let response = read_requirements_json(Some(
+        r#"
+[experimental_network.domains]
+"github.com" = "allow"
+
+[application.network.domains]
+"GOV.example.com." = "allow"
+"github.com" = "deny"
+"#,
+    ))
+    .await;
+    let requirements = &response["requirements"];
+    assert_eq!(
+        requirements["application"],
+        json!({"network": {"enabled": true, "domains": {"gov.example.com": "allow", "github.com": "deny"}}})
+    );
+    assert_eq!(
+        requirements["network"]["domains"],
+        json!({"github.com": "allow"})
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_rejects_invalid_application_network_domains() {
+    let response = read_requirements_rpc(Some(
+        "[application.network.domains]\n'*.example.com' = 'allow'",
+    ))
+    .await;
+    let error = &response["error"];
+    assert_eq!(error["code"], -32603, "{response}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("application.network.domains")),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_exposes_independent_speed_policy() {
+    for (fast_enabled, ultrafast_enabled) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let response = read_requirements(Some(&format!(
+            "[features]\nfast_mode = {fast_enabled}\nultrafast_mode = {ultrafast_enabled}\n"
+        )))
+        .await;
+        assert_eq!(
+            (
+                response.supports_independent_speed_modes,
+                response
+                    .requirements
+                    .expect("speed requirements")
+                    .feature_requirements
+            ),
+            (
+                Some(true),
+                Some(std::collections::BTreeMap::from([
+                    ("fast_mode".to_string(), fast_enabled),
+                    ("ultrafast_mode".to_string(), ultrafast_enabled),
+                ]))
+            ),
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_requirements_read_includes_remote_control_and_managed_hooks() {
+    use ra_protocol::server::protocol::config_requirements::ConfiguredHookHandler;
+    let response = read_requirements(Some(
+        r#"allow_remote_control = false
+
+[hooks]
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo managed"
+additionalContextLimit = 4096
+
+[[hooks.SessionStart.hooks]]
+type = "mcp_tool"
+server = "security"
+tool = "scan"
+input = { path = "${tool_input.file_path}", metadata = { enabled = true, retries = 2 } }
+timeout = 30
+statusMessage = "Scanning file"
+"#,
+    ))
+    .await;
+    let requirements = response
+        .requirements
+        .expect("managed requirements should be returned");
+    assert_eq!(requirements.allow_remote_control, Some(false));
+    assert_eq!(
+        requirements
+            .hooks
+            .expect("managed hooks should be returned")
+            .session_start[0]
+            .hooks,
+        vec![
+            ConfiguredHookHandler::Command {
+                command: "echo managed".to_string(),
+                command_windows: None,
+                timeout_sec: None,
+                r#async: false,
+                status_message: None,
+                additional_context_limit: Some(4_096),
+            },
+            ConfiguredHookHandler::McpTool {
+                server: "security".to_string(),
+                tool: "scan".to_string(),
+                input: serde_json::from_value(json!({
+                    "path": "${tool_input.file_path}",
+                    "metadata": { "enabled": true, "retries": 2 },
+                }))
+                .unwrap(),
+                timeout_sec: Some(30),
+                status_message: Some("Scanning file".to_string()),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_includes_browser_and_computer_use_schema() {
+    use ra_protocol::server::protocol::config_requirements::{
+        AllowDenyRequirement, BrowserUseAccessApprovalLifetime, BrowserUseExtensionRequirements,
+        BrowserUseOriginPolicy, BrowserUseRequirements, ComputerUseMacosRequirements,
+        ComputerUseRequirements, ComputerUseWindowsExeRequirement, ComputerUseWindowsRequirements,
+        RequestHeader,
+    };
+    use std::collections::BTreeMap;
+    let response = read_requirements(Some(
+        r#"
+allow_browser_and_computer_use = false
+
+[browser_use]
+allow_history_access = false
+disable_auto_review = true
+allow_global_persistent_approval = false
+
+[browser_use.extension]
+request_headers = [{ name = "x-browser-agent", value = "ChatGPT/{{session_id}}" }]
+
+[browser_use.default_origin_policy]
+access = "deny"
+downloads = "allow"
+uploads = "deny"
+full_cdp_access = "allow"
+auto_review = "deny"
+persistent_approval = false
+access_approval_lifetime = "turn"
+
+[browser_use.origins."https://example.com"]
+access = "allow"
+downloads = "deny"
+uploads = "allow"
+full_cdp_access = "deny"
+auto_review = "deny"
+persistent_approval = true
+access_approval_lifetime = "thread"
+
+[computer_use]
+allow_locked_computer_use = false
+allow_persistent_approval = false
+default_app_access = "deny"
+
+[computer_use.macos.bundle_ids]
+"com.apple.Safari" = "allow"
+
+[computer_use.windows.aumids]
+"Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
+
+[[computer_use.windows.exes]]
+publisher_name = "CN=Google LLC"
+product_name = "Google Chrome"
+binary_name = "chrome.exe"
+access = "deny"
+"#,
+    ))
+    .await;
+    let requirements = response
+        .requirements
+        .expect("managed requirements should be returned");
+    assert_eq!(requirements.allow_browser_and_computer_use, Some(false));
+    assert_eq!(
+        requirements.browser_use,
+        Some(BrowserUseRequirements {
+            extension: Some(BrowserUseExtensionRequirements {
+                request_headers: Some(vec![RequestHeader {
+                    name: "x-browser-agent".to_string(),
+                    value: "ChatGPT/{{session_id}}".to_string(),
+                }]),
+            }),
+            allow_webmcp: None,
+            allow_history_access: Some(false),
+            disable_auto_review: Some(true),
+            allow_global_persistent_approval: Some(false),
+            default_origin_policy: Some(BrowserUseOriginPolicy {
+                access: Some(AllowDenyRequirement::Deny),
+                downloads: Some(AllowDenyRequirement::Allow),
+                uploads: Some(AllowDenyRequirement::Deny),
+                full_cdp_access: Some(AllowDenyRequirement::Allow),
+                auto_review: Some(AllowDenyRequirement::Deny),
+                persistent_approval: Some(false),
+                access_approval_lifetime: Some(BrowserUseAccessApprovalLifetime::Turn),
+            }),
+            origins: Some(BTreeMap::from([(
+                "https://example.com".to_string(),
+                BrowserUseOriginPolicy {
+                    access: Some(AllowDenyRequirement::Allow),
+                    downloads: Some(AllowDenyRequirement::Deny),
+                    uploads: Some(AllowDenyRequirement::Allow),
+                    full_cdp_access: Some(AllowDenyRequirement::Deny),
+                    auto_review: Some(AllowDenyRequirement::Deny),
+                    persistent_approval: Some(true),
+                    access_approval_lifetime: Some(BrowserUseAccessApprovalLifetime::Thread),
+                },
+            )])),
+        })
+    );
+    assert_eq!(
+        requirements.computer_use,
+        Some(ComputerUseRequirements {
+            allow_locked_computer_use: Some(false),
+            allow_persistent_approval: Some(false),
+            default_app_access: Some(AllowDenyRequirement::Deny),
+            macos: Some(ComputerUseMacosRequirements {
+                bundle_ids: Some(BTreeMap::from([(
+                    "com.apple.Safari".to_string(),
+                    AllowDenyRequirement::Allow,
+                )])),
+            }),
+            windows: Some(ComputerUseWindowsRequirements {
+                aumids: Some(BTreeMap::from([(
+                    "Microsoft.Paint_8wekyb3d8bbwe!App".to_string(),
+                    AllowDenyRequirement::Allow,
+                )])),
+                exes: Some(vec![ComputerUseWindowsExeRequirement {
+                    publisher_name: "CN=Google LLC".to_string(),
+                    product_name: "Google Chrome".to_string(),
+                    binary_name: Some("chrome.exe".to_string()),
+                    access: AllowDenyRequirement::Deny,
+                }]),
+            }),
+        })
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_includes_in_app_updates_policy() {
+    let response = read_requirements(Some("[features]\nin_app_updates = false\n")).await;
+    assert_eq!(
+        response
+            .requirements
+            .and_then(|requirements| requirements.feature_requirements),
+        Some(std::collections::BTreeMap::from([(
+            "in_app_updates".to_string(),
+            false,
+        )]))
+    );
+}
+
+#[tokio::test]
+async fn config_requirements_read_includes_managed_model_policy_and_instructions() {
+    let response = read_requirements(Some(
+        r#"
+additional_developer_instructions = "Follow the managed policy.\nPreserve its formatting."
+
+[auto_review]
+required_on_models = ["gpt-protected", "gpt-sensitive"]
+ignore_rules = ["gpt-protected"]
+
+[models.new_thread]
+model = "gpt-managed"
+model_reasoning_effort = "medium"
+service_tier = "fast"
+"#,
+    ))
+    .await;
+    let requirements = response.requirements.expect("managed requirements");
+    assert_eq!(
+        requirements.additional_developer_instructions.as_deref(),
+        Some("Follow the managed policy.\nPreserve its formatting.")
+    );
+    let auto_review = requirements
+        .auto_review
+        .expect("managed automatic-review requirements");
+    assert_eq!(
+        auto_review.required_on_models,
+        Some(vec![
+            "gpt-protected".to_string(),
+            "gpt-sensitive".to_string()
+        ])
+    );
+    assert_eq!(
+        auto_review.ignore_rules,
+        Some(vec!["gpt-protected".to_string()])
+    );
+    let models = requirements.models.expect("managed model requirements");
+    let defaults = models.new_thread.expect("managed new-thread defaults");
+    assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
+    assert_eq!(
+        defaults.model_reasoning_effort,
+        Some(ra_config::ReasoningEffort::Medium)
+    );
+    assert_eq!(defaults.service_tier.as_deref(), Some("fast"));
+}
+
+/// Codex's `requirements_api_includes_allow_managed_hooks_only`, `..._allow_appshots`,
+/// `..._permission_default_and_allowlist`, `..._allowed_windows_sandbox_implementations` and
+/// `..._exact_managed_values`.
+#[tokio::test]
+async fn config_requirements_read_maps_managed_values() {
+    use ra_protocol::server::protocol::config_requirements::{
+        FeedbackRequirements, WindowsSandboxImplementation,
+    };
+    let managed = std::env::temp_dir();
+    let sqlite_home = managed.join("managed-state");
+    let log_dir = managed.join("managed-logs");
+    let model_catalog_json = managed.join("managed-models.json");
+    let response = read_requirements(Some(&format!(
+        r#"
+allow_managed_hooks_only = true
+allow_appshots = false
+allowed_permission_profiles = {{ managed-build = false, managed-standard = true }}
+default_permissions = "managed-standard"
+sqlite_home = {sqlite_home:?}
+log_dir = {log_dir:?}
+model_catalog_json = {model_catalog_json:?}
+check_for_update_on_startup = false
+allow_login_shell = false
+allowed_sandbox_modes = ["read-only", "external-sandbox"]
+allowed_web_search_modes = ["cached"]
+
+[windows]
+allowed_sandbox_implementations = ["elevated", "unelevated"]
+
+[feedback]
+enabled = false
+"#
+    )))
+    .await;
+    let requirements = response.requirements.expect("managed requirements");
+    assert_eq!(requirements.allow_managed_hooks_only, Some(true));
+    assert_eq!(requirements.hooks, None);
+    assert_eq!(requirements.allow_appshots, Some(false));
+    assert_eq!(
+        requirements.allowed_permission_profiles,
+        Some(std::collections::BTreeMap::from([
+            ("managed-build".to_string(), false),
+            ("managed-standard".to_string(), true),
+        ]))
+    );
+    assert_eq!(
+        requirements.default_permissions.as_deref(),
+        Some("managed-standard")
+    );
+    assert_eq!(
+        requirements.allowed_windows_sandbox_implementations,
+        Some(vec![
+            WindowsSandboxImplementation::Elevated,
+            WindowsSandboxImplementation::Unelevated,
+        ])
+    );
+    // An external sandbox has no wire mode, and a disabled search stays selectable.
+    assert_eq!(
+        requirements.allowed_sandbox_modes,
+        Some(vec![ra_config::SandboxMode::ReadOnly])
+    );
+    assert_eq!(
+        requirements.allowed_web_search_modes,
+        Some(vec![
+            ra_config::WebSearchMode::Cached,
+            ra_config::WebSearchMode::Disabled,
+        ])
+    );
+    let uri = |path: std::path::PathBuf| Some(ra_paths::PathUri::from(absolute(&path)));
+    assert_eq!(requirements.sqlite_home, uri(sqlite_home));
+    assert_eq!(requirements.log_dir, uri(log_dir));
+    assert_eq!(requirements.model_catalog_json, uri(model_catalog_json));
+    assert_eq!(requirements.check_for_update_on_startup, Some(false));
+    assert_eq!(requirements.allow_login_shell, Some(false));
+    assert_eq!(
+        requirements.feedback,
+        Some(FeedbackRequirements {
+            enabled: Some(false),
+        })
+    );
+}

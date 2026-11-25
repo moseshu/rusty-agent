@@ -7,6 +7,27 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### `configRequirements/read` reports managed requirements
+
+App servers with PluginServices now answer Codex's `configRequirements/read`. It is a shared read
+of the `config` queue, like `config/read`, and takes no parameters. The answer carries
+`supportsIndependentSpeedModes: true`, because Fast and Ultra Fast requirements are enforced
+separately, and `requirements`, which is `null` when the composed requirement set is empty after
+excluding account settings. The requirements use Codex's field names and mappings: an external sandbox
+requirement has no wire sandbox mode, a disabled web search is always selectable, managed hooks
+report `timeoutSec`, and `sqliteHome`, `logDir` and `modelCatalogJson` are `file:` URIs.
+
+The answer omits Codex's allowed login methods, CLI credential store and ChatGPT backend URL.
+A managed configuration that sets only `chatgpt_base_url` returns `requirements: null`. With no
+login restriction to report, an absent requirement set stays `null`, as in Codex when every login
+method is allowed.
+
+`ClientRequest::ConfigRequirementsRead` and `PluginManagementRequest::ConfigRequirementsRead` are
+new variants. `ConfigRequirementsReadResponse` and `ConfigRequirements` are exported from
+`ra_protocol::server::protocol`, and their nested records are exported from its new
+`config_requirements` module. An `account/read` request now stands in for an unknown method in the
+request-deserialization regression.
+
 ### Retry policies see every non-cancelled model failure
 
 The runner used to reject any model failure whose `Recoverability` was not `Retryable` before it

@@ -1,14 +1,9 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Codex's shared-read cases of `request_serialization.rs`: consecutive reads of one key run
 //! together, a read that arrives while a batch runs joins it, and no read overtakes a queued write.
-//!
-//! The startup case uses `config/read` where Codex uses `configRequirements/read`; both declare a
-//! shared read of the `config` queue, and requirements reads are not served by this product yet.
 
 use ra_protocol::frame::RequestId;
-use ra_protocol::server::protocol::{
-    ClientRequest, ConfigBatchWriteParams, ConfigReadParams, HooksListParams,
-};
+use ra_protocol::server::protocol::{ClientRequest, ConfigBatchWriteParams, HooksListParams};
 use ra_protocol::server::test_api::{SerializationAccess, SerializationQueues};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
@@ -207,12 +202,9 @@ async fn startup_config_reads_run_concurrently_and_exclude_writes() {
         ),
         (
             SECOND_REQUEST_VALUE,
-            ClientRequest::ConfigRead {
+            ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(i64::from(SECOND_REQUEST_VALUE)),
-                params: ConfigReadParams {
-                    include_layers: false,
-                    cwd: None,
-                },
+                params: None,
             },
         ),
     ] {

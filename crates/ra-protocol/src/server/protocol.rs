@@ -73,10 +73,24 @@ pub use self::config::{
     ComputerUseConfig, ComputerUseMacosConfig, ComputerUseWindowsConfig,
     ComputerUseWindowsExeConfig, Config, ConfigBatchWriteParams, ConfigEdit, ConfigLayer,
     ConfigLayerMetadata, ConfigLayerSource, ConfigReadParams, ConfigReadResponse,
-    ConfigValueWriteParams, ConfigWriteErrorCode, ConfigWriteResponse, MergeStrategy,
-    OverriddenMetadata, SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse,
-    ToolsV2, WriteStatus,
+    ConfigRequirements, ConfigRequirementsReadResponse, ConfigValueWriteParams,
+    ConfigWriteErrorCode, ConfigWriteResponse, MergeStrategy, OverriddenMetadata,
+    SandboxWorkspaceWrite, SkillsConfigWriteParams, SkillsConfigWriteResponse, ToolsV2,
+    WriteStatus,
 };
+/// The managed requirement records `configRequirements/read` answers with.
+pub mod config_requirements {
+    pub use super::config::{
+        AllowDenyRequirement, ApplicationNetworkRequirements, ApplicationRequirements,
+        AutoReviewRequirements, BrowserUseAccessApprovalLifetime, BrowserUseExtensionRequirements,
+        BrowserUseOriginPolicy, BrowserUseRequirements, ComputerUseMacosRequirements,
+        ComputerUseRequirements, ComputerUseWindowsExeRequirement, ComputerUseWindowsRequirements,
+        ConfiguredHookHandler, ConfiguredHookMatcherGroup, FeedbackRequirements,
+        InAppBrowserRequirements, ManagedHooksRequirements, ModelsRequirements,
+        NetworkDomainPermission, NetworkRequirements, NetworkUnixSocketPermission,
+        NewThreadModelDefaults, RequestHeader, ResidencyRequirement, WindowsSandboxImplementation,
+    };
+}
 pub use self::gateway_oauth::{
     GATEWAY_OAUTH_CHANGED_METHOD, GatewayOAuthCancelResponse, GatewayOAuthChangedNotification,
     GatewayOAuthLoginResponse, GatewayOAuthReadResponse, GatewayOAuthStatus,
@@ -345,6 +359,16 @@ pub enum ClientRequest {
         request_id: RequestId,
         /// Source-compatible operation arguments.
         params: ConfigBatchWriteParams,
+    },
+    /// Reads the managed requirements the selected product applies.
+    #[serde(rename = "configRequirements/read")]
+    ConfigRequirementsRead {
+        /// Request identity.
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        /// Takes no parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<()>,
     },
 
     /// Lists configured servers and their current inventory.
@@ -671,6 +695,7 @@ impl ClientRequest {
             | Self::ConfigRead { request_id, .. }
             | Self::ConfigValueWrite { request_id, .. }
             | Self::ConfigBatchWrite { request_id, .. }
+            | Self::ConfigRequirementsRead { request_id, .. }
             | Self::McpServerStatusList { request_id, .. }
             | Self::McpServerRefresh { request_id, .. }
             | Self::McpServerReconnect { request_id, .. }
@@ -724,6 +749,7 @@ impl ClientRequest {
             Self::PluginUninstall { .. } => "plugin/uninstall",
             Self::SkillsConfigWrite { .. } => "skills/config/write",
             Self::ConfigRead { .. } => "config/read",
+            Self::ConfigRequirementsRead { .. } => "configRequirements/read",
             Self::ConfigValueWrite { .. } => "config/value/write",
             Self::ConfigBatchWrite { .. } => "config/batchWrite",
 
@@ -789,6 +815,7 @@ impl ClientRequest {
             | Self::ConfigRead { .. }
             | Self::ConfigValueWrite { .. }
             | Self::ConfigBatchWrite { .. }
+            | Self::ConfigRequirementsRead { .. }
             | Self::McpServerStatusList { .. }
             | Self::McpServerRefresh { .. }
             | Self::McpServerReconnect { .. }
@@ -849,7 +876,10 @@ impl ClientRequest {
         let thread_id = match self {
             // Product configuration, plugin and skill reads share the `config` queue with its
             // writes, as in Codex.
-            Self::SkillsList { .. } | Self::HooksList { .. } | Self::ConfigRead { .. } => {
+            Self::SkillsList { .. }
+            | Self::HooksList { .. }
+            | Self::ConfigRead { .. }
+            | Self::ConfigRequirementsRead { .. } => {
                 return Some(ClientRequestSerializationScope::GlobalSharedRead("config"));
             }
             Self::SkillsExtraRootsSet { .. }
@@ -1283,6 +1313,9 @@ impl ClientRequest {
             Self::ConfigBatchWrite { params, .. } => {
                 Some(PluginManagementRequest::ConfigBatchWrite(params.clone()))
             }
+            Self::ConfigRequirementsRead { .. } => {
+                Some(PluginManagementRequest::ConfigRequirementsRead)
+            }
             _ => None,
         }
     }
@@ -1322,6 +1355,8 @@ pub enum PluginManagementRequest {
     ConfigValueWrite(ConfigValueWriteParams),
     /// `config/batchWrite`.
     ConfigBatchWrite(ConfigBatchWriteParams),
+    /// `configRequirements/read`.
+    ConfigRequirementsRead,
 }
 
 mod environments;
