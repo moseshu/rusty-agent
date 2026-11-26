@@ -197,7 +197,7 @@ fn policy_reexports_remain_usable_in_downstream_traits_and_signatures() {
 #[test]
 fn hook_metadata_flattens_handler_members_without_an_extra_object() {
     let wire = json!({
-        "key": "pre-tool", "eventName": "pre_tool_use", "handlerType": "command",
+        "key": "pre-tool", "eventName": "preToolUse", "handlerType": "command",
         "command": "echo ok", "matcher": null, "timeoutSec": 30, "statusMessage": null,
         "additionalContextLimit": null, "sourcePath": "/tmp/hooks.json", "source": "user",
         "pluginId": null, "displayOrder": 0, "enabled": true, "isManaged": false,

@@ -4,8 +4,9 @@
     missing_docs,
     reason = "Retain source management wire field names and serialization."
 )]
-use super::{HookSource, HookTrustStatus, PluginAuthPolicy, PluginInstallPolicy};
-use ra_core::hook::HookEventName;
+use super::{
+    HookSource, HookTrustStatus, PluginAuthPolicy, PluginInstallPolicy, hook_notification,
+};
 use ra_paths::{AbsolutePathBuf, LegacyAppPathString};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -281,7 +282,7 @@ pub enum HookHandlerMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct HookMetadata {
     pub key: String,
-    pub event_name: HookEventName,
+    pub event_name: hook_notification::HookEventName,
     #[serde(flatten)]
     pub handler: HookHandlerMetadata,
     pub matcher: Option<String>,
@@ -365,7 +366,7 @@ pub struct PluginDetail {
 #[serde(rename_all = "camelCase")]
 pub struct PluginHookSummary {
     pub key: String,
-    pub event_name: HookEventName,
+    pub event_name: hook_notification::HookEventName,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

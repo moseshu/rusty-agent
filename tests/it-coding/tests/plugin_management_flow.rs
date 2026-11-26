@@ -97,8 +97,50 @@ async fn management_wire_installs_reads_lists_and_uninstalls_with_real_config() 
     let market = TempDir::new().unwrap();
     marketplace(market.path(), "1.0.0");
     write(
+        &market.path().join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "company",
+  "plugins": [{
+    "name": "sample",
+    "source": {"source": "local", "path": "./sample"},
+    "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+    "category": "Design"
+  }]
+}"#,
+    );
+    write(
+        &market.path().join("sample/.codex-plugin/plugin.json"),
+        r#"{
+  "name": "sample",
+  "version": "1.0.0",
+  "description": "Sample capabilities",
+  "keywords": ["api-key", "developer tools"],
+  "interface": {
+    "displayName": "Sample Plugin",
+    "category": "Productivity",
+    "defaultPrompt": ["Draft the reply", "Find my next action"],
+    "logoDark": "./assets/logo-dark.png"
+  }
+}"#,
+    );
+    write(
+        &market.path().join("sample/skills/test/agents/openai.yaml"),
+        "policy:\n  products: [CODEX]\n",
+    );
+    write(
+        &market.path().join("sample/skills/chatgpt-only/SKILL.md"),
+        "---\nname: chatgpt-only\ndescription: Visible only for ChatGPT\n---\nFixture\n",
+    );
+    write(
+        &market
+            .path()
+            .join("sample/skills/chatgpt-only/agents/openai.yaml"),
+        "policy:\n  products: [CHATGPT]\n",
+    );
+    write(
         &home.path().join("config.toml"),
-        "[features]\nhooks = true\n[skills.bundled]\nenabled = false\n",
+        "[features]\nhooks = true\n[skills.bundled]\nenabled = false\n\
+         [[skills.config]]\nname = 'sample:test'\nenabled = false\n",
     );
     let services = services(home.path());
     let server = AppServer::new(home.path())
@@ -147,14 +189,36 @@ async fn management_wire_installs_reads_lists_and_uninstalls_with_real_config() 
     let (response,mut mutation_notifications)=call(&events,&mut messages,5,"plugin/install",json!({"marketplacePath":market.path().join(".agents/plugins/marketplace.json"),"pluginName":"sample"})).await;
     assert_eq!(response["result"]["authPolicy"], "ON_INSTALL", "{response}");
     let (response,notifications)=call(&events,&mut messages,6,"plugin/read",json!({"marketplacePath":market.path().join(".agents/plugins/marketplace.json"),"pluginName":"sample"})).await;
+    let detail = &response["result"]["plugin"];
+    let summary = &detail["summary"];
+    assert_eq!(detail["marketplaceName"], "company");
     assert_eq!(
-        response["result"]["plugin"]["summary"]["installed"], true,
-        "{response}"
+        detail["marketplacePath"],
+        json!(market.path().join(".agents/plugins/marketplace.json"))
     );
+    assert_eq!(detail["description"], "Sample capabilities");
+    assert_eq!(summary["id"], "sample@company");
+    assert_eq!(summary["name"], "sample");
+    assert_eq!(summary["localVersion"], "1.0.0");
+    assert_eq!(summary["installed"], true, "{response}");
+    assert_eq!(summary["enabled"], true);
+    assert_eq!(summary["installPolicy"], "AVAILABLE");
+    assert_eq!(summary["authPolicy"], "ON_INSTALL");
+    assert_eq!(summary["keywords"], json!(["api-key", "developer tools"]));
+    let interface = &summary["interface"];
+    assert_eq!(interface["displayName"], "Sample Plugin");
+    assert_eq!(interface["category"], "Design");
     assert_eq!(
-        response["result"]["plugin"]["skills"][0]["name"],
-        "sample:test"
+        interface["defaultPrompt"],
+        json!(["Draft the reply", "Find my next action"])
     );
+    assert!(Path::new(interface["logoDark"].as_str().unwrap()).ends_with("assets/logo-dark.png"));
+    let skills = detail["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["name"], "sample:test");
+    assert_eq!(skills[0]["description"], "test from plugin");
+    assert_eq!(skills[0]["enabled"], false);
+    assert_eq!(detail["mcpServers"], json!(["docs"]));
     assert_eq!(
         response["result"]["plugin"].get("scheduledTasks"),
         Some(&Value::Null)
@@ -171,7 +235,7 @@ async fn management_wire_installs_reads_lists_and_uninstalls_with_real_config() 
         response["result"]["plugin"]["hooks"],
         json!([{
             "key":"sample@company:hooks/hooks.json:session_start:0:0",
-            "eventName":"session_start"
+            "eventName":"sessionStart"
         }])
     );
     mutation_notifications.extend(notifications);
@@ -195,6 +259,10 @@ async fn management_wire_installs_reads_lists_and_uninstalls_with_real_config() 
         Some(true)
     );
     let (response, _) = call(&events, &mut messages, 7, "hooks/list", json!({})).await;
+    assert_eq!(
+        response["result"]["data"][0]["hooks"][0]["eventName"],
+        "sessionStart"
+    );
     assert_eq!(
         response["result"]["data"][0]["hooks"][0]["trustStatus"], "untrusted",
         "{response}"

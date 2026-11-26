@@ -7,6 +7,14 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Hook event names in management responses
+
+The `eventName` values in `plugin/read` and `hooks/list` now use Codex v2 spellings such as
+`sessionStart` and `preToolUse`. Update clients that consumed the earlier snake_case values.
+Rust callers constructing `PluginHookSummary` or `HookMetadata` use
+`ra_protocol::server::protocol::hook_notification::HookEventName` for `event_name`.
+Hook keys retain their existing spelling.
+
 ### Local MCP HTTP headers helpers
 
 Coding-product Streamable HTTP registrations now run the configured `http_headers_helper` in the

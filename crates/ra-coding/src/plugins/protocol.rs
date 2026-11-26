@@ -338,7 +338,7 @@ impl PluginManagement for PluginRequestProcessor {
                                     .hooks
                                     .into_iter()
                                     .filter(|hook| !hook.builtin)
-                                    .map(hook_metadata)
+                                    .filter_map(hook_metadata)
                                     .collect(),
                                 warnings: hooks.warnings,
                                 errors: Vec::new(),
@@ -643,16 +643,19 @@ fn detail(outcome: PluginReadOutcome) -> wire::PluginDetail {
         hooks: plugin
             .hooks
             .into_iter()
-            .map(|hook| wire::PluginHookSummary {
-                key: hook.key,
-                event_name: hook.event_name,
+            .filter_map(|hook| {
+                Some(wire::PluginHookSummary {
+                    key: hook.key,
+                    event_name: wire::hook_notification::HookEventName::from_core(hook.event_name)?,
+                })
             })
             .collect(),
         mcp_servers: plugin.mcp_server_names,
         scheduled_tasks: None,
     }
 }
-fn hook_metadata(value: crate::hooks::HookListEntry) -> wire::HookMetadata {
+fn hook_metadata(value: crate::hooks::HookListEntry) -> Option<wire::HookMetadata> {
+    let event_name = wire::hook_notification::HookEventName::from_core(value.event_name)?;
     let handler = match value.handler {
         crate::hooks::HookListEntryHandler::Command { command, r#async } => {
             wire::HookHandlerMetadata::Command { command, r#async }
@@ -661,9 +664,9 @@ fn hook_metadata(value: crate::hooks::HookListEntry) -> wire::HookMetadata {
             wire::HookHandlerMetadata::McpTool { server, tool }
         }
     };
-    wire::HookMetadata {
+    Some(wire::HookMetadata {
         key: value.key,
-        event_name: value.event_name,
+        event_name,
         handler,
         matcher: value.matcher,
         timeout_sec: value.timeout_sec,
@@ -677,7 +680,7 @@ fn hook_metadata(value: crate::hooks::HookListEntry) -> wire::HookMetadata {
         is_managed: value.is_managed,
         current_hash: value.current_hash,
         trust_status: value.trust_status,
-    }
+    })
 }
 
 fn config_error(err: crate::config_manager_service::ConfigManagerError) -> JsonRpcErrorObject {
