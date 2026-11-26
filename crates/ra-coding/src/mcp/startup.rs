@@ -294,7 +294,7 @@ impl DeferredClient {
             )
         };
         let view = self.entry.binding_view();
-        let listing = view.catalog_listing.ok_or_else(replaced)?;
+        view.catalog_listing.ok_or_else(replaced)?;
         let (client, live, generation, cancel) = {
             let state = self
                 .entry
@@ -315,19 +315,19 @@ impl DeferredClient {
                 state.startup_cancel.clone(),
             )
         };
-        let catalog = tokio::select! {
+        tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(replaced()),
-            result = live.get(&client, listing) => result?,
+            result = live.initialize(&client) => result?,
         };
         let (catalog, binding) = self
             .entry
-            .record_catalog(generation, &cancel, &view, &client, catalog)
+            .record_catalog(generation, &cancel, &view, &client, live.catalog()?)
             .ok_or_else(replaced)?;
         let inner = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(replaced()),
-            result = catalog.prepare_tool(advertised, client, &view.filter, context.run(), context.arguments()) => result?,
+            result = catalog.bind_advertised_tool(advertised, client, &view.filter, context.run()) => result?,
         };
         Ok(super::approval::ProductMcpTool::new(
             Arc::new(inner),

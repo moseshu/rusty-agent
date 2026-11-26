@@ -83,11 +83,8 @@ impl LiveToolCatalog {
             }));
     }
 
-    pub(super) async fn get(
-        &self,
-        client: &McpClient,
-        listing: CatalogListing,
-    ) -> Result<McpToolCatalog> {
+    // Startup listing is lazy in this host. Calls and discovery share the first publication.
+    pub(super) async fn initialize(&self, client: &McpClient) -> Result<()> {
         self.initialized
             .get_or_try_init(|| async {
                 // The client's startup deadline covers the listing itself. Readers waiting
@@ -98,6 +95,15 @@ impl LiveToolCatalog {
                 Ok::<(), Error>(())
             })
             .await?;
+        Ok(())
+    }
+
+    pub(super) async fn get(
+        &self,
+        client: &McpClient,
+        listing: CatalogListing,
+    ) -> Result<McpToolCatalog> {
+        self.initialize(client).await?;
         if listing.refresh_after_notification
             && self.refresh(client, listing.timeout).await.is_err()
         {
@@ -106,6 +112,10 @@ impl LiveToolCatalog {
                 "MCP tool catalog refresh failed; retaining the previous catalog"
             );
         }
+        self.catalog()
+    }
+
+    pub(super) fn catalog(&self) -> Result<McpToolCatalog> {
         self.latest()
             .map(|snapshot| snapshot.catalog.clone())
             .ok_or_else(|| Error::config("MCP tool catalog was not initialized"))

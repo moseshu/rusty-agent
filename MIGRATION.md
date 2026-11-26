@@ -91,11 +91,16 @@ filtered out or hidden, the call fails before reaching the server. A failed star
 original diagnostic. Product approval recovery checks the saved declaration digest and approval
 mode when the original request captured a digest. Live and older approval records without a
 digest can resume through startup-cache bindings under the existing invocation identity checks.
+Call preparation reads the last published live catalog, initializing it on demand if this is
+the connection's first listing. Discovery and inventory reads handle pending tool-list change
+notifications. Cached and live product calls use the same MCP client validation for required
+arguments after any required product approval and before dispatch.
 
 Other hosts can use `McpToolCatalog::prepare_tool` with their own connection lifecycle and approval
 policy. It resolves a regular advertised tool against a complete live catalog and applies the
-SDK's required-argument check. The direct SDK call path, and the coding runtime's manually
-registered cached catalog extension, keep their existing behavior.
+SDK's required-argument check. Hosts that approve before validating can use
+`McpToolCatalog::bind_advertised_tool` to resolve the live declaration and use the client's
+standard validation on invocation.
 
 ### Experimental feature catalog and runtime defaults
 

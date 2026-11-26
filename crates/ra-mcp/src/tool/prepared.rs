@@ -157,6 +157,34 @@ impl McpToolCatalog {
         run: &RunContext,
         arguments: &serde_json::Value,
     ) -> Result<McpTool> {
+        let tool = self
+            .bind_advertised_tool(advertised, client, filter, run)
+            .await?;
+        let arguments = arguments.as_object().ok_or_else(|| {
+            Error::tool(
+                ToolErrorKind::InvalidInput,
+                "mcp",
+                "MCP tool arguments must be a JSON object",
+            )
+        })?;
+        crate::server::tools::validate_required_arguments(
+            tool.info().tool(),
+            Some(arguments),
+            &self.name,
+        )?;
+        Ok(tool)
+    }
+
+    /// Binds a previously advertised identity to its live declaration and routing names.
+    /// Hosts that approve calls before validating arguments can let the client apply its usual
+    /// validation when the bound tool is invoked.
+    pub async fn bind_advertised_tool(
+        &self,
+        advertised: &McpTool,
+        client: McpClient,
+        filter: &ToolFilter,
+        run: &RunContext,
+    ) -> Result<McpTool> {
         let info = advertised.info();
         let unavailable = || {
             Error::tool(
@@ -195,18 +223,6 @@ impl McpToolCatalog {
             .apply(tools, Some(run), Some(run.agent()), &self.name)
             .await?;
         let declaration = tools.pop().ok_or_else(unavailable)?;
-        let arguments = arguments.as_object().ok_or_else(|| {
-            Error::tool(
-                ToolErrorKind::InvalidInput,
-                "mcp",
-                "MCP tool arguments must be a JSON object",
-            )
-        })?;
-        crate::server::tools::validate_required_arguments(
-            &declaration.tool,
-            Some(arguments),
-            &self.name,
-        )?;
         McpTool::new(
             info.clone().with_declaration(declaration),
             advertised.hook_name().to_owned(),

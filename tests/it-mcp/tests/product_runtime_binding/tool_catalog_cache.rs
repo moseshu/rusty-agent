@@ -498,6 +498,114 @@ async fn cached_product_call_uses_live_schema_and_read_only_approval() {
 }
 
 #[tokio::test]
+async fn cached_and_live_product_calls_validate_required_arguments_after_approval() {
+    let mut fixture = Fixture::start(None).await;
+    let runtime =
+        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    let cached = capture_startup_cached_tool(&mut fixture, &runtime).await;
+    *fixture.live_tools.lock().unwrap() = Some(vec![
+        serde_json::from_value(json!({
+            "name": "session_1",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            },
+            "annotations": {"destructiveHint": true}
+        }))
+        .unwrap(),
+    ]);
+    fixture.resume_initialize(2);
+    wait_status(&runtime, "docs", Status::Connected).await;
+    let live = fixture.discover_tools(&runtime, 2).await.remove(0);
+    let run = context();
+    let arguments = json!({});
+    for (tool, call_id) in [(cached, "cached-write"), (live, "live-write")] {
+        let call_id = CallId::new(call_id);
+        let context = || ToolContext::new(&run, tool.as_ref(), &call_id, &arguments);
+        let error = tool.call(context()).await.unwrap_err();
+        let approval = ToolApprovalRequest::of(&error)
+            .unwrap_or_else(|| panic!("expected an approval request, got {error}"));
+        assert!(fixture.calls.try_recv().is_err());
+
+        let error = tool
+            .call(context().with_resume_state(approval.state()))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required parameters: query")
+        );
+        assert!(fixture.calls.try_recv().is_err());
+    }
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn cached_product_call_leaves_catalog_notifications_for_discovery() {
+    let mut fixture = Fixture::start(None).await;
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+
+    fixture.pause_initialize(2);
+    let reconnect = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .reconnect_mcp_server(Some("docs"), false)
+                .await
+                .unwrap()
+        }
+    });
+    fixture.wait_for_initialize(2).await;
+    let cached = tokio::time::timeout(Duration::from_secs(1), model_tools(&runtime))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(cached.schema().name(), "session_1");
+    *fixture.live_tools.lock().unwrap() = Some(vec![
+        serde_json::from_value(json!({
+            "name": "session_1",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true}
+        }))
+        .unwrap(),
+    ]);
+    fixture.resume_initialize(2);
+    reconnect.await.unwrap();
+    assert_eq!(fixture.discover(&runtime, 2).await, ["session_1"]);
+
+    *fixture.live_tools.lock().unwrap() = None;
+    runtime
+        .call_tool_now(
+            "docs",
+            "notify",
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+
+    let mut call = Box::pin(invoke(cached.as_ref()));
+    tokio::select! {
+        biased;
+        _ = fixture.listing(2) => panic!("call preparation tried to refresh the live catalog"),
+        result = &mut call => result.unwrap(),
+    };
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1");
+
+    assert_eq!(fixture.discover(&runtime, 2).await, ["session_2"]);
+    let error = invoke(cached.as_ref()).await.unwrap_err();
+    assert!(error.to_string().contains("not available to the model"));
+    assert!(fixture.calls.try_recv().is_err());
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
 async fn cached_product_call_rejects_a_removed_tool_before_dispatch() {
     let mut fixture = Fixture::start(None).await;
     let runtime =
