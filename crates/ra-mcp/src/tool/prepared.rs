@@ -14,7 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use ra_core::{
     context::{RunAgent, RunContext},
-    error::{Error, Result},
+    error::{Error, Result, ToolErrorKind},
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -144,6 +144,77 @@ impl McpToolCatalog {
             .into_iter()
             .map(|tool| McpToolInfo::from_cached(&self.name, tool))
             .collect())
+    }
+
+    /// Resolves a previously advertised tool in this live catalog before approval or dispatch.
+    /// The caller owns connection readiness and approval policy. The returned tool uses the
+    /// live definition and preserves the advertised routing names.
+    pub async fn prepare_tool(
+        &self,
+        advertised: &McpTool,
+        client: McpClient,
+        filter: &ToolFilter,
+        run: &RunContext,
+        arguments: &serde_json::Value,
+    ) -> Result<McpTool> {
+        let info = advertised.info();
+        let unavailable = || {
+            Error::tool(
+                ToolErrorKind::ExecutionFailed,
+                info.callable_name(),
+                format!(
+                    "MCP tool `{}/{}` is not available to the model",
+                    crate::catalog::safe_server_name(info.server_name()),
+                    info.tool().name
+                ),
+            )
+        };
+        // Regular catalogs have no connector identity. Keep the original server and tool identity.
+        if info.server_name() != self.name
+            || client.server_name() != self.name
+            || info.connector_id().is_some()
+        {
+            return Err(unavailable());
+        }
+        let declaration = self
+            .tools
+            .iter()
+            .find(|tool| tool.tool.name == info.tool().name)
+            .filter(|tool| tool_is_model_visible(&tool.tool))
+            .ok_or_else(unavailable)?;
+        let tools = vec![declaration.clone()];
+        let tools = if self.filtered {
+            tools
+        } else {
+            self.options
+                .tool_filter()
+                .apply(tools, Some(run), Some(run.agent()), &self.name)
+                .await?
+        };
+        let mut tools = filter
+            .apply(tools, Some(run), Some(run.agent()), &self.name)
+            .await?;
+        let declaration = tools.pop().ok_or_else(unavailable)?;
+        let arguments = arguments.as_object().ok_or_else(|| {
+            Error::tool(
+                ToolErrorKind::InvalidInput,
+                "mcp",
+                "MCP tool arguments must be a JSON object",
+            )
+        })?;
+        crate::server::tools::validate_required_arguments(
+            &declaration.tool,
+            Some(arguments),
+            &self.name,
+        )?;
+        McpTool::new(
+            info.clone().with_declaration(declaration),
+            advertised.hook_name().to_owned(),
+            &self.options,
+            Arc::new(client),
+            advertised.options.exposure() == ra_core::tool::ToolExposure::Deferred,
+            Some(run.agent()),
+        )
     }
 
     /// Raw unfiltered declarations for inventory consumers.

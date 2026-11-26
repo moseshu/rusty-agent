@@ -84,11 +84,18 @@ retain their existing listing semantics.
 `McpToolCatalog::fetch_for_revision` provides a guarded listing for the product. A superseded
 listing cannot update the client's schema cache used for tool calls.
 
-Known Codex parity gap for tools advertised from a startup cache. The product waits for the
-connection but dispatches using the cached declaration. Codex resolves the advertised identity
-against the live catalog before approval and dispatch, using the current schema, annotations and
-approval metadata. A cached declaration can therefore prompt for more approvals, and a removed
-tool can reach the server before being rejected.
+For configured coding-product servers, a tool advertised from a startup cache is prepared
+against the live catalog before approval or dispatch. The model-facing name stays fixed. The
+live definition supplies schema, annotations and request metadata. If the tool has been removed,
+filtered out or hidden, the call fails before reaching the server. A failed startup retains its
+original diagnostic. Product approval recovery checks the saved declaration digest and approval
+mode when the original request captured a digest. Live and older approval records without a
+digest can resume through startup-cache bindings under the existing invocation identity checks.
+
+Other hosts can use `McpToolCatalog::prepare_tool` with their own connection lifecycle and approval
+policy. It resolves a regular advertised tool against a complete live catalog and applies the
+SDK's required-argument check. The direct SDK call path, and the coding runtime's manually
+registered cached catalog extension, keep their existing behavior.
 
 ### Experimental feature catalog and runtime defaults
 

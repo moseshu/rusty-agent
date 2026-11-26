@@ -209,6 +209,21 @@ impl McpServerConfig {
     }
 }
 
+#[derive(Clone)]
+enum ToolCallBinding {
+    Live(CatalogBinding),
+    Startup(Arc<DeferredClient>),
+}
+
+impl ToolCallBinding {
+    fn server_name(&self) -> &str {
+        match self {
+            Self::Live(binding) => binding.snapshot.catalog.server_name(),
+            Self::Startup(binding) => binding.entry.server.name(),
+        }
+    }
+}
+
 struct Entry {
     server: Arc<dyn McpRuntimeServer>,
     manager: McpServerManager,
@@ -1048,7 +1063,7 @@ impl CodingMcpRuntime {
     fn product_tool(
         bindings: &[(Arc<Entry>, BindingView)],
         tool: Arc<ra_mcp::tool::McpTool>,
-        catalogs: &[Option<CatalogBinding>],
+        catalogs: &[Option<ToolCallBinding>],
     ) -> Arc<dyn Tool> {
         let policy = bindings
             .iter()
@@ -1057,7 +1072,7 @@ impl CodingMcpRuntime {
         let catalog = catalogs
             .iter()
             .flatten()
-            .find(|binding| binding.snapshot.catalog.server_name() == tool.info().server_name())
+            .find(|binding| binding.server_name() == tool.info().server_name())
             .cloned();
         Arc::new(approval::ProductMcpTool::new(tool, policy, catalog))
     }
@@ -1373,7 +1388,7 @@ impl CodingMcpRuntime {
     async fn tool_catalogs(
         &self,
         bindings: &[(Arc<Entry>, BindingView)],
-    ) -> Vec<(McpToolCatalogSource, Option<CatalogBinding>)> {
+    ) -> Vec<(McpToolCatalogSource, Option<ToolCallBinding>)> {
         join_all(bindings.iter().map(|(entry, view)| async {
             let shared = entry.wait_for_catalog(view).await;
             let (enabled, stopped, status, cached, epoch, generation, cancel, live) = {
@@ -1425,7 +1440,7 @@ impl CodingMcpRuntime {
                                     Arc::new(client) as Arc<dyn McpToolClientSource>,
                                     view.filter.clone(),
                                 ),
-                                binding,
+                                binding.map(ToolCallBinding::Live),
                             )
                         }),
                     Err(error) => {
@@ -1442,18 +1457,22 @@ impl CodingMcpRuntime {
                 let shared =
                     shared.filter(|_| matches!(status, Status::NotStarted | Status::Starting));
                 cached.or(shared).map(|catalog| {
+                    let deferred = Arc::new(DeferredClient {
+                        entry: entry.clone(),
+                        epoch,
+                        resolved: tokio::sync::OnceCell::new(),
+                        view: view.clone(),
+                    });
+                    let binding = view
+                        .catalog_listing
+                        .map(|_| ToolCallBinding::Startup(deferred.clone()));
                     (
                         (
                             view.catalog(catalog),
-                            Arc::new(DeferredClient {
-                                entry: entry.clone(),
-                                epoch,
-                                resolved: tokio::sync::OnceCell::new(),
-                                view: view.clone(),
-                            }) as Arc<dyn McpToolClientSource>,
+                            deferred as Arc<dyn McpToolClientSource>,
                             view.filter.clone(),
                         ),
-                        None,
+                        binding,
                     )
                 })
             }

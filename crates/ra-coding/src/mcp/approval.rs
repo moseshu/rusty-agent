@@ -1,7 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Product MCP approval before execution, over the framework's recoverable in-call interruption.
 
-use super::live_tool_catalog::CatalogBinding;
+use super::ToolCallBinding;
 use crate::thread_settings::CodingThreadSettings;
 use async_trait::async_trait;
 use ra_config::{AppToolApproval, AskForApproval};
@@ -23,6 +23,7 @@ use ra_protocol::server::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -97,6 +98,8 @@ pub(crate) struct McpApprovalState {
     persist_path: Option<PathBuf>,
     title: Option<String>,
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declaration: Option<String>,
 }
 impl McpApprovalState {
     pub(crate) fn from_approval(approval: &ToolApproval) -> Option<Self> {
@@ -229,18 +232,18 @@ impl McpApprovalState {
 pub(crate) struct ProductMcpTool {
     inner: Arc<McpTool>,
     policy: Option<Arc<ProductMcpPolicy>>,
-    catalog: Option<CatalogBinding>,
+    binding: Option<ToolCallBinding>,
 }
 impl ProductMcpTool {
     pub(super) fn new(
         inner: Arc<McpTool>,
         policy: Option<Arc<ProductMcpPolicy>>,
-        catalog: Option<CatalogBinding>,
+        binding: Option<ToolCallBinding>,
     ) -> Self {
         Self {
             inner,
             policy,
-            catalog,
+            binding,
         }
     }
     pub(crate) fn hook_name(&self) -> &str {
@@ -248,11 +251,7 @@ impl ProductMcpTool {
     }
 
     fn check_catalog(&self) -> Result<()> {
-        if self
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| !catalog.is_current())
-        {
+        if matches!(&self.binding, Some(ToolCallBinding::Live(catalog)) if !catalog.is_current()) {
             let info = self.inner.info();
             return Err(Error::tool(
                 ToolErrorKind::ExecutionFailed,
@@ -303,7 +302,12 @@ impl ProductMcpTool {
         }
     }
 
-    fn state(&self, context: &ToolContext<'_>, policy: &ProductMcpPolicy) -> McpApprovalState {
+    fn state(
+        &self,
+        context: &ToolContext<'_>,
+        policy: &ProductMcpPolicy,
+        declaration: Option<String>,
+    ) -> McpApprovalState {
         let info = self.inner.info();
         let mode = policy
             .overrides
@@ -328,6 +332,7 @@ impl ProductMcpTool {
             persist_path: policy.persist_path.clone(),
             title: info.tool().title.clone(),
             description: info.tool().description.as_ref().map(ToString::to_string),
+            declaration,
         }
     }
 }
@@ -442,11 +447,55 @@ impl Tool for ProductMcpTool {
         self.inner.needs_approval(context).await
     }
     async fn call(&self, context: ToolContext<'_>) -> Result<ToolOutput> {
+        if let Some(ToolCallBinding::Startup(deferred)) = &self.binding {
+            let prepared = deferred.prepare_tool(&self.inner, &context).await?;
+            return prepared.call_prepared(context, true).await;
+        }
+        self.call_prepared(context, false).await
+    }
+}
+
+impl ProductMcpTool {
+    async fn call_prepared(
+        &self,
+        context: ToolContext<'_>,
+        track_declaration: bool,
+    ) -> Result<ToolOutput> {
         let Some(policy) = self.policy.as_ref() else {
             return self.invoke(&context).await;
         };
         self.check_catalog()?;
-        let state = self.state(&context, policy);
+        let saved = context
+            .resume_state()
+            .cloned()
+            .and_then(|value| serde_json::from_value::<McpApprovalState>(value).ok());
+        // A resumed invocation can be rediscovered from a live catalog. Carry the declaration
+        // check forward when approval for a cached tool started on an earlier binding.
+        let declaration = if track_declaration
+            || saved
+                .as_ref()
+                .is_some_and(|saved| saved.declaration.is_some())
+        {
+            let mut value = serde_json::to_value(self.inner.info().tool()).map_err(|error| {
+                Error::config("failed to capture MCP tool declaration").with_source(error)
+            })?;
+            value.sort_all_objects();
+            Some(format!("{:x}", Sha256::digest(value.to_string())))
+        } else {
+            None
+        };
+        let state = self.state(&context, policy, declaration);
+        // Live and older approvals can resume through a cached binding that computes a digest.
+        if let Some(saved) = &saved
+            && saved.declaration.is_some()
+            && (saved.declaration != state.declaration || saved.mode != state.mode)
+        {
+            return Err(Error::tool(
+                ToolErrorKind::ExecutionFailed,
+                self.origin().name(),
+                "MCP tool declaration or approval policy changed after approval was requested",
+            ));
+        }
         let settings = context.run().app_context::<CodingThreadSettings>();
         if settings.is_some_and(|settings| auto_approved(settings, state.mode))
             || !self.inner.needs_approval(&context).await?
@@ -481,11 +530,7 @@ impl Tool for ProductMcpTool {
                 "MCP tool approval via request_user_input requires the root thread. Ask the parent agent to handle this request. Do not retry the blocked action until the parent confirms the blocker is resolved.",
             ));
         }
-        if let Some(saved) = context
-            .resume_state()
-            .cloned()
-            .and_then(|value| serde_json::from_value::<McpApprovalState>(value).ok())
-        {
+        if let Some(saved) = saved {
             if saved.product_mcp_approval
                 && saved.run_id == state.run_id
                 && saved.call_id == state.call_id

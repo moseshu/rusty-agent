@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use futures::FutureExt;
 use ra_core::error::Result;
-use ra_mcp::tool::{McpToolCatalog, McpToolClientSource};
+use ra_mcp::tool::{McpTool, McpToolCatalog, McpToolClientSource};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -277,6 +277,64 @@ pub(super) struct DeferredClient {
     pub(super) epoch: u64,
     pub(super) resolved: tokio::sync::OnceCell<ra_mcp::client::McpClient>,
     pub(super) view: super::BindingView,
+}
+
+impl DeferredClient {
+    pub(super) async fn prepare_tool(
+        &self,
+        advertised: &McpTool,
+        context: &ra_core::tool::ToolContext<'_>,
+    ) -> Result<super::approval::ProductMcpTool> {
+        self.client().await?;
+        let replaced = || {
+            Error::tool(
+                ToolErrorKind::ExecutionFailed,
+                "mcp",
+                "MCP tool binding was replaced",
+            )
+        };
+        let view = self.entry.binding_view();
+        let listing = view.catalog_listing.ok_or_else(replaced)?;
+        let (client, live, generation, cancel) = {
+            let state = self
+                .entry
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.epoch != self.epoch
+                || !state.enabled
+                || state.stopped
+                || state.status != Status::Connected
+            {
+                return Err(replaced());
+            }
+            (
+                view.client(self.entry.server.current_client()?),
+                state.live_tool_catalog.clone(),
+                state.generation,
+                state.startup_cancel.clone(),
+            )
+        };
+        let catalog = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(replaced()),
+            result = live.get(&client, listing) => result?,
+        };
+        let (catalog, binding) = self
+            .entry
+            .record_catalog(generation, &cancel, &view, &client, catalog)
+            .ok_or_else(replaced)?;
+        let inner = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(replaced()),
+            result = catalog.prepare_tool(advertised, client, &view.filter, context.run(), context.arguments()) => result?,
+        };
+        Ok(super::approval::ProductMcpTool::new(
+            Arc::new(inner),
+            view.product_policy,
+            binding.map(super::ToolCallBinding::Live),
+        ))
+    }
 }
 
 // Adapter primary messages are already sanitized. Keep host display labels and the original

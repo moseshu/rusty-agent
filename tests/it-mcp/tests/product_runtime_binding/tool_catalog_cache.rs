@@ -6,7 +6,7 @@ use ra_core::{
     error::Result,
     item::CallId,
     state::RunId,
-    tool::{Tool, ToolContext, ToolOutput, ToolResolver},
+    tool::{Tool, ToolApprovalRequest, ToolContext, ToolOutput, ToolResolver},
 };
 use ra_mcp::{McpCatalogBuilder, McpServerRegistration};
 use rmcp::{
@@ -24,7 +24,10 @@ use rmcp::{
 use serde_json::json;
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,8 @@ struct StartupCatalog {
     initializing: mpsc::UnboundedSender<usize>,
     revision: Arc<AtomicUsize>,
     layout: Arc<AtomicUsize>,
+    live_tools: Arc<Mutex<Option<Vec<rmcp::model::Tool>>>>,
+    failing_session: Arc<AtomicUsize>,
     calls: mpsc::UnboundedSender<String>,
 }
 
@@ -71,6 +76,12 @@ impl ServerHandler for StartupCatalog {
             .await
             .unwrap()
             .forget();
+        if self.failing_session.load(Ordering::SeqCst) == self.session {
+            return Err(rmcp::ErrorData::internal_error(
+                "fixture initialization rejected",
+                None,
+            ));
+        }
         context.peer.set_peer_info(params.clone());
         self.negotiate_initialize(&params)
     }
@@ -102,11 +113,13 @@ impl ServerHandler for StartupCatalog {
             }))
             .unwrap()
         };
-        let tools = match self.layout.load(Ordering::SeqCst) {
-            COMPANION_AFTER => vec![tool(&tool_name), tool("companion")],
-            COMPANION_BEFORE => vec![tool("companion"), tool(&tool_name)],
-            _ => vec![tool(&tool_name)],
-        };
+        let tools = self.live_tools.lock().unwrap().clone().unwrap_or_else(|| {
+            match self.layout.load(Ordering::SeqCst) {
+                COMPANION_AFTER => vec![tool(&tool_name), tool("companion")],
+                COMPANION_BEFORE => vec![tool("companion"), tool(&tool_name)],
+                _ => vec![tool(&tool_name)],
+            }
+        });
         Ok(ListToolsResult {
             tools,
             ..Default::default()
@@ -137,6 +150,8 @@ struct Fixture {
     task: tokio::task::JoinHandle<()>,
     revision: Arc<AtomicUsize>,
     layout: Arc<AtomicUsize>,
+    live_tools: Arc<Mutex<Option<Vec<rmcp::model::Tool>>>>,
+    failing_session: Arc<AtomicUsize>,
     calls: mpsc::UnboundedReceiver<String>,
 }
 
@@ -151,12 +166,16 @@ impl Fixture {
         let sessions = AtomicUsize::new(0);
         let revision = Arc::new(AtomicUsize::new(0));
         let layout = Arc::new(AtomicUsize::new(0));
+        let live_tools = Arc::new(Mutex::new(None));
+        let failing_session = Arc::new(AtomicUsize::new(0));
         let service = StreamableHttpService::new(
             {
                 let gates = gates.clone();
                 let initialize_gates = initialize_gates.clone();
                 let revision = revision.clone();
                 let layout = layout.clone();
+                let live_tools = live_tools.clone();
+                let failing_session = failing_session.clone();
                 move || {
                     Ok(StartupCatalog {
                         session: sessions.fetch_add(1, Ordering::SeqCst) + 1,
@@ -167,6 +186,8 @@ impl Fixture {
                         initializing: initializing_sender.clone(),
                         revision: revision.clone(),
                         layout: layout.clone(),
+                        live_tools: live_tools.clone(),
+                        failing_session: failing_session.clone(),
                         calls: call_sender.clone(),
                     })
                 }
@@ -197,6 +218,8 @@ impl Fixture {
             task,
             revision,
             layout,
+            live_tools,
+            failing_session,
             calls,
         }
     }
@@ -391,6 +414,288 @@ async fn catalog_serves_equivalent_reconnect_but_never_crosses_credentials() {
     }
     fixture.release(3, 1);
     assert_eq!(current.await, ["session_3"]);
+    fixture.close(&runtime).await;
+}
+
+async fn capture_startup_cached_tool(
+    fixture: &mut Fixture,
+    runtime: &CodingMcpRuntime,
+) -> Arc<dyn Tool> {
+    assert_eq!(fixture.discover(runtime, 1).await, ["session_1"]);
+    fixture.pause_initialize(2);
+    runtime.replace_mcp_servers(Vec::new()).await.unwrap();
+    runtime
+        .replace_mcp_servers(fixture.registrations(false))
+        .await
+        .unwrap();
+    fixture.wait_for_initialize(2).await;
+    let tools = tokio::time::timeout(Duration::from_secs(1), model_tools(runtime))
+        .await
+        .expect("the startup cache should advertise tools before connection readiness");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].schema().name(), "session_1");
+    tools[0].clone()
+}
+
+#[tokio::test]
+async fn cached_product_call_uses_live_schema_and_read_only_approval() {
+    let mut fixture = Fixture::start(None).await;
+    let runtime =
+        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    let cached = capture_startup_cached_tool(&mut fixture, &runtime).await;
+    *fixture.live_tools.lock().unwrap() = Some(vec![
+        serde_json::from_value(json!({
+            "name": "session_1",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            },
+            "annotations": {"readOnlyHint": true}
+        }))
+        .unwrap(),
+    ]);
+
+    let mut invalid = Box::pin(invoke(cached.as_ref()));
+    assert!(futures::poll!(&mut invalid).is_pending());
+    fixture.resume_initialize(2);
+    tokio::select! {
+        _ = fixture.listing(2) => {}
+        result = &mut invalid => panic!("the call completed before reading the live catalog: {result:?}"),
+    }
+    fixture.release(2, 1);
+    let error = tokio::time::timeout(Duration::from_secs(2), invalid)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("missing required parameters: query"),
+        "{error}"
+    );
+    assert!(fixture.calls.try_recv().is_err());
+
+    let context = context();
+    let call_id = CallId::new("cached-read");
+    let arguments = json!({"query": "rust"});
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        cached.call(ToolContext::new(
+            &context,
+            cached.as_ref(),
+            &call_id,
+            &arguments,
+        )),
+    )
+    .await
+    .unwrap()
+    .expect("the live read-only declaration requires no approval");
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1");
+    assert!(fixture.requested.try_recv().is_err());
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn cached_product_call_rejects_a_removed_tool_before_dispatch() {
+    let mut fixture = Fixture::start(None).await;
+    let runtime =
+        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    let cached = capture_startup_cached_tool(&mut fixture, &runtime).await;
+    fixture.resume_initialize(2);
+    let mut call = Box::pin(invoke(cached.as_ref()));
+    tokio::select! {
+        _ = fixture.listing(2) => {}
+        result = &mut call => panic!("the call completed before reading the live catalog: {result:?}"),
+    }
+    fixture.release(2, 1);
+    let error = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("MCP tool `docs/session_1` is not available to the model"),
+        "{error}"
+    );
+    assert!(fixture.calls.try_recv().is_err());
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn cached_product_call_preserves_startup_failure_before_listing() {
+    let mut fixture = Fixture::start(None).await;
+    let runtime =
+        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    let cached = capture_startup_cached_tool(&mut fixture, &runtime).await;
+    fixture.failing_session.store(2, Ordering::SeqCst);
+    let mut call = Box::pin(invoke(cached.as_ref()));
+    assert!(futures::poll!(&mut call).is_pending());
+    fixture.resume_initialize(2);
+    let error = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("MCP startup failed"), "{error}");
+    assert!(fixture.requested.try_recv().is_err());
+    assert!(fixture.calls.try_recv().is_err());
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn live_approval_can_resume_through_startup_cache_without_a_declaration_digest() {
+    let mut fixture = Fixture::start(None).await;
+    *fixture.live_tools.lock().unwrap() = Some(vec![
+        serde_json::from_value(json!({
+            "name": "session_1",
+            "inputSchema": {"type": "object"},
+            "annotations": {"destructiveHint": true}
+        }))
+        .unwrap(),
+    ]);
+    let runtime =
+        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    let live = fixture.discover_tools(&runtime, 1).await.remove(0);
+    let context = context();
+    let call_id = CallId::new("live-write");
+    let arguments = json!({});
+    let error = live
+        .call(ToolContext::new(
+            &context,
+            live.as_ref(),
+            &call_id,
+            &arguments,
+        ))
+        .await
+        .unwrap_err();
+    let approval = ToolApprovalRequest::of(&error).expect("the live declaration requires approval");
+    assert!(approval.state().get("declaration").is_none());
+    assert!(fixture.calls.try_recv().is_err());
+
+    fixture.pause_initialize(2);
+    let reconnect = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .reconnect_mcp_server(Some("docs"), false)
+                .await
+                .unwrap()
+        }
+    });
+    fixture.wait_for_initialize(2).await;
+    let cached = tokio::time::timeout(Duration::from_secs(1), model_tools(&runtime))
+        .await
+        .expect("the tool should be available from the startup cache")
+        .remove(0);
+    assert_eq!(cached.schema().name(), "session_1");
+    let mut resumed = Box::pin(
+        cached.call(
+            ToolContext::new(&context, cached.as_ref(), &call_id, &arguments)
+                .with_resume_state(approval.state()),
+        ),
+    );
+    assert!(futures::poll!(&mut resumed).is_pending());
+    fixture.resume_initialize(2);
+    tokio::select! {
+        _ = fixture.listing(2) => {}
+        result = &mut resumed => panic!("the call completed before reading the live catalog: {result:?}"),
+    }
+    fixture.release(2, 1);
+    tokio::time::timeout(Duration::from_secs(2), resumed)
+        .await
+        .unwrap()
+        .expect("a valid live approval can be resumed from a startup cache");
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1");
+    assert!(fixture.calls.try_recv().is_err());
+    reconnect.await.unwrap();
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn approval_for_a_cached_call_does_not_authorize_a_changed_live_declaration() {
+    let mut fixture = Fixture::start(None).await;
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+    fixture.pause_initialize(2);
+    let reconnect = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .reconnect_mcp_server(Some("docs"), false)
+                .await
+                .unwrap()
+        }
+    });
+    fixture.wait_for_initialize(2).await;
+    let cached = tokio::time::timeout(Duration::from_secs(1), model_tools(&runtime))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(cached.schema().name(), "session_1");
+    let declaration = |description: &str| {
+        serde_json::from_value(json!({
+            "name": "session_1",
+            "description": description,
+            "inputSchema": {"type": "object"},
+            "annotations": {"destructiveHint": true}
+        }))
+        .unwrap()
+    };
+    *fixture.live_tools.lock().unwrap() = Some(vec![declaration("original")]);
+    fixture.resume_initialize(2);
+    reconnect.await.unwrap();
+
+    let context = context();
+    let call_id = CallId::new("cached-write");
+    let arguments = json!({});
+    let mut pending = Box::pin(cached.call(ToolContext::new(
+        &context,
+        cached.as_ref(),
+        &call_id,
+        &arguments,
+    )));
+    tokio::select! {
+        _ = fixture.listing(2) => {}
+        result = &mut pending => panic!("approval was decided before reading the live declaration: {result:?}"),
+    }
+    fixture.release(2, 1);
+    let error = pending.await.unwrap_err();
+    let approval = ToolApprovalRequest::of(&error).expect("the live declaration requires approval");
+    assert_eq!(approval.state()["description"], "original");
+    assert!(fixture.calls.try_recv().is_err());
+
+    *fixture.live_tools.lock().unwrap() = Some(vec![declaration("changed")]);
+    runtime
+        .call_tool_now(
+            "docs",
+            "notify",
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    let current = fixture.discover_tools(&runtime, 2).await.remove(0);
+    let error = current
+        .call(
+            ToolContext::new(&context, current.as_ref(), &call_id, &arguments)
+                .with_resume_state(approval.state()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed after approval was requested"),
+        "{error}"
+    );
+    assert!(fixture.calls.try_recv().is_err());
     fixture.close(&runtime).await;
 }
 

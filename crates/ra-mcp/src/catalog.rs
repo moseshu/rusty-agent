@@ -51,6 +51,11 @@ impl McpToolInfo {
             connector_id: None,
         }
     }
+    pub(crate) fn with_declaration(mut self, declaration: CachedTool) -> Self {
+        self.tool = declaration.tool;
+        self.metadata = declaration.metadata;
+        self
+    }
     /// Records the server's position in the discovery list. Python's names group tools by
     /// server in this order; discovery assigns it.
     #[must_use]

@@ -116,31 +116,39 @@ impl ToolsCache {
         else {
             return Ok(());
         };
-        let Some(required) = tool
-            .tool
-            .input_schema
-            .get("required")
-            .and_then(serde_json::Value::as_array)
-        else {
-            return Ok(());
-        };
-        let mut missing: Vec<_> = required
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .filter(|name| arguments.is_none_or(|arguments| !arguments.contains_key(*name)))
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        missing.sort_unstable();
-        Err(Error::tool(
-            ToolErrorKind::InvalidInput,
-            "mcp",
-            format!(
-                "Failed to call tool '{name}' on MCP server '{}': missing required parameters: {}",
-                crate::catalog::safe_server_name(server_name),
-                missing.join(", ")
-            ),
-        ))
+        validate_required_arguments(&tool.tool, arguments, server_name)
     }
+}
+
+pub(crate) fn validate_required_arguments(
+    tool: &Tool,
+    arguments: Option<&JsonObject>,
+    server_name: &str,
+) -> Result<()> {
+    let name = &tool.name;
+    let Some(required) = tool
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    let mut missing: Vec<_> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|name| arguments.is_none_or(|arguments| !arguments.contains_key(*name)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    Err(Error::tool(
+        ToolErrorKind::InvalidInput,
+        "mcp",
+        format!(
+            "Failed to call tool '{name}' on MCP server '{}': missing required parameters: {}",
+            crate::catalog::safe_server_name(server_name),
+            missing.join(", ")
+        ),
+    ))
 }
