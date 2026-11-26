@@ -17,9 +17,16 @@ use ra_mcp::{
     },
     filter::{ToolFilter, create_static_tool_filter},
     in_process::InProcessToolServer,
-    tool::{McpDiscoveryOptions, McpToolNaming, discover_tools, discover_tools_with_context},
+    tool::{
+        McpDiscoveryOptions, McpToolCatalog, McpToolNaming, discover_tools,
+        discover_tools_with_context,
+    },
 };
-use rmcp::{ErrorData, RoleServer, ServerHandler, model::*, service::RequestContext};
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::*,
+    service::{Peer, RequestContext},
+};
 use serde_json::json;
 use std::{
     collections::HashSet,
@@ -33,6 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 
 struct ListRequest {
     cursor: Option<String>,
+    peer: Peer<RoleServer>,
     reply: oneshot::Sender<std::result::Result<ListToolsResult, ErrorData>>,
 }
 struct CatalogHandler {
@@ -52,6 +60,7 @@ impl ServerHandler for CatalogHandler {
         self.requests
             .send(ListRequest {
                 cursor: request.and_then(|params| params.cursor),
+                peer: context.peer.clone(),
                 reply,
             })
             .unwrap();
@@ -781,6 +790,85 @@ async fn cancelled_refresh_does_not_publish_or_block_recovery() {
     drop(request);
     assert_eq!(client.cached_tools().unwrap(), initial);
     harness.list(vec![tool("read", "recovered", &[])]).await;
+    harness.server.cleanup().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn notification_relist_uses_the_current_startup_deadline_for_each_page() {
+    let options = McpClientOptions::default()
+        .with_session_timeout(Duration::from_secs(1))
+        .with_catalog_timeout(Duration::from_secs(1))
+        .with_startup_timeout(Duration::from_secs(1));
+    let mut harness = Harness::new(options.clone()).await;
+    harness.list(vec![tool("read", "initial", &[])]).await;
+    let client = harness
+        .client()
+        .with_binding_options(options.with_startup_timeout(Duration::from_secs(6)));
+    let revision = client.tool_list_revision().current();
+    let (catalog, ()) = tokio::join!(
+        McpToolCatalog::fetch_for_revision(&client, revision),
+        async {
+            let first = harness.request().await;
+            assert!(first.cursor.is_none());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            first
+                .reply
+                .send(Ok(ListToolsResult {
+                    tools: vec![tool("read", "first page", &[])],
+                    next_cursor: Some("next".into()),
+                    ..Default::default()
+                }))
+                .expect("the first page can outlast the session timeout");
+            let second = harness.request().await;
+            assert_eq!(second.cursor.as_deref(), Some("next"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            second
+                .reply
+                .send(Ok(ListToolsResult {
+                    tools: vec![tool("write", "second page", &[])],
+                    ..Default::default()
+                }))
+                .expect("every page uses the current startup timeout");
+        }
+    );
+    assert_eq!(names(&catalog.unwrap().tools()), ["read", "write"]);
+    harness.server.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn superseded_notification_relist_does_not_publish_its_schema() {
+    let mut harness = Harness::new(caching()).await;
+    let initial = harness.list(vec![tool("read", "initial", &[])]).await;
+    let client = harness.client();
+    let notifications = client.tool_list_revision();
+    let revision = notifications.current();
+    let superseded = vec![tool("read", "superseded", &["query"])];
+    let (catalog, ()) = tokio::join!(
+        McpToolCatalog::fetch_for_revision(&client, revision),
+        async {
+            let request = harness.request().await;
+            request.peer.notify_tool_list_changed().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while notifications.current() == revision {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("client must observe the notification before the list response");
+            request
+                .reply
+                .send(Ok(ListToolsResult {
+                    tools: superseded.clone(),
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+    );
+
+    assert_eq!(catalog.unwrap().tools(), superseded);
+    assert_eq!(client.cached_tools().unwrap(), initial);
+    client.call_tool("read", None, None).await.unwrap();
+    assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
     harness.server.cleanup().await.unwrap();
 }
 

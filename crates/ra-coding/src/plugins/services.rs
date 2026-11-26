@@ -790,6 +790,13 @@ impl PluginServices {
                 fallback_cwd.as_path(),
                 &snapshot.config.http_client_factory,
             );
+            if snapshot
+                .config
+                .features
+                .enabled(Feature::McpToolListChanged)
+            {
+                crate::mcp::configure_tool_list_refresh(&mut plan.servers);
+            }
             crate::mcp::configure_approval_sources(
                 &mut plan.servers,
                 &snapshot.config.config_layer_stack,

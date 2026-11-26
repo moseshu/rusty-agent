@@ -3,13 +3,16 @@ use super::*;
 use ra_core::{
     agent::{AgentId, AgentSpec},
     context::RunContext,
+    error::Result,
+    item::CallId,
     state::RunId,
-    tool::ToolResolver,
+    tool::{Tool, ToolContext, ToolOutput, ToolResolver},
 };
 use ra_mcp::{McpCatalogBuilder, McpServerRegistration};
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerConfig,
     },
@@ -33,7 +36,15 @@ struct StartupCatalog {
     opt_out_session: Option<usize>,
     initialize_gates: Arc<Vec<Semaphore>>,
     initializing: mpsc::UnboundedSender<usize>,
+    revision: Arc<AtomicUsize>,
+    layout: Arc<AtomicUsize>,
+    calls: mpsc::UnboundedSender<String>,
 }
+
+/// Lists only the session tool by default. A companion tool can follow or precede it, so a
+/// refetch can return an equivalent catalog in a different order.
+const COMPANION_AFTER: usize = 1;
+const COMPANION_BEFORE: usize = 2;
 
 impl ServerHandler for StartupCatalog {
     fn get_info(&self) -> ServerConfig {
@@ -69,6 +80,12 @@ impl ServerHandler for StartupCatalog {
         _: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let revision = self.revision.load(Ordering::SeqCst);
+        let tool_name = if revision == 0 {
+            format!("session_{}", self.session)
+        } else {
+            format!("session_{}_revision_{revision}", self.session)
+        };
         self.requested
             .send((self.session, context.peer.clone()))
             .unwrap();
@@ -77,17 +94,36 @@ impl ServerHandler for StartupCatalog {
             .await
             .unwrap()
             .forget();
+        let tool = |name: &str| {
+            serde_json::from_value(json!({
+                "name": name,
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": true}
+            }))
+            .unwrap()
+        };
+        let tools = match self.layout.load(Ordering::SeqCst) {
+            COMPANION_AFTER => vec![tool(&tool_name), tool("companion")],
+            COMPANION_BEFORE => vec![tool("companion"), tool(&tool_name)],
+            _ => vec![tool(&tool_name)],
+        };
         Ok(ListToolsResult {
-            tools: vec![
-                serde_json::from_value(json!({
-                    "name": format!("session_{}", self.session),
-                    "inputSchema": {"type": "object"},
-                    "annotations": {"readOnlyHint": true}
-                }))
-                .unwrap(),
-            ],
+            tools,
             ..Default::default()
         })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        if request.name == "notify" {
+            context.peer.notify_tool_list_changed().await.unwrap();
+        } else {
+            self.calls.send(request.name.to_string()).unwrap();
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text("called")]).into())
     }
 }
 
@@ -99,6 +135,9 @@ struct Fixture {
     initializing: mpsc::UnboundedReceiver<usize>,
     cancellation: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    revision: Arc<AtomicUsize>,
+    layout: Arc<AtomicUsize>,
+    calls: mpsc::UnboundedReceiver<String>,
 }
 
 impl Fixture {
@@ -106,13 +145,18 @@ impl Fixture {
         let cancellation = CancellationToken::new();
         let gates = Arc::new((0..4).map(|_| Semaphore::new(0)).collect::<Vec<_>>());
         let (sender, requested) = mpsc::unbounded_channel();
+        let (call_sender, calls) = mpsc::unbounded_channel();
         let initialize_gates = Arc::new((0..4).map(|_| Semaphore::new(1)).collect::<Vec<_>>());
         let (initializing_sender, initializing) = mpsc::unbounded_channel();
         let sessions = AtomicUsize::new(0);
+        let revision = Arc::new(AtomicUsize::new(0));
+        let layout = Arc::new(AtomicUsize::new(0));
         let service = StreamableHttpService::new(
             {
                 let gates = gates.clone();
                 let initialize_gates = initialize_gates.clone();
+                let revision = revision.clone();
+                let layout = layout.clone();
                 move || {
                     Ok(StartupCatalog {
                         session: sessions.fetch_add(1, Ordering::SeqCst) + 1,
@@ -121,6 +165,9 @@ impl Fixture {
                         opt_out_session,
                         initialize_gates: initialize_gates.clone(),
                         initializing: initializing_sender.clone(),
+                        revision: revision.clone(),
+                        layout: layout.clone(),
+                        calls: call_sender.clone(),
                     })
                 }
             },
@@ -148,6 +195,9 @@ impl Fixture {
             initializing,
             cancellation,
             task,
+            revision,
+            layout,
+            calls,
         }
     }
 
@@ -218,10 +268,22 @@ impl Fixture {
     }
 
     async fn discover(&mut self, runtime: &CodingMcpRuntime, session: usize) -> Vec<String> {
-        let mut discovery = Box::pin(names(runtime));
+        self.discover_tools(runtime, session)
+            .await
+            .iter()
+            .map(|tool| tool.schema().name().to_owned())
+            .collect()
+    }
+
+    async fn discover_tools(
+        &mut self,
+        runtime: &CodingMcpRuntime,
+        session: usize,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut discovery = Box::pin(model_tools(runtime));
         tokio::select! {
             peer = self.listing(session) => drop(peer),
-            tools = &mut discovery => panic!("unexpected cached discovery: {tools:?}"),
+            _ = &mut discovery => panic!("unexpected cached discovery"),
         }
         self.release(session, 1);
         discovery.await
@@ -248,20 +310,41 @@ impl Fixture {
 }
 
 async fn names(runtime: &CodingMcpRuntime) -> Vec<String> {
+    model_tools(runtime)
+        .await
+        .iter()
+        .map(|tool| tool.schema().name().to_owned())
+        .collect()
+}
+
+fn context() -> RunContext {
     let agent = AgentSpec::builder()
         .id(AgentId::new("catalog-test"))
         .name("Catalog")
         .build()
         .unwrap();
-    let context = RunContext::new(RunId::new("catalog-test"), &agent);
+    RunContext::new(RunId::new("catalog-test"), &agent)
+}
+
+async fn model_tools(runtime: &CodingMcpRuntime) -> Vec<Arc<dyn Tool>> {
+    let context = context();
     runtime
         .get_tools(&context, &BTreeSet::new())
         .await
         .unwrap()
         .into_iter()
-        .map(|tool| tool.schema().name().to_owned())
-        .filter(|name| name.starts_with("session_"))
+        .filter(|tool| tool.schema().name().starts_with("session_"))
         .collect()
+}
+
+async fn invoke(tool: &dyn Tool) -> Result<ToolOutput> {
+    tool.call(ToolContext::new(
+        &context(),
+        tool,
+        &CallId::new("catalog-call"),
+        &json!({}),
+    ))
+    .await
 }
 
 #[tokio::test]
@@ -343,12 +426,222 @@ async fn server_opt_out_discards_the_previous_catalog() {
     fixture.close(&runtime).await;
 }
 
-#[tokio::test]
-async fn list_change_during_discovery_makes_its_catalog_ineligible_for_the_next_connection() {
-    let mut fixture = Fixture::start(None).await;
-    let runtime =
-        CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
+async fn bind_refresh(
+    fixture: &Fixture,
+    enabled: bool,
+) -> (
+    TempDir,
+    Arc<PluginServices>,
+    Arc<CodingMcpRuntime>,
+    ra_coding::plugins::ConsumerBinding,
+) {
+    let home = TempDir::new().unwrap();
+    let features = if enabled {
+        "[features]\nmcp_tool_list_changed = true\n"
+    } else {
+        ""
+    };
+    write(
+        &home.path().join("config.toml"),
+        &format!(
+            "{features}[mcp_servers.docs]\nurl = {}\nstartup_readiness = \"catalog\"\nstartup_timeout_sec = 1\n",
+            toml_string(&fixture.url)
+        ),
+    );
+    let services = services(home.path());
+    let runtime = CodingMcpRuntime::new(Vec::new(), McpDiscoveryOptions::new()).unwrap();
+    let binding = services.bind_mcp_runtime(&runtime, absolute(home.path()));
+    let outcome = binding.wait_for(services.generation()).await.unwrap();
+    assert_eq!(outcome.error(), None);
     runtime.connect_all().await.unwrap();
+    (home, services, runtime, binding)
+}
+
+#[tokio::test]
+async fn notifications_during_discovery_and_refresh_relist_without_reconnecting() {
+    let mut fixture = Fixture::start(None).await;
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    let mut readers = Box::pin(async { tokio::join!(names(&runtime), names(&runtime)) });
+    let peer = tokio::select! {
+        peer = fixture.listing(1) => peer,
+        tools = &mut readers => panic!("unexpected catalog: {tools:?}"),
+    };
+    fixture.revision.store(1, Ordering::SeqCst);
+    peer.notify_tool_list_changed().await.unwrap();
+    fixture.release(1, 1);
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        tools = &mut readers => panic!("initial notification was missed: {tools:?}"),
+    }
+    fixture.revision.store(2, Ordering::SeqCst);
+    peer.notify_tool_list_changed().await.unwrap();
+    fixture.release(1, 1);
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        tools = &mut readers => panic!("catalog changed during refresh: {tools:?}"),
+    }
+    fixture.release(1, 1);
+
+    let (first, second) = readers.await;
+    assert_eq!(first, ["session_1_revision_2"]);
+    assert_eq!(first, second);
+    assert_eq!(names(&runtime).await, first);
+    assert!(fixture.requested.try_recv().is_err());
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn changed_catalog_rejects_prepared_calls_but_equivalent_catalogs_do_not() {
+    let mut fixture = Fixture::start(None).await;
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    let original = fixture.discover_tools(&runtime, 1).await;
+    let old_tool = original[0].as_ref();
+    let notify = || {
+        runtime.call_tool_now(
+            "docs",
+            "notify",
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+    };
+
+    notify().await.unwrap();
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+    tokio::time::timeout(Duration::from_secs(2), invoke(old_tool))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1");
+
+    fixture.revision.store(1, Ordering::SeqCst);
+    notify().await.unwrap();
+    let updated = fixture.discover_tools(&runtime, 1).await;
+    assert_eq!(updated[0].schema().name(), "session_1_revision_1");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), invoke(old_tool))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains(
+        "tool call rejected because the catalog changed after `docs/session_1` was prepared"
+    ));
+    assert!(fixture.calls.try_recv().is_err());
+
+    tokio::time::timeout(Duration::from_secs(2), invoke(updated[0].as_ref()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1_revision_1");
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn reordered_equivalent_catalog_keeps_prepared_calls() {
+    let mut fixture = Fixture::start(None).await;
+    fixture.layout.store(COMPANION_AFTER, Ordering::SeqCst);
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    let original = fixture.discover_tools(&runtime, 1).await;
+    let old_tool = original[0].as_ref();
+
+    // The refetched catalog has the same definitions in another order.
+    fixture.layout.store(COMPANION_BEFORE, Ordering::SeqCst);
+    runtime
+        .call_tool_now(
+            "docs",
+            "notify",
+            None,
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+    tokio::time::timeout(Duration::from_secs(2), invoke(old_tool))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.calls.try_recv().unwrap(), "session_1");
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn failed_refresh_keeps_the_last_listing_and_coalesces_retries() {
+    let mut fixture = Fixture::start(None).await;
+    let (_home, _services, runtime, _binding) = bind_refresh(&fixture, true).await;
+    let mut discovery = Box::pin(names(&runtime));
+    let peer = tokio::select! {
+        peer = fixture.listing(1) => peer,
+        tools = &mut discovery => panic!("unexpected catalog: {tools:?}"),
+    };
+    fixture.release(1, 1);
+    assert_eq!(discovery.await, ["session_1"]);
+
+    let mut refresh = Box::pin(names(&runtime));
+    fixture.revision.store(1, Ordering::SeqCst);
+    peer.notify_tool_list_changed().await.unwrap();
+    // Wait for delivery through the stream before reading the catalog.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                _ = fixture.listing(1) => break,
+                tools = &mut refresh => {
+                    assert_eq!(tools, ["session_1"]);
+                    tokio::task::yield_now().await;
+                    refresh.set(names(&runtime));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(refresh.await, ["session_1"]);
+    assert_eq!(names(&runtime).await, ["session_1"]);
+    assert!(fixture.requested.try_recv().is_err());
+    fixture.release(1, 1);
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn enabling_notifications_on_reload_waits_for_a_tracked_catalog() {
+    let mut fixture = Fixture::start(None).await;
+    let (home, services, runtime, binding) = bind_refresh(&fixture, false).await;
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    write(
+        &config_path,
+        &format!("{config}\n[features]\nmcp_tool_list_changed = true\n"),
+    );
+    fixture.pause_initialize(2);
+    services.invalidate();
+    let outcome = binding.wait_for(services.generation()).await.unwrap();
+    assert_eq!(outcome.error(), None);
+    fixture.wait_for_initialize(2).await;
+    let mut discovery = Box::pin(names(&runtime));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut discovery)
+            .await
+            .is_err(),
+        "refresh-enabled startup must wait for the new connection"
+    );
+    fixture.resume_initialize(2);
+    tokio::select! {
+        _ = fixture.listing(2) => {}
+        tools = &mut discovery => panic!("unexpected cached discovery: {tools:?}"),
+    }
+    fixture.release(2, 1);
+    assert_eq!(discovery.await, ["session_2"]);
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn replacing_a_connection_cancels_its_notification_refresh() {
+    let mut fixture = Fixture::start(None).await;
+    let (home, services, runtime, binding) = bind_refresh(&fixture, true).await;
     let mut discovery = Box::pin(names(&runtime));
     let peer = tokio::select! {
         peer = fixture.listing(1) => peer,
@@ -356,23 +649,77 @@ async fn list_change_during_discovery_makes_its_catalog_ineligible_for_the_next_
     };
     peer.notify_tool_list_changed().await.unwrap();
     fixture.release(1, 1);
-    assert_eq!(discovery.await, ["session_1"]);
-
-    fixture.pause_initialize(2);
-    runtime.replace_mcp_servers(Vec::new()).await.unwrap();
-    runtime
-        .replace_mcp_servers(fixture.registrations(false))
-        .await
-        .unwrap();
-    fixture.wait_for_initialize(2).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), names(&runtime))
-            .await
-            .is_err()
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        tools = &mut discovery => panic!("initial notification was missed: {tools:?}"),
+    }
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    write(
+        &config_path,
+        &format!("{config}http_headers = {{ \"X-Test-Connection\" = \"replacement\" }}\n"),
     );
-    fixture.resume_initialize(2);
+    services.invalidate();
+    let (tools, outcome) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(&mut discovery, binding.wait_for(services.generation()))
+    })
+    .await
+    .unwrap();
+    assert!(tools.is_empty());
+    assert_eq!(outcome.unwrap().error(), None);
+
+    fixture.release(1, 1);
     assert_eq!(fixture.discover(&runtime, 2).await, ["session_2"]);
+    assert_eq!(names(&runtime).await, ["session_2"]);
     fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn startup_catalog_invalidation_is_gated_by_the_feature() {
+    for enabled in [false, true] {
+        let mut fixture = Fixture::start(None).await;
+        let (home, services, runtime, binding) = bind_refresh(&fixture, enabled).await;
+        let mut discovery = Box::pin(names(&runtime));
+        let peer = tokio::select! {
+            peer = fixture.listing(1) => peer,
+            tools = &mut discovery => panic!("unexpected catalog: {tools:?}"),
+        };
+        peer.notify_tool_list_changed().await.unwrap();
+        fixture.release(1, 1);
+        if enabled {
+            tokio::select! {
+                _ = fixture.listing(1) => {}
+                tools = &mut discovery => panic!("initial notification was missed: {tools:?}"),
+            }
+            fixture.release(1, 1);
+        }
+        assert_eq!(discovery.await, ["session_1"]);
+
+        fixture.pause_initialize(2);
+        let config_path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        write(&config_path, "");
+        services.invalidate();
+        binding.wait_for(services.generation()).await.unwrap();
+        write(&config_path, &config);
+        services.invalidate();
+        // A paused handshake can delay the config reconciliation, so let tool discovery and
+        // configuration observe the newly published entry concurrently.
+        fixture.wait_for_initialize(2).await;
+        if enabled {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), names(&runtime))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert_eq!(names(&runtime).await, ["session_1"]);
+        }
+        fixture.resume_initialize(2);
+        wait_status(&runtime, "docs", Status::Connected).await;
+        assert_eq!(fixture.discover(&runtime, 2).await, ["session_2"]);
+        fixture.close(&runtime).await;
+    }
 }
 
 #[tokio::test]
@@ -397,9 +744,16 @@ async fn default_connection_lists_once_and_shutdown_cancels_a_stalled_live_listi
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
+    assert_eq!(names(&runtime).await, ["session_1"]);
+    assert!(fixture.requested.try_recv().is_err());
+    runtime
+        .reconnect_mcp_server(Some("docs"), false)
+        .await
+        .unwrap();
+
     let mut discovery = Box::pin(names(&runtime));
     tokio::select! {
-        _ = fixture.listing(1) => {}
+        _ = fixture.listing(2) => {}
         tools = &mut discovery => panic!("unexpected catalog: {tools:?}"),
     }
     let (result, tools) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -409,7 +763,7 @@ async fn default_connection_lists_once_and_shutdown_cancels_a_stalled_live_listi
     .unwrap();
     result.unwrap();
     assert!(tools.is_empty());
-    fixture.release(1, 1);
+    fixture.release(2, 1);
     fixture.close(&runtime).await;
 }
 
@@ -457,6 +811,56 @@ async fn first_catalog_uses_reloaded_startup_timeout_on_the_existing_session() {
             .is_some_and(|error| error.contains("timed out"))
     );
     fixture.release(1, 2);
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
+async fn queued_first_listing_uses_its_own_deadline_and_preserves_the_startup_error() {
+    use ra_protocol::server::McpRuntimeControl;
+
+    let mut fixture = Fixture::start(None).await;
+    let runtime = CodingMcpRuntime::new(
+        fixture.configured(false, None, OutboundProxyPolicy::ReqwestDefault),
+        McpDiscoveryOptions::new(),
+    )
+    .unwrap();
+    runtime.connect_all().await.unwrap();
+    runtime
+        .replace_mcp_servers(fixture.registrations_from(
+            json!({"url": fixture.url, "startup_timeout_sec": 0.5}),
+            OutboundProxyPolicy::ReqwestDefault,
+        ))
+        .await
+        .unwrap();
+    let mut first = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false);
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        status = &mut first => panic!("first inventory did not list tools: {status:?}"),
+    }
+
+    let mut queued = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false);
+    assert!(futures::poll!(&mut queued).is_pending());
+    let status = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap();
+    let status = serde_json::to_value(status).unwrap();
+    let error = status["toolsError"].as_str().unwrap();
+    assert!(
+        error.contains("MCP catalog listing timed out") || error.contains("MCP request timed out"),
+        "{error}"
+    );
+
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        status = &mut queued => panic!("queued inventory ran out of time before sending tools/list: {status:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.release(1, 2);
+    let status = tokio::time::timeout(Duration::from_secs(2), queued)
+        .await
+        .unwrap();
+    let status = serde_json::to_value(status).unwrap();
+    assert!(status["tools"]["session_1"].is_object(), "{status}");
     fixture.close(&runtime).await;
 }
 

@@ -34,10 +34,10 @@ discovery and token storage remain separate work.
 All coding-product MCP registrations use `startup_timeout_sec` for initialize and separately for
 the first complete tools/list, with a 30-second default. The startup catalog is fetched at first
 discovery or inventory in this runtime. If configuration changes before the first listing on a
-reused connection, that listing uses the refreshed startup timeout. Later listings and ordinary
-requests retain their existing deadlines regardless of whether a helper is configured. Framework
-callers still use the session defaults unless they explicitly set
-`McpClientOptions::with_startup_timeout`.
+reused connection, that listing uses the refreshed startup timeout. Notification-driven relists
+use the current startup timeout for each page and for the complete listing. Ordinary requests
+retain their existing deadlines regardless of whether a helper is configured. Framework callers
+use the session defaults unless they set `McpClientOptions::with_startup_timeout`.
 
 ### Coding MCP reuses startup tool catalogs
 
@@ -53,16 +53,42 @@ bearer environment values participate in the existing connection fingerprint, as
 route changes retain the existing connection reuse rules. OAuth and header-helper connections
 remain outside this cache.
 
-The first successful live model discovery on a connection also seeds its startup cache. The
+The first successful live discovery or inventory on a connection also seeds its startup cache. The
 handshake sends no extra `tools/list`, and stop or replacement cancels in-flight discovery.
 Shared snapshots omit tool annotations and use the current filters and approval policy. Servers
 can opt out with `codex/tool-catalog-cache: { "cacheable": false }`. An older connection cannot
 replace a newer published catalog.
 
-Codex gates cross-connection invalidation by `mcp_tool_list_changed`. Rusty Agent has no matching
-configuration switch or notification-driven live refresh yet. It invalidates startup snapshots
-on any received `notifications/tools/list_changed` so announced changes do not survive into a
-new connection. The framework's explicit `cache_tools_list` option keeps its existing semantics.
+Configured product connections reuse their last complete live listing. To enable notification-driven
+refresh for local stdio and Streamable HTTP servers, set `mcp_tool_list_changed = true` in
+`[features]`. It defaults to false, as in Codex, and is configured through the product settings.
+With the feature enabled, a new connection accepts only shared startup snapshots published with
+notification tracking. `notifications/tools/list_changed` invalidates the notifying connection's
+shared startup snapshot. The next model discovery or inventory refreshes its live catalog with the
+current `startup_timeout_sec`. Concurrent readers share the relist. A notification during pagination
+restarts the listing once. Failure retains the last complete catalog and delays retry by five seconds.
+Later live refreshes stay with their connection. Reloading configuration with a different feature
+setting replaces the enabled connection, as in Codex. Replacing a connection cancels its discovery.
+
+The product fetches the initial catalog on first discovery or inventory. Codex fetches it as part
+of connection startup. Initial discovery keeps the client's tools/list timeout and diagnostic.
+Concurrent readers share initialization, and a reader that retries a failed first listing gets a
+fresh startup deadline. Notification refresh has its own deadline, including time waiting for the
+refresh lock.
+
+Live tool bindings retain their captured declarations. If a notification refresh changes the
+catalog, new calls through an older binding fail before dispatch. An equivalent listing preserves
+calls, including when tools are returned in a different order, and an already admitted call can
+finish. The framework's explicit `cache_tools_list` option and manually registered runtime servers
+retain their existing listing semantics.
+`McpToolCatalog::fetch_for_revision` provides a guarded listing for the product. A superseded
+listing cannot update the client's schema cache used for tool calls.
+
+Known Codex parity gap for tools advertised from a startup cache. The product waits for the
+connection but dispatches using the cached declaration. Codex resolves the advertised identity
+against the live catalog before approval and dispatch, using the current schema, annotations and
+approval metadata. A cached declaration can therefore prompt for more approvals, and a removed
+tool can reach the server before being rejected.
 
 ### Experimental feature catalog and runtime defaults
 

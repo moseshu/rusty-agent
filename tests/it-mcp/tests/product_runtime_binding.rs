@@ -283,7 +283,7 @@ async fn configured_http_headers_helper_runs_in_the_product_working_directory() 
             ResponseTemplate::new(200)
                 .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
         })
-        .expect(4)
+        .expect(3)
         .mount(&endpoint)
         .await;
     let home = TempDir::new().unwrap();

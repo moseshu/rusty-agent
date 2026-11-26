@@ -65,15 +65,33 @@ impl McpToolCatalog {
     /// the host, which can isolate that server before joint name allocation.
     pub async fn fetch(client: &McpClient) -> Result<Self> {
         let tools = client.list_unfiltered_cached_tools().await?;
+        Ok(Self::from_listing(client, tools))
+    }
+    /// Relists directly for a notification-driven product refresh. A configured startup timeout
+    /// applies to each page and the complete listing. A listing superseded by another notification
+    /// does not update the client schema cache used by tool calls.
+    /// The caller must also check the revision before publishing the returned catalog.
+    pub async fn fetch_for_revision(client: &McpClient, revision: u64) -> Result<Self> {
+        let notifications = client.tool_list_revision();
+        let tools = client
+            .tools
+            .list_with_publication_guard(
+                client.fetch_tools(true),
+                Some(|| notifications.current() == revision),
+            )
+            .await?;
+        Ok(Self::from_listing(client, tools))
+    }
+    fn from_listing(client: &McpClient, tools: Vec<CachedTool>) -> Self {
         let mut options = client.options().clone();
         options = options.with_tool_filter(client.tools.filter());
-        Ok(Self {
+        Self {
             name: client.server_name().to_owned(),
             tools,
             options,
             instructions: client.server_instructions().map(str::to_owned),
             filtered: false,
-        })
+        }
     }
     pub(super) async fn filtered(
         mut self,

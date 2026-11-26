@@ -1,6 +1,7 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Product MCP approval before execution, over the framework's recoverable in-call interruption.
 
+use super::live_tool_catalog::CatalogBinding;
 use crate::thread_settings::CodingThreadSettings;
 use async_trait::async_trait;
 use ra_config::{AppToolApproval, AskForApproval};
@@ -228,16 +229,46 @@ impl McpApprovalState {
 pub(crate) struct ProductMcpTool {
     inner: Arc<McpTool>,
     policy: Option<Arc<ProductMcpPolicy>>,
+    catalog: Option<CatalogBinding>,
 }
 impl ProductMcpTool {
-    pub(super) fn new(inner: Arc<McpTool>, policy: Option<Arc<ProductMcpPolicy>>) -> Self {
-        Self { inner, policy }
+    pub(super) fn new(
+        inner: Arc<McpTool>,
+        policy: Option<Arc<ProductMcpPolicy>>,
+        catalog: Option<CatalogBinding>,
+    ) -> Self {
+        Self {
+            inner,
+            policy,
+            catalog,
+        }
     }
     pub(crate) fn hook_name(&self) -> &str {
         self.inner.hook_name()
     }
 
+    fn check_catalog(&self) -> Result<()> {
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.is_current())
+        {
+            let info = self.inner.info();
+            return Err(Error::tool(
+                ToolErrorKind::ExecutionFailed,
+                self.origin().name(),
+                format!(
+                    "tool call rejected because the catalog changed after `{}/{}` was prepared",
+                    ra_mcp::catalog::safe_server_name(info.server_name()),
+                    info.tool().name,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, context: &ToolContext<'_>) -> Result<ToolOutput> {
+        self.check_catalog()?;
         let result = self.inner.invoke_raw(context.arguments().clone()).await?;
         if let Some(limits) = context
             .run()
@@ -414,6 +445,7 @@ impl Tool for ProductMcpTool {
         let Some(policy) = self.policy.as_ref() else {
             return self.invoke(&context).await;
         };
+        self.check_catalog()?;
         let state = self.state(&context, policy);
         let settings = context.run().app_context::<CodingThreadSettings>();
         if settings.is_some_and(|settings| auto_approved(settings, state.mode))

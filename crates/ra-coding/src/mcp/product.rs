@@ -32,7 +32,7 @@ use ra_mcp::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{McpServerConfig, tool_catalog_cache::CacheKey};
+use super::{McpServerConfig, live_tool_catalog::CatalogListing, tool_catalog_cache::CacheKey};
 
 mod headers_helper_process;
 
@@ -181,6 +181,10 @@ fn product_mcp_server(
         .with_binding_options(binding_options)
         .with_connection_identity(connection_identity(server, local_process_cwd));
     registration.startup_readiness = config.startup_readiness;
+    registration.catalog_listing = Some(CatalogListing {
+        timeout: startup_timeout,
+        refresh_after_notification: false,
+    });
     registration.shared_catalog_key =
         tool_catalog_key(name, config, registration.connection_identity());
     registration.product_policy = Some(Arc::new(super::approval::ProductMcpPolicy::new(server)));

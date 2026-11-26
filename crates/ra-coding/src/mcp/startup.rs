@@ -117,7 +117,10 @@ impl Entry {
             if view.startup_readiness == ra_config::McpStartupReadiness::Catalog
                 && matches!(state.status, Status::NotStarted | Status::Starting)
                 && let Some(cache) = &self.shared_catalog
-                && let Some(catalog) = cache.current_catalog()
+                && let Some(catalog) = cache.current_catalog(
+                    view.catalog_listing
+                        .is_some_and(|listing| listing.refresh_after_notification),
+                )
                 && catalog.allows_deferred_startup(&view.filter)
             {
                 return Some(catalog);

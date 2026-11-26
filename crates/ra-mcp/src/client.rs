@@ -164,8 +164,8 @@ impl McpClientOptions {
         self.session_timeout = timeout.into().filter(|timeout| !timeout.is_zero());
         self
     }
-    /// Overrides the deadlines for initialize and the initial complete tools/list only.
-    /// Ordinary requests retain the configured session and tool deadlines.
+    /// Overrides the deadlines for initialize, the initial complete tools/list and
+    /// notification-driven relists. Ordinary requests retain their configured deadlines.
     #[must_use]
     pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = Some(timeout);
@@ -409,7 +409,7 @@ impl McpClient {
         &self,
     ) -> Result<Vec<crate::metadata::CachedTool>> {
         self.peer().await?;
-        self.tools.list(self.fetch_tools()).await
+        self.tools.list(self.fetch_tools(false)).await
     }
     /// Replaces the active discovery filter without invalidating the unfiltered cache.
     pub fn set_tool_filter(&self, filter: crate::filter::ToolFilter) {
@@ -428,11 +428,13 @@ impl McpClient {
     pub fn invalidate_tools_cache(&self) {
         self.tools.invalidate();
     }
-    async fn fetch_tools(&self) -> Result<Vec<Tool>> {
+    pub(crate) async fn fetch_tools(&self, use_startup_timeout: bool) -> Result<Vec<Tool>> {
         let peer = self.peer().await?;
         let options = self.options();
         let initial_listing = !self.session.initial_tools_listed.load(Ordering::Acquire);
-        let startup_timeout = options.startup_timeout.filter(|_| initial_listing);
+        let startup_timeout = options
+            .startup_timeout
+            .filter(|_| initial_listing || use_startup_timeout);
         let request_timeout = startup_timeout.or(options.session_timeout);
         let startup_options;
         let options = if let Some(timeout) = startup_timeout {

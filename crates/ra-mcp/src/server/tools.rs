@@ -66,9 +66,18 @@ impl ToolsCache {
         &self,
         fetch: impl Future<Output = Result<Vec<Tool>>>,
     ) -> Result<Vec<CachedTool>> {
+        self.list_with_publication_guard(fetch, None::<fn() -> bool>)
+            .await
+    }
+    pub(crate) async fn list_with_publication_guard(
+        &self,
+        fetch: impl Future<Output = Result<Vec<Tool>>>,
+        publish_if: Option<impl FnOnce() -> bool>,
+    ) -> Result<Vec<CachedTool>> {
         let (generation, sequence) = {
             let mut state = self.state();
-            if state.cache_tools_list
+            if publish_if.is_none()
+                && state.cache_tools_list
                 && !state.dirty
                 && let Some(tools) = &state.tools
                 && !tools.is_empty()
@@ -80,7 +89,10 @@ impl ToolsCache {
         };
         let tools: Vec<CachedTool> = fetch.await?.into_iter().map(CachedTool::from).collect();
         let mut state = self.state();
-        if generation == state.generation && sequence > state.last_published_sequence {
+        if generation == state.generation
+            && sequence > state.last_published_sequence
+            && publish_if.is_none_or(|is_current| is_current())
+        {
             state.tools = Some(tools.clone());
             state.dirty = false;
             state.last_published_sequence = sequence;

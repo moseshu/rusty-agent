@@ -42,11 +42,21 @@ use tokio_util::sync::CancellationToken;
 
 mod approval;
 mod hook_catalog;
+mod live_tool_catalog;
 mod product;
 mod tool_catalog_cache;
 pub(crate) use approval::{McpApprovalKey, McpApprovalState};
 pub use approval::{McpPermissionPromptAutoApproveContext, mcp_permission_prompt_is_auto_approved};
+use live_tool_catalog::{CatalogBinding, CatalogListing, LiveToolCatalog};
 use tool_catalog_cache::{CacheEntry, CacheKey, ToolCatalogCache};
+
+pub(crate) fn configure_tool_list_refresh(servers: &mut [McpServerConfig]) {
+    for server in servers {
+        if let Some(listing) = &mut server.catalog_listing {
+            listing.refresh_after_notification = true;
+        }
+    }
+}
 
 pub(crate) fn configure_approval_sources(
     servers: &mut [McpServerConfig],
@@ -112,6 +122,7 @@ pub struct McpServerConfig {
     product_policy: Option<Arc<approval::ProductMcpPolicy>>,
     shared_catalog_key: Option<CacheKey>,
     startup_readiness: McpStartupReadiness,
+    catalog_listing: Option<CatalogListing>,
 }
 impl McpServerConfig {
     /// Registers a reconnectable server without opening its transport.
@@ -129,6 +140,7 @@ impl McpServerConfig {
             product_policy: None,
             shared_catalog_key: None,
             startup_readiness: McpStartupReadiness::Connection,
+            catalog_listing: None,
         }
     }
     /// The connection identity this registration carries, if any.
@@ -219,6 +231,7 @@ struct BindingView {
     options: Option<ra_mcp::client::McpClientOptions>,
     product_policy: Option<Arc<approval::ProductMcpPolicy>>,
     startup_readiness: McpStartupReadiness,
+    catalog_listing: Option<CatalogListing>,
 }
 impl BindingView {
     fn client(&self, client: ra_mcp::client::McpClient) -> ra_mcp::client::McpClient {
@@ -245,6 +258,7 @@ struct EntryState {
     tools_error: Option<Arc<Error>>,
     cached_catalog: Option<McpToolCatalog>,
     catalog_ticket: Option<u64>,
+    live_tool_catalog: Arc<LiveToolCatalog>,
     stopped: bool,
     epoch: u64,
     pending: Option<StartupAttempt>,
@@ -332,6 +346,7 @@ impl CodingMcpRuntime {
                         options: config.binding_options,
                         product_policy: config.product_policy,
                         startup_readiness: config.startup_readiness,
+                        catalog_listing: config.catalog_listing,
                     },
                 ));
                 retained.insert(Arc::as_ptr(entry).addr());
@@ -662,6 +677,7 @@ impl Entry {
                 options: config.binding_options,
                 product_policy: config.product_policy,
                 startup_readiness: config.startup_readiness,
+                catalog_listing: config.catalog_listing,
             }),
             identity: config.identity,
             configured_enabled: config.enabled,
@@ -679,6 +695,7 @@ impl Entry {
                 tools_error: None,
                 cached_catalog: config.cached_catalog,
                 catalog_ticket: None,
+                live_tool_catalog: Arc::default(),
                 stopped: false,
                 epoch: 0,
                 pending: None,
@@ -712,7 +729,15 @@ impl Entry {
         if !state.enabled || state.cleanup_failed {
             return true;
         }
-        if state.stopped {
+        if state.stopped
+            || self
+                .binding_view()
+                .catalog_listing
+                .is_some_and(|listing| listing.refresh_after_notification)
+                != desired
+                    .catalog_listing
+                    .is_some_and(|listing| listing.refresh_after_notification)
+        {
             return false;
         }
         if state.status == Status::Connected {
@@ -789,6 +814,44 @@ impl Entry {
         state.failure = Some((phase, error));
         drop(state);
         self.publish(status);
+    }
+    fn record_catalog(
+        &self,
+        generation: u64,
+        cancel: &CancellationToken,
+        view: &BindingView,
+        client: &ra_mcp::client::McpClient,
+        mut catalog: McpToolCatalog,
+    ) -> Option<(McpToolCatalog, Option<CatalogBinding>)> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if cancel.is_cancelled() || state.generation != generation {
+            return None;
+        }
+        let binding = view.catalog_listing.and_then(|listing| {
+            // Capture the declarations and the binding from the same publication.
+            let live = &state.live_tool_catalog;
+            let snapshot = live.latest()?;
+            catalog = view.catalog(snapshot.catalog.clone());
+            listing.refresh_after_notification.then(|| CatalogBinding {
+                live: live.clone(),
+                snapshot,
+            })
+        });
+        // An existing entry retains the last live catalog even if sharing is disallowed.
+        state.cached_catalog = Some(catalog.clone());
+        if let Some(cache) = &self.shared_catalog
+            && let Some(ticket) = state.catalog_ticket.take()
+        {
+            cache.publish_if_newest(
+                ticket,
+                client,
+                &catalog,
+                view.catalog_listing
+                    .is_some_and(|listing| listing.refresh_after_notification),
+            );
+        }
+        state.tools_error = None;
+        Some((catalog, binding))
     }
     fn clear_diagnostics(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -951,6 +1014,7 @@ impl Entry {
             });
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.catalog_ticket = catalog_ticket;
+            state.live_tool_catalog = Arc::default();
             state.consecutive_failures = 0;
             state.retry_not_before = None;
             drop(state);
@@ -984,12 +1048,18 @@ impl CodingMcpRuntime {
     fn product_tool(
         bindings: &[(Arc<Entry>, BindingView)],
         tool: Arc<ra_mcp::tool::McpTool>,
+        catalogs: &[Option<CatalogBinding>],
     ) -> Arc<dyn Tool> {
         let policy = bindings
             .iter()
             .find(|(entry, _)| entry.server.name() == tool.info().server_name())
             .and_then(|(_, view)| view.product_policy.clone());
-        Arc::new(approval::ProductMcpTool::new(tool, policy))
+        let catalog = catalogs
+            .iter()
+            .flatten()
+            .find(|binding| binding.snapshot.catalog.server_name() == tool.info().server_name())
+            .cloned();
+        Arc::new(approval::ProductMcpTool::new(tool, policy, catalog))
     }
     pub(crate) async fn hook_tool_infos(
         &self,
@@ -998,7 +1068,7 @@ impl CodingMcpRuntime {
         let bindings = self.bindings();
         let catalogs = self.tool_catalogs(&bindings).await;
         let mut infos = Vec::new();
-        for (catalog, _, filter) in catalogs {
+        for ((catalog, _, filter), _) in catalogs {
             infos.extend(
                 catalog
                     .enabled_tool_infos(&filter, run)
@@ -1012,7 +1082,12 @@ impl CodingMcpRuntime {
 
     pub(crate) async fn visible_server_names(&self, context: &RunContext) -> Result<Vec<String>> {
         let bindings = self.bindings();
-        let catalogs = self.tool_catalogs(&bindings).await;
+        let catalogs = self
+            .tool_catalogs(&bindings)
+            .await
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
         let tools = discover_catalog_tools(
             &catalogs,
             &self.discovery,
@@ -1081,7 +1156,8 @@ impl ToolResolver for CodingMcpRuntime {
         let _ = self.get_mcp_status();
         let bindings = self.bindings();
         let resource_sources = Self::resource_sources(&bindings);
-        let catalogs = self.tool_catalogs(&bindings).await;
+        let (catalogs, call_bindings): (Vec<_>, Vec<_>) =
+            self.tool_catalogs(&bindings).await.into_iter().unzip();
         let mut tools = discover_catalog_tools(
             &catalogs,
             &self.discovery,
@@ -1091,7 +1167,7 @@ impl ToolResolver for CodingMcpRuntime {
         )
         .await?
         .into_iter()
-        .map(|tool| Self::product_tool(&bindings, tool))
+        .map(|tool| Self::product_tool(&bindings, tool, &call_bindings))
         .collect::<Vec<_>>();
         // Resource helpers are ordinary advertised tools, independent of server tool filtering,
         // tools/list failures and deferred function discovery. Their sessions share the same owner.
@@ -1119,11 +1195,19 @@ impl McpRuntimeControl for CodingMcpRuntime {
             return futures::future::ready(McpServerStatus::new(name, Status::NotStarted)).boxed();
         };
         let (status, generation) = entry.snapshot_with_generation();
+        let view = entry.binding_view();
         let client = entry
             .ready()
             .then(|| entry.server.current_client().ok())
             .flatten()
-            .map(|client| entry.binding_view().client(client));
+            .map(|client| view.client(client));
+        let (live, cancel) = {
+            let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                state.live_tool_catalog.clone(),
+                state.startup_cancel.clone(),
+            )
+        };
         async move {
             if entry.snapshot_with_generation().1 != generation {
                 return entry.snapshot();
@@ -1136,7 +1220,27 @@ impl McpRuntimeControl for CodingMcpRuntime {
                 serde_json::to_value(&info.server_info).unwrap_or_default(),
                 serde_json::to_value(&info.capabilities).unwrap_or_default(),
             );
-            let tools = client.list_tools().await;
+            let tools = match view.catalog_listing {
+                Some(listing) => {
+                    let result = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return entry.snapshot(),
+                        result = live.get(&client, listing) => result,
+                    };
+                    match result {
+                        Ok(catalog) => {
+                            let Some((catalog, _)) =
+                                entry.record_catalog(generation, &cancel, &view, &client, catalog)
+                            else {
+                                return entry.snapshot();
+                            };
+                            Ok(catalog.tools())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                None => client.list_tools().await,
+            };
             let status = match tools {
                 Ok(tools) => status.with_tools(
                     tools
@@ -1269,10 +1373,10 @@ impl CodingMcpRuntime {
     async fn tool_catalogs(
         &self,
         bindings: &[(Arc<Entry>, BindingView)],
-    ) -> Vec<McpToolCatalogSource> {
+    ) -> Vec<(McpToolCatalogSource, Option<CatalogBinding>)> {
         join_all(bindings.iter().map(|(entry, view)| async {
             let shared = entry.wait_for_catalog(view).await;
-            let (enabled, stopped, status, cached, epoch, generation, cancel) = {
+            let (enabled, stopped, status, cached, epoch, generation, cancel, live) = {
                 let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     state.enabled,
@@ -1287,6 +1391,7 @@ impl CodingMcpRuntime {
                     state.epoch,
                     state.generation,
                     state.startup_cancel.clone(),
+                    state.live_tool_catalog.clone(),
                 )
             };
             if !enabled || stopped {
@@ -1303,32 +1408,29 @@ impl CodingMcpRuntime {
                 let result = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return None,
-                    result = McpToolCatalog::fetch(&client) => result,
+                    result = async {
+                        match view.catalog_listing {
+                            Some(listing) => live.get(&client, listing).await,
+                            None => McpToolCatalog::fetch(&client).await,
+                        }
+                    } => result,
                 };
                 match result {
-                    Ok(catalog) => {
-                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.generation != generation {
-                            return None;
-                        }
-                        // An existing entry can reconnect with its last live catalog even
-                        // when it cannot share that catalog with a new entry.
-                        state.cached_catalog = Some(catalog.clone());
-                        if let Some(cache) = &entry.shared_catalog
-                            && let Some(ticket) = state.catalog_ticket.take()
-                        {
-                            cache.publish_if_newest(ticket, &client, &catalog);
-                        }
-                        state.tools_error = None;
-                        Some((
-                            catalog,
-                            Arc::new(client) as Arc<dyn McpToolClientSource>,
-                            view.filter.clone(),
-                        ))
-                    }
+                    Ok(catalog) => entry
+                        .record_catalog(generation, &cancel, view, &client, catalog)
+                        .map(|(catalog, binding)| {
+                            (
+                                (
+                                    catalog,
+                                    Arc::new(client) as Arc<dyn McpToolClientSource>,
+                                    view.filter.clone(),
+                                ),
+                                binding,
+                            )
+                        }),
                     Err(error) => {
                         let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if state.generation == generation {
+                        if !cancel.is_cancelled() && state.generation == generation {
                             state.tools_error = Some(Arc::new(error));
                         }
                         drop(state);
@@ -1341,14 +1443,17 @@ impl CodingMcpRuntime {
                     shared.filter(|_| matches!(status, Status::NotStarted | Status::Starting));
                 cached.or(shared).map(|catalog| {
                     (
-                        view.catalog(catalog),
-                        Arc::new(DeferredClient {
-                            entry: entry.clone(),
-                            epoch,
-                            resolved: tokio::sync::OnceCell::new(),
-                            view: view.clone(),
-                        }) as Arc<dyn McpToolClientSource>,
-                        view.filter.clone(),
+                        (
+                            view.catalog(catalog),
+                            Arc::new(DeferredClient {
+                                entry: entry.clone(),
+                                epoch,
+                                resolved: tokio::sync::OnceCell::new(),
+                                view: view.clone(),
+                            }) as Arc<dyn McpToolClientSource>,
+                            view.filter.clone(),
+                        ),
+                        None,
                     )
                 })
             }
@@ -1356,7 +1461,7 @@ impl CodingMcpRuntime {
         .await
         .into_iter()
         .flatten()
-        .collect::<Vec<McpToolCatalogSource>>()
+        .collect()
     }
 }
 

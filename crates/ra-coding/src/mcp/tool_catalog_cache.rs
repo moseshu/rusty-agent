@@ -52,7 +52,7 @@ struct CacheState {
 struct Snapshot {
     catalog: McpToolCatalog,
     published_at: Instant,
-    revision: McpToolListRevision,
+    revision: Option<McpToolListRevision>,
 }
 
 impl CacheEntry {
@@ -62,13 +62,18 @@ impl CacheEntry {
         state.next_generation
     }
 
-    pub(super) fn current_catalog(&self) -> Option<McpToolCatalog> {
+    pub(super) fn current_catalog(&self, track_notifications: bool) -> Option<McpToolCatalog> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state
             .snapshot
             .as_ref()
             .filter(|snapshot| {
-                snapshot.revision.current() == 0 && snapshot.published_at.elapsed() <= TTL
+                // A reader that tracks changes needs a snapshot that tracked them from publication.
+                snapshot
+                    .revision
+                    .as_ref()
+                    .map_or(!track_notifications, |revision| revision.current() == 0)
+                    && snapshot.published_at.elapsed() <= TTL
             })
             .map(|snapshot| snapshot.catalog.clone())
     }
@@ -96,8 +101,9 @@ impl CacheEntry {
         generation: u64,
         client: &McpClient,
         live_catalog: &McpToolCatalog,
+        track_notifications: bool,
     ) {
-        let revision = client.tool_list_revision();
+        let revision = track_notifications.then(|| client.tool_list_revision());
         let mut tools = live_catalog.tools();
         for tool in &mut tools {
             // Cached declarations cannot supply approval or parallelism hints.
@@ -114,10 +120,13 @@ impl CacheEntry {
         }
         // A newer session whose list changed also supersedes older cached declarations.
         state.published_generation = generation;
-        state.snapshot = (revision.current() == 0).then(|| Snapshot {
-            catalog,
-            revision,
-            published_at: Instant::now(),
-        });
+        state.snapshot = revision
+            .as_ref()
+            .is_none_or(|revision| revision.current() == 0)
+            .then(|| Snapshot {
+                catalog,
+                revision,
+                published_at: Instant::now(),
+            });
     }
 }
