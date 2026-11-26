@@ -1384,14 +1384,14 @@ args = [{}]
         "{} bytes: {text}",
         text.len()
     );
-    // Each model request advertises the MCP tools once; the hook added no listing of its own.
+    // Both model requests share the connection's first tool listing. PostToolUse adds none.
     let lists = std::fs::read_to_string(&methods)
         .unwrap_or_default()
         .lines()
         .filter(|method| *method == "tools/list")
         .count();
-    let requests = fixture.home.script.requests.lock().unwrap().len();
-    assert_eq!(lists - lists_before, requests);
+    assert_eq!(fixture.home.script.requests.lock().unwrap().len(), 2);
+    assert_eq!(lists - lists_before, 1);
     fixture.mcp.shutdown().await.unwrap();
 }
 
