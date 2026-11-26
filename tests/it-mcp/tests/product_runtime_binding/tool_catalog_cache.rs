@@ -151,9 +151,9 @@ impl Fixture {
         }
     }
 
-    fn registrations(&self, executor_credentials: bool) -> Vec<ra_coding::mcp::McpServerConfig> {
+    fn registrations(&self, alternate_credentials: bool) -> Vec<ra_coding::mcp::McpServerConfig> {
         self.configured(
-            executor_credentials,
+            alternate_credentials,
             Some("catalog"),
             OutboundProxyPolicy::ReqwestDefault,
         )
@@ -161,7 +161,7 @@ impl Fixture {
 
     fn configured(
         &self,
-        executor_credentials: bool,
+        alternate_credentials: bool,
         readiness: Option<&str>,
         proxy: OutboundProxyPolicy,
     ) -> Vec<ra_coding::mcp::McpServerConfig> {
@@ -169,23 +169,21 @@ impl Fixture {
         if let Some(readiness) = readiness {
             config["startup_readiness"] = json!(readiness);
         }
-        self.registrations_from(config, executor_credentials, proxy)
+        if alternate_credentials {
+            config["http_headers"] = json!({"Authorization": "Bearer alternate-test-token"});
+        }
+        self.registrations_from(config, proxy)
     }
 
     fn registrations_from(
         &self,
         config: serde_json::Value,
-        executor_credentials: bool,
         proxy: OutboundProxyPolicy,
     ) -> Vec<ra_coding::mcp::McpServerConfig> {
         let config = serde_json::from_value(config).unwrap();
         let mut catalog = McpCatalogBuilder::default();
         let name = "docs".to_owned();
-        catalog.register(if executor_credentials {
-            McpServerRegistration::from_executor_config(name, config)
-        } else {
-            McpServerRegistration::from_config(name, config)
-        });
+        catalog.register(McpServerRegistration::from_config(name, config));
         product_mcp_servers(
             &catalog.build(),
             Path::new("."),
@@ -267,7 +265,7 @@ async fn names(runtime: &CodingMcpRuntime) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn catalog_serves_equivalent_reconnect_but_never_crosses_credential_policy() {
+async fn catalog_serves_equivalent_reconnect_but_never_crosses_credentials() {
     let mut fixture = Fixture::start(None).await;
     let runtime =
         CodingMcpRuntime::new(fixture.registrations(false), McpDiscoveryOptions::new()).unwrap();
@@ -416,6 +414,53 @@ async fn default_connection_lists_once_and_shutdown_cancels_a_stalled_live_listi
 }
 
 #[tokio::test]
+async fn first_catalog_uses_reloaded_startup_timeout_on_the_existing_session() {
+    use ra_protocol::server::McpRuntimeControl;
+
+    let mut fixture = Fixture::start(None).await;
+    let runtime = CodingMcpRuntime::new(
+        fixture.configured(false, None, OutboundProxyPolicy::ReqwestDefault),
+        McpDiscoveryOptions::new(),
+    )
+    .unwrap();
+    runtime.connect_all().await.unwrap();
+    runtime
+        .replace_mcp_servers(fixture.registrations_from(
+            json!({"url": fixture.url, "startup_timeout_sec": 0.5}),
+            OutboundProxyPolicy::ReqwestDefault,
+        ))
+        .await
+        .unwrap();
+
+    let mut discovery = Box::pin(names(&runtime));
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        tools = &mut discovery => panic!("discovery finished before listing: {tools:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), discovery)
+            .await
+            .expect("first discovery should use the reloaded timeout")
+            .is_empty()
+    );
+    let mut inventory = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false);
+    tokio::select! {
+        _ = fixture.listing(1) => {}
+        status = &mut inventory => panic!("inventory finished before listing: {status:?}"),
+    }
+    let status = tokio::time::timeout(Duration::from_secs(2), inventory)
+        .await
+        .expect("first inventory should use the reloaded timeout");
+    assert!(
+        serde_json::to_value(status).unwrap()["toolsError"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out"))
+    );
+    fixture.release(1, 2);
+    fixture.close(&runtime).await;
+}
+
+#[tokio::test]
 async fn proxy_policy_change_does_not_reenable_a_runtime_disabled_server() {
     let fixture = Fixture::start(None).await;
     let runtime =
@@ -508,7 +553,6 @@ async fn bearer_environment_credentials_can_reuse_a_catalog() {
                 "bearer_token_env_var": TOKEN_VAR,
                 "startup_readiness": "catalog",
             }),
-            false,
             OutboundProxyPolicy::ReqwestDefault,
         )
     };
@@ -569,4 +613,40 @@ async fn default_connection_reuses_its_last_live_catalog_during_reconnect() {
         assert_eq!(fixture.discover(&runtime, 2).await, ["session_2"]);
         fixture.close(&runtime).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn header_helper_catalog_does_not_cross_connection_entries() {
+    let mut fixture = Fixture::start(None).await;
+    let registrations = |fixture: &Fixture| {
+        fixture.registrations_from(
+            json!({
+                "url": fixture.url,
+                "http_headers_helper": "printf '{}'",
+                "startup_readiness": "catalog",
+            }),
+            OutboundProxyPolicy::ReqwestDefault,
+        )
+    };
+    let runtime =
+        CodingMcpRuntime::new(registrations(&fixture), McpDiscoveryOptions::new()).unwrap();
+    runtime.connect_all().await.unwrap();
+    assert_eq!(fixture.discover(&runtime, 1).await, ["session_1"]);
+
+    fixture.pause_initialize(2);
+    runtime.replace_mcp_servers(Vec::new()).await.unwrap();
+    runtime
+        .replace_mcp_servers(registrations(&fixture))
+        .await
+        .unwrap();
+    fixture.wait_for_initialize(2).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), names(&runtime))
+            .await
+            .is_err()
+    );
+    fixture.resume_initialize(2);
+    assert_eq!(fixture.discover(&runtime, 2).await, ["session_2"]);
+    fixture.close(&runtime).await;
 }

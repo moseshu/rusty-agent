@@ -1,12 +1,15 @@
 // Adapted from openai/codex (Apache-2.0) @ 815ef9bbc47bef3bde9cfceaaaf3ef74bb43d052, modified.
 //! Native HTTP boundary for the SDK worker. Errors never retain requests, URLs or response bodies.
 
-use super::{McpHttpParams, safe_error};
+use super::{McpHttpParams, headers_helper::HeadersHelper, safe_error};
 use futures::{StreamExt, stream::BoxStream};
 use ra_core::error::{Result, ToolErrorKind};
 use reqwest::{
-    Method, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+    Method, Request, RequestBuilder, Response, StatusCode,
+    header::{
+        ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION,
+        PROXY_AUTHORIZATION,
+    },
 };
 use rmcp::{
     model::{ClientJsonRpcMessage, ClientNotification, ClientRequest, ServerJsonRpcMessage},
@@ -21,6 +24,8 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
+
+use tokio::time::Instant;
 
 mod sse;
 
@@ -73,6 +78,7 @@ pub(super) struct HttpClient {
     default_headers: HeaderMap,
     params: McpHttpParams,
     bearer: Option<String>,
+    headers_helper: Option<Arc<HeadersHelper>>,
     pub(super) session: Arc<HttpSession>,
 }
 impl HttpClient {
@@ -83,6 +89,15 @@ impl HttpClient {
             return Err(safe_error(
                 ToolErrorKind::InvalidInput,
                 "invalid MCP HTTP URL",
+            ));
+        }
+        if params.headers_helper.is_some()
+            && params.client_factory.is_some()
+            && params.route_factory.is_none()
+        {
+            return Err(safe_error(
+                ToolErrorKind::InvalidInput,
+                "MCP HTTP headers helper requires a client with redirects disabled",
             ));
         }
         let mut headers = HeaderMap::new();
@@ -150,6 +165,10 @@ impl HttpClient {
             default_headers,
             params: params.clone(),
             bearer,
+            headers_helper: params
+                .headers_helper
+                .clone()
+                .map(|helper| Arc::new(HeadersHelper::new(&url, helper))),
             session: Arc::default(),
         })
     }
@@ -186,10 +205,89 @@ impl HttpClient {
         Ok(request)
     }
     async fn send(&self, request: RequestBuilder) -> HttpResult<Response> {
-        let Some(pool) = &self.routed else {
-            return request.send().await.map_err(http_error);
+        let (client, request) = request.build_split();
+        let mut request = request.map_err(http_error)?;
+        let Some(helper) = &self.headers_helper else {
+            return self.send_request(&client, request).await;
         };
-        let request = request.build().map_err(http_error)?;
+        if !helper.matches(request.url()) {
+            return self.send_request(&client, request).await;
+        }
+        // Match the source's explicit Authorization precedence, including static headers.
+        if !request.headers().contains_key(AUTHORIZATION)
+            && let Some(authorization) = self.default_headers.get(AUTHORIZATION)
+        {
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, authorization.clone());
+        }
+        let deadline = request.timeout().map(|timeout| Instant::now() + *timeout);
+        let headers = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, helper.headers())
+                .await
+                .map_err(|_| request_timeout())?,
+            None => helper.headers().await,
+        }
+        .map_err(|error| StreamableHttpError::Client(io::Error::other(error)))?;
+        let original = (request.method() == Method::POST)
+            .then(|| request.try_clone())
+            .flatten();
+        headers.apply(&mut request);
+        let response = self.send_helper_request(request, deadline).await?;
+        let Some(original) = original else {
+            return Ok(response);
+        };
+        let retry = helper.retry(&original, &headers, &response);
+        let retry = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, retry)
+                .await
+                .ok()
+                .flatten(),
+            None => retry.await,
+        };
+        let Some(retry) = retry else {
+            return Ok(response);
+        };
+        drop(response);
+        self.send_helper_request(retry, deadline).await
+    }
+
+    async fn send_helper_request(
+        &self,
+        mut request: Request,
+        deadline: Option<Instant>,
+    ) -> HttpResult<Response> {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(request_timeout());
+            }
+            *request.timeout_mut() = Some(remaining);
+        }
+        let proxy_authorization = request.url().scheme() == "http"
+            && (request.headers().contains_key(PROXY_AUTHORIZATION)
+                || self.default_headers.contains_key(PROXY_AUTHORIZATION));
+        // Use the configured no-redirect client regardless of the builder returned by an auth hook.
+        let response = self.send_request(&self.client, request).await?;
+        if proxy_authorization
+            && response.status().is_redirection()
+            && response.headers().contains_key(LOCATION)
+        {
+            return Err(failure(
+                "MCP HTTP redirect cannot safely replay Proxy-Authorization credentials",
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn send_request(
+        &self,
+        client: &reqwest::Client,
+        request: Request,
+    ) -> HttpResult<Response> {
+        let Some(pool) = &self.routed else {
+            return client.execute(request).await.map_err(http_error);
+        };
         // The routed pool does not see this client's default headers. Static headers fill only
         // names the request does not set, as reqwest's defaults do, so session, hook and bearer
         // values keep their precedence.
@@ -418,6 +516,12 @@ fn media_type(response: &Response) -> Option<String> {
         .split(';')
         .next()
         .map(|media_type| media_type.trim().to_ascii_lowercase())
+}
+fn request_timeout() -> StreamableHttpError<io::Error> {
+    StreamableHttpError::Client(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "MCP HTTP request timed out",
+    ))
 }
 fn failure(message: &'static str) -> StreamableHttpError<io::Error> {
     StreamableHttpError::Client(io::Error::other(message))

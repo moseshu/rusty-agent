@@ -7,6 +7,38 @@ with what to do about it. Upgrade all crates together: crates from two tags are 
 
 ## Unreleased
 
+### Local MCP HTTP headers helpers
+
+Coding-product Streamable HTTP registrations now run the configured `http_headers_helper` in the
+local product working directory. The helper inherits the allowlisted MCP environment and returns
+a JSON object of header names and string values. Startup and reconnect each own their helper
+credentials. A helper invocation is limited to ten seconds and 64 KiB of standard output.
+The local product registry rejects `ExecutorOnly` registrations before creating a transport
+or resolving host credentials. Executor-owned connections require remote MCP transport support.
+
+Helper values override same-name headers. Explicit Authorization keeps precedence. Helper
+credentials are scoped to the configured origin, and the transport stops redirects. A rejected
+POST (401 or 403) can refresh the helper and replay once when its effective headers change.
+Concurrent rejections share the refresh. A Bearer insufficient-scope challenge, unchanged headers
+or a failed refresh preserves the original response. Tool catalogs for helper connections continue
+to bypass the shared startup cache.
+
+Rust supplies the local process launcher through `McpHttpParams::with_http_headers_helper`.
+The product reports the helper's exit status, startup error kind, or ten-second timeout. Raw
+callback errors, script output and command text are excluded from the diagnostic. Custom
+direct reqwest factories cannot enforce the helper's redirect rule and are incompatible with
+this option. Routed product connections use the existing no-redirect HTTP pool. The Python-style
+`with_auth` option stays available, with its explicit Authorization taking precedence. OAuth
+discovery and token storage remain separate work.
+
+All coding-product MCP registrations use `startup_timeout_sec` for initialize and separately for
+the first complete tools/list, with a 30-second default. The startup catalog is fetched at first
+discovery or inventory in this runtime. If configuration changes before the first listing on a
+reused connection, that listing uses the refreshed startup timeout. Later listings and ordinary
+requests retain their existing deadlines regardless of whether a helper is configured. Framework
+callers still use the session defaults unless they explicitly set
+`McpClientOptions::with_startup_timeout`.
+
 ### Coding MCP reuses startup tool catalogs
 
 The coding product keeps up to 32 shared startup tool catalogs per MCP runtime for 30 minutes. A

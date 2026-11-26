@@ -7,13 +7,64 @@ use ra_core::error::{Result, ToolErrorKind};
 use rmcp::transport::{
     StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, ffi::OsString, sync::Arc, time::Duration};
 
+mod headers_helper;
 mod transport;
 
 /// The reqwest version used by authentication hooks and client factories. Use this re-export
 /// so hook types always match the adapter's HTTP stack.
 pub use reqwest;
+
+/// Safe process diagnostics a headers helper launcher can attach to its callback error.
+/// Other callback errors are redacted, including any command, output or credential text.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum HttpHeadersHelperProcessError {
+    /// The launcher could not start the process.
+    Start(std::io::ErrorKind),
+    /// The process returned a non-success exit status.
+    Exit(std::process::ExitStatus),
+}
+
+impl std::fmt::Display for HttpHeadersHelperProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start(kind) => write!(
+                f,
+                "MCP HTTP headers helper failed to start: {}",
+                std::io::Error::from(*kind)
+            ),
+            Self::Exit(status) => match status.code() {
+                Some(code) => write!(f, "MCP HTTP headers helper exited with status {code}"),
+                None => write!(f, "MCP HTTP headers helper exited: {status}"),
+            },
+        }
+    }
+}
+
+impl std::error::Error for HttpHeadersHelperProcessError {}
+
+pub(super) fn helper_diagnostic(
+    error: &rmcp::transport::DynamicTransportError,
+) -> Option<ra_core::error::Error> {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+
+    let StreamableHttpError::Client(error) = error
+        .error
+        .downcast_ref::<StreamableHttpError<std::io::Error>>()?
+    else {
+        return None;
+    };
+    let diagnostic = error
+        .get_ref()?
+        .downcast_ref::<headers_helper::HelperFailure>()?;
+    Some(ra_core::error::Error::tool(
+        ToolErrorKind::ExecutionFailed,
+        "mcp",
+        diagnostic.to_string(),
+    ))
+}
 
 // Reqwest configures authentication on requests rather than on its client. Keep this native
 // representation inside the adapter; OAuth challenge handling and storage are separate concerns.
@@ -42,6 +93,7 @@ pub struct McpHttpParams {
     auth: Option<Auth>,
     client_factory: Option<ClientFactory>,
     route_factory: Option<ra_http::HttpClientFactory>,
+    headers_helper: Option<headers_helper::RunHelper>,
 }
 impl McpHttpParams {
     /// Selects an MCP endpoint. HTTP connect and stream read timeouts default to 5 and 300 seconds.
@@ -58,6 +110,7 @@ impl McpHttpParams {
             auth: None,
             client_factory: None,
             route_factory: None,
+            headers_helper: None,
         }
     }
     /// Explicitly routes product requests through the owner's destination and proxy policy.
@@ -116,6 +169,19 @@ impl McpHttpParams {
         Fut: Future<Output = Result<reqwest::RequestBuilder>> + Send + 'static,
     {
         self.auth = Some(Arc::new(move |request| Box::pin(auth(request))));
+        self
+    }
+    /// Sets a connection-scoped Codex headers helper. The launcher receives the MCP subprocess
+    /// environment and maximum stdout size, and returns the command's JSON output. The transport
+    /// applies the decoded headers to the configured origin and refreshes them after rejected POSTs.
+    /// A launcher can attach [`HttpHeadersHelperProcessError`] as a safe error source.
+    #[must_use]
+    pub fn with_http_headers_helper<F, Fut>(mut self, helper: F) -> Self
+    where
+        F: Fn(Vec<(OsString, OsString)>, usize) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
+        self.headers_helper = Some(Arc::new(move |env, limit| Box::pin(helper(env, limit))));
         self
     }
     /// Builds a client at each connection from a builder containing the configured headers,
@@ -306,4 +372,15 @@ impl crate::server::McpServer for McpServerStreamableHttp {
     async fn read_resource(&self, uri: &str) -> Result<rmcp::model::ReadResourceResult> {
         self.client()?.read_resource(uri).await
     }
+}
+
+/// Access to the request transport for tests that need overlapping requests on one connection.
+#[cfg(feature = "test-api")]
+#[doc(hidden)]
+pub fn transport_for_test(
+    params: &McpHttpParams,
+) -> Result<
+    impl rmcp::transport::streamable_http_client::StreamableHttpClient<Error = std::io::Error> + use<>,
+> {
+    transport::HttpClient::new(params)
 }

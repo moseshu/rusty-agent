@@ -71,7 +71,7 @@ async fn bound_runtime_follows_config_and_plugin_changes() {
     write(
         &home.path().join("config.toml"),
         &format!(
-            "[skills.bundled]\nenabled = false\n[mcp_servers.configured]\ncommand = {}\n[mcp_servers.helper]\nurl = \"https://helper.example/mcp\"\nhttp_headers_helper = \"print-headers\"\n",
+            "[skills.bundled]\nenabled = false\n[mcp_servers.configured]\ncommand = {}\n",
             toml_string(FIXTURE)
         ),
     );
@@ -94,9 +94,7 @@ async fn bound_runtime_follows_config_and_plugin_changes() {
 
     let outcome = binding.wait_for(services.generation()).await.unwrap();
     assert_eq!(outcome.error(), None);
-    assert_eq!(outcome.unavailable().len(), 1, "{outcome:?}");
-    assert_eq!(outcome.unavailable()[0].0, "helper");
-    assert!(outcome.unavailable()[0].1.contains("header helper"));
+    assert!(outcome.unavailable().is_empty(), "{outcome:?}");
     wait_status(&runtime, "configured", Status::Connected).await;
 
     services
@@ -193,3 +191,169 @@ mod policy;
 
 #[path = "product_runtime_binding/tool_catalog_cache.rs"]
 mod tool_catalog_cache;
+
+#[test]
+fn product_registry_rejects_executor_only_transports() {
+    use ra_mcp::{McpCatalogBuilder, McpServerRegistration};
+    use serde_json::json;
+
+    let home = TempDir::new().unwrap();
+    let mut catalog = McpCatalogBuilder::default();
+    for (name, config) in [
+        ("local_stdio", json!({"command": FIXTURE})),
+        ("local_http", json!({"url": "http://127.0.0.1:1/mcp"})),
+        (
+            "local_env_header",
+            json!({
+                "url": "http://127.0.0.1:1/mcp",
+                "env_http_headers": {"X-MCP-Test": "RA_TEST_MCP_HEADER"},
+            }),
+        ),
+        (
+            "local_bearer",
+            json!({
+                "url": "http://127.0.0.1:1/mcp",
+                "bearer_token_env_var": "RA_TEST_MCP_BEARER",
+            }),
+        ),
+        (
+            "local_helper",
+            json!({
+                "url": "http://127.0.0.1:1/mcp",
+                "http_headers_helper": "exit 1",
+            }),
+        ),
+        (
+            "remote_http",
+            json!({"url": "http://127.0.0.1:1/mcp", "environment_id": "executor-1"}),
+        ),
+    ] {
+        catalog.register(McpServerRegistration::from_executor_config(
+            name.into(),
+            serde_json::from_value(config).unwrap(),
+        ));
+    }
+
+    let plan = product_mcp_servers(
+        &catalog.build(),
+        home.path(),
+        &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    assert!(plan.servers.is_empty());
+    assert_eq!(plan.unavailable.len(), 6);
+    for (name, diagnostic) in plan.unavailable {
+        let reason = if name == "remote_http" {
+            "which this registry does not connect"
+        } else {
+            "requires a remote HTTP transport"
+        };
+        assert!(diagnostic.contains(reason), "{name}: {diagnostic}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_http_headers_helper_runs_in_the_product_working_directory() {
+    use ra_protocol::server::McpRuntimeControl;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method},
+    };
+
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-helper", "product-header"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["method"] == "notifications/initialized" {
+                return ResponseTemplate::new(202);
+            }
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({
+                    "protocolVersion": body["params"]["protocolVersion"],
+                    "serverInfo": {"name": "test", "version": "1"},
+                    "capabilities": {"tools": {}}
+                }),
+                "tools/list" => json!({"tools": [{
+                    "name": "from_helper", "inputSchema": {"type": "object"}
+                }]}),
+                method => panic!("unexpected MCP method {method}"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+        })
+        .expect(4)
+        .mount(&endpoint)
+        .await;
+    let home = TempDir::new().unwrap();
+    let helper = r#"printf x >> helper-runs; sleep 6; printf '%s' '{"X-Helper":"product-header"}'"#;
+    write(
+        &home.path().join("config.toml"),
+        &format!(
+            "[mcp_servers.docs]\nurl = {}\nhttp_headers_helper = {}\nstartup_timeout_sec = 15\n",
+            toml_string(&endpoint.uri()),
+            toml_string(helper),
+        ),
+    );
+    let snapshot = services(home.path())
+        .snapshot(absolute(home.path()))
+        .await
+        .unwrap();
+    let registrations = product_mcp_servers(
+        &snapshot.mcp_catalog,
+        home.path(),
+        &snapshot.config.http_client_factory,
+    );
+    assert!(registrations.unavailable.is_empty());
+    assert!(!home.path().join("helper-runs").exists());
+
+    let runtime = CodingMcpRuntime::new(registrations.servers, McpDiscoveryOptions::new()).unwrap();
+    let statuses = runtime.connect_all().await.unwrap();
+    assert_eq!(statuses[0].runtime_status(), Some(Status::Connected));
+    for _ in 0..2 {
+        let inventory = McpRuntimeControl::inventory(runtime.as_ref(), "docs", false).await;
+        assert!(serde_json::to_value(inventory).unwrap()["tools"]["from_helper"].is_object());
+    }
+    runtime.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("helper-runs")).unwrap(),
+        "x"
+    );
+    endpoint.verify().await;
+}
+
+#[tokio::test]
+async fn product_helper_startup_reports_exit_status_without_command_output() {
+    let home = TempDir::new().unwrap();
+    let helper = if cfg!(windows) {
+        "echo private-helper-output & exit /b 23"
+    } else {
+        "printf private-helper-output; exit 23"
+    };
+    write(
+        &home.path().join("config.toml"),
+        &format!(
+            "[mcp_servers.docs]\nurl = \"http://127.0.0.1:1/mcp\"\nhttp_headers_helper = {}\n",
+            toml_string(helper),
+        ),
+    );
+    let snapshot = services(home.path())
+        .snapshot(absolute(home.path()))
+        .await
+        .unwrap();
+    let registrations = product_mcp_servers(
+        &snapshot.mcp_catalog,
+        home.path(),
+        &snapshot.config.http_client_factory,
+    );
+    assert!(registrations.unavailable.is_empty());
+
+    let runtime = CodingMcpRuntime::new(registrations.servers, McpDiscoveryOptions::new()).unwrap();
+    let statuses = runtime.connect_all().await.unwrap();
+    assert_eq!(statuses[0].runtime_status(), Some(Status::Failed));
+    let diagnostic = statuses[0].startup_error().unwrap();
+    assert!(diagnostic.contains("exited with status 23"), "{diagnostic}");
+    assert!(!diagnostic.contains("private-helper-output"));
+    runtime.shutdown().await.unwrap();
+}

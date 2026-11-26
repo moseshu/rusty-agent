@@ -37,6 +37,7 @@ struct Behavior {
     initialize_error: Option<Value>,
     initialized_status: Option<StatusCode>,
     request_status: Option<StatusCode>,
+    request_challenge: Option<&'static str>,
     delete_status: Option<StatusCode>,
     initialize_delay: Duration,
     initialized_delay: Duration,
@@ -111,6 +112,37 @@ impl Drop for Server {
         self.cancel.cancel();
         self.task.abort();
     }
+}
+
+#[tokio::test]
+async fn startup_timeout_applies_to_initialize_and_first_tool_catalog_only() {
+    let fixture = Server::new().await;
+    {
+        let mut behavior = fixture.state.behavior.lock().unwrap();
+        behavior.initialize_delay = Duration::from_millis(400);
+        behavior.request_delay = Duration::from_millis(400);
+    }
+    let options = McpClientOptions::default().with_session_timeout(Duration::from_millis(200));
+    let error = McpClient::connect_http("sdk", fixture.params(), options.clone())
+        .await
+        .err()
+        .expect("the SDK session timeout still bounds initialize");
+    assert!(
+        error.to_string().contains("initialize timed out"),
+        "{error}"
+    );
+
+    let client = McpClient::connect_http(
+        "product",
+        fixture.params(),
+        options.with_startup_timeout(Duration::from_secs(3)),
+    )
+    .await
+    .unwrap();
+    client.list_tools().await.unwrap();
+    let error = client.list_tools().await.unwrap_err();
+    assert!(error.to_string().contains("request timed out"), "{error}");
+    client.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -209,9 +241,15 @@ async fn handle(
     state.active.fetch_sub(1, Ordering::SeqCst);
     if let Some(status) = status {
         // HTTP error bodies and challenges are transport data, never protocol tool output.
+        let challenge = state
+            .behavior
+            .lock()
+            .unwrap()
+            .request_challenge
+            .unwrap_or("Bearer realm=credential-secret");
         return (
             status,
-            [("www-authenticate", "Bearer realm=credential-secret")],
+            [("www-authenticate", challenge)],
             "credential-secret",
         )
             .into_response();
@@ -895,3 +933,6 @@ async fn routed_requests_keep_static_header_precedence_and_session_lifecycle() {
     }
     assert!(seen.iter().any(|request| request.method == Method::DELETE));
 }
+
+#[path = "http/headers_helper.rs"]
+mod headers_helper;

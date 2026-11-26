@@ -1122,7 +1122,8 @@ impl McpRuntimeControl for CodingMcpRuntime {
         let client = entry
             .ready()
             .then(|| entry.server.current_client().ok())
-            .flatten();
+            .flatten()
+            .map(|client| entry.binding_view().client(client));
         async move {
             if entry.snapshot_with_generation().1 != generation {
                 return entry.snapshot();

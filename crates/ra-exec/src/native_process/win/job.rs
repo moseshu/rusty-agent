@@ -204,6 +204,13 @@ impl JobObject {
         }
     }
 
+    /// Starts a console-free child whose process tree cannot break away from the returned job.
+    pub fn spawn_background_contained(command: &mut Command) -> io::Result<(Child, Self)> {
+        let job = Self::create_without_breakaway()?;
+        let child = job.spawn_contained(command)?;
+        Ok((child, job))
+    }
+
     /// Starts a console-free background process, falling back when containment is unavailable.
     /// The returned job owns the contained process tree when assignment succeeds.
     #[allow(

@@ -33,6 +33,8 @@ pub mod http;
 #[cfg(feature = "stdio")]
 pub mod stdio;
 
+#[cfg(any(feature = "stdio", feature = "http"))]
+mod process_env;
 mod tool_list_changes;
 pub use tool_list_changes::McpToolListRevision;
 
@@ -59,13 +61,14 @@ pub const MAX_MCP_CATALOG_ITEMS: usize = 2_048;
 /// Server options shared by all transports, including discovery, approval and tool guardrails.
 ///
 /// As in Python, an enabled session timeout bounds every request: initialize, each tools/list
-/// or prompts/list page, and the single-page resource requests. Catalog bounds are opt-in product
-/// policy. Codex's per-server tool timeout can replace the session timeout for calls, including
-/// the Codex-style resource aggregation and the model-facing resource tools.
+/// or prompts/list page, and the single-page resource requests. Startup and catalog overrides are
+/// opt-in product policy. Codex's per-server tool timeout can replace the session timeout for
+/// calls, including the Codex-style resource aggregation and the model-facing resource tools.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_field_names)] // Each timeout bounds a different protocol scope.
 pub struct McpClientOptions {
     session_timeout: Option<Duration>,
+    startup_timeout: Option<Duration>,
     catalog_timeout: Option<Duration>,
     max_list_pages: Option<NonZeroUsize>,
     max_catalog_items: Option<usize>,
@@ -80,6 +83,7 @@ impl Default for McpClientOptions {
     fn default() -> Self {
         Self {
             session_timeout: Some(DEFAULT_SESSION_TIMEOUT),
+            startup_timeout: None,
             catalog_timeout: None,
             max_list_pages: None,
             max_catalog_items: None,
@@ -160,6 +164,13 @@ impl McpClientOptions {
         self.session_timeout = timeout.into().filter(|timeout| !timeout.is_zero());
         self
     }
+    /// Overrides the deadlines for initialize and the initial complete tools/list only.
+    /// Ordinary requests retain the configured session and tool deadlines.
+    #[must_use]
+    pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = Some(timeout);
+        self
+    }
     /// Sets the overall tools/list and prompts/list deadline, including all pages.
     #[must_use]
     pub const fn with_catalog_timeout(mut self, timeout: Duration) -> Self {
@@ -202,6 +213,7 @@ impl McpClientOptions {
 
 struct ClientSessionServer {
     cleanup_unconfirmed: AtomicBool,
+    initial_tools_listed: AtomicBool,
     initialize_result: Arc<ServerPeerInfo>,
     tool_list_revision: McpToolListRevision,
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
@@ -271,7 +283,7 @@ impl McpClient {
         let tool_list_revision = McpToolListRevision::default();
         let transport = tool_list_changes::track_tool_list_changes(transport, &tool_list_revision);
         let initialize = rmcp::service::serve_client(ClientConfig::default(), transport);
-        let service = match options.session_timeout {
+        let service = match options.startup_timeout.or(options.session_timeout) {
             Some(timeout) => tokio::time::timeout(timeout, initialize)
                 .await
                 .map_err(|_| safe_error(ToolErrorKind::Timeout, "initialize timed out"))?,
@@ -290,10 +302,11 @@ impl McpClient {
                 options.tool_filter.clone(),
             )),
             session: Arc::new(ClientSessionServer {
+                cleanup_unconfirmed: AtomicBool::new(false),
+                initial_tools_listed: AtomicBool::new(false),
                 initialize_result,
                 tool_list_revision,
                 service: Mutex::new(Some(service)),
-                cleanup_unconfirmed: AtomicBool::new(false),
                 options,
                 request_lock: None,
                 #[cfg(feature = "http")]
@@ -417,7 +430,18 @@ impl McpClient {
     }
     async fn fetch_tools(&self) -> Result<Vec<Tool>> {
         let peer = self.peer().await?;
-        collect_paginated(self.options(), "tools/list", |params| {
+        let options = self.options();
+        let initial_listing = !self.session.initial_tools_listed.load(Ordering::Acquire);
+        let startup_timeout = options.startup_timeout.filter(|_| initial_listing);
+        let request_timeout = startup_timeout.or(options.session_timeout);
+        let startup_options;
+        let options = if let Some(timeout) = startup_timeout {
+            startup_options = options.clone().with_catalog_timeout(timeout);
+            &startup_options
+        } else {
+            options
+        };
+        let tools = collect_paginated(options, "tools/list", |params| {
             let peer = peer.clone();
             async move {
                 let request = params.map_or_else(
@@ -428,7 +452,7 @@ impl McpClient {
                     .send_request(
                         peer,
                         ClientRequest::ListToolsRequest(request),
-                        self.options().session_timeout,
+                        request_timeout,
                         None,
                     )
                     .await?
@@ -438,7 +462,13 @@ impl McpClient {
                 }
             }
         })
-        .await
+        .await?;
+        if initial_listing {
+            self.session
+                .initial_tools_listed
+                .store(true, Ordering::Release);
+        }
+        Ok(tools)
     }
     /// Aggregates every prompt page and retains the first page's metadata, as Python does.
     pub async fn list_prompts(&self) -> Result<ListPromptsResult> {
@@ -843,6 +873,9 @@ impl Drop for CancelOnDrop {
 fn initialize_error(error: ClientInitializeError) -> Error {
     match error {
         ClientInitializeError::JsonRpcError(error) => service_error(ServiceError::McpError(error)),
+        #[cfg(feature = "http")]
+        ClientInitializeError::TransportError { error, .. } => http::helper_diagnostic(&error)
+            .unwrap_or_else(|| safe_error(ToolErrorKind::ExecutionFailed, "initialize failed")),
         _ => safe_error(ToolErrorKind::ExecutionFailed, "initialize failed"),
     }
 }

@@ -8,11 +8,11 @@
 //! environment, plugin root, the stdio fallback cwd and the values of referenced environment
 //! variables. It is stored as a digest so secret values never live in the registry.
 //!
-//! Stored OAuth credentials, enterprise-managed authorization, HTTP header helpers and
-//! executor-owned servers need runtime pieces that are not part of this product registry yet;
+//! Stored OAuth credentials, enterprise-managed authorization and executor-owned servers
+//! need runtime pieces that are not part of this product registry yet;
 //! such servers are reported as unavailable rather than started without them.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use ra_mcp::{
 use sha2::{Digest, Sha256};
 
 use super::{McpServerConfig, tool_catalog_cache::CacheKey};
+
+mod headers_helper_process;
 
 /// Source default for a server's startup handshake.
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +100,11 @@ fn product_mcp_server(
             config.environment_id
         )));
     }
+    if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
+        return Err(Error::config(format!(
+            "Executor-only MCP server `{name}` requires a remote HTTP transport without host environment credentials or helpers"
+        )));
+    }
     if matches!(config.auth, McpServerAuth::EmaAuth) {
         return Err(Error::config(format!(
             "MCP server `{name}` requires enterprise-managed authorization, which this registry does not provide"
@@ -110,6 +117,7 @@ fn product_mcp_server(
     let filter = tool_filter(config);
     // The registry applies the filter per run, so it can change without reconnecting.
     let options = McpClientOptions::default()
+        .with_startup_timeout(startup_timeout)
         .with_tool_timeout(tool_timeout)
         .with_require_approval(approval_policy(config));
     let binding_options = options.clone();
@@ -146,29 +154,23 @@ fn product_mcp_server(
             http_headers,
             env_http_headers,
             http_headers_helper,
-        } => {
-            if http_headers_helper.is_some() {
-                return Err(Error::config(format!(
-                    "MCP server `{name}` uses an HTTP header helper, which this registry does not run"
-                )));
-            }
-            let mut params = McpHttpParams::new(url.clone())
-                .with_route_factory(http_client_factory.clone())
-                .with_headers(http_headers_with_env(
+        } => Arc::new(
+            McpServerStreamableHttp::new(
+                product_http_params(
+                    url,
+                    bearer_token_env_var.as_deref(),
                     http_headers.as_ref(),
                     env_http_headers.as_ref(),
-                ))
+                    http_headers_helper.as_deref(),
+                    local_process_cwd,
+                    http_client_factory,
+                )
                 // The source bounds connection setup by the startup timeout alone.
-                .with_timeout(startup_timeout);
-            if let Some(env_var) = bearer_token_env_var {
-                params = params.with_bearer_token_env_var(env_var.clone());
-            }
-            Arc::new(
-                McpServerStreamableHttp::new(params)
-                    .with_name(name)
-                    .with_options(options),
+                .with_timeout(startup_timeout),
             )
-        }
+            .with_name(name)
+            .with_options(options),
+        ),
     };
     let lifecycle =
         McpServerManagerOptions::default().with_connect_timeout(Some(startup_timeout))?;
@@ -185,15 +187,46 @@ fn product_mcp_server(
     Ok(registration)
 }
 
+fn product_http_params(
+    url: &str,
+    bearer_token_env_var: Option<&str>,
+    http_headers: Option<&HashMap<String, String>>,
+    env_http_headers: Option<&HashMap<String, String>>,
+    http_headers_helper: Option<&str>,
+    local_process_cwd: &Path,
+    http_client_factory: &ra_http::HttpClientFactory,
+) -> McpHttpParams {
+    let mut params = McpHttpParams::new(url)
+        .with_route_factory(http_client_factory.clone())
+        .with_headers(http_headers_with_env(http_headers, env_http_headers));
+    if let Some(env_var) = bearer_token_env_var {
+        params = params.with_bearer_token_env_var(env_var);
+    }
+    if let Some(command) = http_headers_helper {
+        let command: Arc<str> = Arc::from(command);
+        let cwd = Arc::new(local_process_cwd.to_path_buf());
+        params = params.with_http_headers_helper(move |env, limit| {
+            let command = command.clone();
+            let cwd = cwd.clone();
+            async move { headers_helper_process::run(&command, &cwd, env, limit).await }
+        });
+    }
+    params
+}
+
 fn tool_catalog_key(
     name: &str,
     config: &ProductServerConfig,
     identity: Option<&str>,
 ) -> Option<CacheKey> {
-    if matches!(
-        config.transport,
-        McpServerTransportConfig::StreamableHttp { .. }
-    ) && (config.oauth.is_some() || config.scopes.is_some() || config.oauth_resource.is_some())
+    if let McpServerTransportConfig::StreamableHttp {
+        http_headers_helper,
+        ..
+    } = &config.transport
+        && (http_headers_helper.is_some()
+            || config.oauth.is_some()
+            || config.scopes.is_some()
+            || config.oauth_resource.is_some())
     {
         return None;
     }

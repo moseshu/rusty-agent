@@ -86,11 +86,7 @@ impl McpClient {
         let codec = encoding::TextCodec::new(&params.encoding, params.encoding_error_handler)?;
         let mut command = tokio::process::Command::new(params.command);
         command.args(params.args).kill_on_drop(true).env_clear();
-        for name in DEFAULT_ENV_VARS {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
+        command.envs(super::process_env::core_env());
         if let Some(cwd) = params.cwd {
             command.current_dir(cwd);
         }
@@ -103,49 +99,6 @@ impl McpClient {
         Ok(client)
     }
 }
-
-// From Codex rmcp-client/utils.rs and protocol/shell_environment.rs. Explicit env overrides
-// are applied afterward, preserving PATH and normal runtime settings without ambient secrets.
-#[cfg(not(windows))]
-const DEFAULT_ENV_VARS: &[&str] = &[
-    "HOME",
-    "LOGNAME",
-    "PATH",
-    "SHELL",
-    "USER",
-    "__CF_USER_TEXT_ENCODING",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "TMPDIR",
-    "TZ",
-];
-#[cfg(windows)]
-const DEFAULT_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "SHELL",
-    "COMSPEC",
-    "SYSTEMROOT",
-    "WINDIR",
-    "SYSTEMDRIVE",
-    "USERNAME",
-    "USERDOMAIN",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "PROGRAMFILES",
-    "PROGRAMFILES(X86)",
-    "PROGRAMW6432",
-    "PROGRAMDATA",
-    "LOCALAPPDATA",
-    "APPDATA",
-    "TEMP",
-    "TMP",
-    "TMPDIR",
-    "POWERSHELL",
-    "PWSH",
-];
 
 /// A reusable configured stdio server, corresponding to Python's `MCPServerStdio`.
 /// Existing client handles stay bound to their original session after a reconnect.
