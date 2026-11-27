@@ -14,7 +14,7 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerConfig,
+        ServerCapabilities, ServerConfig, ServerRequest,
     },
     service::{Peer, RequestContext},
     transport::streamable_http_server::{
@@ -44,6 +44,23 @@ struct StartupCatalog {
     live_tools: Arc<Mutex<Option<Vec<rmcp::model::Tool>>>>,
     failing_session: Arc<AtomicUsize>,
     calls: mpsc::UnboundedSender<String>,
+}
+
+/// Announces a tool-list change and returns once the client has read the notification.
+/// Streamable HTTP sends notifications on the standalone stream but each response on its
+/// request's stream, so the two arrive in no fixed order. A ping sent outside any request handler
+/// follows the notification on the standalone stream, and its response shows the client read both.
+async fn announce_tool_list_change(peer: &Peer<RoleServer>) {
+    peer.notify_tool_list_changed().await.unwrap();
+    let peer = peer.clone();
+    // A request sent from a handler task would ride that request's stream instead.
+    tokio::spawn(async move {
+        peer.send_request(ServerRequest::PingRequest(Default::default()))
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
 }
 
 /// Lists only the session tool by default. A companion tool can follow or precede it, so a
@@ -132,7 +149,7 @@ impl ServerHandler for StartupCatalog {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         if request.name == "notify" {
-            context.peer.notify_tool_list_changed().await.unwrap();
+            announce_tool_list_change(&context.peer).await;
         } else {
             self.calls.send(request.name.to_string()).unwrap();
         }
@@ -880,14 +897,14 @@ async fn notifications_during_discovery_and_refresh_relist_without_reconnecting(
         tools = &mut readers => panic!("unexpected catalog: {tools:?}"),
     };
     fixture.revision.store(1, Ordering::SeqCst);
-    peer.notify_tool_list_changed().await.unwrap();
+    announce_tool_list_change(&peer).await;
     fixture.release(1, 1);
     tokio::select! {
         _ = fixture.listing(1) => {}
         tools = &mut readers => panic!("initial notification was missed: {tools:?}"),
     }
     fixture.revision.store(2, Ordering::SeqCst);
-    peer.notify_tool_list_changed().await.unwrap();
+    announce_tool_list_change(&peer).await;
     fixture.release(1, 1);
     tokio::select! {
         _ = fixture.listing(1) => {}
@@ -994,7 +1011,7 @@ async fn failed_refresh_keeps_the_last_listing_and_coalesces_retries() {
 
     let mut refresh = Box::pin(names(&runtime));
     fixture.revision.store(1, Ordering::SeqCst);
-    peer.notify_tool_list_changed().await.unwrap();
+    announce_tool_list_change(&peer).await;
     // Wait for delivery through the stream before reading the catalog.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1060,7 +1077,7 @@ async fn replacing_a_connection_cancels_its_notification_refresh() {
         peer = fixture.listing(1) => peer,
         tools = &mut discovery => panic!("unexpected catalog: {tools:?}"),
     };
-    peer.notify_tool_list_changed().await.unwrap();
+    announce_tool_list_change(&peer).await;
     fixture.release(1, 1);
     tokio::select! {
         _ = fixture.listing(1) => {}
@@ -1097,7 +1114,7 @@ async fn startup_catalog_invalidation_is_gated_by_the_feature() {
             peer = fixture.listing(1) => peer,
             tools = &mut discovery => panic!("unexpected catalog: {tools:?}"),
         };
-        peer.notify_tool_list_changed().await.unwrap();
+        announce_tool_list_change(&peer).await;
         fixture.release(1, 1);
         if enabled {
             tokio::select! {
